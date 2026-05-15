@@ -7,7 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 use scry_walker::{FileKind, Profile};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -164,6 +164,17 @@ pub struct RefRecord {
     pub resolved_to: Option<u64>,
 }
 
+impl RefRecord {
+    /// See `SymbolRecord::estimated_bytes`.
+    pub fn estimated_bytes(&self) -> usize {
+        let mut n = std::mem::size_of::<Self>();
+        n += self.name.capacity();
+        n += self.scope_path.capacity() * std::mem::size_of::<String>();
+        for s in &self.scope_path { n += s.capacity(); }
+        n
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolRecord {
     pub id: u64,
@@ -180,6 +191,20 @@ pub struct SymbolRecord {
 }
 
 impl SymbolRecord {
+    /// Cheap, deterministic estimate of how much RAM this record occupies
+    /// when held in a `Vec<SymbolRecord>`. Used by the streaming indexer to
+    /// decide when to flush a chunk to disk WITHOUT polling /proc/self/status
+    /// (which lags real allocation by 100s of ms and counts shared pages).
+    pub fn estimated_bytes(&self) -> usize {
+        // fixed struct fields + String capacities + Vec<String> contents
+        let mut n = std::mem::size_of::<Self>();
+        n += self.name.capacity();
+        if let Some(s) = self.fqn.as_ref() { n += s.capacity(); }
+        n += self.scope_path.capacity() * std::mem::size_of::<String>();
+        for s in &self.scope_path { n += s.capacity(); }
+        n
+    }
+
     pub fn compute_id(
         root_id: u8,
         relpath: &str,
@@ -261,6 +286,19 @@ pub struct StoreWriter {
     pub files: Vec<FileEntry>,
     pub symbols: Vec<SymbolRecord>,
     pub refs: Vec<RefRecord>,
+    /// On-disk staging directory for streaming chunk flushes (under
+    /// `<index>.tmp/`). When `None`, the writer is in legacy all-RAM mode and
+    /// callers should invoke `finalize`. When `Some`, callers can invoke
+    /// `flush_symbols_chunk`/`flush_refs_chunk` and finish via
+    /// `finalize_streaming`.
+    pub tmp_dir: Option<PathBuf>,
+    /// Number of symbol chunks already flushed.
+    pub symbol_chunk_count: u32,
+    pub ref_chunk_count: u32,
+    /// Per-chunk totals so we can stamp the final `Vec<T>` length without
+    /// re-reading the chunks first.
+    pub symbol_chunk_lens: Vec<u64>,
+    pub ref_chunk_lens: Vec<u64>,
 }
 
 impl StoreWriter {
@@ -271,7 +309,99 @@ impl StoreWriter {
             files: Vec::new(),
             symbols: Vec::new(),
             refs: Vec::new(),
+            tmp_dir: None,
+            symbol_chunk_count: 0,
+            ref_chunk_count: 0,
+            symbol_chunk_lens: Vec::new(),
+            ref_chunk_lens: Vec::new(),
         }
+    }
+
+    /// Create the writer in streaming mode. Initializes the `<index>.tmp/`
+    /// staging dir up front so flush calls can write chunk files.
+    pub fn new_streaming<P: Into<PathBuf>>(root: P) -> Result<Self> {
+        let root: PathBuf = root.into();
+        let tmp = root.with_extension("tmp");
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp)
+                .with_context(|| format!("clean stale tmp {}", tmp.display()))?;
+        }
+        std::fs::create_dir_all(&tmp)?;
+        Ok(Self {
+            paths: StorePaths::new(root),
+            roots: Vec::new(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            refs: Vec::new(),
+            tmp_dir: Some(tmp),
+            symbol_chunk_count: 0,
+            ref_chunk_count: 0,
+            symbol_chunk_lens: Vec::new(),
+            ref_chunk_lens: Vec::new(),
+        })
+    }
+
+    fn chunk_path(tmp: &Path, kind: &str, n: u32) -> PathBuf {
+        tmp.join(format!("{kind}.chunk.{:06}.bin", n))
+    }
+
+    /// Drain `self.symbols` to a chunk file. Also writes a sorted
+    /// `(name, final_idx)` side-file used by the finalize k-way merge so we
+    /// never have to hold a `BTreeMap<String, Vec<u32>>` of every name in RAM.
+    pub fn flush_symbols_chunk(&mut self) -> Result<u64> {
+        if self.symbols.is_empty() {
+            return Ok(0);
+        }
+        let tmp = self
+            .tmp_dir
+            .clone()
+            .ok_or_else(|| anyhow!("flush_symbols_chunk requires streaming mode"))?;
+        let n = self.symbol_chunk_count;
+        let p = Self::chunk_path(&tmp, "symbols", n);
+        let names_p = Self::chunk_path(&tmp, "symbol_names", n);
+        let count = self.symbols.len() as u64;
+        let idx_offset: u32 = self.symbol_chunk_lens.iter().sum::<u64>() as u32;
+        // Sorted names side-file: 4-byte name_len, name_bytes, 4-byte idx.
+        // Sorting a single chunk's names in RAM is bounded (chunk size).
+        let mut tuples: Vec<(String, u32)> = self.symbols.iter().enumerate()
+            .map(|(i, s)| (s.name.clone(), idx_offset + i as u32))
+            .collect();
+        tuples.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        write_sorted_names_chunk(&names_p, &tuples)?;
+        drop(tuples);
+        // Records file: bincode Vec preserved in original (chunk-insertion) order.
+        let take = std::mem::take(&mut self.symbols);
+        write_bincode(&p, &take)?;
+        self.symbol_chunk_count = n + 1;
+        self.symbol_chunk_lens.push(count);
+        Ok(count)
+    }
+
+    /// Drain `self.refs` to a chunk file (with sorted names side-file).
+    pub fn flush_refs_chunk(&mut self) -> Result<u64> {
+        if self.refs.is_empty() {
+            return Ok(0);
+        }
+        let tmp = self
+            .tmp_dir
+            .clone()
+            .ok_or_else(|| anyhow!("flush_refs_chunk requires streaming mode"))?;
+        let n = self.ref_chunk_count;
+        let p = Self::chunk_path(&tmp, "refs", n);
+        let names_p = Self::chunk_path(&tmp, "ref_names", n);
+        let count = self.refs.len() as u64;
+        let idx_offset: u32 = self.ref_chunk_lens.iter().sum::<u64>() as u32;
+        let mut tuples: Vec<(String, u32)> = self.refs.iter().enumerate()
+            .map(|(i, r)| (r.name.clone(), idx_offset + i as u32))
+            .collect();
+        tuples.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        write_sorted_names_chunk(&names_p, &tuples)?;
+        drop(tuples);
+        let take = std::mem::take(&mut self.refs);
+        write_bincode(&p, &take)?;
+        self.ref_chunk_count = n + 1;
+        self.ref_chunk_lens.push(count);
+        Ok(count)
     }
 
     /// Layer-1 resolution: best-effort name match. For each ref we look up
@@ -301,6 +431,126 @@ impl StoreWriter {
                 r.resolved_to = Some(self.symbols[idx as usize].id);
             }
         }
+    }
+
+    /// Streaming finalize: assumes the writer is in streaming mode and that
+    /// symbols + refs have been periodically flushed to chunk files. Any
+    /// records still in `self.symbols` / `self.refs` are flushed first.
+    ///
+    /// Memory envelope (peak) during finalize:
+    ///   - one chunk's `Vec<SymbolRecord>` (or `RefRecord`) at a time, plus
+    ///   - a single `BTreeMap<String, Vec<u32>>` of name -> indices used to
+    ///     emit the FST + postings (built incrementally as we stream).
+    pub fn finalize_streaming(mut self, stats: IndexStats) -> Result<()> {
+        // Flush any remaining in-RAM records.
+        let _ = self.flush_symbols_chunk()?;
+        let _ = self.flush_refs_chunk()?;
+
+        let final_dir = self.paths.root.clone();
+        let tmp = self
+            .tmp_dir
+            .clone()
+            .ok_or_else(|| anyhow!("finalize_streaming requires streaming mode"))?;
+        let tmp_paths = StorePaths::new(tmp.clone());
+
+        write_bincode(&tmp_paths.roots(), &self.roots)?;
+        write_bincode(&tmp_paths.files(), &self.files)?;
+
+        // -- symbols.bin: concatenate chunks into a single bincode Vec<SymbolRecord> --
+        let total_syms: u64 = self.symbol_chunk_lens.iter().sum();
+        {
+            let mut w = BufWriter::new(File::create(tmp_paths.symbols())?);
+            // bincode 1.3 with default config encodes Vec<T> as u64-LE length
+            // followed by each element. We stamp the length, then stream each
+            // chunk's records back out one by one without rebuilding a Vec.
+            w.write_all(&total_syms.to_le_bytes())?;
+            for n in 0..self.symbol_chunk_count {
+                let p = Self::chunk_path(&tmp, "symbols", n);
+                let chunk: Vec<SymbolRecord> = read_bincode(&p)?;
+                for s in &chunk {
+                    bincode::serialize_into(&mut w, s)
+                        .with_context(|| "stream symbol")?;
+                }
+            }
+            w.flush()?;
+        }
+
+        // -- names.fst + name_postings.bin (k-way merge over per-chunk sorted
+        //    names side-files). RAM ≈ chunks × small buffer; no in-RAM map. --
+        {
+            let chunk_paths: Vec<PathBuf> = (0..self.symbol_chunk_count)
+                .map(|n| Self::chunk_path(&tmp, "symbol_names", n))
+                .collect();
+            kway_merge_names_to_fst(
+                &chunk_paths,
+                &tmp_paths.names_fst(),
+                &tmp_paths.name_postings(),
+            )?;
+        }
+
+        // -- refs.bin + ref_names.fst + ref_postings.bin --
+        let total_refs: u64 = self.ref_chunk_lens.iter().sum();
+        {
+            let mut w = BufWriter::new(File::create(tmp_paths.refs())?);
+            w.write_all(&total_refs.to_le_bytes())?;
+            for n in 0..self.ref_chunk_count {
+                let p = Self::chunk_path(&tmp, "refs", n);
+                let chunk: Vec<RefRecord> = read_bincode(&p)?;
+                for r in &chunk {
+                    bincode::serialize_into(&mut w, r)
+                        .with_context(|| "stream ref")?;
+                }
+            }
+            w.flush()?;
+        }
+        {
+            let chunk_paths: Vec<PathBuf> = (0..self.ref_chunk_count)
+                .map(|n| Self::chunk_path(&tmp, "ref_names", n))
+                .collect();
+            kway_merge_names_to_fst(
+                &chunk_paths,
+                &tmp_paths.ref_names_fst(),
+                &tmp_paths.ref_postings(),
+            )?;
+        }
+
+        let manifest = Manifest {
+            version: 1,
+            scry_version: env!("CARGO_PKG_VERSION").to_string(),
+            indexed_at: now_iso(),
+            roots: self.roots.clone(),
+            stats,
+        };
+        let mut mf = BufWriter::new(File::create(tmp_paths.manifest())?);
+        serde_json::to_writer_pretty(&mut mf, &manifest)?;
+        mf.flush()?;
+
+        // Drop chunk files now that the final bin files are written. Keeps
+        // disk usage roughly to the size of the final index.
+        for n in 0..self.symbol_chunk_count {
+            let _ = std::fs::remove_file(Self::chunk_path(&tmp, "symbols", n));
+            let _ = std::fs::remove_file(Self::chunk_path(&tmp, "symbol_names", n));
+        }
+        for n in 0..self.ref_chunk_count {
+            let _ = std::fs::remove_file(Self::chunk_path(&tmp, "refs", n));
+            let _ = std::fs::remove_file(Self::chunk_path(&tmp, "ref_names", n));
+        }
+
+        if final_dir.exists() {
+            let old = final_dir.with_extension("old");
+            if old.exists() {
+                std::fs::remove_dir_all(&old).ok();
+            }
+            std::fs::rename(&final_dir, &old)?;
+            std::fs::rename(&tmp, &final_dir)?;
+            std::fs::remove_dir_all(&old).ok();
+        } else {
+            if let Some(parent) = final_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&tmp, &final_dir)?;
+        }
+        Ok(())
     }
 
     pub fn finalize(self, stats: IndexStats) -> Result<()> {
@@ -360,6 +610,41 @@ impl StoreWriter {
     }
 }
 
+/// Like `build_name_fst` but takes a pre-built (already-sorted via BTreeMap)
+/// name -> indices map. Used by the streaming finalize so we don't have to
+/// hold the raw records in RAM while emitting postings.
+fn write_postings_and_fst(
+    by_name: &BTreeMap<String, Vec<u32>>,
+    fst_path: &Path,
+    postings_path: &Path,
+) -> Result<()> {
+    let mut postings = BufWriter::new(File::create(postings_path)?);
+    let mut pos: u64 = 0;
+    let mut offsets: Vec<(&str, u64)> = Vec::with_capacity(by_name.len());
+    for (name, idxs) in by_name.iter() {
+        offsets.push((name.as_str(), pos));
+        postings.write_all(&(idxs.len() as u32).to_le_bytes())?;
+        pos += 4;
+        for i in idxs {
+            postings.write_all(&i.to_le_bytes())?;
+            pos += 4;
+        }
+    }
+    if pos == 0 {
+        postings.write_all(&[0u8])?;
+    }
+    postings.flush()?;
+    let fst_file = BufWriter::new(File::create(fst_path)?);
+    let mut builder = fst::MapBuilder::new(fst_file)?;
+    for (name, off) in offsets {
+        builder
+            .insert(name.as_bytes(), off)
+            .with_context(|| format!("fst insert {name}"))?;
+    }
+    builder.finish()?;
+    Ok(())
+}
+
 /// Build a FST + posting list for a stream of (name, idx) tuples.
 /// The FST stores `name -> u64 offset` into the postings file.
 /// Each posting is `u32 count + count * u32 idx` (little-endian).
@@ -400,6 +685,158 @@ fn build_name_fst<'a, I: Iterator<Item = (&'a str, u32)>>(
             .with_context(|| format!("fst insert {name}"))?;
     }
     builder.finish()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// External merge sort for FST construction.
+// Per-chunk we write a side-file of sorted (name, idx) tuples. Finalize
+// k-way merges them, feeding fst::MapBuilder in sorted order. RAM peak ≈
+// (num_chunks × a few KB) regardless of corpus size — replaces the previous
+// in-RAM BTreeMap<String, Vec<u32>> that OOM'd on full AOSP.
+// ---------------------------------------------------------------------------
+
+/// On-disk record format: u32 name_len LE, name_bytes, u32 idx LE.
+fn write_sorted_names_chunk(path: &Path, sorted: &[(String, u32)]) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path)?);
+    for (name, idx) in sorted {
+        w.write_all(&(name.len() as u32).to_le_bytes())?;
+        w.write_all(name.as_bytes())?;
+        w.write_all(&idx.to_le_bytes())?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+struct NamesChunkReader {
+    file: BufReader<File>,
+    /// The next (name, idx) pair this reader will emit; None when exhausted.
+    next: Option<(String, u32)>,
+}
+
+impl NamesChunkReader {
+    fn open(path: &Path) -> Result<Self> {
+        let mut r = Self {
+            file: BufReader::new(
+                File::open(path).with_context(|| format!("open {}", path.display()))?,
+            ),
+            next: None,
+        };
+        r.advance()?;
+        Ok(r)
+    }
+    fn advance(&mut self) -> Result<()> {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        if self.file.read_exact(&mut len_buf).is_err() {
+            self.next = None;
+            return Ok(());
+        }
+        let name_len = u32::from_le_bytes(len_buf) as usize;
+        let mut name_bytes = vec![0u8; name_len];
+        self.file.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8(name_bytes).context("bad utf8 in names chunk")?;
+        self.file.read_exact(&mut len_buf)?;
+        let idx = u32::from_le_bytes(len_buf);
+        self.next = Some((name, idx));
+        Ok(())
+    }
+}
+
+/// Min-heap item: smallest (name, then reader_id for stability) at the top.
+#[derive(Eq, PartialEq)]
+struct HeapItem {
+    name: String,
+    idx: u32,
+    reader_id: usize,
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // std BinaryHeap is a max-heap, so reverse the natural order.
+        other
+            .name
+            .cmp(&self.name)
+            .then(other.reader_id.cmp(&self.reader_id))
+            .then(other.idx.cmp(&self.idx))
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+fn kway_merge_names_to_fst(
+    chunk_paths: &[PathBuf],
+    fst_path: &Path,
+    postings_path: &Path,
+) -> Result<()> {
+    use std::collections::BinaryHeap;
+    let mut readers: Vec<NamesChunkReader> = chunk_paths
+        .iter()
+        .map(|p| NamesChunkReader::open(p))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(readers.len());
+    for (i, r) in readers.iter().enumerate() {
+        if let Some((name, idx)) = r.next.as_ref() {
+            heap.push(HeapItem { name: name.clone(), idx: *idx, reader_id: i });
+        }
+    }
+
+    let mut postings = BufWriter::new(File::create(postings_path)?);
+    let fst_file = BufWriter::new(File::create(fst_path)?);
+    let mut fst_builder = fst::MapBuilder::new(fst_file)?;
+    let mut current_name: Option<String> = None;
+    let mut current_offset: u64 = 0;
+    let mut current_idxs: Vec<u32> = Vec::new();
+    let mut pos: u64 = 0;
+
+    let flush_group = |postings: &mut BufWriter<File>,
+                       fst_builder: &mut fst::MapBuilder<BufWriter<File>>,
+                       name: &str,
+                       idxs: &[u32],
+                       offset: u64,
+                       pos: &mut u64|
+     -> Result<()> {
+        if idxs.is_empty() { return Ok(()); }
+        postings.write_all(&(idxs.len() as u32).to_le_bytes())?;
+        for i in idxs {
+            postings.write_all(&i.to_le_bytes())?;
+        }
+        *pos += 4 + (idxs.len() * 4) as u64;
+        fst_builder
+            .insert(name.as_bytes(), offset)
+            .with_context(|| format!("fst insert {name}"))?;
+        Ok(())
+    };
+
+    while let Some(HeapItem { name, idx, reader_id }) = heap.pop() {
+        let same = current_name.as_deref() == Some(name.as_str());
+        if !same {
+            if let Some(n) = current_name.take() {
+                flush_group(&mut postings, &mut fst_builder, &n, &current_idxs, current_offset, &mut pos)?;
+                current_idxs.clear();
+            }
+            current_name = Some(name);
+            current_offset = pos;
+        }
+        current_idxs.push(idx);
+        readers[reader_id].advance()?;
+        if let Some((next_name, next_idx)) = readers[reader_id].next.as_ref() {
+            heap.push(HeapItem {
+                name: next_name.clone(),
+                idx: *next_idx,
+                reader_id,
+            });
+        }
+    }
+    if let Some(n) = current_name.take() {
+        flush_group(&mut postings, &mut fst_builder, &n, &current_idxs, current_offset, &mut pos)?;
+    }
+    if pos == 0 {
+        postings.write_all(&[0u8])?;
+    }
+    postings.flush()?;
+    fst_builder.finish()?;
     Ok(())
 }
 

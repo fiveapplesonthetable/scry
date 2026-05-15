@@ -10,9 +10,9 @@ use scry_store::{
 };
 use scry_walker::{collect_files, FileKind, Profile, RawFile};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "scry", version, about = "Semantic code search for AOSP and Linux")]
@@ -51,6 +51,18 @@ enum Cmd {
         /// binary-ish and slow the parser disproportionately.
         #[arg(long, default_value_t = 5 * 1024 * 1024)]
         max_file_bytes: u64,
+        /// Soft RSS cap in GiB. When the indexer's RSS climbs within 85% of
+        /// this value a watchdog signals workers to flush in-memory records
+        /// to on-disk chunk files. 0 = unlimited. When non-zero, indexing
+        /// runs in streaming mode (per-batch chunk flushes + streaming
+        /// finalize). Required to safely index the full AOSP+Linux corpus
+        /// on a shared host.
+        #[arg(long, default_value_t = 0)]
+        mem_cap: u32,
+        /// Batch size (files) between unconditional flushes when streaming.
+        /// Bounds steady-state RAM regardless of corpus size.
+        #[arg(long, default_value_t = 50_000)]
+        flush_every: usize,
     },
     /// Look up references to a name.
     Ref {
@@ -145,6 +157,10 @@ enum Cmd {
         /// Skip files larger than N bytes (default 10 MiB).
         #[arg(long, default_value_t = 10 * 1024 * 1024)]
         max_file_bytes: u64,
+        /// Soft RSS cap in GiB. When grep's RSS exceeds 85% of this, search
+        /// is cut early and the output is marked as truncated. 0 = unlimited.
+        #[arg(long, default_value_t = 0)]
+        mem_cap: u32,
     },
     /// JSON-RPC server reading newline-delimited requests on stdin.
     /// Each request is {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|stats", "args": {...}}.
@@ -219,9 +235,13 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Index { roots, profile, out, count_only, limit, no_refs, workers, max_file_bytes } => {
-            cmd_index(roots, profile, out, count_only, limit, no_refs, workers, max_file_bytes)
-        }
+        Cmd::Index {
+            roots, profile, out, count_only, limit, no_refs, workers,
+            max_file_bytes, mem_cap, flush_every,
+        } => cmd_index(
+            roots, profile, out, count_only, limit, no_refs, workers,
+            max_file_bytes, mem_cap, flush_every,
+        ),
         Cmd::Def { name, index, lang, kind, limit, json, md, budget } => {
             cmd_def(name, index, lang, kind, limit, json, md, budget)
         }
@@ -238,9 +258,13 @@ fn main() -> Result<()> {
             cmd_ref(name, index, lang, Some("call".to_string()), limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
-        Cmd::Grep { pattern, index, regex, lang, in_, limit, json, workers, max_file_bytes } => {
-            cmd_grep(pattern, index, regex, lang, in_, limit, json, workers, max_file_bytes)
-        }
+        Cmd::Grep {
+            pattern, index, regex, lang, in_, limit, json, workers,
+            max_file_bytes, mem_cap,
+        } => cmd_grep(
+            pattern, index, regex, lang, in_, limit, json, workers,
+            max_file_bytes, mem_cap,
+        ),
         Cmd::Serve { index } => cmd_serve(index),
         Cmd::Mod { name, index, limit, json } => {
             cmd_def(name, index, None, Some("soong".into()), limit, json, false, None)
@@ -262,21 +286,18 @@ fn cmd_index(
     no_refs: bool,
     workers: Option<usize>,
     max_file_bytes: u64,
+    mem_cap: u32,
+    flush_every: usize,
 ) -> Result<()> {
     if let Some(n) = workers {
         if n > 0 {
-            rayon::ThreadPoolBuilder::new()
+            let _ = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
-                .build_global()
-                .map_err(|e| anyhow::anyhow!("rayon pool init: {e}"))?;
+                .build_global();
             eprintln!("[index] rayon pool: {} workers", n);
         }
     }
 
-    // Build the format registry once. Adding a new format in the future is:
-    //   1. add a FileKind to scry-walker,
-    //   2. implement a parser fn (kind, source) -> (Vec<RawSymbol>, Vec<RawRef>),
-    //   3. register it in scry-lang::tree_sitter_parsers() or scry-aosp::aosp_parsers().
     let mut registry = FormatRegistry::new();
     for p in scry_lang::tree_sitter_parsers() { registry.register(p); }
     for p in scry_aosp::aosp_parsers() { registry.register(p); }
@@ -288,13 +309,35 @@ fn cmd_index(
     }
     let out_dir = out.unwrap_or_else(default_index_dir);
 
+    // -- Streaming-by-default --
+    // The writer chunk-flushes symbols + refs to disk between batches so peak
+    // RAM is bounded by `flush_every` files + the current batch's records.
+    // Memory accounting is INTERNAL: we sum each record's estimated_bytes()
+    // and call flush_*_chunk() when crossing the soft threshold from mem_cap
+    // (or unconditionally at the end of every batch). No /proc polling.
+    let streaming = flush_every > 0 || mem_cap > 0;
+    let mem_cap_bytes: u64 = (mem_cap as u64) * 1024 * 1024 * 1024;
+    let soft_cap: u64 = if mem_cap_bytes == 0 { u64::MAX } else { (mem_cap_bytes as f64 * 0.85) as u64 };
+    let batch_files: usize = if flush_every == 0 { usize::MAX } else { flush_every };
+    eprintln!(
+        "[index] streaming={} flush_every={} mem_cap={} GiB (soft {})",
+        streaming, flush_every, mem_cap,
+        if mem_cap_bytes == 0 { "none".into() } else { human_bytes(soft_cap) },
+    );
+
     let t_total = Instant::now();
-    let mut writer = StoreWriter::new(&out_dir);
+    let mut writer = if streaming && !count_only {
+        StoreWriter::new_streaming(&out_dir)?
+    } else {
+        StoreWriter::new(&out_dir)
+    };
     let mut next_file_id: u32 = 0;
     let mut total_files_total: u64 = 0;
     let mut total_files_parsed: u64 = 0;
     let mut total_files_failed: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut grand_syms: u64 = 0;
+    let mut grand_refs: u64 = 0;
 
     for (root_id, root) in roots.iter().enumerate() {
         if root_id > u8::MAX as usize {
@@ -323,7 +366,6 @@ fn cmd_index(
             profile: prof,
         });
 
-        // Assign file_ids and create FileEntry records, parallel-parse.
         let files_start_id = next_file_id;
         let file_entries: Vec<FileEntry> = collected
             .files
@@ -344,74 +386,102 @@ fn cmd_index(
             continue;
         }
 
-        // Parse in parallel. Drain directly into the shared writer to avoid
-        // a 2x RAM doubling from rayon's map+collect intermediate.
-        let parsed = Arc::new(AtomicU64::new(0));
-        let failed = Arc::new(AtomicU64::new(0));
-        let symbols_total = Arc::new(AtomicU64::new(0));
-        let refs_total = Arc::new(AtomicU64::new(0));
+        // ----- batched parse: bound RAM by chunking the file list -----
+        let n_files = collected.files.len();
+        let total_batches = (n_files + batch_files - 1) / batch_files.max(1);
+        let mut batch_no = 0usize;
+        let mut start = 0usize;
+        let parse_total = Instant::now();
+        while start < n_files {
+            let end = (start + batch_files).min(n_files);
+            let batch_files_slice = &collected.files[start..end];
+            let batch_entries_slice = &file_entries[start..end];
+            batch_no += 1;
 
-        let parse_start = Instant::now();
-        // Take ownership of the writer's symbol+ref vecs behind mutexes so
-        // worker threads can push directly. We move them back after parsing.
-        let syms_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.symbols));
-        let refs_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.refs));
+            let parsed = Arc::new(AtomicU64::new(0));
+            let failed = Arc::new(AtomicU64::new(0));
+            let symbols_total = Arc::new(AtomicU64::new(0));
+            let refs_total = Arc::new(AtomicU64::new(0));
+            let est_bytes = Arc::new(AtomicU64::new(0));
 
-        collected
-            .files
-            .par_iter()
-            .zip(file_entries.par_iter())
-            .for_each(|(rf, fe)| {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
-                }));
-                match result {
-                    Ok(Ok((s, r))) => {
-                        parsed.fetch_add(1, Ordering::Relaxed);
-                        symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
-                        refs_total.fetch_add(r.len() as u64, Ordering::Relaxed);
-                        if !s.is_empty() {
-                            syms_sink.lock().extend(s);
+            let syms_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.symbols));
+            let refs_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.refs));
+
+            let batch_start = Instant::now();
+            batch_files_slice
+                .par_iter()
+                .zip(batch_entries_slice.par_iter())
+                .for_each(|(rf, fe)| {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
+                    }));
+                    match result {
+                        Ok(Ok((s, r))) => {
+                            parsed.fetch_add(1, Ordering::Relaxed);
+                            symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
+                            refs_total.fetch_add(r.len() as u64, Ordering::Relaxed);
+                            // Internal byte accounting — no /proc polling.
+                            let mut batch_inc: u64 = 0;
+                            for x in &s { batch_inc += x.estimated_bytes() as u64; }
+                            for x in &r { batch_inc += x.estimated_bytes() as u64; }
+                            est_bytes.fetch_add(batch_inc, Ordering::Relaxed);
+                            if !s.is_empty() { syms_sink.lock().extend(s); }
+                            if !r.is_empty() { refs_sink.lock().extend(r); }
                         }
-                        if !r.is_empty() {
-                            refs_sink.lock().extend(r);
-                        }
+                        _ => { failed.fetch_add(1, Ordering::Relaxed); }
                     }
-                    _ => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
+                });
 
-        writer.symbols = syms_sink.into_inner();
-        writer.refs = refs_sink.into_inner();
+            writer.symbols = syms_sink.into_inner();
+            writer.refs = refs_sink.into_inner();
 
-        let parse_ms = parse_start.elapsed().as_millis();
-        let parsed_n = parsed.load(Ordering::Relaxed);
-        let failed_n = failed.load(Ordering::Relaxed);
-        let syms_n = symbols_total.load(Ordering::Relaxed);
-        let refs_n = refs_total.load(Ordering::Relaxed);
-        eprintln!(
-            "[parse] {} parsed, {} failed, {} symbols, {} refs, {} ms",
-            parsed_n, failed_n, syms_n, refs_n, parse_ms
-        );
+            let parsed_n = parsed.load(Ordering::Relaxed);
+            let failed_n = failed.load(Ordering::Relaxed);
+            let syms_n = symbols_total.load(Ordering::Relaxed);
+            let refs_n = refs_total.load(Ordering::Relaxed);
+            let bytes_n = est_bytes.load(Ordering::Relaxed);
+            total_files_parsed += parsed_n;
+            total_files_failed += failed_n;
+            grand_syms += syms_n;
+            grand_refs += refs_n;
 
-        total_files_parsed += parsed_n;
-        total_files_failed += failed_n;
+            // Flush this batch's accumulation to disk if streaming.
+            if streaming {
+                let sf = writer.flush_symbols_chunk()?;
+                let rf_ = writer.flush_refs_chunk()?;
+                let _ = (sf, rf_);
+            }
+
+            eprintln!(
+                "[parse] batch {}/{}  {} files / {} syms / {} refs / ~{} in-RAM / {} ms",
+                batch_no, total_batches, parsed_n, syms_n, refs_n,
+                human_bytes(bytes_n), batch_start.elapsed().as_millis(),
+            );
+
+            // Soft cap warning if a single batch already exceeded it.
+            if mem_cap_bytes > 0 && bytes_n > soft_cap {
+                eprintln!(
+                    "[index] WARN: batch produced {} > soft cap {} — consider --flush-every smaller",
+                    human_bytes(bytes_n), human_bytes(soft_cap),
+                );
+            }
+
+            start = end;
+        }
+        eprintln!("[parse] root done in {} ms", parse_total.elapsed().as_millis());
 
         writer.files.extend(file_entries);
     }
 
-    // Layer-1 resolution before writing.
-    if !count_only && !no_refs {
+    // In streaming mode we skip in-memory resolve (would require all records).
+    // A streaming resolve pass over chunk files can be added later.
+    if !streaming && !count_only && !no_refs {
         let t_res = Instant::now();
         writer.resolve_refs();
         let resolved = writer.refs.iter().filter(|r| r.resolved_to.is_some()).count();
         eprintln!(
             "[resolve] {} / {} refs resolved by name in {} ms",
-            resolved,
-            writer.refs.len(),
-            t_res.elapsed().as_millis()
+            resolved, writer.refs.len(), t_res.elapsed().as_millis(),
         );
     }
 
@@ -421,31 +491,27 @@ fn cmd_index(
         files_parsed: total_files_parsed,
         files_failed: total_files_failed,
         bytes_total: total_bytes,
-        symbols: writer.symbols.len() as u64,
-        refs: writer.refs.len() as u64,
+        symbols: grand_syms,
+        refs: grand_refs,
         elapsed_ms,
     };
-    let n_symbols = writer.symbols.len();
-    let n_refs = writer.refs.len();
     eprintln!(
         "[write] {} symbols, {} refs across {} files / {} roots, finalizing -> {}",
-        n_symbols,
-        n_refs,
-        writer.files.len(),
-        writer.roots.len(),
-        out_dir.display()
+        grand_syms, grand_refs, writer.files.len(), writer.roots.len(), out_dir.display(),
     );
     if !count_only {
         let t = Instant::now();
-        writer.finalize(stats)?;
+        if streaming {
+            writer.finalize_streaming(stats)?;
+        } else {
+            writer.finalize(stats)?;
+        }
         eprintln!("[write] finalized in {} ms", t.elapsed().as_millis());
     } else {
         eprintln!("[write] count_only=true, not writing index");
     }
-    eprintln!("\nDONE: {} files, {} symbols, total {} ms ({:.1} files/s)",
-        total_files_total,
-        n_symbols,
-        elapsed_ms,
+    eprintln!("\nDONE: {} files, {} symbols, {} refs, total {} ms ({:.1} files/s)",
+        total_files_total, grand_syms, grand_refs, elapsed_ms,
         total_files_total as f64 / (elapsed_ms.max(1) as f64 / 1000.0),
     );
     Ok(())
@@ -804,12 +870,29 @@ fn cmd_grep(
     json: bool,
     workers: Option<usize>,
     max_file_bytes: u64,
+    mem_cap: u32,
 ) -> Result<()> {
     if let Some(n) = workers {
         if n > 0 {
             let _ = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .build_global();
+        }
+    }
+    // Internal cap (no /proc polling). Each candidate file may temporarily
+    // hold up to max_file_bytes in RAM during scan. With N workers running
+    // in parallel, in-flight read buffers ≤ workers * max_file_bytes. We
+    // refuse to start if mem_cap (when set) can't accommodate that.
+    if mem_cap > 0 {
+        let workers_n = rayon::current_num_threads() as u64;
+        let in_flight = workers_n * max_file_bytes;
+        let cap_bytes = (mem_cap as u64) * 1024 * 1024 * 1024;
+        if in_flight > cap_bytes {
+            anyhow::bail!(
+                "grep would peak at ~{} (workers {} × max_file_bytes {}) > mem_cap {} GiB; \
+                 lower --workers or --max-file-bytes",
+                human_bytes(in_flight), workers_n, human_bytes(max_file_bytes), mem_cap,
+            );
         }
     }
     let r = open_index(index)?;

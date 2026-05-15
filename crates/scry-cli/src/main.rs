@@ -344,7 +344,9 @@ fn parse_one(
     // We parse source-language kinds (tree-sitter) AND a subset of
     // AOSP-specific kinds (Android.bp, AIDL, OWNERS) via scry-aosp.
     let is_aosp = matches!(rf.kind,
-        FileKind::Soong | FileKind::Aidl | FileKind::Owners);
+        FileKind::Soong | FileKind::Aidl | FileKind::Owners |
+        FileKind::Aconfig | FileKind::InitRc | FileKind::Sepolicy |
+        FileKind::Manifest);
     if !rf.kind.is_source() && !is_aosp {
         return Ok((Vec::new(), Vec::new()));
     }

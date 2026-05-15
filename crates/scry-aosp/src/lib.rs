@@ -7,6 +7,10 @@
 pub mod bp;
 pub mod aidl;
 pub mod owners;
+pub mod aconfig;
+pub mod initrc;
+pub mod sepolicy;
+pub mod manifest;
 
 use scry_lang::RawSymbol;
 use scry_lang::RawRef;
@@ -21,6 +25,10 @@ pub fn extract(kind: FileKind, source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
         FileKind::Soong => bp::parse(source),
         FileKind::Aidl => aidl::parse(source),
         FileKind::Owners => owners::parse(source),
+        FileKind::Aconfig => aconfig::parse(source),
+        FileKind::InitRc => initrc::parse(source),
+        FileKind::Sepolicy => sepolicy::parse(source),
+        FileKind::Manifest => manifest::parse(source),
         _ => (Vec::new(), Vec::new()),
     }
 }

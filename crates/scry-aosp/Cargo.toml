@@ -12,3 +12,4 @@ tracing = { workspace = true }
 scry-walker = { path = "../scry-walker" }
 scry-store = { path = "../scry-store" }
 scry-lang = { path = "../scry-lang" }
+quick-xml = "0.31"

@@ -16,6 +16,31 @@ use std::path::{Path, PathBuf};
 // Types
 // ---------------------------------------------------------------------------
 
+/// Kind of reference site (call, ctor, inheritance edge, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[repr(u8)]
+pub enum RefKind {
+    Call = 0,
+    Ctor = 1,
+    TypeUse = 2,
+    FieldAccess = 3,
+    Import = 4,
+    InheritFrom = 5,
+}
+
+impl RefKind {
+    pub fn short(&self) -> &'static str {
+        match self {
+            RefKind::Call => "call",
+            RefKind::Ctor => "ctor",
+            RefKind::TypeUse => "type",
+            RefKind::FieldAccess => "field",
+            RefKind::Import => "import",
+            RefKind::InheritFrom => "inherit",
+        }
+    }
+}
+
 /// Stable cross-language symbol category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 pub enum SymbolKind {
@@ -124,6 +149,22 @@ impl FileEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefRecord {
+    pub name: String,
+    pub kind: RefKind,
+    pub file_id: u32,
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub line: u32,
+    pub col: u32,
+    pub scope_path: Vec<String>,
+    pub lang: FileKind,
+    /// Set during Phase 1 of resolution: a probable definition (by name match
+    /// alone for now). Phase 2+ refines via scope/imports.
+    pub resolved_to: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolRecord {
     pub id: u64,
     pub name: String,
@@ -183,6 +224,7 @@ pub struct IndexStats {
     pub files_failed: u64,
     pub bytes_total: u64,
     pub symbols: u64,
+    pub refs: u64,
     pub elapsed_ms: u128,
 }
 
@@ -204,6 +246,9 @@ impl StorePaths {
     pub fn symbols(&self) -> PathBuf { self.root.join("symbols.bin") }
     pub fn names_fst(&self) -> PathBuf { self.root.join("names.fst") }
     pub fn name_postings(&self) -> PathBuf { self.root.join("name_postings.bin") }
+    pub fn refs(&self) -> PathBuf { self.root.join("refs.bin") }
+    pub fn ref_names_fst(&self) -> PathBuf { self.root.join("ref_names.fst") }
+    pub fn ref_postings(&self) -> PathBuf { self.root.join("ref_postings.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +260,7 @@ pub struct StoreWriter {
     pub roots: Vec<RootEntry>,
     pub files: Vec<FileEntry>,
     pub symbols: Vec<SymbolRecord>,
+    pub refs: Vec<RefRecord>,
 }
 
 impl StoreWriter {
@@ -224,6 +270,7 @@ impl StoreWriter {
             roots: Vec::new(),
             files: Vec::new(),
             symbols: Vec::new(),
+            refs: Vec::new(),
         }
     }
 
@@ -240,37 +287,20 @@ impl StoreWriter {
         write_bincode(&tmp_paths.roots(), &self.roots)?;
         write_bincode(&tmp_paths.files(), &self.files)?;
         write_bincode(&tmp_paths.symbols(), &self.symbols)?;
+        write_bincode(&tmp_paths.refs(), &self.refs)?;
 
-        // name -> postings
-        let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
-        for (idx, sym) in self.symbols.iter().enumerate() {
-            by_name.entry(sym.name.clone()).or_default().push(idx as u32);
-        }
-        let mut names: Vec<String> = by_name.keys().cloned().collect();
-        names.sort();
-
-        let mut postings = BufWriter::new(File::create(tmp_paths.name_postings())?);
-        let mut offsets: Vec<(String, u64)> = Vec::with_capacity(names.len());
-        let mut pos: u64 = 0;
-        for name in &names {
-            let idxs = &by_name[name];
-            offsets.push((name.clone(), pos));
-            postings.write_all(&(idxs.len() as u32).to_le_bytes())?;
-            pos += 4;
-            for i in idxs {
-                postings.write_all(&i.to_le_bytes())?;
-                pos += 4;
-            }
-        }
-        postings.flush()?;
-
-        let fst_file = BufWriter::new(File::create(tmp_paths.names_fst())?);
-        let mut builder = fst::MapBuilder::new(fst_file)?;
-        for (name, off) in offsets {
-            builder.insert(name.as_bytes(), off)
-                .with_context(|| format!("fst insert {name}"))?;
-        }
-        builder.finish()?;
+        // symbol name -> postings
+        build_name_fst(
+            self.symbols.iter().enumerate().map(|(i, s)| (s.name.as_str(), i as u32)),
+            &tmp_paths.names_fst(),
+            &tmp_paths.name_postings(),
+        )?;
+        // ref name -> postings
+        build_name_fst(
+            self.refs.iter().enumerate().map(|(i, r)| (r.name.as_str(), i as u32)),
+            &tmp_paths.ref_names_fst(),
+            &tmp_paths.ref_postings(),
+        )?;
 
         let manifest = Manifest {
             version: 1,
@@ -301,6 +331,49 @@ impl StoreWriter {
     }
 }
 
+/// Build a FST + posting list for a stream of (name, idx) tuples.
+/// The FST stores `name -> u64 offset` into the postings file.
+/// Each posting is `u32 count + count * u32 idx` (little-endian).
+fn build_name_fst<'a, I: Iterator<Item = (&'a str, u32)>>(
+    items: I,
+    fst_path: &Path,
+    postings_path: &Path,
+) -> Result<()> {
+    let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
+    for (name, idx) in items {
+        by_name.entry(name.to_string()).or_default().push(idx);
+    }
+    let mut names: Vec<String> = by_name.keys().cloned().collect();
+    names.sort();
+    let mut postings = BufWriter::new(File::create(postings_path)?);
+    let mut offsets: Vec<(String, u64)> = Vec::with_capacity(names.len());
+    let mut pos: u64 = 0;
+    for name in &names {
+        let idxs = &by_name[name];
+        offsets.push((name.clone(), pos));
+        postings.write_all(&(idxs.len() as u32).to_le_bytes())?;
+        pos += 4;
+        for i in idxs {
+            postings.write_all(&i.to_le_bytes())?;
+            pos += 4;
+        }
+    }
+    // memmap can't map a 0-byte file; if we wrote nothing, leave a placeholder.
+    if pos == 0 {
+        postings.write_all(&[0u8])?;
+    }
+    postings.flush()?;
+    let fst_file = BufWriter::new(File::create(fst_path)?);
+    let mut builder = fst::MapBuilder::new(fst_file)?;
+    for (name, off) in offsets {
+        builder
+            .insert(name.as_bytes(), off)
+            .with_context(|| format!("fst insert {name}"))?;
+    }
+    builder.finish()?;
+    Ok(())
+}
+
 fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let f = BufWriter::new(File::create(path)?);
     bincode::serialize_into(f, value)
@@ -326,8 +399,11 @@ pub struct StoreReader {
     pub roots: Vec<RootEntry>,
     pub files: Vec<FileEntry>,
     pub symbols: Vec<SymbolRecord>,
+    pub refs: Vec<RefRecord>,
     pub fst: fst::Map<memmap2::Mmap>,
     pub postings_mmap: memmap2::Mmap,
+    pub ref_fst: fst::Map<memmap2::Mmap>,
+    pub ref_postings_mmap: memmap2::Mmap,
 }
 
 impl StoreReader {
@@ -340,12 +416,41 @@ impl StoreReader {
         let roots: Vec<RootEntry> = read_bincode(&paths.roots())?;
         let files: Vec<FileEntry> = read_bincode(&paths.files())?;
         let symbols: Vec<SymbolRecord> = read_bincode(&paths.symbols())?;
+        // refs.bin may be absent for old indexes
+        let refs: Vec<RefRecord> = if paths.refs().exists() {
+            read_bincode(&paths.refs())?
+        } else {
+            Vec::new()
+        };
         let fst_file = File::open(paths.names_fst())?;
         let fst_mmap = unsafe { memmap2::Mmap::map(&fst_file)? };
         let fst = fst::Map::new(fst_mmap)?;
         let postings_file = File::open(paths.name_postings())?;
         let postings_mmap = unsafe { memmap2::Mmap::map(&postings_file)? };
-        Ok(Self { paths, manifest, roots, files, symbols, fst, postings_mmap })
+        // Refs map is always written during finalize (even if empty). For
+        // backwards compatibility with pre-Phase-2 indexes that don't have
+        // it, callers should re-index.
+        let rf = File::open(paths.ref_names_fst())
+            .with_context(|| format!("open {} (re-run \"scry index\" if missing)", paths.ref_names_fst().display()))?;
+        let ref_fst_mmap = unsafe { memmap2::Mmap::map(&rf)? };
+        let ref_fst = fst::Map::new(ref_fst_mmap)?;
+        let pf = File::open(paths.ref_postings())?;
+        let ref_postings_mmap = unsafe { memmap2::Mmap::map(&pf)? };
+        Ok(Self {
+            paths, manifest, roots, files, symbols, refs,
+            fst, postings_mmap, ref_fst, ref_postings_mmap,
+        })
+    }
+
+    pub fn lookup_refs_exact(&self, name: &str) -> Vec<&RefRecord> {
+        let off = match self.ref_fst.get(name.as_bytes()) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        read_posting(&self.ref_postings_mmap, off)
+            .into_iter()
+            .filter_map(|i| self.refs.get(i as usize))
+            .collect()
     }
 
     pub fn lookup_exact(&self, name: &str) -> Vec<&SymbolRecord> {
@@ -400,20 +505,24 @@ impl StoreReader {
     }
 
     fn read_posting(&self, off: u64) -> Vec<u32> {
-        let buf = &self.postings_mmap[..];
-        let start = off as usize;
-        if start + 4 > buf.len() { return Vec::new(); }
-        let count = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
-        let mut v = Vec::with_capacity(count);
-        let mut p = start + 4;
-        for _ in 0..count {
-            if p + 4 > buf.len() { break; }
-            v.push(u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()));
-            p += 4;
-        }
-        v
+        read_posting(&self.postings_mmap, off)
     }
 }
+
+fn read_posting(buf: &[u8], off: u64) -> Vec<u32> {
+    let start = off as usize;
+    if start + 4 > buf.len() { return Vec::new(); }
+    let count = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
+    let mut v = Vec::with_capacity(count);
+    let mut p = start + 4;
+    for _ in 0..count {
+        if p + 4 > buf.len() { break; }
+        v.push(u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()));
+        p += 4;
+    }
+    v
+}
+
 
 fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let f = BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);

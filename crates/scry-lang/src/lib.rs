@@ -1,7 +1,7 @@
 //! scry-lang: per-language symbol extraction via tree-sitter.
 
 use anyhow::Result;
-use scry_store::SymbolKind;
+use scry_store::{RefKind, SymbolKind};
 use scry_walker::FileKind;
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -12,6 +12,17 @@ use tree_sitter::{Language, Parser, Query, QueryCursor};
 pub struct RawSymbol {
     pub name: String,
     pub kind: SymbolKind,
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub line: u32,
+    pub col: u32,
+    pub scope_path: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawRef {
+    pub name: String,
+    pub kind: RefKind,
     pub byte_start: u32,
     pub byte_end: u32,
     pub line: u32,
@@ -37,6 +48,90 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
         _ => return Ok(Vec::new()),
     };
     extract_with(spec, source)
+}
+
+pub fn extract_refs(kind: FileKind, source: &[u8]) -> Result<Vec<RawRef>> {
+    use FileKind::*;
+    let (lang_spec, refs) = match kind {
+        C => (c_spec(), c_refs_spec()),
+        Cpp | HeaderCpp | Header => (cpp_spec(), cpp_refs_spec()),
+        Java => (java_spec(), java_refs_spec()),
+        Kotlin => (kotlin_spec(), kotlin_refs_spec()),
+        Rust => (rust_spec(), rust_refs_spec()),
+        Go => (go_spec(), go_refs_spec()),
+        Python => (python_spec(), python_refs_spec()),
+        _ => return Ok(Vec::new()),
+    };
+    extract_refs_with(lang_spec, refs, source)
+}
+
+struct RefSpec {
+    query: &'static Query,
+    capture_kinds: &'static [(&'static str, RefKind)],
+}
+
+fn extract_refs_with(
+    lang: &'static LangSpec,
+    refs: &'static RefSpec,
+    source: &[u8],
+) -> Result<Vec<RawRef>> {
+    PARSER.with(|cell| {
+        let mut parser = cell.borrow_mut();
+        parser.set_language(lang.language)?;
+        let tree = match parser.parse(source, None) {
+            Some(t) => t,
+            None => return Ok(Vec::new()),
+        };
+        let mut out: Vec<RawRef> = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(refs.query, tree.root_node(), source);
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                let cap_name = &refs.query.capture_names()[cap.index as usize];
+                if let Some((_, k)) = refs.capture_kinds.iter().find(|(n, _)| n == cap_name) {
+                    let node = cap.node;
+                    let name = match node.utf8_text(source) {
+                        Ok(s) if !s.is_empty() => s.to_string(),
+                        _ => continue,
+                    };
+                    // Skip ultra-common noise names that appear millions of times
+                    // and would explode the index for no value.
+                    if is_noise_name(&name) {
+                        continue;
+                    }
+                    let pos = node.start_position();
+                    out.push(RawRef {
+                        name,
+                        kind: *k,
+                        byte_start: node.start_byte() as u32,
+                        byte_end: node.end_byte() as u32,
+                        line: (pos.row as u32).saturating_add(1),
+                        col: (pos.column as u32).saturating_add(1),
+                        scope_path: compute_scope(
+                            node,
+                            source,
+                            lang.scope_node_kinds,
+                            lang.package_node_kind,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Drop refs whose name is a generic keyword or builtin. Keeps the ref table
+/// down to call-site-grade signal.
+fn is_noise_name(s: &str) -> bool {
+    matches!(
+        s,
+        "self" | "this" | "super" | "true" | "false" | "null" | "None" | "nil" |
+        "Box" | "Option" | "Result" | "Vec" | "String" | "str" | "bool" | "int" |
+        "void" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" |
+        "f32" | "f64" | "char" | "uint" | "size_t" | "ssize_t" |
+        "T" | "K" | "V" | "E" | "_" | "" | "size" | "length" | "len" | "count"
+    )
 }
 
 struct LangSpec {
@@ -441,6 +536,210 @@ fn python_spec() -> &'static LangSpec {
             name_capture: "name",
             scope_node_kinds: &["class_definition", "function_definition"],
             package_node_kind: None,
+        }
+    })
+}
+
+// ===========================================================================
+// REF QUERIES — one per language. Phase 2 focuses on call sites + ctors +
+// inheritance edges, which gives us callers/callees/impls cheaply. Generic
+// "type identifier used anywhere" refs are deferred until we can filter out
+// definition sites cleanly.
+// ===========================================================================
+
+fn java_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = java_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (method_invocation name: (identifier) @ref.call)
+                (object_creation_expression type: (type_identifier) @ref.ctor)
+                (superclass (type_identifier) @ref.inherit)
+                (super_interfaces (type_list (type_identifier) @ref.inherit))
+                (extends_interfaces (type_list (type_identifier) @ref.inherit))
+                (import_declaration (scoped_identifier name: (identifier) @ref.import))
+                (import_declaration (identifier) @ref.import)
+                "#,
+            )
+            .expect("java refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.ctor", RefKind::Ctor),
+                ("ref.inherit", RefKind::InheritFrom),
+                ("ref.import", RefKind::Import),
+            ],
+        }
+    })
+}
+
+fn kotlin_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = kotlin_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call_expression (simple_identifier) @ref.call)
+                (import_header (identifier (simple_identifier) @ref.import))
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(source_file) @noop").unwrap())
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.import", RefKind::Import),
+            ],
+        }
+    })
+}
+
+fn c_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = c_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call_expression function: (identifier) @ref.call)
+                (preproc_include path: (string_literal) @ref.import)
+                "#,
+            )
+            .expect("c refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.import", RefKind::Import),
+            ],
+        }
+    })
+}
+
+fn cpp_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = cpp_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call_expression function: (identifier) @ref.call)
+                (call_expression function: (field_expression field: (field_identifier) @ref.call))
+                (call_expression function: (qualified_identifier name: (identifier) @ref.call))
+                (call_expression function: (template_function name: (identifier) @ref.call))
+                (new_expression type: (type_identifier) @ref.ctor)
+                (base_class_clause (type_identifier) @ref.inherit)
+                (preproc_include path: (string_literal) @ref.import)
+                "#,
+            )
+            .expect("cpp refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.ctor", RefKind::Ctor),
+                ("ref.inherit", RefKind::InheritFrom),
+                ("ref.import", RefKind::Import),
+            ],
+        }
+    })
+}
+
+fn rust_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = rust_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call_expression function: (identifier) @ref.call)
+                (call_expression function: (scoped_identifier name: (identifier) @ref.call))
+                (call_expression function: (field_expression field: (field_identifier) @ref.call))
+                (macro_invocation macro: (identifier) @ref.call)
+                (use_declaration (scoped_identifier name: (identifier) @ref.import))
+                (impl_item trait: (type_identifier) @ref.inherit)
+                "#,
+            )
+            .expect("rust refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.inherit", RefKind::InheritFrom),
+                ("ref.import", RefKind::Import),
+            ],
+        }
+    })
+}
+
+fn go_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = go_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call_expression function: (identifier) @ref.call)
+                (call_expression function: (selector_expression field: (field_identifier) @ref.call))
+                (import_spec path: (interpreted_string_literal) @ref.import)
+                "#,
+            )
+            .expect("go refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.import", RefKind::Import),
+            ],
+        }
+    })
+}
+
+fn python_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = python_spec().language;
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call function: (identifier) @ref.call)
+                (call function: (attribute attribute: (identifier) @ref.call))
+                (import_statement name: (dotted_name) @ref.import)
+                (import_from_statement module_name: (dotted_name) @ref.import)
+                "#,
+            )
+            .expect("python refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.import", RefKind::Import),
+            ],
         }
     })
 }

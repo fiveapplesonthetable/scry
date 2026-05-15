@@ -82,6 +82,12 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Emit Markdown with code snippets (LLM-friendly).
+        #[arg(long)]
+        md: bool,
+        /// Cap total output size in bytes (drops lowest-ranked results).
+        #[arg(long)]
+        budget: Option<usize>,
     },
     /// Prefix-match symbol names.
     Prefix {
@@ -181,8 +187,8 @@ fn main() -> Result<()> {
         Cmd::Index { roots, profile, out, count_only, limit, no_refs } => {
             cmd_index(roots, profile, out, count_only, limit, no_refs)
         }
-        Cmd::Def { name, index, lang, kind, limit, json } => {
-            cmd_def(name, index, lang, kind, limit, json)
+        Cmd::Def { name, index, lang, kind, limit, json, md, budget } => {
+            cmd_def(name, index, lang, kind, limit, json, md, budget)
         }
         Cmd::Prefix { prefix, index, limit, json } => {
             cmd_prefix(prefix, index, limit, json)
@@ -326,6 +332,19 @@ fn cmd_index(
         }
     }
 
+    // Layer-1 resolution before writing.
+    if !count_only && !no_refs {
+        let t = Instant::now();
+        writer.resolve_refs();
+        let resolved = writer.refs.iter().filter(|r| r.resolved_to.is_some()).count();
+        eprintln!(
+            "[resolve] {} / {} refs resolved by name in {} ms",
+            resolved,
+            writer.refs.len(),
+            t.elapsed().as_millis()
+        );
+    }
+
     let elapsed_ms = t_total.elapsed().as_millis();
     let stats = IndexStats {
         files_total: total_files_total,
@@ -347,7 +366,7 @@ fn cmd_index(
         out_dir.display()
     );
     if !count_only {
-        let t = Instant::now();
+        let _t = Instant::now();
         writer.finalize(stats)?;
         eprintln!("[write] finalized in {} ms", t.elapsed().as_millis());
     } else {
@@ -457,11 +476,17 @@ fn cmd_def(
     kind: Option<String>,
     limit: usize,
     json: bool,
+    md: bool,
+    budget: Option<usize>,
 ) -> Result<()> {
     let r = open_index(index)?;
     let results = r.lookup_exact(&name);
     let filtered: Vec<&SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
-    print_results(&r, &filtered, limit, json);
+    if md {
+        print_results_md(&r, &filtered, limit, budget);
+    } else {
+        print_results(&r, &filtered, limit, json);
+    }
     Ok(())
 }
 
@@ -567,6 +592,63 @@ fn filter_results<'a>(
             true
         })
         .collect()
+}
+
+/// Markdown formatter: one section per result, optional code snippet. Stops
+/// emitting if the byte budget is exhausted.
+fn print_results_md(
+    reader: &StoreReader,
+    syms: &[&SymbolRecord],
+    limit: usize,
+    budget: Option<usize>,
+) {
+    let mut emitted_bytes: usize = 0;
+    for s in syms.iter().take(limit) {
+        let file = reader.files.get(s.file_id as usize);
+        let path = file.map(|f| f.display_path(&reader.roots)).unwrap_or_default();
+        let snippet = read_snippet(&path, s.line, 8);
+        let scope_str = if s.scope_path.is_empty() {
+            String::new()
+        } else {
+            format!("**scope**: `{}`  ", s.scope_path.join("::"))
+        };
+        let lang_label = format!("{:?}", s.lang);
+        let section = format!(
+            "### `{}`  ({} · {})\n\
+             **location**: `{}:{}:{}`  \n\
+             {}\n\
+             ```{}\n{}\n```\n\n",
+            s.name, s.kind.short(), lang_label.to_lowercase(),
+            path, s.line, s.col,
+            scope_str,
+            short_lang(s.lang),
+            snippet,
+        );
+        if let Some(b) = budget {
+            if emitted_bytes + section.len() > b {
+                println!("\n_(budget {} bytes reached, {} more results omitted)_",
+                    b, syms.len().saturating_sub(syms.iter().take_while(|_| false).count()));
+                break;
+            }
+        }
+        emitted_bytes += section.len();
+        print!("{}", section);
+    }
+}
+
+/// Read a snippet of `total_lines` centered roughly on `line`.
+fn read_snippet(path: &str, line: u32, total_lines: u32) -> String {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let src = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = src.lines().collect();
+    let target = line.saturating_sub(1) as usize;
+    let half = (total_lines / 2) as usize;
+    let start = target.saturating_sub(half);
+    let end = (target + half).min(lines.len().saturating_sub(1));
+    lines[start..=end].join("\n")
 }
 
 fn print_results(reader: &StoreReader, syms: &[&SymbolRecord], limit: usize, json: bool) {

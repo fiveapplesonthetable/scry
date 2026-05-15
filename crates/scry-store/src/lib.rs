@@ -274,6 +274,35 @@ impl StoreWriter {
         }
     }
 
+    /// Layer-1 resolution: best-effort name match. For each ref we look up
+    /// symbols with the same name and pick the strongest candidate:
+    ///   1. same-language definition wins,
+    ///   2. then any single definition,
+    ///   3. otherwise leave unresolved (ambiguous).
+    /// This is intentionally cheap (a single hashmap pass) — proper
+    /// scope/import resolution happens in a future phase.
+    pub fn resolve_refs(&mut self) {
+        if self.refs.is_empty() || self.symbols.is_empty() { return; }
+        let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
+        for (i, s) in self.symbols.iter().enumerate() {
+            by_name.entry(s.name.clone()).or_default().push(i as u32);
+        }
+        for r in self.refs.iter_mut() {
+            let cands = match by_name.get(&r.name) {
+                Some(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+            // Prefer same-lang match; otherwise unique; otherwise first.
+            let chosen = cands.iter()
+                .find(|&&idx| self.symbols[idx as usize].lang == r.lang)
+                .copied()
+                .or_else(|| if cands.len() == 1 { Some(cands[0]) } else { Some(cands[0]) });
+            if let Some(idx) = chosen {
+                r.resolved_to = Some(self.symbols[idx as usize].id);
+            }
+        }
+    }
+
     pub fn finalize(self, stats: IndexStats) -> Result<()> {
         let final_dir = self.paths.root.clone();
         let tmp = final_dir.with_extension("tmp");

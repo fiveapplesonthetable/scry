@@ -1,39 +1,108 @@
 # scry
 
-Semantic code search and cross-reference engine for AOSP.
+Semantic code search and cross-reference engine for AOSP and the Linux kernel.
 
-**Status:** Design / research. No code yet — see `docs/DESIGN.md`.
+**Status:** Phases 0–4 implemented. Live on `/mnt/agent/scry-index` against
+`~/dev/aosp` + `/mnt/agent/dev/linux`. Full design in `docs/DESIGN.md`.
 
 ## What it is
 
-A single-binary, ripgrep-fast, build-aware code intelligence tool that indexes a
-full AOSP checkout (~118 GB of source, ~735k files across C/C++, Java, Kotlin,
-Rust, Go, Python, AIDL, .proto, Android.bp, Makefile, OWNERS) and answers
-queries — definitions, references, callers, callees, hierarchies, fuzzy
-symbol lookup, module-aware filters — in tens of milliseconds.
+A single static Rust binary, ripgrep-fast, build-aware code intelligence
+tool that indexes a full AOSP checkout (~118 GB / ~830k files) plus a
+Linux kernel tree (37 GB / ~76k files) — combined **~906k files / ~155 GB
+of source** — and answers semantic and substring queries at interactive
+latency on a warm mmap index.
 
-Built to be consumed by **both humans at a terminal and LLM agents over a
-JSON/RPC protocol**. The index is read-only and mmapped, so many query clients
-can share one warm index.
+Coverage spans source languages (C, C++, Java, Kotlin, Rust, Go, Python,
+shell), build systems (Android.bp, Android.mk, Bazel BUILD, Kconfig,
+Makefile), Android-specific configs (aconfig flags, init.rc services,
+SELinux .te policy, AndroidManifest.xml components), and AIDL interfaces.
+
+Built to be driven by **both humans at a terminal and LLM agents over
+JSON-RPC** — every query has a `--json` variant and `scry serve` reads
+newline-delimited JSON on stdin.
+
+## Quickstart
+
+```sh
+cd /mnt/agent/scry
+. ./env.sh                         # CARGO_HOME / RUSTUP_HOME / PATH
+cargo build --release              # ~20 s cold, ~10 s incremental
+
+# Build the index against AOSP + Linux (default roots if present).
+./target/release/scry index
+
+# Or pass explicit roots:
+./target/release/scry index ~/dev/aosp /mnt/agent/dev/linux \
+    -o /mnt/agent/scry-index
+
+# Query.
+./target/release/scry def ActivityManagerService --kind class
+./target/release/scry callers transact --lang Java --limit 20
+./target/release/scry ref liblog --lang Soong              # who depends on liblog?
+./target/release/scry def libbinder --kind soong           # Soong module info
+./target/release/scry def zygote --kind init.svc           # init.rc service
+./target/release/scry def IBinder --kind aidl.iface        # AIDL interface
+./target/release/scry prefix Activity --limit 20
+./target/release/scry fuzzy ParcelFile --limit 10
+./target/release/scry grep "TODO\(.*\): " --regex --lang Java
+./target/release/scry stats
+```
+
+## LLM/agent integration
+
+`scry serve` reads newline-delimited JSON-RPC requests from stdin and
+writes JSON responses to stdout. Open it once per task and reuse the
+warm mmap'd index.
+
+```sh
+$ printf '%s\n' \
+    '{"id":1,"cmd":"def","args":{"name":"Binder","limit":3}}' \
+    '{"id":2,"cmd":"callers","args":{"name":"transact","limit":3}}' \
+  | scry serve --index /mnt/agent/scry-index
+{"id":1,"result":[{"name":"Binder","kind":"class","lang":"Java","path":"…","line":85,...}]}
+{"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","path":"…","line":1234,...}]}
+```
+
+Supported commands: `def`, `ref`, `callers`, `prefix`, `fuzzy`, `stats`.
+
+## Architecture (one paragraph)
+
+A parallel `ignore`-crate walker classifies files into 38 categories
+(source langs / build files / AOSP configs / OWNERS), then rayon pumps
+each file through either a tree-sitter parser (for source languages) or
+a tiny custom parser (for `.bp`, `.aidl`, `.aconfig`, `.te`, `.rc`,
+`AndroidManifest.xml`, `OWNERS`). Definitions and references are
+collected with scope paths, blake3-hashed for stable ids, and resolved
+by name to candidate definitions (best-effort Layer 1). The index ships
+as bincode columns + an FST over symbol names + posting lists, all
+atomically swapped into place. The `StoreReader` mmaps everything for
+zero-copy reads.
+
+See `docs/DESIGN.md` for the full design and `notes/AOSP_SCALE.md` for
+the source-tree scale numbers.
 
 ## Why not just $existing_tool
 
-- **ctags / gtags / cscope**: tag-only, no real semantics, weak on Java/Kotlin,
-  no build-graph awareness, single-threaded indexing.
-- **ripgrep**: full-text grep only; no symbol model, no xrefs.
-- **clangd / IntelliJ / Android Studio**: precise but per-language, slow to
-  warm, can't scale to the whole AOSP tree at once, not LLM-shaped.
-- **Sourcegraph / Zoekt**: closest in spirit, but heavyweight services not
-  designed to be driven from a CLI loop in an LLM agent.
-- **Kythe / Glean**: industrial-grade semantic graphs, but require deep
-  per-language indexer integration and big infra.
-
-`scry` aims for the **80% semantic precision of clangd, 80% speed of ripgrep,
-100% breadth across AOSP languages** in one local binary.
+- **ctags / gtags / cscope**: tag-only, no scope awareness, no AOSP-
+  specific kinds (aconfig flags, init services, SELinux types), no
+  build-graph awareness, single-threaded indexing.
+- **ripgrep**: full-text grep only; no symbol model, no xrefs, no
+  language- or module-scoped filtering.
+- **clangd / IntelliJ / Android Studio**: precise but per-language,
+  slow to warm, can't scale to the whole AOSP tree at once, not
+  LLM-shaped.
+- **Sourcegraph / Zoekt**: closest in spirit, but heavyweight services
+  not designed to be driven from a CLI loop in an LLM agent.
+- **Kythe / Glean**: industrial-grade semantic graphs; require deep
+  per-language indexer integration we'd rather avoid.
 
 ## Constraints
 
-- **Zero changes inside `~/dev/aosp/`** (no in-tree mutation, no symlink farm).
-- Index lives off-tree on `/mnt/agent/scry-index/`.
-- Static binary deliverable; no daemon required for one-shot CLI use, but a
-  daemon mode is provided for hot indexes and LLM sessions.
+- **Zero changes inside `~/dev/aosp/` or `/mnt/agent/dev/linux/`.**
+- All scry source, dependencies, indexes, and reference repos live
+  under `/mnt/agent/` (the host's `/` filesystem only has ~42 G free).
+- Static Rust binary; no daemon required for one-shot CLI use, and
+  `scry serve` is a stdin/stdout RPC, not a long-lived service.
+- 7-day cron-driven hourly status emails to the maintainer; project
+  is built autonomously and continuously.

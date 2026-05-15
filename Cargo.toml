@@ -5,6 +5,7 @@ members = [
     "crates/scry-walker",
     "crates/scry-lang",
     "crates/scry-store",
+    "crates/scry-aosp",
 ]
 
 [workspace.package]

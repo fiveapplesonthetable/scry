@@ -341,7 +341,11 @@ fn parse_one(
     root_id: u8,
     no_refs: bool,
 ) -> Result<(Vec<SymbolRecord>, Vec<RefRecord>)> {
-    if !rf.kind.is_source() {
+    // We parse source-language kinds (tree-sitter) AND a subset of
+    // AOSP-specific kinds (Android.bp, AIDL, OWNERS) via scry-aosp.
+    let is_aosp = matches!(rf.kind,
+        FileKind::Soong | FileKind::Aidl | FileKind::Owners);
+    if !rf.kind.is_source() && !is_aosp {
         return Ok((Vec::new(), Vec::new()));
     }
     if rf.size > 5 * 1024 * 1024 {
@@ -349,8 +353,14 @@ fn parse_one(
     }
     let bytes = std::fs::read(&rf.path)
         .with_context(|| format!("read {}", rf.path.display()))?;
-    let raw_syms = extract(rf.kind, &bytes)
-        .with_context(|| format!("parse {}", rf.path.display()))?;
+    let (raw_syms, aosp_raw_refs) = if is_aosp {
+        let (s, r) = scry_aosp::extract(rf.kind, &bytes);
+        (s, r)
+    } else {
+        let s = extract(rf.kind, &bytes)
+            .with_context(|| format!("parse {}", rf.path.display()))?;
+        (s, Vec::new())
+    };
     let mut syms = Vec::with_capacity(raw_syms.len());
     let relpath = fe.relpath.clone();
     for r in raw_syms {
@@ -379,8 +389,11 @@ fn parse_one(
     let refs = if no_refs {
         Vec::new()
     } else {
-        let raw_refs = extract_refs(rf.kind, &bytes).unwrap_or_default();
-        raw_refs
+        let mut combined = aosp_raw_refs;
+        if !is_aosp {
+            combined.extend(extract_refs(rf.kind, &bytes).unwrap_or_default());
+        }
+        combined
             .into_iter()
             .map(|r| RefRecord {
                 name: r.name,

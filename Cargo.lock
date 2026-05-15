@@ -500,12 +500,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scry-aosp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "scry-lang",
+ "scry-store",
+ "scry-walker",
+ "tracing",
+]
+
+[[package]]
 name = "scry-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
  "rayon",
+ "scry-aosp",
  "scry-lang",
  "scry-store",
  "scry-walker",

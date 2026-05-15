@@ -11,6 +11,11 @@ pub mod aconfig;
 pub mod initrc;
 pub mod sepolicy;
 pub mod manifest;
+pub mod hidl;
+pub mod bazel;
+pub mod cmake;
+pub mod gn;
+pub mod api_txt;
 
 use scry_lang::RawSymbol;
 use scry_lang::RawRef;
@@ -29,6 +34,11 @@ pub fn extract(kind: FileKind, source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
         FileKind::InitRc => initrc::parse(source),
         FileKind::Sepolicy => sepolicy::parse(source),
         FileKind::Manifest => manifest::parse(source),
+        FileKind::Hidl => hidl::parse(source),
+        FileKind::Bazel | FileKind::Bzl => bazel::parse(source),
+        FileKind::CMake => cmake::parse(source),
+        FileKind::Gn => gn::parse(source),
+        FileKind::ApiTxt => api_txt::parse(source),
         _ => (Vec::new(), Vec::new()),
     }
 }

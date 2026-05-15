@@ -73,14 +73,19 @@ pub enum FileKind {
     Bash,
     Proto,
     Aidl,
+    Hidl,          // *.hal — legacy AOSP IPC
     Assembly,      // .s / .S
 
     // ---- build files ----
     Soong,         // Android.bp / *.bp
     AndroidMk,     // Android.mk / *.mk
     Bazel,         // BUILD / BUILD.bazel
+    Bzl,           // *.bzl / *.star — Starlark
+    CMake,         // CMakeLists.txt / *.cmake
+    Gn,            // *.gn / *.gni — Chromium-style GN
     Kconfig,       // Kconfig / Kconfig.*
     Makefile,      // Makefile / Kbuild / GNUmakefile
+    Gradle,        // *.gradle / *.gradle.kts
     FlagsFile,     // *.flags
     Jarjar,        // *.jarjar
     Toml,          // Cargo.toml etc.
@@ -91,14 +96,17 @@ pub enum FileKind {
     Sepolicy,      // *.te
     SepolicyOther, // *.policy
     Manifest,      // AndroidManifest.xml
+    ApiTxt,        // api/*.txt — Android public/system/test API surface
     XmlOther,      // generic *.xml
     Json,
     Properties,
     Cfg,
+    Yaml,          // *.yaml / *.yml
 
     // ---- ownership / docs ----
     Owners,
     Markdown,
+    License,       // LICENSE / METADATA / NOTICE
 }
 
 impl FileKind {
@@ -114,10 +122,22 @@ impl FileKind {
             "Makefile" | "Kbuild" | "GNUmakefile" => return Some(FileKind::Makefile),
             "OWNERS" => return Some(FileKind::Owners),
             "AndroidManifest.xml" => return Some(FileKind::Manifest),
+            "CMakeLists.txt" => return Some(FileKind::CMake),
+            "LICENSE" | "NOTICE" | "METADATA" | "MODULE_LICENSE_APACHE2"
+            | "MODULE_LICENSE_BSD" | "MODULE_LICENSE_MIT" => return Some(FileKind::License),
             _ => {}
         }
         if name == "Kconfig" || name.starts_with("Kconfig.") || name.starts_with("Kconfig-") {
             return Some(FileKind::Kconfig);
+        }
+        // API surface .txt files live under .../api/<name>.txt and use the
+        // metalava signature format. Detect by parent directory.
+        if path.extension().and_then(|e| e.to_str()) == Some("txt") {
+            if let Some(parent) = path.parent() {
+                if parent.file_name().and_then(|s| s.to_str()) == Some("api") {
+                    return Some(FileKind::ApiTxt);
+                }
+            }
         }
 
         let ext = path.extension()?.to_str()?;
@@ -136,7 +156,13 @@ impl FileKind {
             "sh" | "bash" => FileKind::Bash,
             "proto" => FileKind::Proto,
             "aidl" => FileKind::Aidl,
+            "hal" => FileKind::Hidl,
             "s" => FileKind::Assembly,
+            "bzl" | "star" => FileKind::Bzl,
+            "cmake" => FileKind::CMake,
+            "gn" | "gni" => FileKind::Gn,
+            "gradle" => FileKind::Gradle,
+            "yaml" | "yml" => FileKind::Yaml,
             "bp" => FileKind::Soong,
             "mk" => FileKind::AndroidMk,
             "flags" => FileKind::FlagsFile,
@@ -161,15 +187,16 @@ impl FileKind {
             FileKind::C | FileKind::Cpp | FileKind::Header | FileKind::HeaderCpp |
             FileKind::Java | FileKind::Kotlin | FileKind::Rust | FileKind::Go |
             FileKind::Python | FileKind::Bash | FileKind::Proto | FileKind::Aidl |
-            FileKind::Assembly
+            FileKind::Hidl | FileKind::Assembly
         )
     }
 
     pub fn is_build(self) -> bool {
         matches!(
             self,
-            FileKind::Soong | FileKind::AndroidMk | FileKind::Bazel | FileKind::Kconfig |
-            FileKind::Makefile | FileKind::FlagsFile | FileKind::Jarjar | FileKind::Toml
+            FileKind::Soong | FileKind::AndroidMk | FileKind::Bazel | FileKind::Bzl |
+            FileKind::CMake | FileKind::Gn | FileKind::Kconfig | FileKind::Makefile |
+            FileKind::Gradle | FileKind::FlagsFile | FileKind::Jarjar | FileKind::Toml
         )
     }
 
@@ -177,7 +204,7 @@ impl FileKind {
         matches!(
             self,
             FileKind::Aconfig | FileKind::InitRc | FileKind::Sepolicy | FileKind::SepolicyOther |
-            FileKind::Manifest
+            FileKind::Manifest | FileKind::ApiTxt
         )
     }
 }

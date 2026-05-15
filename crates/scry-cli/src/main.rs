@@ -42,6 +42,15 @@ enum Cmd {
         /// Skip extracting references (much smaller index, no callers/ref queries).
         #[arg(long)]
         no_refs: bool,
+        /// Limit the rayon thread pool. Default: all cores. Lower this on
+        /// shared / memory-constrained hosts.
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Skip individual source files larger than this many bytes. Default
+        /// 5 MiB. Most AOSP files over this size are auto-generated or
+        /// binary-ish and slow the parser disproportionately.
+        #[arg(long, default_value_t = 5 * 1024 * 1024)]
+        max_file_bytes: u64,
     },
     /// Look up references to a name.
     Ref {
@@ -203,8 +212,8 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Index { roots, profile, out, count_only, limit, no_refs } => {
-            cmd_index(roots, profile, out, count_only, limit, no_refs)
+        Cmd::Index { roots, profile, out, count_only, limit, no_refs, workers, max_file_bytes } => {
+            cmd_index(roots, profile, out, count_only, limit, no_refs, workers, max_file_bytes)
         }
         Cmd::Def { name, index, lang, kind, limit, json, md, budget } => {
             cmd_def(name, index, lang, kind, limit, json, md, budget)
@@ -244,7 +253,18 @@ fn cmd_index(
     count_only: bool,
     limit: Option<usize>,
     no_refs: bool,
+    workers: Option<usize>,
+    max_file_bytes: u64,
 ) -> Result<()> {
+    if let Some(n) = workers {
+        if n > 0 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global()
+                .map_err(|e| anyhow::anyhow!("rayon pool init: {e}"))?;
+            eprintln!("[index] rayon pool: {} workers", n);
+        }
+    }
     let roots = if roots.is_empty() { default_roots() } else { roots };
     if roots.is_empty() {
         anyhow::bail!("no source roots: pass one or more paths");
@@ -319,7 +339,7 @@ fn cmd_index(
             .par_iter()
             .zip(file_entries.par_iter())
             .map(|(rf, fe)| -> (Vec<SymbolRecord>, Vec<RefRecord>) {
-                match parse_one(rf, fe, root_id, no_refs) {
+                match parse_one(rf, fe, root_id, no_refs, max_file_bytes) {
                     Ok((s, r)) => {
                         parsed.fetch_add(1, Ordering::Relaxed);
                         symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
@@ -408,17 +428,19 @@ fn parse_one(
     fe: &FileEntry,
     root_id: u8,
     no_refs: bool,
+    max_file_bytes: u64,
 ) -> Result<(Vec<SymbolRecord>, Vec<RefRecord>)> {
     // We parse source-language kinds (tree-sitter) AND a subset of
     // AOSP-specific kinds (Android.bp, AIDL, OWNERS) via scry-aosp.
     let is_aosp = matches!(rf.kind,
         FileKind::Soong | FileKind::Aidl | FileKind::Owners |
         FileKind::Aconfig | FileKind::InitRc | FileKind::Sepolicy |
-        FileKind::Manifest);
+        FileKind::Manifest | FileKind::Hidl | FileKind::Bazel | FileKind::Bzl |
+        FileKind::CMake | FileKind::Gn | FileKind::ApiTxt);
     if !rf.kind.is_source() && !is_aosp {
         return Ok((Vec::new(), Vec::new()));
     }
-    if rf.size > 5 * 1024 * 1024 {
+    if rf.size > max_file_bytes {
         return Ok((Vec::new(), Vec::new()));
     }
     let bytes = std::fs::read(&rf.path)

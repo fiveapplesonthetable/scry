@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scry-cli",
+    "crates/scry-walker",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/fiveapplesonthetable/scry"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+crossbeam = "0.8"
+parking_lot = "0.12"
+memchr = "2"
+fnv = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1

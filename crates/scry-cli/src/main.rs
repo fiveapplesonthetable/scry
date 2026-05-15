@@ -138,6 +138,13 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Cap rayon thread-pool size for this search. Useful on shared
+        /// machines or to lower memory pressure (each worker mmaps files).
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Skip files larger than N bytes (default 10 MiB).
+        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        max_file_bytes: u64,
     },
     /// JSON-RPC server reading newline-delimited requests on stdin.
     /// Each request is {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|stats", "args": {...}}.
@@ -231,8 +238,8 @@ fn main() -> Result<()> {
             cmd_ref(name, index, lang, Some("call".to_string()), limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
-        Cmd::Grep { pattern, index, regex, lang, in_, limit, json } => {
-            cmd_grep(pattern, index, regex, lang, in_, limit, json)
+        Cmd::Grep { pattern, index, regex, lang, in_, limit, json, workers, max_file_bytes } => {
+            cmd_grep(pattern, index, regex, lang, in_, limit, json, workers, max_file_bytes)
         }
         Cmd::Serve { index } => cmd_serve(index),
         Cmd::Mod { name, index, limit, json } => {
@@ -795,7 +802,16 @@ fn cmd_grep(
     in_: Option<String>,
     limit: usize,
     json: bool,
+    workers: Option<usize>,
+    max_file_bytes: u64,
 ) -> Result<()> {
+    if let Some(n) = workers {
+        if n > 0 {
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global();
+        }
+    }
     let r = open_index(index)?;
     let re = if is_regex {
         Some(regex::bytes::Regex::new(&pattern).context("invalid regex")?)
@@ -835,6 +851,10 @@ fn cmd_grep(
             return; // bound work after we have plenty of candidates
         }
         let path = fe.display_path(&r.roots);
+        let md = std::fs::metadata(&path).ok();
+        if let Some(m) = md.as_ref() {
+            if m.len() > max_file_bytes { return; }
+        }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(_) => return,

@@ -1,12 +1,17 @@
 //! scry: semantic code search and cross-reference engine for AOSP and Linux.
-//!
-//! Phase 0 surface: only `scry index <ROOT>...` works, and it just reports
-//! file counts. Later phases attach parsers and a real on-disk index.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scry_walker::{walk_root, FileKind, Profile, WalkResult};
+use rayon::prelude::*;
+use scry_lang::extract;
+use scry_store::{
+    FileEntry, IndexStats, RootEntry, StoreReader, StoreWriter, SymbolKind, SymbolRecord,
+};
+use scry_walker::{collect_files, FileKind, Profile, RawFile};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "scry", version, about = "Semantic code search for AOSP and Linux")]
@@ -17,16 +22,61 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Walk source root(s) and report per-language file counts (Phase 0).
+    /// Walk source root(s), parse files, and write the on-disk index.
     Index {
-        /// Source root(s). Default: ~/dev/aosp and /mnt/agent/dev/linux if present.
+        /// Source root(s). Default: ~/dev/aosp + /mnt/agent/dev/linux if present.
         roots: Vec<PathBuf>,
         /// Override profile (aosp / linux / generic). Default: auto-detect per root.
         #[arg(long)]
         profile: Option<String>,
-        /// Emit JSON instead of human-readable output.
+        /// Output index directory. Default: /mnt/agent/scry-index or $SCRY_INDEX_DIR.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+        /// Just walk and count — do not parse or write. (Phase-0 behavior.)
+        #[arg(long)]
+        count_only: bool,
+        /// Limit per-root file count for quick smoke tests.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Look up exact symbol definitions by name.
+    Def {
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value = "100")]
+        limit: usize,
         #[arg(long)]
         json: bool,
+    },
+    /// Prefix-match symbol names.
+    Prefix {
+        prefix: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Substring (fuzzy-ish) search over symbol names.
+    Fuzzy {
+        substr: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show index metadata.
+    Stats {
+        #[arg(long)]
+        index: Option<PathBuf>,
     },
 }
 
@@ -45,77 +95,23 @@ fn default_roots() -> Vec<PathBuf> {
     v
 }
 
+fn default_index_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("SCRY_INDEX_DIR") {
+        PathBuf::from(p)
+    } else {
+        PathBuf::from("/mnt/agent/scry-index")
+    }
+}
+
 fn human_bytes(b: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut x = b as f64;
     let mut i = 0;
-    while x >= 1024.0 && i + 1 < UNITS.len() {
+    while x >= 1024.0 && i + 1 < U.len() {
         x /= 1024.0;
         i += 1;
     }
-    format!("{:.1} {}", x, UNITS[i])
-}
-
-fn print_result(r: &WalkResult) {
-    println!("\n=== {} ===", r.root.display());
-    println!("  profile:       {:?}", r.profile);
-    println!("  total files:   {}", r.total_files);
-    println!("  unknown ext:   {}", r.unknown_files);
-    println!("  bytes:         {}", human_bytes(r.total_bytes));
-    println!("  elapsed:       {} ms", r.elapsed_ms);
-    let mut entries: Vec<_> = r.counts.iter().map(|(k, v)| (*k, *v)).collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-
-    println!("\n  source:");
-    for (k, c) in entries.iter().filter(|(k, _)| k.is_source()) {
-        println!("    {:>10}  {:?}", c, k);
-    }
-    println!("  build:");
-    for (k, c) in entries.iter().filter(|(k, _)| k.is_build()) {
-        println!("    {:>10}  {:?}", c, k);
-    }
-    println!("  android-config:");
-    for (k, c) in entries.iter().filter(|(k, _)| k.is_android_config()) {
-        println!("    {:>10}  {:?}", c, k);
-    }
-    println!("  other:");
-    for (k, c) in entries.iter().filter(|(k, _)| {
-        !k.is_source() && !k.is_build() && !k.is_android_config()
-    }) {
-        println!("    {:>10}  {:?}", c, k);
-    }
-}
-
-#[derive(serde::Serialize)]
-struct JsonResult<'a> {
-    root: String,
-    profile: Profile,
-    total_files: u64,
-    unknown_files: u64,
-    total_bytes: u64,
-    elapsed_ms: u128,
-    counts: std::collections::BTreeMap<String, u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    _phantom: Option<&'a ()>,
-}
-
-fn print_json(r: &WalkResult) {
-    let counts: std::collections::BTreeMap<String, u64> = r
-        .counts
-        .iter()
-        .map(|(k, v)| (format!("{:?}", k), *v))
-        .collect();
-    let j = JsonResult {
-        root: r.root.display().to_string(),
-        profile: r.profile,
-        total_files: r.total_files,
-        unknown_files: r.unknown_files,
-        total_bytes: r.total_bytes,
-        elapsed_ms: r.elapsed_ms,
-        counts,
-        _phantom: None,
-    };
-    println!("{}", serde_json::to_string(&j).unwrap());
+    format!("{:.1} {}", x, U[i])
 }
 
 fn main() -> Result<()> {
@@ -129,58 +125,382 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Index { roots, profile, json } => {
-            let roots = if roots.is_empty() { default_roots() } else { roots };
-            if roots.is_empty() {
-                anyhow::bail!(
-                    "no source roots: pass one or more paths, or ensure ~/dev/aosp / \
-                    /mnt/agent/dev/linux exist"
-                );
-            }
-
-            // total summary across all roots
-            let mut grand_total = 0u64;
-            let mut grand_bytes = 0u64;
-            let mut grand_counts: std::collections::HashMap<FileKind, u64> =
-                std::collections::HashMap::new();
-            let t_all = std::time::Instant::now();
-
-            for root in &roots {
-                let prof = match &profile {
-                    Some(s) => Profile::parse(s)?,
-                    None => Profile::auto_detect(root),
-                };
-                eprintln!(
-                    "scanning {} (profile: {:?})",
-                    root.display(),
-                    prof
-                );
-                let r = walk_root(root, prof)?;
-                grand_total += r.total_files;
-                grand_bytes += r.total_bytes;
-                for (k, c) in &r.counts {
-                    *grand_counts.entry(*k).or_insert(0) += c;
-                }
-                if json {
-                    print_json(&r);
-                } else {
-                    print_result(&r);
-                }
-            }
-
-            if !json && roots.len() > 1 {
-                let elapsed_all = t_all.elapsed().as_millis();
-                println!("\n=== TOTAL across {} roots ===", roots.len());
-                println!("  total files:   {}", grand_total);
-                println!("  bytes:         {}", human_bytes(grand_bytes));
-                println!("  elapsed:       {} ms", elapsed_all);
-                let mut entries: Vec<_> = grand_counts.into_iter().collect();
-                entries.sort_by(|a, b| b.1.cmp(&a.1));
-                for (k, c) in entries.iter().take(20) {
-                    println!("  {:>10}  {:?}", c, k);
-                }
-            }
-            Ok(())
+        Cmd::Index { roots, profile, out, count_only, limit } => {
+            cmd_index(roots, profile, out, count_only, limit)
         }
+        Cmd::Def { name, index, lang, kind, limit, json } => {
+            cmd_def(name, index, lang, kind, limit, json)
+        }
+        Cmd::Prefix { prefix, index, limit, json } => {
+            cmd_prefix(prefix, index, limit, json)
+        }
+        Cmd::Fuzzy { substr, index, limit, json } => {
+            cmd_fuzzy(substr, index, limit, json)
+        }
+        Cmd::Stats { index } => cmd_stats(index),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// index
+// ---------------------------------------------------------------------------
+
+fn cmd_index(
+    roots: Vec<PathBuf>,
+    profile: Option<String>,
+    out: Option<PathBuf>,
+    count_only: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    let roots = if roots.is_empty() { default_roots() } else { roots };
+    if roots.is_empty() {
+        anyhow::bail!("no source roots: pass one or more paths");
+    }
+    let out_dir = out.unwrap_or_else(default_index_dir);
+
+    let t_total = Instant::now();
+    let mut writer = StoreWriter::new(&out_dir);
+    let mut next_file_id: u32 = 0;
+    let mut total_files_total: u64 = 0;
+    let mut total_files_parsed: u64 = 0;
+    let mut total_files_failed: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    for (root_id, root) in roots.iter().enumerate() {
+        if root_id > u8::MAX as usize {
+            anyhow::bail!("too many roots (max 256)");
+        }
+        let root_id = root_id as u8;
+        let prof = match &profile {
+            Some(s) => Profile::parse(s)?,
+            None => Profile::auto_detect(root),
+        };
+        eprintln!("[walk]  {} (profile: {:?})", root.display(), prof);
+        let t = Instant::now();
+        let mut collected = collect_files(root, prof)?;
+        if let Some(n) = limit { collected.files.truncate(n); }
+        eprintln!(
+            "[walk]  {} files / {} / {} ms",
+            collected.files.len(),
+            human_bytes(collected.total_bytes),
+            collected.elapsed_ms
+        );
+        total_files_total += collected.files.len() as u64;
+        total_bytes += collected.total_bytes;
+
+        writer.roots.push(RootEntry {
+            id: root_id,
+            path: collected.root.display().to_string(),
+            profile: prof,
+        });
+
+        // Assign file_ids and create FileEntry records, parallel-parse.
+        let files_start_id = next_file_id;
+        let file_entries: Vec<FileEntry> = collected
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, rf)| FileEntry {
+                id: files_start_id + i as u32,
+                root_id,
+                relpath: rf.relpath.display().to_string(),
+                kind: rf.kind,
+                size: rf.size,
+            })
+            .collect();
+        next_file_id += collected.files.len() as u32;
+
+        if count_only {
+            writer.files.extend(file_entries);
+            continue;
+        }
+
+        // Parse in parallel. Each task returns (file_id, Vec<SymbolRecord>).
+        let parsed = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+        let symbols_total = Arc::new(AtomicU64::new(0));
+
+        let parse_start = Instant::now();
+        let symbols: Vec<Vec<SymbolRecord>> = collected
+            .files
+            .par_iter()
+            .zip(file_entries.par_iter())
+            .map(|(rf, fe)| -> Vec<SymbolRecord> {
+                let syms = parse_one(rf, fe, root_id, &collected.root);
+                match syms {
+                    Ok(v) => {
+                        parsed.fetch_add(1, Ordering::Relaxed);
+                        symbols_total.fetch_add(v.len() as u64, Ordering::Relaxed);
+                        v
+                    }
+                    Err(_) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        Vec::new()
+                    }
+                }
+            })
+            .collect();
+
+        let parse_ms = parse_start.elapsed().as_millis();
+        let parsed_n = parsed.load(Ordering::Relaxed);
+        let failed_n = failed.load(Ordering::Relaxed);
+        let syms_n = symbols_total.load(Ordering::Relaxed);
+        eprintln!(
+            "[parse] {} parsed, {} failed, {} symbols, {} ms",
+            parsed_n, failed_n, syms_n, parse_ms
+        );
+
+        total_files_parsed += parsed_n;
+        total_files_failed += failed_n;
+
+        writer.files.extend(file_entries);
+        for sv in symbols {
+            writer.symbols.extend(sv);
+        }
+    }
+
+    let elapsed_ms = t_total.elapsed().as_millis();
+    let stats = IndexStats {
+        files_total: total_files_total,
+        files_parsed: total_files_parsed,
+        files_failed: total_files_failed,
+        bytes_total: total_bytes,
+        symbols: writer.symbols.len() as u64,
+        elapsed_ms,
+    };
+    let n_symbols = writer.symbols.len();
+    eprintln!(
+        "[write] {} symbols across {} files / {} roots, finalizing -> {}",
+        n_symbols,
+        writer.files.len(),
+        writer.roots.len(),
+        out_dir.display()
+    );
+    if !count_only {
+        let t = Instant::now();
+        writer.finalize(stats)?;
+        eprintln!("[write] finalized in {} ms", t.elapsed().as_millis());
+    } else {
+        eprintln!("[write] count_only=true, not writing index");
+    }
+    eprintln!("\nDONE: {} files, {} symbols, total {} ms ({:.1} files/s)",
+        total_files_total,
+        n_symbols,
+        elapsed_ms,
+        total_files_total as f64 / (elapsed_ms.max(1) as f64 / 1000.0),
+    );
+    Ok(())
+}
+
+fn parse_one(
+    rf: &RawFile,
+    fe: &FileEntry,
+    root_id: u8,
+    _root: &PathBuf,
+) -> Result<Vec<SymbolRecord>> {
+    // We only parse source-language file kinds in Phase 1.
+    if !rf.kind.is_source() {
+        return Ok(Vec::new());
+    }
+    // Skip very large files (>5 MB) — almost always autogen or binary blobs.
+    if rf.size > 5 * 1024 * 1024 {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&rf.path)
+        .with_context(|| format!("read {}", rf.path.display()))?;
+    let raws = extract(rf.kind, &bytes)
+        .with_context(|| format!("parse {}", rf.path.display()))?;
+    let mut out = Vec::with_capacity(raws.len());
+    let relpath = fe.relpath.clone();
+    for r in raws {
+        let id = SymbolRecord::compute_id(
+            root_id,
+            &relpath,
+            r.kind,
+            &r.scope_path,
+            &r.name,
+            r.line,
+        );
+        let fqn = if r.scope_path.is_empty() {
+            None
+        } else {
+            Some(format!("{}::{}", r.scope_path.join("::"), r.name))
+        };
+        out.push(SymbolRecord {
+            id,
+            name: r.name,
+            fqn,
+            kind: r.kind,
+            file_id: fe.id,
+            byte_start: r.byte_start,
+            byte_end: r.byte_end,
+            line: r.line,
+            col: r.col,
+            scope_path: r.scope_path,
+            lang: rf.kind,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// queries
+// ---------------------------------------------------------------------------
+
+fn open_index(index: Option<PathBuf>) -> Result<StoreReader> {
+    let p = index.unwrap_or_else(default_index_dir);
+    StoreReader::open(&p).with_context(|| format!("open index {}", p.display()))
+}
+
+fn cmd_def(
+    name: String,
+    index: Option<PathBuf>,
+    lang: Option<String>,
+    kind: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let r = open_index(index)?;
+    let results = r.lookup_exact(&name);
+    let filtered: Vec<&SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
+    print_results(&r, &filtered, limit, json);
+    Ok(())
+}
+
+fn cmd_prefix(prefix: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
+    let r = open_index(index)?;
+    let results = r.lookup_prefix(&prefix, limit);
+    print_results(&r, &results, limit, json);
+    Ok(())
+}
+
+fn cmd_fuzzy(substr: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
+    let r = open_index(index)?;
+    let results = r.lookup_substring(&substr, limit);
+    print_results(&r, &results, limit, json);
+    Ok(())
+}
+
+fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
+    let r = open_index(index)?;
+    println!("scry-version: {}", r.manifest.scry_version);
+    println!("indexed-at:   {}", r.manifest.indexed_at);
+    println!("roots:        {}", r.roots.len());
+    for root in &r.roots {
+        println!("  - {} ({:?})", root.path, root.profile);
+    }
+    println!("files-total:  {}", r.manifest.stats.files_total);
+    println!("files-parsed: {}", r.manifest.stats.files_parsed);
+    println!("files-failed: {}", r.manifest.stats.files_failed);
+    println!("bytes-total:  {}", human_bytes(r.manifest.stats.bytes_total));
+    println!("symbols:      {}", r.manifest.stats.symbols);
+    println!("elapsed-ms:   {}", r.manifest.stats.elapsed_ms);
+
+    let mut by_lang: std::collections::HashMap<FileKind, u64> = std::collections::HashMap::new();
+    let mut by_kind: std::collections::HashMap<SymbolKind, u64> =
+        std::collections::HashMap::new();
+    for s in &r.symbols {
+        *by_lang.entry(s.lang).or_default() += 1;
+        *by_kind.entry(s.kind).or_default() += 1;
+    }
+    println!("\nby language:");
+    let mut lv: Vec<_> = by_lang.into_iter().collect();
+    lv.sort_by(|a, b| b.1.cmp(&a.1));
+    for (l, c) in lv {
+        println!("  {:>10}  {:?}", c, l);
+    }
+    println!("\nby kind:");
+    let mut kv: Vec<_> = by_kind.into_iter().collect();
+    kv.sort_by(|a, b| b.1.cmp(&a.1));
+    for (k, c) in kv {
+        println!("  {:>10}  {}", c, k.short());
+    }
+    Ok(())
+}
+
+fn filter_results<'a>(
+    syms: Vec<&'a SymbolRecord>,
+    lang: Option<&str>,
+    kind: Option<&str>,
+) -> Vec<&'a SymbolRecord> {
+    syms.into_iter()
+        .filter(|s| {
+            if let Some(l) = lang {
+                if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) {
+                    return false;
+                }
+            }
+            if let Some(k) = kind {
+                if !s.kind.short().eq_ignore_ascii_case(k) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+fn print_results(reader: &StoreReader, syms: &[&SymbolRecord], limit: usize, json: bool) {
+    if json {
+        for s in syms.iter().take(limit) {
+            let file = reader.files.get(s.file_id as usize);
+            let path = file
+                .map(|f| f.display_path(&reader.roots))
+                .unwrap_or_default();
+            let obj = serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "fqn": s.fqn,
+                "kind": s.kind.short(),
+                "lang": format!("{:?}", s.lang),
+                "path": path,
+                "line": s.line,
+                "col": s.col,
+                "scope": s.scope_path,
+            });
+            println!("{}", obj);
+        }
+        return;
+    }
+    for s in syms.iter().take(limit) {
+        let file = reader.files.get(s.file_id as usize);
+        let path = file
+            .map(|f| f.display_path(&reader.roots))
+            .unwrap_or_default();
+        let scope = if s.scope_path.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", s.scope_path.join("::"))
+        };
+        println!(
+            "{}:{}:{}  ({} {}){}  {}",
+            path,
+            s.line,
+            s.col,
+            s.kind.short(),
+            short_lang(s.lang),
+            scope,
+            s.name,
+        );
+    }
+    eprintln!("\n{} results (showing {})", syms.len(), syms.len().min(limit));
+}
+
+fn short_lang(k: FileKind) -> &'static str {
+    use FileKind::*;
+    match k {
+        Java => "java",
+        Kotlin => "kt",
+        C => "c",
+        Cpp => "cpp",
+        Header => "h",
+        HeaderCpp => "hpp",
+        Rust => "rs",
+        Go => "go",
+        Python => "py",
+        Bash => "sh",
+        Proto => "proto",
+        Aidl => "aidl",
+        _ => "?",
     }
 }

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Profile {
     Aosp,
     Linux,
@@ -58,7 +58,7 @@ impl Profile {
 }
 
 /// All file categories scry knows about. Drives every later phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Ord, PartialOrd)]
 pub enum FileKind {
     // ---- source languages ----
     C,
@@ -191,6 +191,109 @@ pub struct WalkResult {
     pub unknown_files: u64,
     pub total_bytes: u64,
     pub elapsed_ms: u128,
+}
+
+/// One classified file produced by `collect_files`. Phase-1+ pipelines consume
+/// these directly as the work items for the parser pool.
+#[derive(Debug, Clone)]
+pub struct RawFile {
+    pub path: PathBuf,
+    pub relpath: PathBuf,
+    pub kind: FileKind,
+    pub size: u64,
+}
+
+#[derive(Debug)]
+pub struct CollectedFiles {
+    pub root: PathBuf,
+    pub profile: Profile,
+    pub files: Vec<RawFile>,
+    pub total_bytes: u64,
+    pub unknown_files: u64,
+    pub elapsed_ms: u128,
+}
+
+/// Walk `root` and return every classified file. Files we can't classify
+/// are counted (`unknown_files`) but dropped from the list.
+pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
+    let root = root.canonicalize()
+        .map_err(|e| anyhow!("cannot resolve root {}: {e}", root.display()))?;
+    let skiplist: std::collections::HashSet<String> =
+        profile.skiplist().iter().map(|s| s.to_string()).collect();
+
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let files: Arc<Mutex<Vec<RawFile>>> = Arc::new(Mutex::new(Vec::with_capacity(1_000_000)));
+    let unknown = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(AtomicU64::new(0));
+
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .standard_filters(false)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .parents(false)
+        .follow_links(false)
+        .threads(threads);
+    builder.filter_entry(move |e| {
+        if let Some(name) = e.file_name().to_str() {
+            !skiplist.contains(name)
+        } else {
+            true
+        }
+    });
+
+    let start = Instant::now();
+    let root_for_strip = root.clone();
+    let files_c = files.clone();
+    let unknown_c = unknown.clone();
+    let bytes_c = bytes.clone();
+    builder.build_parallel().run(|| {
+        let files = files_c.clone();
+        let unknown = unknown_c.clone();
+        let bytes = bytes_c.clone();
+        let root_for_strip = root_for_strip.clone();
+        Box::new(move |dent| {
+            if let Ok(e) = dent {
+                if e.file_type().map_or(false, |t| t.is_file()) {
+                    let p = e.path();
+                    let md_ok = e.metadata().ok();
+                    let size = md_ok.as_ref().map_or(0, |m| m.len());
+                    bytes.fetch_add(size, Ordering::Relaxed);
+                    match FileKind::classify(p) {
+                        Some(kind) => {
+                            let rel = p.strip_prefix(&root_for_strip)
+                                .unwrap_or(p)
+                                .to_path_buf();
+                            let rf = RawFile {
+                                path: p.to_path_buf(),
+                                relpath: rel,
+                                kind,
+                                size,
+                            };
+                            files.lock().push(rf);
+                        }
+                        None => {
+                            unknown.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            WalkState::Continue
+        })
+    });
+    let elapsed_ms = start.elapsed().as_millis();
+    let files = std::mem::take(&mut *files.lock());
+    Ok(CollectedFiles {
+        root,
+        profile,
+        files,
+        total_bytes: bytes.load(Ordering::Relaxed),
+        unknown_files: unknown.load(Ordering::Relaxed),
+        elapsed_ms,
+    })
 }
 
 /// Walk one source root with the given profile. Parallelized via the `ignore`

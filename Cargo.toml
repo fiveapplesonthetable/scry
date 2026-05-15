@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/scry-cli",
     "crates/scry-walker",
+    "crates/scry-lang",
+    "crates/scry-store",
 ]
 
 [workspace.package]

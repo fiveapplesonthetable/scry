@@ -526,7 +526,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "memchr",
+ "parking_lot",
  "rayon",
+ "regex",
  "scry-aosp",
  "scry-lang",
  "scry-store",

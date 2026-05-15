@@ -108,6 +108,29 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Substring or regex search over indexed source files (rg-like).
+    Grep {
+        pattern: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        regex: bool,
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(long, value_name = "PREFIX")]
+        in_: Option<String>,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// JSON-RPC server reading newline-delimited requests on stdin.
+    /// Each request is {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|stats", "args": {...}}.
+    /// Responses are one JSON object per request.
+    Serve {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -174,6 +197,10 @@ fn main() -> Result<()> {
             cmd_ref(name, index, lang, Some("call".to_string()), limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
+        Cmd::Grep { pattern, index, regex, lang, in_, limit, json } => {
+            cmd_grep(pattern, index, regex, lang, in_, limit, json)
+        }
+        Cmd::Serve { index } => cmd_serve(index),
     }
 }
 
@@ -624,6 +651,293 @@ fn print_refs(reader: &StoreReader, refs: &[&RefRecord], limit: usize, json: boo
         );
     }
     eprintln!("\n{} refs (showing {})", refs.len(), refs.len().min(limit));
+}
+
+// ---------------------------------------------------------------------------
+// grep
+// ---------------------------------------------------------------------------
+
+fn cmd_grep(
+    pattern: String,
+    index: Option<PathBuf>,
+    is_regex: bool,
+    lang: Option<String>,
+    in_: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let r = open_index(index)?;
+    let re = if is_regex {
+        Some(regex::bytes::Regex::new(&pattern).context("invalid regex")?)
+    } else {
+        None
+    };
+
+    // Filter files
+    let lang_lower = lang.as_ref().map(|s| s.to_ascii_lowercase());
+    let prefix = in_.as_deref().unwrap_or("");
+    let candidates: Vec<&FileEntry> = r
+        .files
+        .iter()
+        .filter(|fe| {
+            if let Some(ref l) = lang_lower {
+                if !format!("{:?}", fe.kind).eq_ignore_ascii_case(l) {
+                    return false;
+                }
+            }
+            if !prefix.is_empty() {
+                let full = fe.display_path(&r.roots);
+                if !full.starts_with(prefix) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    let total_files = candidates.len();
+    eprintln!("[grep] scanning {} files", total_files);
+
+    let hits: parking_lot::Mutex<Vec<Hit>> = parking_lot::Mutex::new(Vec::new());
+    let hit_count = std::sync::atomic::AtomicUsize::new(0);
+    candidates.par_iter().for_each(|fe| {
+        if hit_count.load(std::sync::atomic::Ordering::Relaxed) >= limit * 8 {
+            return; // bound work after we have plenty of candidates
+        }
+        let path = fe.display_path(&r.roots);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // Find matches
+        let mut local: Vec<Hit> = Vec::new();
+        if let Some(re) = &re {
+            for m in re.find_iter(&bytes) {
+                let (line, col, snippet) = locate_match(&bytes, m.start(), m.end());
+                local.push(Hit { file_id: fe.id, line, col, snippet });
+                if local.len() >= limit { break; }
+            }
+        } else {
+            let needle = pattern.as_bytes();
+            let mut start = 0usize;
+            while let Some(p) = memchr::memmem::find(&bytes[start..], needle) {
+                let abs = start + p;
+                let (line, col, snippet) = locate_match(&bytes, abs, abs + needle.len());
+                local.push(Hit { file_id: fe.id, line, col, snippet });
+                start = abs + needle.len();
+                if local.len() >= limit { break; }
+            }
+        }
+        if !local.is_empty() {
+            hit_count.fetch_add(local.len(), std::sync::atomic::Ordering::Relaxed);
+            hits.lock().extend(local);
+        }
+    });
+
+    let mut hits = hits.into_inner();
+    hits.truncate(limit);
+    if json {
+        for h in &hits {
+            let path = r.files.get(h.file_id as usize)
+                .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+            let obj = serde_json::json!({
+                "path": path,
+                "line": h.line,
+                "col": h.col,
+                "snippet": h.snippet,
+            });
+            println!("{}", obj);
+        }
+    } else {
+        for h in &hits {
+            let path = r.files.get(h.file_id as usize)
+                .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+            println!("{}:{}:{}: {}", path, h.line, h.col, h.snippet);
+        }
+        eprintln!("\n{} hits across {} files", hits.len(), total_files);
+    }
+    Ok(())
+}
+
+struct Hit {
+    file_id: u32,
+    line: u32,
+    col: u32,
+    snippet: String,
+}
+
+fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {
+    // Count newlines up to start to find line; column is bytes since last newline.
+    let mut line = 1u32;
+    let mut last_nl: i64 = -1;
+    for (i, b) in bytes.iter().enumerate().take(start) {
+        if *b == b'\n' { line += 1; last_nl = i as i64; }
+    }
+    let col = (start as i64 - last_nl) as u32;
+    // Find end of line
+    let mut line_end = end;
+    while line_end < bytes.len() && bytes[line_end] != b'\n' { line_end += 1; }
+    let line_start = (last_nl + 1) as usize;
+    let snippet = String::from_utf8_lossy(&bytes[line_start..line_end]).to_string();
+    let snippet = if snippet.len() > 200 {
+        format!("{}…", &snippet[..200])
+    } else {
+        snippet
+    };
+    (line, col, snippet)
+}
+
+// ---------------------------------------------------------------------------
+// serve (JSON-RPC over stdin)
+// ---------------------------------------------------------------------------
+
+fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let reader = open_index(index)?;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let in_lock = stdin.lock();
+    for line in in_lock.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let req: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = serde_json::json!({"error": format!("bad json: {e}")});
+                writeln!(out, "{}", resp)?;
+                out.flush()?;
+                continue;
+            }
+        };
+        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+        let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let lang = args.get("lang").and_then(|v| v.as_str());
+        let kind = args.get("kind").and_then(|v| v.as_str());
+
+        let result = match cmd {
+            "def" => serve_def(&reader, name, lang, kind, limit),
+            "prefix" => serve_prefix(&reader, name, limit),
+            "fuzzy" => serve_fuzzy(&reader, name, limit),
+            "ref" => serve_ref(&reader, name, lang, kind, limit),
+            "callers" => serve_ref(&reader, name, lang, Some("call"), limit),
+            "stats" => serve_stats(&reader),
+            other => serde_json::json!({"error": format!("unknown cmd: {other}")}),
+        };
+
+        let resp = serde_json::json!({
+            "id": id,
+            "result": result,
+        });
+        writeln!(out, "{}", resp)?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+fn serve_def(
+    r: &StoreReader,
+    name: &str,
+    lang: Option<&str>,
+    kind: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
+    let mut out = Vec::new();
+    let syms = r.lookup_exact(name);
+    for s in syms.into_iter().take(limit) {
+        if let Some(l) = lang {
+            if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) { continue; }
+        }
+        if let Some(k) = kind {
+            if !s.kind.short().eq_ignore_ascii_case(k) { continue; }
+        }
+        out.push(symbol_to_json(r, s));
+    }
+    serde_json::Value::Array(out)
+}
+
+fn serve_prefix(r: &StoreReader, prefix: &str, limit: usize) -> serde_json::Value {
+    let v: Vec<_> = r.lookup_prefix(prefix, limit).into_iter()
+        .map(|s| symbol_to_json(r, s)).collect();
+    serde_json::Value::Array(v)
+}
+
+fn serve_fuzzy(r: &StoreReader, substr: &str, limit: usize) -> serde_json::Value {
+    let v: Vec<_> = r.lookup_substring(substr, limit).into_iter()
+        .map(|s| symbol_to_json(r, s)).collect();
+    serde_json::Value::Array(v)
+}
+
+fn serve_ref(
+    r: &StoreReader,
+    name: &str,
+    lang: Option<&str>,
+    kind: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
+    let mut out = Vec::new();
+    for rr in r.lookup_refs_exact(name).into_iter().take(limit) {
+        if let Some(l) = lang {
+            if !format!("{:?}", rr.lang).eq_ignore_ascii_case(l) { continue; }
+        }
+        if let Some(k) = kind {
+            if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
+        }
+        out.push(ref_to_json(r, rr));
+    }
+    serde_json::Value::Array(out)
+}
+
+fn serve_stats(r: &StoreReader) -> serde_json::Value {
+    serde_json::json!({
+        "scry_version": r.manifest.scry_version,
+        "indexed_at": r.manifest.indexed_at,
+        "roots": r.roots.iter().map(|x| serde_json::json!({
+            "path": x.path, "profile": x.profile,
+        })).collect::<Vec<_>>(),
+        "files_total": r.manifest.stats.files_total,
+        "symbols": r.manifest.stats.symbols,
+        "refs": r.manifest.stats.refs,
+        "bytes_total": r.manifest.stats.bytes_total,
+        "elapsed_ms": r.manifest.stats.elapsed_ms,
+    })
+}
+
+fn symbol_to_json(r: &StoreReader, s: &SymbolRecord) -> serde_json::Value {
+    let path = r.files.get(s.file_id as usize)
+        .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+    serde_json::json!({
+        "id": s.id,
+        "name": s.name,
+        "fqn": s.fqn,
+        "kind": s.kind.short(),
+        "lang": format!("{:?}", s.lang),
+        "path": path,
+        "line": s.line,
+        "col": s.col,
+        "scope": s.scope_path,
+    })
+}
+
+fn ref_to_json(r: &StoreReader, rr: &RefRecord) -> serde_json::Value {
+    let path = r.files.get(rr.file_id as usize)
+        .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+    serde_json::json!({
+        "name": rr.name,
+        "ref_kind": rr.kind.short(),
+        "lang": format!("{:?}", rr.lang),
+        "path": path,
+        "line": rr.line,
+        "col": rr.col,
+        "scope": rr.scope_path,
+    })
 }
 
 fn short_lang(k: FileKind) -> &'static str {

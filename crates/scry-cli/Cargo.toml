@@ -22,3 +22,6 @@ scry-lang = { path = "../scry-lang" }
 scry-store = { path = "../scry-store" }
 scry-aosp = { path = "../scry-aosp" }
 rayon = { workspace = true }
+memchr = { workspace = true }
+regex = { workspace = true }
+parking_lot = { workspace = true }

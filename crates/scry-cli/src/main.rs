@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use scry_lang::{extract, extract_refs};
+use scry_lang::FormatRegistry;
 use scry_store::{
     FileEntry, IndexStats, RefRecord, RootEntry, StoreReader, StoreWriter,
     SymbolKind, SymbolRecord,
@@ -265,6 +265,16 @@ fn cmd_index(
             eprintln!("[index] rayon pool: {} workers", n);
         }
     }
+
+    // Build the format registry once. Adding a new format in the future is:
+    //   1. add a FileKind to scry-walker,
+    //   2. implement a parser fn (kind, source) -> (Vec<RawSymbol>, Vec<RawRef>),
+    //   3. register it in scry-lang::tree_sitter_parsers() or scry-aosp::aosp_parsers().
+    let mut registry = FormatRegistry::new();
+    for p in scry_lang::tree_sitter_parsers() { registry.register(p); }
+    for p in scry_aosp::aosp_parsers() { registry.register(p); }
+    eprintln!("[index] registered {} format parsers", registry.list().len());
+    let registry = Arc::new(registry);
     let roots = if roots.is_empty() { default_roots() } else { roots };
     if roots.is_empty() {
         anyhow::bail!("no source roots: pass one or more paths");
@@ -327,32 +337,47 @@ fn cmd_index(
             continue;
         }
 
-        // Parse in parallel. Each task returns (Vec<SymbolRecord>, Vec<RefRecord>).
+        // Parse in parallel. Drain directly into the shared writer to avoid
+        // a 2x RAM doubling from rayon's map+collect intermediate.
         let parsed = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicU64::new(0));
         let symbols_total = Arc::new(AtomicU64::new(0));
         let refs_total = Arc::new(AtomicU64::new(0));
 
         let parse_start = Instant::now();
-        let results: Vec<(Vec<SymbolRecord>, Vec<RefRecord>)> = collected
+        // Take ownership of the writer's symbol+ref vecs behind mutexes so
+        // worker threads can push directly. We move them back after parsing.
+        let syms_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.symbols));
+        let refs_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.refs));
+
+        collected
             .files
             .par_iter()
             .zip(file_entries.par_iter())
-            .map(|(rf, fe)| -> (Vec<SymbolRecord>, Vec<RefRecord>) {
-                match parse_one(rf, fe, root_id, no_refs, max_file_bytes) {
-                    Ok((s, r)) => {
+            .for_each(|(rf, fe)| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
+                }));
+                match result {
+                    Ok(Ok((s, r))) => {
                         parsed.fetch_add(1, Ordering::Relaxed);
                         symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
                         refs_total.fetch_add(r.len() as u64, Ordering::Relaxed);
-                        (s, r)
+                        if !s.is_empty() {
+                            syms_sink.lock().extend(s);
+                        }
+                        if !r.is_empty() {
+                            refs_sink.lock().extend(r);
+                        }
                     }
-                    Err(_) => {
+                    _ => {
                         failed.fetch_add(1, Ordering::Relaxed);
-                        (Vec::new(), Vec::new())
                     }
                 }
-            })
-            .collect();
+            });
+
+        writer.symbols = syms_sink.into_inner();
+        writer.refs = refs_sink.into_inner();
 
         let parse_ms = parse_start.elapsed().as_millis();
         let parsed_n = parsed.load(Ordering::Relaxed);
@@ -368,10 +393,6 @@ fn cmd_index(
         total_files_failed += failed_n;
 
         writer.files.extend(file_entries);
-        for (sv, rv) in results {
-            writer.symbols.extend(sv);
-            writer.refs.extend(rv);
-        }
     }
 
     // Layer-1 resolution before writing.
@@ -429,15 +450,9 @@ fn parse_one(
     root_id: u8,
     no_refs: bool,
     max_file_bytes: u64,
+    registry: &FormatRegistry,
 ) -> Result<(Vec<SymbolRecord>, Vec<RefRecord>)> {
-    // We parse source-language kinds (tree-sitter) AND a subset of
-    // AOSP-specific kinds (Android.bp, AIDL, OWNERS) via scry-aosp.
-    let is_aosp = matches!(rf.kind,
-        FileKind::Soong | FileKind::Aidl | FileKind::Owners |
-        FileKind::Aconfig | FileKind::InitRc | FileKind::Sepolicy |
-        FileKind::Manifest | FileKind::Hidl | FileKind::Bazel | FileKind::Bzl |
-        FileKind::CMake | FileKind::Gn | FileKind::ApiTxt);
-    if !rf.kind.is_source() && !is_aosp {
+    if !registry.supports(rf.kind) {
         return Ok((Vec::new(), Vec::new()));
     }
     if rf.size > max_file_bytes {
@@ -445,14 +460,7 @@ fn parse_one(
     }
     let bytes = std::fs::read(&rf.path)
         .with_context(|| format!("read {}", rf.path.display()))?;
-    let (raw_syms, aosp_raw_refs) = if is_aosp {
-        let (s, r) = scry_aosp::extract(rf.kind, &bytes);
-        (s, r)
-    } else {
-        let s = extract(rf.kind, &bytes)
-            .with_context(|| format!("parse {}", rf.path.display()))?;
-        (s, Vec::new())
-    };
+    let (raw_syms, raw_refs) = registry.parse(rf.kind, &bytes);
     let mut syms = Vec::with_capacity(raw_syms.len());
     let relpath = fe.relpath.clone();
     for r in raw_syms {
@@ -481,11 +489,7 @@ fn parse_one(
     let refs = if no_refs {
         Vec::new()
     } else {
-        let mut combined = aosp_raw_refs;
-        if !is_aosp {
-            combined.extend(extract_refs(rf.kind, &bytes).unwrap_or_default());
-        }
-        combined
+        raw_refs
             .into_iter()
             .map(|r| RefRecord {
                 name: r.name,

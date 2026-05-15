@@ -744,6 +744,90 @@ fn python_refs_spec() -> &'static RefSpec {
     })
 }
 
+// ===========================================================================
+// FORMAT REGISTRY — open/closed extension point. Adding a new format is
+// "implement FormatParser, register it". Tree-sitter source parsers and
+// the AOSP custom parsers both live behind this trait.
+// ===========================================================================
+
+pub trait FormatParser: Send + Sync {
+    fn kinds(&self) -> &'static [FileKind];
+    fn parse(&self, kind: FileKind, source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>);
+    fn name(&self) -> &'static str;
+}
+
+pub struct FormatRegistry {
+    parsers: Vec<Box<dyn FormatParser>>,
+    by_kind: std::collections::HashMap<FileKind, usize>,
+}
+
+impl FormatRegistry {
+    pub fn new() -> Self {
+        Self {
+            parsers: Vec::new(),
+            by_kind: std::collections::HashMap::new(),
+        }
+    }
+    pub fn register(&mut self, p: Box<dyn FormatParser>) {
+        let id = self.parsers.len();
+        for k in p.kinds() {
+            self.by_kind.insert(*k, id);
+        }
+        self.parsers.push(p);
+    }
+    pub fn parse(&self, kind: FileKind, source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
+        match self.by_kind.get(&kind) {
+            Some(&id) => self.parsers[id].parse(kind, source),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+    pub fn supports(&self, kind: FileKind) -> bool {
+        self.by_kind.contains_key(&kind)
+    }
+    pub fn list(&self) -> Vec<(&'static str, &'static [FileKind])> {
+        self.parsers.iter().map(|p| (p.name(), p.kinds())).collect()
+    }
+}
+
+impl Default for FormatRegistry {
+    fn default() -> Self { Self::new() }
+}
+
+/// Free-function adapter so most parsers can be one-line registrations.
+pub struct FnAdapter {
+    pub name: &'static str,
+    pub kinds: &'static [FileKind],
+    pub f: fn(FileKind, &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>),
+}
+impl FormatParser for FnAdapter {
+    fn kinds(&self) -> &'static [FileKind] { self.kinds }
+    fn name(&self) -> &'static str { self.name }
+    fn parse(&self, kind: FileKind, source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
+        (self.f)(kind, source)
+    }
+}
+
+fn ts_unified(kind: FileKind, src: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
+    let s = extract(kind, src).unwrap_or_default();
+    let r = extract_refs(kind, src).unwrap_or_default();
+    (s, r)
+}
+
+/// Built-in tree-sitter source-language parsers. Call this from your
+/// FormatRegistry setup to get C / C++ / Header / Java / Kotlin / Rust /
+/// Go / Python coverage out of the box.
+pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
+    vec![
+        Box::new(FnAdapter { name: "ts-java", kinds: &[FileKind::Java], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-kotlin", kinds: &[FileKind::Kotlin], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-c", kinds: &[FileKind::C], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-cpp", kinds: &[FileKind::Cpp, FileKind::HeaderCpp, FileKind::Header], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-rust", kinds: &[FileKind::Rust], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-go", kinds: &[FileKind::Go], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-python", kinds: &[FileKind::Python], f: ts_unified }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

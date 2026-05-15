@@ -137,6 +137,25 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Show Soong modules matching NAME (sugar for `def NAME --kind soong`).
+    Mod {
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Which Soong module declares PATH as one of its sources?
+    /// Looks up the file's basename across Soong Import refs.
+    ModuleOf {
+        path: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -207,6 +226,10 @@ fn main() -> Result<()> {
             cmd_grep(pattern, index, regex, lang, in_, limit, json)
         }
         Cmd::Serve { index } => cmd_serve(index),
+        Cmd::Mod { name, index, limit, json } => {
+            cmd_def(name, index, None, Some("soong".into()), limit, json, false, None)
+        }
+        Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
     }
 }
 
@@ -246,7 +269,6 @@ fn cmd_index(
             None => Profile::auto_detect(root),
         };
         eprintln!("[walk]  {} (profile: {:?})", root.display(), prof);
-        let t = Instant::now();
         let mut collected = collect_files(root, prof)?;
         if let Some(n) = limit { collected.files.truncate(n); }
         eprintln!(
@@ -334,14 +356,14 @@ fn cmd_index(
 
     // Layer-1 resolution before writing.
     if !count_only && !no_refs {
-        let t = Instant::now();
+        let t_res = Instant::now();
         writer.resolve_refs();
         let resolved = writer.refs.iter().filter(|r| r.resolved_to.is_some()).count();
         eprintln!(
             "[resolve] {} / {} refs resolved by name in {} ms",
             resolved,
             writer.refs.len(),
-            t.elapsed().as_millis()
+            t_res.elapsed().as_millis()
         );
     }
 
@@ -366,7 +388,7 @@ fn cmd_index(
         out_dir.display()
     );
     if !count_only {
-        let _t = Instant::now();
+        let t = Instant::now();
         writer.finalize(stats)?;
         eprintln!("[write] finalized in {} ms", t.elapsed().as_millis());
     } else {
@@ -872,6 +894,33 @@ fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {
 // ---------------------------------------------------------------------------
 // serve (JSON-RPC over stdin)
 // ---------------------------------------------------------------------------
+
+fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<()> {
+    let r = open_index(index)?;
+    // Heuristic: in Soong .bp files, a src is recorded by basename (relative
+    // to the .bp's package). So we look up refs whose name matches the
+    // basename, restrict to lang=Soong + kind=import.
+    let pb = std::path::Path::new(&path);
+    let basename = pb.file_name().and_then(|s| s.to_str()).unwrap_or(&path);
+    let refs = r.lookup_refs_exact(basename);
+    let mut out: Vec<&RefRecord> = refs.into_iter()
+        .filter(|rr| matches!(rr.lang, FileKind::Soong))
+        .collect();
+    out.dedup_by(|a, b| a.scope_path == b.scope_path);
+    if out.is_empty() {
+        eprintln!("(no Soong module references basename {})", basename);
+        return Ok(());
+    }
+    for rr in out.iter().take(limit) {
+        let file = r.files.get(rr.file_id as usize);
+        let bp_path = file.map(|f| f.display_path(&r.roots)).unwrap_or_default();
+        let module_name = rr.scope_path.get(1).cloned().unwrap_or_default();
+        let module_type = rr.scope_path.get(0).cloned().unwrap_or_default();
+        println!("{} ({})  declared in {}", module_name, module_type, bp_path);
+    }
+    eprintln!("\n{} module(s)", out.len());
+    Ok(())
+}
 
 fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};

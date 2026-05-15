@@ -213,7 +213,7 @@ impl<'a> Parser<'a> {
     fn skip_object(&mut self) {
         // Assumes peek() == '{', consumes balanced braces.
         if self.peek() != b'{' { return; }
-        let mut depth = 0i32;
+        let mut depth: i32;
         self.advance(); depth = 1;
         while !self.at_end() && depth > 0 {
             match self.peek() {

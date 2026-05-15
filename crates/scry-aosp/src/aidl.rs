@@ -269,7 +269,7 @@ impl<'a> P<'a> {
         // Assumes peek() == open OR we'll find one soon.
         while !self.at_end() && self.peek() != open { self.advance(); }
         if self.peek() != open { return; }
-        let mut depth = 0i32;
+        let mut depth: i32;
         self.advance(); depth = 1;
         while !self.at_end() && depth > 0 {
             let c = self.peek();

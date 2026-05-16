@@ -7,6 +7,47 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.23] — 2026-05-17
+
+Three connected fixes, all from a cold-start eval agent's critique
+of v0.1.21:
+
+**1. Cold-open 45s → 342ms (130× faster).**
+   `module_graph.json` (256MB on AOSP) was eager-parsed inside
+   every `StoreReader::open`, so every `scry def` paid ~30s of
+   JSON-parse + Warshall reachability build even when the query
+   didn't need it. Made it lazy via `OnceLock`: first
+   `module_graph()` call pays the cost, queries that never touch
+   it (def, outline, coverage, grep, plain ref/callers) skip it
+   entirely. All 9 call sites in scry-cli switched to the
+   accessor.
+
+**2. `--no-precise` flag; precision now default-on.**
+   `--clang-precise` and `--scip-precise` were opt-in flags
+   nobody knew to pass. Per user feedback ("no need for a
+   billion flags. just have precise as a flag enabled by
+   default"), precision now auto-engages: clang USR + SCIP
+   identity filters apply automatically when their sidecars are
+   present, no-op gracefully when absent. Pass `--no-precise`
+   for raw name-match results. `--reachable` stays explicit
+   opt-in because the module_graph parse is the expensive one.
+   Individual flags (`--reachable`, `--clang-precise`,
+   `--scip-precise`) still work, just hidden from `--help`.
+
+**3. `--scope CLASS` filter on ref / callers.**
+   Drops the 1417-unfilterable-hits problem on hub functions:
+   `scry callers traceBegin --scope BroadcastQueueImpl` keeps
+   only call sites whose enclosing scope_path contains
+   `BroadcastQueueImpl` as an exact segment. Cheap exact match;
+   pairs naturally with the auto-on clang/scip precision for
+   really tight result sets on overloaded names.
+
+Result for the agent's specific query path
+(`scry callers bindService --index /mnt/agent/scry-index`):
+   v0.1.21 cold: 45000ms
+   v0.1.23 cold: 328ms
+   v0.1.23 cold with explicit `--reachable`: 44000ms (graph parse)
+
 ## [0.1.22] — 2026-05-17
 
 CLI inconsistency fix: `scry fuzzy` now accepts `--in PREFIX`,

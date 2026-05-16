@@ -185,28 +185,33 @@ enum Cmd {
         /// Mutually exclusive with --json.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
-        /// Filter refs by build-graph reachability: keep only refs
-        /// whose owning Soong / GN / kernel module can transitively
-        /// reach a module that defines the name. Requires the index
-        /// to have been built with `scry index --build <system>`
-        /// so a `module_graph.json` sidecar is present; otherwise
-        /// emits a one-line stderr note and returns unfiltered.
+        /// Disable all precision filters (build-graph reachability,
+        /// clang USR identity, SCIP symbol identity). Defaults to
+        /// OFF: precision is ON when the relevant sidecar is
+        /// present, so out of the box you get the precise answer
+        /// when possible and gracefully fall back to raw name-match
+        /// when no sidecar exists. Pass `--no-precise` if you
+        /// specifically want unfiltered name-match results.
         #[arg(long)]
+        no_precise: bool,
+        // Below are the individual precision-filter knobs from
+        // v0.1.12–v0.1.16. They still work but are hidden from
+        // --help since the single `--no-precise` flag covers the
+        // 95 % case; users who want fine-grained control can still
+        // pass them explicitly.
+        #[arg(long, hide = true)]
         reachable: bool,
-        /// Filter refs by clang USR identity: keep only refs whose
-        /// (file, byte_start) maps to the same USR as the def site.
-        /// Drops name-collision noise for C/C++/ObjC. Requires
-        /// `scry clang-index --compile-commands ... --index DIR` to
-        /// have been run first. No-op without the sidecar.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         clang_precise: bool,
-        /// Filter refs by SCIP symbol identity (Path C). Same shape
-        /// as --clang-precise but reads symbols from the
-        /// `scip_index.bin` sidecar built by `scry scip-import` —
-        /// works for any language with a SCIP indexer (Java/Kotlin/
-        /// Go/Rust/TypeScript/Python/...). No-op without the sidecar.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         scip_precise: bool,
+        /// Keep only refs whose enclosing scope_path contains
+        /// SCOPE as an exact segment. Example:
+        /// `--scope BroadcastQueueImpl` drops every ref outside
+        /// that class. Cheap exact match; for partial / fuzzy
+        /// class matching use `--in` on the file path instead.
+        #[arg(long, value_name = "CLASS")]
+        scope: Option<String>,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -235,22 +240,24 @@ enum Cmd {
         /// compile_commands.json are missing.
         #[arg(long)]
         precise: bool,
-        /// Filter callers by build-graph reachability: keep only call
-        /// sites whose owning Soong / GN / kernel module can
-        /// transitively reach a module that defines the name. Requires
-        /// the index to have been built with `scry index --build
-        /// <system>`. Composes with --precise — applied after the
-        /// clangd path if both are passed.
+        /// Disable all precision filters (see `scry ref --no-precise`).
+        /// Defaults OFF: precision is automatically applied when the
+        /// relevant sidecar is present.
         #[arg(long)]
+        no_precise: bool,
+        // Hidden back-compat: individual precision knobs.
+        #[arg(long, hide = true)]
         reachable: bool,
-        /// Filter callers by clang USR identity (see `scry ref
-        /// --clang-precise`). Requires `clang_usrs.bin` sidecar.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         clang_precise: bool,
-        /// Filter callers by SCIP symbol identity (see `scry ref
-        /// --scip-precise`). Requires `scip_index.bin` sidecar.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         scip_precise: bool,
+        /// Keep only callers whose enclosing scope_path contains
+        /// SCOPE as an exact segment. Big win on hub functions:
+        /// `scry callers traceBegin --scope BroadcastQueueImpl`
+        /// drops the 1400+ traceBegin sites outside that class.
+        #[arg(long, value_name = "CLASS")]
+        scope: Option<String>,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -1093,10 +1100,15 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise } => {
-            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise)
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope } => {
+            // Default-on precision: when --no-precise isn't set, turn
+            // every filter on. Each one auto-no-ops if its sidecar
+            // isn't there, so behavior degrades cleanly.
+            let (reachable, clang_precise, scip_precise) =
+                resolve_precision(no_precise, reachable, clang_precise, scip_precise);
+            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise, scope)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, reachable, clang_precise, scip_precise, format } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, format } => {
             if precise {
                 // clangd path returns precise callers; reachable filter
                 // is composed on top there too (TODO: thread through —
@@ -1104,8 +1116,9 @@ fn main() -> Result<()> {
                 // to heuristic + reachable below if both are passed).
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
-            // Fall through to the heuristic path with reachable filter.
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise)
+            let (reachable, clang_precise, scip_precise) =
+                resolve_precision(no_precise, reachable, clang_precise, scip_precise);
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise, scope)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -2414,7 +2427,7 @@ fn cmd_callgraph(
     // Optional reachability pruning: precompute callee modules
     // (set of modules that define `name`).
     let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
-        r.module_graph.as_ref().map(|mg| {
+        r.module_graph().map(|mg| {
             r.lookup_exact(&name)
                 .iter()
                 .filter_map(|s| mg.module_of_file(s.file_id))
@@ -2456,7 +2469,7 @@ fn cmd_callgraph(
             }
             // Reachability filter on the caller side.
             if let (Some(mg), Some(cms)) =
-                (r.module_graph.as_ref(), callee_modules) {
+                (r.module_graph(), callee_modules) {
                 if !cms.is_empty() {
                     if let Some(caller_mod) = mg.module_of_file(rr.file_id) {
                         if !cms.iter().any(|cm| mg.is_reachable(caller_mod, *cm)) {
@@ -2577,7 +2590,7 @@ fn cmd_impact(
         })
         .collect();
     if reachable {
-        if let Some(mg) = r.module_graph.as_ref() {
+        if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(&name);
             let callee_modules: std::collections::HashSet<u32> = defs.iter()
                 .filter_map(|s| mg.module_of_file(s.file_id)).collect();
@@ -2774,6 +2787,30 @@ fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bo
         scored.len());
 }
 
+/// Resolve the precision flags. Default-on precision picks up
+/// clang USR + SCIP identity filters (both cheap: small sidecars,
+/// O(1) hash lookups, no-op if missing). Build-graph reachability
+/// (`--reachable`) stays explicit opt-in because the AOSP
+/// `module_graph.json` is 256MB and its eager parse + Warshall
+/// closure costs ~30s cold — paying that on every CLI invocation
+/// would crush the per-query latency the user expects from a
+/// grep-class tool. `--no-precise` disables everything.
+fn resolve_precision(
+    no_precise: bool,
+    explicit_reachable: bool,
+    _explicit_clang: bool,
+    _explicit_scip: bool,
+) -> (bool, bool, bool) {
+    if no_precise {
+        return (false, false, false);
+    }
+    // Cheap filters auto-engage; expensive reachability is opt-in.
+    // `_explicit_clang` / `_explicit_scip` are accepted from
+    // back-compat scripts but ignored — clang+scip are already on
+    // by default. Setting them again is a no-op.
+    (explicit_reachable, true, true)
+}
+
 fn cmd_ref(
     name: String,
     index: Option<PathBuf>,
@@ -2786,6 +2823,7 @@ fn cmd_ref(
     reachable: bool,
     clang_precise: bool,
     scip_precise: bool,
+    scope: Option<String>,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2819,6 +2857,17 @@ fn cmd_ref(
                     return false;
                 }
             }
+            // --scope CLASS: keep only refs whose enclosing scope
+            // chain contains CLASS as an exact segment. Matches Java
+            // nested classes (`["pkg","Outer","Inner"]` with
+            // `--scope Outer` keeps), but not partial-name collisions
+            // (`--scope Foo` won't match `["FooBar"]`). For partial
+            // matching use --in on file path instead.
+            if let Some(sc) = &scope {
+                if !rr.scope_path.iter().any(|seg| seg == sc) {
+                    return false;
+                }
+            }
             true
         })
         .collect();
@@ -2827,7 +2876,7 @@ fn cmd_ref(
     // kernel module-graph sidecar. No-op without the sidecar
     // (logged once so the user knows to rebuild with --build).
     let filtered = if reachable {
-        match r.module_graph.as_ref() {
+        match r.module_graph() {
             None => {
                 eprintln!(
                     "[scry] --reachable: this index has no module_graph.json sidecar; \
@@ -6700,6 +6749,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Filter refs by clang USR identity (C/C++/ObjC name-collision pruning). No-op without the clang_usrs.bin sidecar (`scry clang-index ...`)."},
                 "scip_precise": {"type": "boolean", "default": false,
                     "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer). No-op without the scip_index.bin sidecar (`scry scip-import ...`)."},
+                "scope": {"type": "string",
+                    "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
             })),
         ),
         tool(
@@ -6722,6 +6773,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Same as on `ref` — clang USR identity filter; no-op without clang_usrs.bin."},
                 "scip_precise": {"type": "boolean", "default": false,
                     "description": "Same as on `ref` — SCIP symbol identity filter; no-op without scip_index.bin."},
+                "scope": {"type": "string",
+                    "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
             })),
         ),
         tool(
@@ -7546,22 +7599,32 @@ fn serve_one_request<W: std::io::Write>(
             serve_fuzzy_with_distance(reader, arg_str("substr"), in_, dist, limit)
         }
         "ref"     => {
-            let reachable = args.get("reachable")
+            let no_precise = args.get("no_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let clang_precise = args.get("clang_precise")
+            let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let scip_precise = args.get("scip_precise")
+            let explicit_clang = args.get("clang_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise)
+            let explicit_scip = args.get("scip_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let (reachable, clang_precise, scip_precise) =
+                resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
+            let scope = args.get("scope").and_then(serde_json::Value::as_str);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope)
         }
         "callers" => {
-            let reachable = args.get("reachable")
+            let no_precise = args.get("no_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let clang_precise = args.get("clang_precise")
+            let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let scip_precise = args.get("scip_precise")
+            let explicit_clang = args.get("clang_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise)
+            let explicit_scip = args.get("scip_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let (reachable, clang_precise, scip_precise) =
+                resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
+            let scope = args.get("scope").and_then(serde_json::Value::as_str);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope)
         }
         "subclasses" | "implementations" => {
             let depth = args.get("depth")
@@ -7813,6 +7876,7 @@ fn serve_fuzzy_with_distance(
     serde_json::Value::Array(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_ref(
     r: &StoreReader,
     name: &str,
@@ -7823,6 +7887,7 @@ fn serve_ref(
     reachable: bool,
     clang_precise: bool,
     scip_precise: bool,
+    scope: Option<&str>,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     // Precompute the callee module set ONCE if --reachable + sidecar.
@@ -7830,7 +7895,7 @@ fn serve_ref(
     // (callers pass through unchanged; the daemon doesn't emit a
     // diagnostic line per request to keep the wire-stream clean).
     let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
-        r.module_graph.as_ref().map(|mg| {
+        r.module_graph().map(|mg| {
             r.lookup_exact(name)
                 .iter()
                 .filter_map(|s| mg.module_of_file(s.file_id))
@@ -7874,9 +7939,12 @@ fn serve_ref(
             if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
         }
         if !file_in_prefix(r, rr.file_id, prefix) { continue; }
+        if let Some(sc) = scope {
+            if !rr.scope_path.iter().any(|seg| seg == sc) { continue; }
+        }
         // Reachability filter: keep only refs whose owning module can
         // reach at least one module that defines `name`.
-        if let (Some(mg), Some(cms)) = (r.module_graph.as_ref(), callee_modules.as_ref()) {
+        if let (Some(mg), Some(cms)) = (r.module_graph(), callee_modules.as_ref()) {
             if !cms.is_empty() {
                 if let Some(caller_mod) = mg.module_of_file(rr.file_id) {
                     if !cms.iter().any(|cm| mg.is_reachable(caller_mod, *cm)) {
@@ -7927,7 +7995,7 @@ fn serve_callgraph(
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
-        r.module_graph.as_ref().map(|mg| {
+        r.module_graph().map(|mg| {
             r.lookup_exact(name).iter()
                 .filter_map(|s| mg.module_of_file(s.file_id)).collect()
         })
@@ -7958,7 +8026,7 @@ fn serve_callgraph(
                 let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
                 if !fe.display_path(&r.roots).contains(in_prefix) { continue; }
             }
-            if let (Some(mg), Some(cms)) = (r.module_graph.as_ref(), callee_modules) {
+            if let (Some(mg), Some(cms)) = (r.module_graph(), callee_modules) {
                 if !cms.is_empty() {
                     if let Some(caller_mod) = mg.module_of_file(rr.file_id) {
                         if !cms.iter().any(|cm| mg.is_reachable(caller_mod, *cm)) {
@@ -8018,7 +8086,7 @@ fn serve_impact(
         .filter(|rr| prefix.is_empty() || file_in_prefix(r, rr.file_id, prefix))
         .collect();
     if reachable {
-        if let Some(mg) = r.module_graph.as_ref() {
+        if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(name);
             let callee_modules: std::collections::HashSet<u32> = defs.iter()
                 .filter_map(|s| mg.module_of_file(s.file_id)).collect();

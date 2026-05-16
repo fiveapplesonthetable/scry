@@ -1689,13 +1689,21 @@ pub struct StoreReader {
     /// Number of chunks in the embedding sidecar. Matches chunks.len()
     /// when both are present.
     pub embedding_count: u32,
-    /// Build-system module graph + reachability bitmap. Present iff
-    /// the index has a `module_graph.json` sidecar (v0.1.12+
-    /// `--build soong/gn/kernel`). Loaded eagerly because (a) it's
-    /// small (a few MB even for AOSP-scale), (b) every `--precise`
-    /// query touches it, and (c) the reachability bitmap is the
-    /// hot path. None on legacy / non-build-aware indexes.
-    pub module_graph: Option<modgraph::ModuleGraph>,
+    /// Build-system module graph + reachability bitmap.
+    ///
+    /// Lazy: the `module_graph.json` sidecar is 256MB on AOSP, and
+    /// `serde_json::from_slice` plus reachability-bitmap construction
+    /// takes ~10–30 s on cold cache. The vast majority of queries
+    /// (`def`, `outline`, `coverage`, `grep`, `prefix`, plain
+    /// `callers`/`ref` without `--reachable`) never touch the graph,
+    /// so we defer the work until the first call site that *needs*
+    /// it. After that, the cached value lives in this `OnceLock` for
+    /// the rest of the process — `--reachable` callers stay O(1)
+    /// like before.
+    ///
+    /// Access via [`StoreReader::module_graph`] — that's the only
+    /// reader allowed to touch the cell.
+    pub(crate) module_graph_cell: std::sync::OnceLock<Option<modgraph::ModuleGraph>>,
 }
 
 impl StoreReader {
@@ -1811,40 +1819,11 @@ impl StoreReader {
         } else {
             (None, None, 0u32, 0u32)
         };
-        // Build-system module graph sidecar (v0.1.12+). Read as JSON
-        // (small, parsed once at open) and compacted into a packed
-        // reachability bitmap by ModuleGraph::from_json_v1. The
-        // file→path-to-file_id resolver walks `files` once to build
-        // a HashMap; thereafter the lookup is O(1). Skip silently if
-        // missing — indexes built by v0.1.11 and earlier have no
-        // such sidecar and queries should work exactly as before.
-        let module_graph = if paths.module_graph_json().exists() {
-            let raw = std::fs::read(paths.module_graph_json())
-                .with_context(|| format!("read {}", paths.module_graph_json().display()))?;
-            let v: modgraph::ModuleGraphJsonV1 = serde_json::from_slice(&raw)
-                .with_context(|| format!("parse {}", paths.module_graph_json().display()))?;
-            if v.version != 1 {
-                anyhow::bail!(
-                    "{}: unsupported version {} (this binary understands v1)",
-                    paths.module_graph_json().display(), v.version,
-                );
-            }
-            // Build a path → file_id lookup once. Use the FileEntry's
-            // display_path so the adapter's path format (which can be
-            // absolute or root-relative depending on the build system)
-            // matches what scry indexed.
-            let path_to_id: HashMap<String, u32> = files
-                .iter()
-                .map(|fe| (fe.display_path(&roots), fe.id))
-                .collect();
-            let total_files = files.len();
-            let mg = modgraph::ModuleGraph::from_json_v1(v, total_files, |p| {
-                path_to_id.get(p).copied()
-            });
-            Some(mg)
-        } else {
-            None
-        };
+        // Build-system module graph sidecar is loaded LAZILY (see
+        // doc on module_graph_cell): parsing the 256MB AOSP graph
+        // takes 10–30s cold and almost no queries actually need it,
+        // so we defer construction until the first call to
+        // `module_graph()` on a query that requires reachability.
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
@@ -1856,8 +1835,52 @@ impl StoreReader {
             ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
             chunks, embeddings_mmap, embedding_dim, embedding_count,
-            module_graph,
+            module_graph_cell: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Lazy accessor for the build-system module graph. First call
+    /// pays the JSON-parse + reachability-bitmap cost (~10–30 s
+    /// cold on AOSP-scale); subsequent calls are O(1). Returns
+    /// `None` when no `module_graph.json` sidecar exists, when its
+    /// version is unsupported, or when it fails to parse — we log
+    /// the failure to stderr instead of panicking so a corrupt
+    /// sidecar doesn't take down queries that don't need it.
+    pub fn module_graph(&self) -> Option<&modgraph::ModuleGraph> {
+        self.module_graph_cell.get_or_init(|| {
+            let path = self.paths.module_graph_json();
+            if !path.exists() { return None; }
+            let raw = match std::fs::read(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[scry] module_graph.json: read failed: {e}");
+                    return None;
+                }
+            };
+            let v: modgraph::ModuleGraphJsonV1 = match serde_json::from_slice(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[scry] module_graph.json: parse failed: {e}");
+                    return None;
+                }
+            };
+            if v.version != 1 {
+                eprintln!(
+                    "[scry] module_graph.json: unsupported version {} (expected v1); \
+                     --reachable queries will pass through unfiltered",
+                    v.version,
+                );
+                return None;
+            }
+            let path_to_id: HashMap<String, u32> = self.files
+                .iter()
+                .map(|fe| (fe.display_path(&self.roots), fe.id))
+                .collect();
+            let total_files = self.files.len();
+            Some(modgraph::ModuleGraph::from_json_v1(v, total_files, |p| {
+                path_to_id.get(p).copied()
+            }))
+        }).as_ref()
     }
 
     /// Read the embedding for a chunk index. Returns None when the

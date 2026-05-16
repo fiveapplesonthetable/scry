@@ -560,6 +560,39 @@ silent-bad-data bugs (a parser fix that changes record shape on
 a corpus you haven't reindexed) before the agent acts on the
 result. `SCRY_QUIET=1` suppresses for CI.
 
+**Query plan with `--explain`.** When a grep feels slow, `scry
+grep PATTERN --explain` short-circuits the scan and prints the
+trigrams it extracted (smallest-first, with posting size each),
+the final candidate count, and a rough scan-cost estimate. An
+agent that hits a slow query can now diagnose "the pattern is
+too common, narrow with `--in foo/`" without guessing.
+
+**Auto-narrow hint.** When a result set saturates `--limit` and
+the shown paths share a 2+ segment common directory prefix, a
+one-line stderr suggestion appears: `try --in <prefix>/ to
+narrow, or tighten --kind / --lang`. Saves the agent a guessing
+round when the answer is obviously "filter by the dominant
+subtree".
+
+**Cross-language symbol shadows.** Three flavors:
+- AIDL: `scry def IFoo.Stub --kind aidl.shadow` (Java) and
+  `scry def BpIFoo --kind aidl.shadow` (C++) both land on the
+  .aidl source.
+- AIDL frozen: files under `aidl_api/<pkg>/<N>/` emit
+  `aidl.frozen` so versioned-surface queries don't get mixed
+  with the live development copy.
+- JNI: every Java `native` method emits a `jni`-kind shadow
+  named `Java_<pkg>_<class>_<method>` (full mangling rules).
+  `scry def Java_android_os_Parcel_nativeWriteString --kind jni`
+  finds the Java declaration even when the C++ impl isn't
+  in the indexed tree.
+
+**OWNERS chain (Gerrit semantics).** `scry owner PATH`
+nearest-first by default; `--include-deep` shows every layer;
+`--accumulate` emits the union of emails across all layers
+(the "potential approvers" set). All three modes respect
+`set noparent` per Gerrit.
+
 ## Things I'd still want
 
 1. **Streaming MCP `tools/call`.** `scry serve` already has

@@ -77,8 +77,30 @@ $ scry def BpIBinder --kind aidl.shadow
 $ scry def BpIServiceManager --kind hidl.shadow
 /home/zim/dev/aosp/hardware/.../IServiceManager.hal:14:11  (hidl.shadow hidl)  BpIServiceManager
 
+# Frozen AIDL surface (files under aidl_api/<pkg>/<N>/) gets its own
+# kind so agents can scope "what is the V3 surface of IFoo" without
+# matching the live development copy.
+$ scry def IFoo --kind aidl.frozen --limit 2
+hardware/interfaces/foo/aidl/aidl_api/android.hardware.foo/3/android/hardware/foo/IFoo.aidl:14:11  (aidl.frozen aidl)  IFoo
+
+# Java `native` methods get a synthetic JNI shadow named after the
+# standard JNI mangling — useful when the C++ side is missing,
+# shared across modules, or you're working from the C++ side and
+# want to find the Java declaration.
+$ scry def Java_android_os_Parcel_nativeWriteString --kind jni
+frameworks/base/core/java/android/os/Parcel.java:1453:32  (jni java)  Java_android_os_Parcel_nativeWriteString
+
 $ scry def system_server --kind sepolicy --limit 2
 /home/zim/dev/aosp/system/sepolicy/public/system_server.te:1:6  (sepolicy sepolicy)  system_server
+```
+
+Bash scripts (envsetup.sh, soong_ui.bash, OEM build helpers) are
+also tree-sitter-parsed; functions and top-level variable
+assignments surface like any other lang:
+
+```sh
+$ scry def lunch --lang sh --limit 1
+build/envsetup.sh:1234:1  (fn bash)  lunch
 ```
 
 Subdir scoping with `--in`:
@@ -301,6 +323,33 @@ $ scry grep ZygoteInit --format=count --limit 10000
 
 `--json` and `--format` are mutually exclusive.
 
+### Diagnose a slow grep with `--explain`
+
+`--explain` short-circuits the actual scan and dumps the query
+plan: the extracted trigrams (smallest-first, with posting size
+each), the final candidate count after intersection, and a rough
+scan-cost estimate. Use it when a grep is unexpectedly slow and
+you want to know *why* before tightening the pattern.
+
+```sh
+$ scry grep ActivityManagerService --explain
+query:      "ActivityManagerService"
+trigrams (20 extracted, smallest-first intersection):
+  "tyM"        11913 files
+  "yMa"        24505 files
+  "vit"        35649 files
+  ...
+candidates: 1276 files post-intersection
+scan-cost:  ~89 MiB estimated I/O (1276 candidates × 71 KiB avg file size)
+```
+
+A small `candidates:` count means the trigram pre-filter is
+doing its job; a large one means the pattern is too common
+across the corpus and a `--lang` / `--in` filter would help.
+Regex patterns report whether literal-extraction analysis
+found anything to pre-filter on, falling back to a full-scan
+notice when no literals could be extracted.
+
 ---
 
 ## File outline: `scry outline`
@@ -493,6 +542,35 @@ by kind:
      6543210  method
      ...
 ```
+
+### Machine-readable: `scry stats --json`
+
+```sh
+$ scry stats --json | jq .
+{
+  "scry_version": "0.1.6",
+  "manifest_version": 1,
+  "indexed_at": "2026-05-16T14:19:56Z",
+  "roots": [
+    {"path": "/home/zim/dev/aosp", "profile": "Aosp"},
+    {"path": "/mnt/agent/dev/linux", "profile": "Linux"}
+  ],
+  "files_total":  1009161,
+  "files_parsed": 1009161,
+  "files_failed": 0,
+  "bytes_total":  75603456000,
+  "symbols":      25082959,
+  "refs":         63166322,
+  "elapsed_ms":   5510277,
+  "by_lang": {"Java": 5615791, "Header": 7607137, ...},
+  "by_kind": {"class": 8210123, "method": 6543210, ...}
+}
+```
+
+Stable shape: new fields may be appended in future releases,
+but existing keys won't move or change type (pinned by an e2e
+shape assertion). Powered by `serve_stats` on the JSON-RPC
+side so the schemas match across stdio + listener + CLI use.
 
 ---
 
@@ -894,6 +972,53 @@ is the supported editor-loop refresh — sub-second on small change
 sets, atomic, never leaves the old index in a partial state.
 `scry compact` is the future tombstone-reclaim pass (placeholder
 today; in-place rewrite TODO).
+
+## OWNERS lookup: `scry owner`
+
+Walk up from a path collecting OWNERS entries from each enclosing
+OWNERS file. The closest-to-PATH owner list comes first, more-distant
+inherited owners after — matches Gerrit's evaluation order. The walk
+respects `set noparent` (and the bare `noparent` form): visited at
+that level, then halted.
+
+```sh
+$ scry owner frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+owners for /home/zim/dev/aosp/.../ActivityManagerService.java:
+  via /home/zim/dev/aosp/frameworks/base/services/core/java/com/android/server/am/OWNERS
+    alice@example.com
+    bob@example.com
+```
+
+Three modes:
+
+| flag             | when to use                                                                            |
+|------------------|----------------------------------------------------------------------------------------|
+| (default)        | "who do I @-mention?" — nearest non-empty owner set, stops there.                      |
+| `--include-deep` | "show me the full chain" — every layer the walk visited, in evaluation order.          |
+| `--accumulate`   | "who can approve this?" — union of emails across every visited layer, sorted + deduped. |
+
+```sh
+$ scry owner frameworks/base/services/.../ActivityManagerService.java --accumulate
+owners for /home/zim/dev/aosp/.../ActivityManagerService.java:
+  via .../am/OWNERS
+    alice@example.com
+  via frameworks/base/services/core/java/.../OWNERS
+    bob@example.com
+  via frameworks/base/OWNERS
+    carol@example.com
+
+approvers (3):
+  alice@example.com
+  bob@example.com
+  carol@example.com
+```
+
+`--json` emits one object per layer (with `set_noparent` flagged
+where present) plus, under `--accumulate`, an `approvers` array
+on the envelope. Suitable for piping into the CI bot that does
+the actual `gerrit-push` invocation.
+
+---
 
 ## Semantic retrieval: `scry ask`
 

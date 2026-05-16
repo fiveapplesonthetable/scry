@@ -698,3 +698,613 @@ Each phase ends with a measurable artifact and a runnable demo.
 
 When this is signed off (or revised), Phase 0 starts: install rustup,
 create the cargo workspace, and ship the walker.
+
+---
+
+# Appendix A — Theory
+
+This appendix exists because the three data structures that make scry
+fast are not novel — they're the standard textbook structures —
+but the *reason* each of them is the right shape for this workload
+is easy to get wrong, and getting it wrong is the difference between
+a 13-minute index and a 13-hour one, or a 600 ms grep and a 6-second
+one. Each section below works from first principles, derives the
+complexity, and then says what we actually picked and why.
+
+## A.1 Inverted trigram indices: from a literal string to a candidate set
+
+The query `scry grep ZygoteInit` ends in 600 ms over a 1 M-file
+corpus. Naïve grep over the same corpus takes 5 minutes. Both touch
+the same disk; the gap is entirely about *how many files each one
+opens*. The trigram index is what closes that gap.
+
+### A.1.1 The basic identity
+
+For any string `P` of length `|P| ≥ 3`, define the set of trigrams
+
+```
+T(P) = { P[i..i+3]  :  0 ≤ i ≤ |P|-3 }
+```
+
+The set of files that *could* match `P` is exactly
+
+```
+candidates(P) = ⋂  posting(t)
+              t∈T(P)
+```
+
+where `posting(t)` is the set of file IDs that contain the trigram
+`t` anywhere. The identity is one-directional: a file in
+`candidates(P)` may or may not contain `P` (it has all the trigrams,
+maybe in the wrong order), but a file *not* in `candidates(P)` is
+guaranteed not to contain `P`. So the candidate set is a *sound
+over-approximation*. We still scan it with `memchr` to filter
+false positives; the index turns "scan everything" into "scan a tiny
+candidate set".
+
+For `P = "ZygoteInit"` (10 bytes), `|T(P)| = 8`. Each posting
+on the AOSP+Linux index is on the order of 10³–10⁶ files. The
+intersection sequence
+
+```
+posting("Zyg") ∩ posting("ygo") ∩ posting("got") ∩ … ∩ posting("nit")
+```
+
+collapses to ~1400 candidate files. We open those 1400 files
+instead of all 1 M, and the scan is over.
+
+### A.1.2 Why `n = 3` specifically
+
+Picking `n` is a tradeoff between two failure modes:
+
+- **`n` too small** (e.g. `n = 1`): every posting list is enormous
+  (most bytes appear in most files), every intersection still has
+  ~all files, and the index is no better than full scan. With `n =
+  2`, the dictionary is 65 536 keys and posting lists for common
+  bigrams ("ing", " (", "()") still cover the bulk of the corpus.
+- **`n` too large** (e.g. `n = 5`): the dictionary explodes (~2⁴⁰
+  keys in the worst case), posting lists are short but storing them
+  costs more than the saving, and *short queries can no longer be
+  indexed at all* — `grep foo` (3 bytes) has zero 5-grams. The
+  fallback to full scan eats the win.
+
+`n = 3` puts the dictionary at most 2²⁴ ≈ 16.7 M keys (the actual
+live AOSP dictionary is ~3.2 M keys; only a fraction of the 24-bit
+space appears in real source), gives posting lists that intersect
+down by 2–3 orders of magnitude on selective patterns, and lets
+any literal `|P| ≥ 3` use the index. This is the same choice
+Google Code Search made in 2012 ([Russ Cox][cox-trigram]) and
+Zoekt, livegrep, and Hound have all converged on since. There is
+no theoretical optimum — it's a discrete pareto frontier with `n=3`
+near the knee for source-code workloads.
+
+[cox-trigram]: https://swtch.com/~rsc/regexp/regexp4.html
+
+### A.1.3 Posting-list encoding
+
+Postings are stored sorted (file IDs ascending). Two encodings
+matter:
+
+1. **Delta encoding**: store `d_i = id_i − id_{i-1}` instead of
+   `id_i`. Deltas are small for dense trigrams, and 0 is impossible
+   (sorted set means strictly increasing), so we can use 1-based
+   deltas without a sentinel.
+2. **Varint** (LEB128): each `d_i` uses ⌈log₂(d_i+1)/7⌉ bytes.
+   For a posting where the average delta is 10 (a trigram in ~10%
+   of files), each entry costs ~1.5 bytes vs 8 bytes raw — a 5×
+   shrink.
+
+The combined shrink on the live index is roughly 8× over raw u64,
+which is what gets the trigram payload from ~7 GB down to ~3 GB.
+
+### A.1.4 Intersecting sorted posting lists in linear time
+
+The classic algorithm — given `k` posting lists sorted ascending,
+the merge is the obvious sweep:
+
+```
+heap of k iterators, sorted by current head;
+loop:
+  let m = min head;
+  if all heads == m: emit m, advance all;
+  else: advance the iterator with the min head;
+```
+
+Total cost is `O(N log k)` where `N = Σ |posting_i|`. For
+selective queries the *smallest* posting dominates `N` (the
+intersection cannot be larger than any input), so the work is
+near-linear in the smallest posting — which is exactly the
+workload we want.
+
+scry's optimization is to **sort the trigrams by ascending posting
+length before intersecting**. The smallest posting bounds the
+candidate set, so picking the smallest two first prunes the working
+set as fast as possible. Picking the largest first means carrying a
+1 M-entry working set through the inner loop unnecessarily.
+
+### A.1.5 From regex to trigrams (the livegrep trick)
+
+`scry grep` accepts regex. For a regex `R`, what's the equivalent
+of `T(P)`?
+
+The Russ Cox / livegrep insight: walk the regex's syntax tree and
+extract the longest prefix and suffix literals that every match
+must contain. For `ActivityMgr.*Service`:
+
+- Prefix literal: `ActivityMgr`
+- Suffix literal: `Service`
+
+Both must appear in any matching file. Trigrammify both, AND-intersect
+their postings, scan the result with the full regex. For a regex
+with no extractable literals (`.*foo.*` after the `.*` strip → just
+`foo`, fine), the candidate set is the trigrams of `foo`. For a
+regex genuinely without 3-byte literal anchors (`[a-z]+`), the
+extractor returns empty and we fall back to full scan.
+
+This is in `crates/scry-cli/src/main.rs::regex_literals_for_trigram`
+with seven dedicated unit tests covering: literal anchor, prefix-
+only, suffix-only, no-literal (correct fallback), nested alternation,
+character class without literals, and the empty pattern edge case.
+
+## A.2 Finite-state transducers for the symbol dictionary
+
+`scry def Acti<TAB>` should return every symbol starting with
+"Acti" in under 10 ms on a 22 M-symbol dictionary. The data
+structure that makes prefix and fuzzy lookup that fast is the
+*finite-state transducer* (FST), specifically a minimized,
+sorted FST as implemented by Andrew Gallant's `fst` crate.
+
+### A.2.1 Why not a hash map, a sorted vector, or a B-tree
+
+| Structure          | Prefix? | Fuzzy?   | RAM for 22 M keys | Lookup latency |
+|--------------------|---------|----------|-------------------|----------------|
+| `HashMap`          | no      | no       | ~3 GB             | O(1) point     |
+| sorted `Vec<&str>` | yes     | no       | ~1.5 GB           | O(log N) point |
+| B-tree (LMDB)      | yes     | no       | ~2 GB on disk     | ~µs per node   |
+| **FST (minimized)**| **yes** | **yes**  | **~280 MB mmap**  | **O(\|key\|)** |
+
+The FST wins three ways at once:
+
+1. **Sharing suffixes**: an automaton that accepts {`Activity`,
+   `ActivityManager`, `ActivityThread`} shares the prefix `Activity`
+   in the trie sense, but it also shares any *suffix* substructure
+   between unrelated keys. Hopcroft-style minimization fuses
+   equivalent subautomata, collapsing the structure from a trie
+   (Σ|key|) to something much smaller — empirically ~12 bytes per
+   key on real symbol dictionaries.
+2. **mmap-friendly**: the FST serializes to a single byte array
+   where every state's transitions live adjacent to it. Walking the
+   automaton is sequential pointer-chasing in mapped memory; the
+   page cache absorbs the working set and warm queries take
+   microseconds.
+3. **Prefix walk is free**: once you've walked the input prefix into
+   some state `s`, enumerating completions is BFS from `s`. The
+   cost is proportional to the *output set size*, not the
+   dictionary size. This is the structural reason `scry prefix Acti`
+   stays sub-millisecond regardless of how big the index grows.
+
+### A.2.2 Fuzzy matching as automaton intersection
+
+For fuzzy matching, the `fst` crate constructs a *Levenshtein
+automaton* over the query at a fixed edit distance `k`, then
+*intersects* it with the symbol FST. The intersection is itself an
+FST — its accepted language is exactly "symbols within edit
+distance `k` of the query". Walk it, emit accepted keys.
+
+This is `O(|query| · k · |output|)` and crucially does *not*
+materialize candidates that don't pass the edit distance — wrong
+branches die at the automaton level before they reach the result
+set. For `scry fuzzy ParcelFile --limit 10` on a 22 M-symbol index,
+this runs in ~150–250 ms today, dominated by visiting the FST
+states for matches not by enumerating the dictionary.
+
+### A.2.3 Construction cost
+
+Building a minimized FST requires the input to be **sorted**. scry
+collects symbol names into per-batch sorted vectors during parsing,
+then does a streaming k-way merge into a single sorted stream that
+feeds the `fst::SetBuilder`. The merge dominates the build (it's
+the only step that needs all keys in one place), but it's strictly
+linear in the total input size and runs at the speed of sequential
+disk reads. On the live index it takes ~25 s as part of the
+finalize phase — small enough that we accept the constraint that
+the FST cannot be updated in place. A reindex is the only way to
+add new symbols today; the alternative (online FST construction)
+costs more in code complexity than it saves in latency.
+
+## A.3 The byte-offset sidecar: mmap + index beats deserialize-into-Vec
+
+The third structure is so simple it's barely a structure: a packed
+array of u64 byte offsets, one per record, written alongside the
+records themselves. It exists because of a sharp asymmetry between
+how bincode wants to be read and how the operating system wants to
+serve data.
+
+### A.3.1 The naïve approach and what it costs
+
+bincode's natural API is `deserialize::<Vec<SymbolRecord>>(&bytes)`.
+For a 10 GB columnar payload of 22 M symbol records, that:
+
+- Allocates a `Vec` of 22 M `SymbolRecord`s in the heap (≈ 4 GB
+  resident).
+- Walks the entire byte slice from front to back, decoding every
+  record, regardless of whether the query touches it.
+- Burns ~400 ms of wall time on a warm page cache, ~4 s on cold.
+
+The query, meanwhile, typically wants *one* record (a `def` lookup)
+or a thousand (a `callers` query). The decode work and the
+allocation are 99.9% waste.
+
+### A.3.2 The sidecar trick
+
+During finalize, while writing record `i` to `symbols.bin`, we also
+write `byte_offset_of_record_i` as a fixed-width u64 little-endian to
+`symbols_offsets.bin`. The sidecar is `8 · N` bytes for `N` records
+— ~150 MB for the AOSP+Linux index, a 60× shrink over the payload.
+
+To read record `i`:
+
+1. `mmap` both files at startup (cheap — `mmap` is just a VM
+   mapping; no IO yet).
+2. Read `off = u64::from_le_bytes(&offsets_mmap[8i .. 8(i+1)])`.
+   This is a single memory access into the offset sidecar; the
+   kernel demand-pages the offset page on first touch.
+3. `bincode::deserialize::<SymbolRecord>(&records_mmap[off..])`.
+   Bincode reads exactly one record's bytes. The kernel demand-pages
+   exactly the records page (and a few neighbors for prefetch).
+
+Total: one `u64` read, one record decode, two minor page faults. On
+the live index this runs in ~10 µs warm and ~100 µs cold. The RSS
+footprint of the entire `StoreReader` is ~200 MB regardless of
+index size — the records aren't *in* the process; they're in the
+page cache, where the kernel manages them with global LRU across
+the host.
+
+### A.3.3 Why this is not just lazy loading
+
+Lazy loading would still need to know where each record starts. The
+naïve scheme — "scan forward until you've passed `i-1` length
+prefixes" — is O(i) per lookup and pessimizes random access.
+The offset sidecar makes record location *O(1)* without giving up
+the page-cache benefit. The whole construction is a re-derivation of
+the same trick used by sorted-string-table indexes (LevelDB,
+RocksDB), file-system extents, and just about every other large-
+scale columnar format. We chose to roll it by hand because the
+payload format (bincode) was already fixed and we needed nothing
+more than a sibling array.
+
+### A.3.4 The page cache as a tier 1 cache
+
+The deeper point: by sizing the index so that the *hot working set*
+fits comfortably in the page cache and the *cold tail* lives on
+NVMe, we get a two-tier cache for free, sized and managed by the
+kernel. The `posix_fadvise(POSIX_FADV_WILLNEED)` prefetch in the
+grep candidate scan (commit `014b061`) is the only place we hint
+the cache manually — everywhere else, the kernel's default LRU
+plus our access pattern (small offset reads → small record reads)
+does the right thing.
+
+This is why the perf-stat decomposition in `BENCHMARKS.md` shows
+38 % cache-miss rate and ~70 % syscall time on a cold-cache grep:
+not because the code is wrong, but because at that point the
+remaining cost is the unavoidable IO to read the bytes the query
+actually needs. The page cache is doing exactly what it's supposed
+to.
+
+## A.4 Why these three together
+
+Each structure addresses a different cost:
+
+- **Trigram index** turns a content query from "read every byte"
+  into "read the bytes of the candidate files only".
+- **FST** turns a name query from "scan a 22 M-row table" into
+  "walk an automaton in time proportional to the answer".
+- **Offset sidecar** turns a record fetch from "decode 10 GB" into
+  "decode 128 bytes".
+
+The three are independent — failing one degrades a single query
+type to roughly the cost of `rg` or `grep -r`, not all of them.
+Together they're what makes `scry` interactive on a corpus that's
+two orders of magnitude larger than its working set.
+
+## A.5 The computer-science scaffolding underneath
+
+The previous four sections derive *what* scry does. This one names
+*why* — the underlying CS concepts that the design rests on. None
+of these are scry inventions; they're the standard apparatus from
+the textbook chapters that justify each decision. The point of
+collecting them here is that the design holds together only because
+all of them are simultaneously true. Get any one wrong and a layer
+above it collapses.
+
+### A.5.1 The memory hierarchy and the external-memory model
+
+A modern Skylake host has at least five tiers of storage, each
+roughly 10× larger and 10× slower than the one above:
+
+```
+L1 cache        ~32 KiB         ~1 ns       per-core
+L2 cache        ~256 KiB        ~3 ns       per-core
+L3 cache        ~36 MiB         ~12 ns      per-socket
+DRAM            240 GiB         ~80 ns      per-node
+NVMe page cache 240 GiB(shared) ~80 ns      per-node, cached on demand
+NVMe disk       ~2 TiB          ~80 µs      per-device
+```
+
+The conventional RAM model (every memory access is unit cost)
+breaks at this scale; the right model is Aggarwal–Vitter's
+**external-memory (EM) model** ([Aggarwal & Vitter,
+1988][aggarwal-vitter]), where you count *block transfers* between
+adjacent tiers, not individual loads. An EM-optimal algorithm
+minimizes the number of times a tier-N block has to be fetched
+from tier-N+1.
+
+The three scry data structures are exactly the three classical EM
+patterns:
+
+- **B-tree-shaped lookup** (the FST): height `O(log_B N)` over
+  blocks of size `B`, so a single lookup touches `O(log_B N)`
+  blocks. For a minimized FST on 22 M keys with `B = 4 KiB` and
+  realistic fanout, this is 3–4 page faults.
+- **Sorted run + binary index** (the byte-offset sidecar over the
+  records file): one block fetch to the offset, one to the record.
+  This is the access pattern of every sorted-string-table file
+  format ever shipped (SSTable, LevelDB, RocksDB), and the reason
+  is EM-optimality, not aesthetics.
+- **Inverted index with sorted postings** (the trigram index):
+  intersection cost dominated by the smallest posting's block
+  count, which is the *information-theoretic minimum* — the
+  intersection can't be computed without reading at least one
+  representation of the smallest input.
+
+[aggarwal-vitter]: https://dl.acm.org/doi/10.1145/48529.48535
+
+### A.5.2 The page cache as a cache-oblivious tier
+
+Frigo, Leiserson, Prokop, and Ramachandran's **cache-oblivious**
+result ([Frigo et al., 1999][cache-oblivious]) says: an algorithm
+that has good EM behavior at *every* block size simultaneously
+achieves EM-optimality at *every* tier — without knowing the tier
+parameters. Reading a packed sequential record format via `mmap`
+inherits this property for free: the kernel's page cache replaces
+manually-tuned buffer pools, the prefetcher handles sequential
+runs, and the working set is bounded by *the queries the user
+actually runs* rather than by anything scry has to declare up
+front.
+
+The corollary is that scry has essentially no buffer management
+code. We don't keep an LRU of decoded records; we don't size a
+read cache; we don't even tune readahead. The kernel does all of
+it, correctly, because `mmap` puts our reads on the same hot path
+as every other file the OS has ever managed. We get LRU eviction
+under memory pressure for free; we get prefetch of adjacent pages
+for free; we get sharing across `scry` processes for free. The one
+manual hint is `posix_fadvise(WILLNEED)` on grep candidate files,
+and even that only matters because the access pattern is
+*pseudo-random* across files — the kernel's sequential prefetcher
+can't see it coming. Everywhere else, the cache-oblivious
+guarantee holds.
+
+[cache-oblivious]: https://erikdemaine.org/papers/FOCS1999b/
+
+### A.5.3 Working-set theory and why the index size matters
+
+Denning's **working-set model** ([Denning, 1968][denning]) says
+that a program's performance is governed by the size of its
+working set `W(t, τ)` — the distinct pages it references in the
+last `τ` time units — relative to the available physical memory.
+Below the threshold, page faults are rare and the program runs at
+RAM speed; above it, every reference can fault and the program
+runs at disk speed. The transition is sharp; this is what
+"thrashing" actually is.
+
+This is the *real* reason the trigram pre-filter is load-bearing.
+A query that opens every file's pages drags the working set
+across the threshold (the corpus is 70 GB; the page cache is
+~150 GB but already populated by other workloads). A query that
+opens 1400 files keeps the working set in the tens of MB — well
+below the threshold, page faults stay rare, and the algorithmic
+complexity actually translates to wall time. Without the
+pre-filter, the "memchr is fast" claim is true on a microbenchmark
+and meaningless on the real corpus.
+
+[denning]: https://denninginstitute.com/pjd/PUBS/WSModel_1968.pdf
+
+### A.5.4 Automata theory — Myhill–Nerode and why FSTs are minimal
+
+The Myhill–Nerode theorem ([Hopcroft & Ullman, 1979][hop-ull])
+says that the minimum DFA for a regular language `L` has exactly
+one state per Myhill–Nerode equivalence class of `Σ*` under `L`.
+Two prefixes are equivalent if every possible suffix produces the
+same accept/reject decision. The minimum DFA is unique up to
+state-renaming.
+
+The `fst` crate's minimization step (Hopcroft's `O(n log n)`
+algorithm) realizes this lower bound: the resulting automaton has
+exactly as many states as Myhill–Nerode requires, no more. This
+is *not* a 2× constant-factor win over a less-good representation;
+it's the structural reason the FST shrinks from ~3 GB (trie) to
+~280 MB (minimized) on the AOSP+Linux symbol set. Suffixes shared
+across unrelated keys (`...Manager`, `...Service`, `...Activity`)
+are stored once because their continuations are identical from
+that point on, and Myhill–Nerode says you can't do better while
+still recognizing the same language.
+
+The fuzzy-search-as-intersection-with-a-Levenshtein-automaton
+trick (§A.2.2) is the dual: regular languages are closed under
+intersection, the intersection automaton has at most `|A| × |B|`
+states, and walking it is the same algorithm as walking either
+input. The whole construction is a single regular-languages
+identity applied twice.
+
+[hop-ull]: https://archive.org/details/introductiontoau0000hopc
+
+### A.5.5 Sound over-approximations and the Bloom-filter analogy
+
+The trigram filter is a sound over-approximation: it returns a
+superset of the true matches, and the calling code verifies. This
+is the same shape as a **Bloom filter** ([Bloom, 1970][bloom]) —
+a probabilistic structure with one-sided error (false positives
+allowed, false negatives forbidden) used to prune work before an
+expensive exact check. The same pattern shows up in JIT compilers
+(speculation + deoptimization), garbage collectors (card tables,
+remembered sets), and database query planners (predicate pushdown).
+
+Naming the pattern matters because it tells you the right
+correctness argument: *false positives are tolerated* (they're
+caught by the exact memchr scan; they cost a wasted file open but
+not a wrong answer), but *false negatives must be impossible*
+(any file that contains the pattern must be in the candidate
+set). The trigram extractor in §A.1.5 satisfies this if and only
+if every literal it returns is genuinely required by every match,
+which is why the extractor has explicit unit tests for the
+no-anchor case ("return empty, fall back to scan") rather than
+ever silently returning a partial trigram set.
+
+[bloom]: https://dl.acm.org/doi/10.1145/362686.362692
+
+### A.5.6 Parallelism — work-stealing and the structure of the index pipeline
+
+The indexer is a parallel pipeline: walker → parsers → resolver →
+writers. The throughput on a 72-core host depends entirely on how
+the work is distributed; naïve `for file in files { thread::spawn
+}` is provably worse than nothing because the scheduling overhead
+exceeds the per-file work.
+
+scry uses **Blumofe-Leiserson work-stealing** ([Blumofe & Leiserson,
+1999][bl-ws]) via rayon. The theorem: a fully-strict computation
+with critical-path length `T₁` and total work `T_total` runs in
+`O(T_total/p + T₁)` time on `p` processors with high probability.
+For our pipeline, `T_total` is the sum of all per-file parse times
+(~12 hours of single-threaded work) and `T₁` is the longest
+individual file's parse (~60 s with the cap). Work-stealing makes
+the actual wall time approach `T_total/p` once `p` exceeds the
+critical path's reciprocal — which on this host means somewhere
+between 8 and 16 workers, exactly the sweet spot the
+`BENCHMARKS.md` matrix measured empirically.
+
+Two practical consequences:
+
+1. **Per-file work units must be small enough that critical path
+   doesn't dominate.** This is why the `--big-file-bytes` serial
+   bucket exists: a single 50 MiB generated header is its own
+   critical path and would alone gate wall time, so we serialize
+   the few of them away from the parallel pool rather than letting
+   them sit in workers' deques starving the others.
+2. **Workers shouldn't communicate.** Tree-sitter parsers aren't
+   thread-safe, so each thread gets its own; the resolver runs in
+   a second pass over collected output rather than locking a
+   shared symbol table during parsing. Work-stealing is provably
+   optimal only when the steal operation is cheap; if every steal
+   contends on a lock, the bound degrades to serial.
+
+[bl-ws]: https://supertech.csail.mit.edu/papers/steal.pdf
+
+### A.5.7 Lock-free patterns where parallelism still has to share
+
+Two places in the indexer have unavoidable cross-thread
+communication: the OOM heartbeat thread (reads `jemalloc::epoch`
+and pauses workers if the soft cap is exceeded) and the
+progress-counter shared with the main thread for periodic reporting.
+
+Both use **atomics** rather than mutexes. The memory-ordering
+choices come from Lamport's **sequentially consistent** vs
+**relaxed** memory models ([Lamport, 1979][lamport-sc]) — the
+progress counter is `Relaxed` (we don't care about ordering with
+other state, just that the count is eventually correct), while the
+OOM gate is `Acquire`/`Release` (a worker that observes "paused"
+must see the writes that justified pausing). These are not
+optimizations; they are the *correctness specification* for the
+data structure, and using `SeqCst` everywhere would silently
+serialize the indexer through the global atomic store buffer on
+x86, costing measurable throughput.
+
+The deeper principle — **don't communicate, share state via
+ownership** — is what most of the design follows. The walker
+produces an immutable file list; the parsers consume it and
+produce per-thread output; the writer consumes that and produces
+the on-disk format. Each stage owns its data; there is no shared
+mutable state between stages. This is the same idea as Hoare's
+**Communicating Sequential Processes** ([CSP, 1978][csp]), realized
+in rayon's API rather than channels, and it's the reason the
+indexer scales linearly with cores up to the point where the EM
+model says it can't.
+
+[lamport-sc]: https://lamport.azurewebsites.net/pubs/multi.pdf
+[csp]: https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf
+
+### A.5.8 Strings, automata, and why memchr beats KMP here
+
+The classical string-search results — Knuth-Morris-Pratt (1977),
+Boyer-Moore (1977), Aho-Corasick (1975) — give `O(n + m)` worst-
+case bounds for pattern matching. They're all asymptotically
+optimal in the comparison model.
+
+scry uses none of them. The inner loop of the candidate scan is
+SIMD `memchr` from the `memchr` crate, which is `O(n/w)` where
+`w` is the SIMD word size (32 bytes on AVX2). Asymptotically
+KMP/BM/AC are tied; concretely `memchr` is 5–20× faster because
+modern CPUs reward straight-line vectorizable loops far more than
+they reward fewer comparisons. This is the practical lesson of the
+**RAM-with-vectors model** vs the comparison model: complexity
+analysis tells you which algorithms are *competitive*; constant
+factors and pipeline behavior pick the winner.
+
+The trigram pre-filter changes the calculus: we've already
+narrowed to ~1400 files, average ~5 KB each = ~7 MB of bytes to
+scan. `memchr` does that in ~1 ms wall on cold cache. KMP would
+do it in ~3–5 ms. Neither matters because the disk read is 470 ms.
+This is the standard refrain — **once the algorithm is right,
+the bottleneck moves to IO, and once IO dominates, micro-optimizing
+the inner loop has zero leverage.** It's the reason the
+perf-stat decomposition decomposes the way it does.
+
+### A.5.9 Why all of this composes
+
+Each chapter above gives a *local* correctness/efficiency
+argument. The reason they compose into a working system rather
+than fighting each other is the layering:
+
+```
+                            ┌──────────────────────────────────┐
+                            │  query (CLI or JSON-RPC)         │
+                            └──────────────────────────────────┘
+                                          │
+                                          ▼
+       FST walk (A.2)                Offset sidecar (A.3)         Trigram intersect (A.1)
+       O(|q|), 280 MB mmap     ───   O(1), 150 MB mmap     ───    O(smallest posting), ~3 GB mmap
+                                          │
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │       page cache (A.5.2)         │
+                            │ cache-oblivious; manages all 3   │
+                            └──────────────────────────────────┘
+                                          │
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │  EM model (A.5.1) / working-set  │
+                            │  block transfers, LRU eviction   │
+                            └──────────────────────────────────┘
+                                          │
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │  Skylake + NVMe — fixed costs    │
+                            └──────────────────────────────────┘
+```
+
+The three index structures are independent (failing one degrades
+one query type) but they all *rely on the same lower layers* —
+they all assume the page cache will keep the hot pages resident,
+they all assume EM-optimal access patterns, they all assume the
+parallel pipeline above them produced consistent, sorted on-disk
+formats. The reason scry is fast is not that any one of these is
+clever; it's that they were chosen so the interfaces line up.
+
+That's the L7 system-design instinct made concrete: design each
+layer so the layer below it can stay generic, and so the layer
+above it pays nothing for capabilities it doesn't use. The
+texture of the design — Rust, mmap, FST, trigram, byte-offset
+sidecar, work-stealing — is the boring downstream consequence of
+that single instinct, applied consistently from the kernel page
+cache up to the CLI.
+

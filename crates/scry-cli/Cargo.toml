@@ -24,6 +24,7 @@ scry-aosp = { path = "../scry-aosp" }
 rayon = { workspace = true }
 memchr = { workspace = true }
 regex = { workspace = true }
+regex-syntax = "0.8"
 parking_lot = { workspace = true }
 bincode = { workspace = true }
 tikv-jemallocator = "0.6"

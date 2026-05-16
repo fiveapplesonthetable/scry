@@ -1512,7 +1512,21 @@ fn cmd_grep(
         }
         cs
     } else {
-        None
+        // Regex pre-filter: extract literal substrings from the pattern
+        // via regex-syntax HIR analysis, trigram-intersect each literal,
+        // then UNION across alternatives. Russ Cox / livegrep style.
+        // If extraction yields no useful trigrams we fall back to a full
+        // scan rather than over-narrow.
+        let t_tg = Instant::now();
+        let cs = grep_candidates_for_regex(&r, &pattern);
+        if let Some(ref c) = cs {
+            eprintln!("[grep] regex→trigram pre-filter: {} candidate files in {} ms",
+                c.len(), t_tg.elapsed().as_millis());
+        } else {
+            eprintln!("[grep] regex has no extractable literal — full scan in {} ms decision",
+                t_tg.elapsed().as_millis());
+        }
+        cs
     };
     let candidates: Vec<&FileEntry> = r
         .files
@@ -1802,6 +1816,39 @@ fn cmd_build_trigrams(
         t_total.elapsed().as_millis(),
     );
     Ok(())
+}
+
+/// For a regex pattern, return the trigram candidate set if any can be
+/// extracted via regex-syntax HIR analysis. Returns None ⇒ caller should
+/// fall back to a full scan (rg-class).
+///
+/// Algorithm: parse → extract a finite Seq of prefix literals → for each
+/// literal that's ≥ 3 bytes, intersect its per-trigram posting lists,
+/// then UNION across alternatives (the regex matches if ANY alternative
+/// matches). Bails when extraction yields infinite Seq, an empty set, or
+/// any literal too short to trigram — over-broad pre-filters are worse
+/// than no pre-filter because they pay both costs.
+fn grep_candidates_for_regex(
+    r: &StoreReader,
+    pattern: &str,
+) -> Option<std::collections::HashSet<u32>> {
+    use regex_syntax::hir::literal::{Extractor, ExtractKind};
+    let hir = regex_syntax::parse(pattern).ok()?;
+    let seq = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
+    let lits = seq.literals()?;
+    if lits.is_empty() { return None; }
+    // Cap: too many alternatives means the union is going to be most of
+    // the corpus anyway. 64 is generous; livegrep uses similar bounds.
+    if lits.len() > 64 { return None; }
+    let mut union: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for lit in lits {
+        let bytes = lit.as_bytes();
+        if bytes.len() < 3 { return None; }
+        let part = r.grep_candidates(bytes)?;
+        if part.is_empty() { continue; }
+        union.extend(part);
+    }
+    Some(union)
 }
 
 fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {

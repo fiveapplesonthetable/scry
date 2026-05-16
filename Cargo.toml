@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.79"
 license = "Apache-2.0"
 repository = "https://github.com/fiveapplesonthetable/scry"
 
@@ -40,3 +40,50 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+# Workspace-wide lint policy. Strict where it catches real bugs;
+# silent on style nitpicks that would just create noise. Every crate
+# in the workspace inherits this via `[lints] workspace = true`.
+[workspace.lints.rust]
+# Unsafe blocks inside unsafe fn must be explicit (modern best practice,
+# default in Rust 2024 edition).
+unsafe_op_in_unsafe_fn = "warn"
+# Drop-floor anything we don't actually use — keeps the surface minimal.
+unused_import_braces  = "warn"
+unused_lifetimes      = "warn"
+unused_qualifications = "warn"
+# Forgotten `must_use` returns are real bugs, not style.
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Always-on tiers.
+correctness = { level = "deny",  priority = -1 }
+suspicious  = { level = "warn",  priority = -1 }
+perf        = { level = "warn",  priority = -1 }
+style       = { level = "warn",  priority = -1 }
+complexity  = { level = "warn",  priority = -1 }
+
+# Selected from `pedantic` — each one earns its place by catching
+# real code smells in this codebase without flooding entry points
+# with stylistic noise. Lints that fire on every clap-driven `cmd_*`
+# function (`needless_pass_by_value`, `unnecessary_wraps`) are
+# deliberately omitted: those entry points consume their args by
+# design and return Result for uniform `?` propagation.
+redundant_closure_for_method_calls = "warn"
+explicit_iter_loop                 = "warn"
+match_wildcard_for_single_variants = "warn"
+manual_string_new                  = "warn"
+inefficient_to_string              = "warn"
+implicit_clone                     = "warn"
+# match_same_arms: omitted. Our score / kind-classification tables
+# group enum variants by intent (e.g. all AIDL kinds rank 85, all
+# Proto kinds also rank 85); collapsing them by body would hide
+# the conceptual grouping.
+
+# Quiet down complexity warnings that don't help here.
+too_many_arguments = "allow"
+too_many_lines     = "allow"
+type_complexity    = "allow"
+# Doc indentation suggestions don't catch bugs; clippy churns on
+# every rustdoc bullet list.
+doc_lazy_continuation = "allow"

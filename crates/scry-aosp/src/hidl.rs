@@ -213,7 +213,7 @@ impl<'a> P<'a> {
     fn consume_name(&mut self) -> (Option<String>, u32, u32, u32) {
         self.ws();
         let line = self.line; let col = self.col; let byte = self.pos as u32;
-        let name = self.parse_ident().map(|s| s.to_string());
+        let name = self.parse_ident().map(ToString::to_string);
         (name, line, col, byte)
     }
     fn parse_interface_body(

@@ -541,8 +541,8 @@ enum Cmd {
     /// sidecars round-trip a small sample of records, and the
     /// optional sidecars (file_symbols, ref_resolutions, file_digests,
     /// trigrams, chunks/embeddings) are either present-and-valid or
-    /// absent (legacy). Reports the state of each. Exits non-zero on
-    /// any required-artifact failure.
+    /// absent (each has its own build subcommand). Reports the state
+    /// of each. Exits non-zero on any required-artifact failure.
     Health {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1000,11 +1000,11 @@ fn cmd_index(
                     .with_context(|| format!("read {}", p.display()))?;
                 let v: serde_json::Value = serde_json::from_str(&s)
                     .with_context(|| format!("parse {}", p.display()))?;
-                watermark = v.get("completed_files").and_then(|x| x.as_u64())
+                watermark = v.get("completed_files").and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32;
-                let saved_sym = v.get("symbol_chunks").and_then(|x| x.as_u64())
+                let saved_sym = v.get("symbol_chunks").and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32;
-                let saved_ref = v.get("ref_chunks").and_then(|x| x.as_u64())
+                let saved_ref = v.get("ref_chunks").and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32;
                 // Verify the roots signature matches: if the user reindexes
                 // with different roots or the source tree changed size, file_ids
@@ -1029,7 +1029,7 @@ fn cmd_index(
                 let mut any_path_changed = false;
                 for (i, rj) in want.iter().enumerate() {
                     let want_path = rj.get("path").and_then(|x| x.as_str()).unwrap_or("");
-                    let want_n = rj.get("n_files").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let want_n = rj.get("n_files").and_then(serde_json::Value::as_u64).unwrap_or(0);
                     let cur = &prepared[i];
                     let cur_path = cur.root_path.display().to_string();
                     if cur_path != want_path {
@@ -1683,13 +1683,13 @@ fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
     }
     println!("\nby language:");
     let mut lv: Vec<_> = by_lang.into_iter().collect();
-    lv.sort_by(|a, b| b.1.cmp(&a.1));
+    lv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (l, c) in lv {
-        println!("  {:>10}  {:?}", c, l);
+        println!("  {c:>10}  {l:?}");
     }
     println!("\nby kind:");
     let mut kv: Vec<_> = by_kind.into_iter().collect();
-    kv.sort_by(|a, b| b.1.cmp(&a.1));
+    kv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (k, c) in kv {
         println!("  {:>10}  {}", c, k.short());
     }
@@ -1846,7 +1846,7 @@ fn resolve_file_id(r: &StoreReader, arg: &str) -> Option<u32> {
     let mut exact: Option<u32> = None;
     let mut suffix_hits: Vec<(usize, u32, String)> = Vec::new();
     let suf_pat = format!("/{}", arg.trim_start_matches('/'));
-    for fe in r.files.iter() {
+    for fe in &r.files {
         let p = fe.display_path(&r.roots);
         if p == arg {
             exact = Some(fe.id);
@@ -1981,7 +1981,7 @@ fn symbol_total_score(s: &SymbolRecord, path: &str) -> i64 {
         score -= PENALTY_GENERATED_PATH;
     }
     let depth = path.bytes().filter(|b| *b == b'/').count() as i64;
-    score -= (depth - PATH_DEPTH_FREE_SEGMENTS).max(0).min(PATH_DEPTH_MAX_PENALTY);
+    score -= (depth - PATH_DEPTH_FREE_SEGMENTS).clamp(0, PATH_DEPTH_MAX_PENALTY);
     score
 }
 
@@ -2016,8 +2016,12 @@ fn print_results_md(
     budget: Option<usize>,
 ) {
     let mut emitted_bytes: usize = 0;
+    // Not a simple iterator counter: incremented only when we actually
+    // print a section (skipped on budget exhaustion mid-loop), then
+    // reported back to the user.
     let mut emitted_count: usize = 0;
     let cap = syms.len().min(limit);
+    #[allow(clippy::explicit_counter_loop)]
     for s in syms.iter().take(cap) {
         let file = reader.files.get(s.file_id as usize);
         let path = file.map(|f| f.display_path(&reader.roots)).unwrap_or_default();
@@ -2377,7 +2381,7 @@ fn cmd_grep(
         let t_pf = Instant::now();
         candidates.par_iter().for_each(|fe| {
             let path = fe.display_path(&r.roots);
-            scry_store::prefault_path(std::path::Path::new(&path));
+            scry_store::prefault_path(Path::new(&path));
         });
         eprintln!("[grep] prefaulted {} files in {} ms",
                   total_files, t_pf.elapsed().as_millis());
@@ -2386,7 +2390,7 @@ fn cmd_grep(
     let hits: parking_lot::Mutex<Vec<Hit>> = parking_lot::Mutex::new(Vec::new());
     let hit_count = std::sync::atomic::AtomicUsize::new(0);
     candidates.par_iter().for_each(|fe| {
-        if hit_count.load(std::sync::atomic::Ordering::Relaxed) >= limit * 8 {
+        if hit_count.load(Ordering::Relaxed) >= limit * 8 {
             return; // bound work after we have plenty of candidates
         }
         let path = fe.display_path(&r.roots);
@@ -2417,7 +2421,7 @@ fn cmd_grep(
             // vs the previous std::fs::read approach.
             let needle = pattern.as_bytes();
             let offsets = scry_store::scan_file_literal(
-                std::path::Path::new(&path),
+                Path::new(&path),
                 needle, limit, max_file_bytes,
             );
             if offsets.is_empty() { return; }
@@ -2436,7 +2440,7 @@ fn cmd_grep(
             }
         }
         if !local.is_empty() {
-            hit_count.fetch_add(local.len(), std::sync::atomic::Ordering::Relaxed);
+            hit_count.fetch_add(local.len(), Ordering::Relaxed);
             hits.lock().extend(local);
         }
     });
@@ -2523,10 +2527,10 @@ fn cmd_build_offsets(index: Option<PathBuf>) -> Result<()> {
         Ok(total)
     }
 
-    let n_syms = build_one::<scry_store::SymbolRecord>(
+    let n_syms = build_one::<SymbolRecord>(
         &paths.symbols(), &paths.symbol_offsets(), "symbols"
     )?;
-    let n_refs = build_one::<scry_store::RefRecord>(
+    let n_refs = build_one::<RefRecord>(
         &paths.refs(), &paths.ref_offsets(), "refs"
     )?;
     eprintln!(
@@ -2549,7 +2553,7 @@ fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
     // Need the file count + the symbol vec (lazy is fine — we walk it
     // exactly once). Open through StoreReader so the offsets sidecar is
     // available and we avoid loading the whole 10 GB symbols.bin into RAM.
-    let r = scry_store::StoreReader::open(&index_dir)
+    let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
     let n_files = r.files.len();
     eprintln!("[fsyms] {} files, {} symbols — building reverse map", n_files, r.n_symbols());
@@ -2634,7 +2638,7 @@ fn cmd_build_digests(index: Option<PathBuf>, workers: usize) -> Result<()> {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
     }
     let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = scry_store::StoreReader::open(&index_dir)
+    let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
     let n_files = r.files.len();
     eprintln!("[digests] {} files to hash", n_files);
@@ -2705,7 +2709,7 @@ fn cmd_index_diff(
     if roots.is_empty() {
         anyhow::bail!("no source roots provided and no default available");
     }
-    let r = scry_store::StoreReader::open(&index_dir)
+    let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
     if r.file_digests_mmap.is_none() {
         anyhow::bail!(
@@ -2718,7 +2722,7 @@ fn cmd_index_diff(
     // the existing index.
     let mut old_map: std::collections::HashMap<(u8, String), (u32, [u8; 32])> =
         std::collections::HashMap::with_capacity(r.files.len());
-    for fe in r.files.iter() {
+    for fe in &r.files {
         if let Some(d) = r.file_digest(fe.id) {
             old_map.insert((fe.root_id, fe.relpath.clone()), (fe.id, d));
         }
@@ -2731,12 +2735,12 @@ fn cmd_index_diff(
     for (root_idx, root_path) in roots.iter().enumerate() {
         // Auto-detect profile per root unless the user pinned one.
         let prof = match profile.as_str() {
-            "aosp" => scry_walker::Profile::Aosp,
-            "linux" => scry_walker::Profile::Linux,
-            "generic" => scry_walker::Profile::Generic,
-            _ => scry_walker::Profile::auto_detect(root_path),
+            "aosp" => Profile::Aosp,
+            "linux" => Profile::Linux,
+            "generic" => Profile::Generic,
+            _ => Profile::auto_detect(root_path),
         };
-        let collected = scry_walker::collect_files(root_path, prof)
+        let collected = collect_files(root_path, prof)
             .with_context(|| format!("walk {}", root_path.display()))?;
         // Hash in parallel.
         let hashed: Vec<(String, [u8; 32])> = collected.files.par_iter().map(|rf| {
@@ -2766,7 +2770,7 @@ fn cmd_index_diff(
         }
     }
     let mut removed: Vec<(u8, String)> = Vec::new();
-    for (k, _) in &old_map {
+    for k in old_map.keys() {
         if !seen_new.contains(k) {
             removed.push(k.clone());
         }
@@ -2856,7 +2860,7 @@ fn cmd_index_incremental(
             out_dir.display()
         );
     }
-    let old = scry_store::StoreReader::open(&out_dir)
+    let old = StoreReader::open(&out_dir)
         .with_context(|| format!("open existing index at {}", out_dir.display()))?;
     if old.file_digests_mmap.is_none() {
         anyhow::bail!(
@@ -2895,24 +2899,24 @@ fn cmd_index_incremental(
     // (the typical case: same roots between runs) old_id == new_id.
     struct Categorized {
         root_id: u8,
-        rf: scry_walker::RawFile,
+        rf: RawFile,
         rel: String,
         digest: [u8; 32],
     }
     let mut all_files: Vec<Categorized> = Vec::new();
     for (root_idx, root_path) in roots.iter().enumerate() {
         let prof = match profile.as_deref() {
-            Some("aosp") => scry_walker::Profile::Aosp,
-            Some("linux") => scry_walker::Profile::Linux,
-            Some("generic") => scry_walker::Profile::Generic,
+            Some("aosp") => Profile::Aosp,
+            Some("linux") => Profile::Linux,
+            Some("generic") => Profile::Generic,
             Some(other) => anyhow::bail!("unknown profile '{other}'"),
-            None => scry_walker::Profile::auto_detect(root_path),
+            None => Profile::auto_detect(root_path),
         };
         eprintln!("[incremental] walking root {} ({prof:?})", root_path.display());
-        let collected = scry_walker::collect_files(root_path, prof)
+        let collected = collect_files(root_path, prof)
             .with_context(|| format!("walk {}", root_path.display()))?;
         // Hash in parallel — blake3 is ~3 GB/s/core.
-        let hashed: Vec<(scry_walker::RawFile, String, [u8; 32])> =
+        let hashed: Vec<(RawFile, String, [u8; 32])> =
             collected.files.par_iter().map(|rf| {
                 let rel = rf.relpath.to_string_lossy().to_string();
                 let bytes = std::fs::read(&rf.path).unwrap_or_default();
@@ -2965,17 +2969,17 @@ fn cmd_index_incremental(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("create staging dir {}", staging.display()))?;
-    let mut writer = scry_store::StoreWriter::new_streaming(&staging)
+    let mut writer = StoreWriter::new_streaming(&staging)
         .with_context(|| "open streaming writer")?;
     if build_trigrams { writer.enable_trigrams(); }
 
     // Carry over root entries with their original profiles.
     for (i, root_path) in roots.iter().enumerate() {
         let prof = old.roots.iter()
-            .find(|r| std::path::Path::new(&r.path) == root_path.as_path())
+            .find(|r| Path::new(&r.path) == root_path.as_path())
             .map(|r| r.profile)
-            .unwrap_or_else(|| scry_walker::Profile::auto_detect(root_path));
-        writer.roots.push(scry_store::RootEntry {
+            .unwrap_or_else(|| Profile::auto_detect(root_path));
+        writer.roots.push(RootEntry {
             id: i as u8,
             path: root_path.display().to_string(),
             profile: prof,
@@ -2992,7 +2996,7 @@ fn cmd_index_incremental(
         let c = &all_files[i];
         let old_id = old_map[&(c.root_id, c.rel.clone())].0;
         id_remap.insert(old_id, new_fid);
-        writer.files.push(scry_store::FileEntry {
+        writer.files.push(FileEntry {
             id: new_fid, root_id: c.root_id,
             relpath: c.rel.clone(),
             kind: c.rf.kind, size: c.rf.size,
@@ -3002,7 +3006,7 @@ fn cmd_index_incremental(
     let parse_id_start: u32 = new_fid;
     for &i in &needs_parse_idx {
         let c = &all_files[i];
-        writer.files.push(scry_store::FileEntry {
+        writer.files.push(FileEntry {
             id: new_fid, root_id: c.root_id,
             relpath: c.rel.clone(),
             kind: c.rf.kind, size: c.rf.size,
@@ -3063,7 +3067,7 @@ fn cmd_index_incremental(
         for (fid, tgs) in per_file {
             writer.push_trigrams(&tgs, fid);
         }
-        if let Some(_) = writer.trigrams.as_ref() {
+        if writer.trigrams.as_ref().is_some() {
             writer.flush_trigrams_chunk()
                 .with_context(|| "flush replayed trigrams")?;
         }
@@ -3085,7 +3089,7 @@ fn cmd_index_incremental(
         needs_parse_idx.par_iter().enumerate().map(|(i, &cat_i)| {
             let c = &all_files[cat_i];
             let new_fid = parse_id_start + i as u32;
-            let fe = scry_store::FileEntry {
+            let fe = FileEntry {
                 id: new_fid, root_id: c.root_id,
                 relpath: c.rel.clone(),
                 kind: c.rf.kind, size: c.rf.size,
@@ -3114,7 +3118,7 @@ fn cmd_index_incremental(
 
     // === Phase 7: finalize ===
     let final_files_total = writer.files.len();
-    let stats = scry_store::IndexStats {
+    let stats = IndexStats {
         files_total: final_files_total as u64,
         files_parsed: needs_parse_idx.len() as u64,
         files_failed: 0,
@@ -3178,7 +3182,7 @@ fn cmd_index_incremental(
 fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
     let index_dir = index.unwrap_or_else(default_index_dir);
     let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = scry_store::StoreReader::open(&index_dir)
+    let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
 
     let needle = path.to_string_lossy().to_string();
@@ -3368,7 +3372,7 @@ fn cmd_build_embeddings(
         let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
     }
     let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = scry_store::StoreReader::open(&index_dir)
+    let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
     let n_files = r.files.len();
     eprintln!("[embed] {} files; dim={}, chunk={}+{}overlap",
@@ -3393,7 +3397,7 @@ fn cmd_build_embeddings(
     let mut all: Vec<(embed::ChunkEntry, Vec<f32>)> = per_file.into_iter().flatten().collect();
     // Stable sort: (file_id ASC, start_line ASC) so consumers can
     // binary-search by file_id or scan by file order.
-    all.sort_by(|a, b| (a.0.file_id, a.0.start_line).cmp(&(b.0.file_id, b.0.start_line)));
+    all.sort_by_key(|a| (a.0.file_id, a.0.start_line));
     eprintln!("[embed] computed {} chunks in {} ms", all.len(), t.elapsed().as_millis());
 
     // Write chunks.bin (bincode Vec<ChunkEntry>).
@@ -3534,11 +3538,11 @@ fn chunk_snippet(path: &str, start_line: u32, end_line: u32) -> String {
 fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     let index_dir = index.unwrap_or_else(default_index_dir);
     let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = scry_store::StoreReader::open(&index_dir)
+    let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
     let n_files = r.files.len();
     let mut tombstoned = 0usize;
-    for fe in r.files.iter() {
+    for fe in &r.files {
         if r.is_tombstoned(fe.id) { tombstoned += 1; }
     }
     if tombstoned == 0 {
@@ -3565,7 +3569,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     let index_dir = index.unwrap_or_else(default_index_dir);
     eprintln!("[res] target index: {}", index_dir.display());
     let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = scry_store::StoreReader::open(&index_dir)?;
+    let r = StoreReader::open(&index_dir)?;
     let n_refs = r.n_refs();
     let n_syms = r.n_symbols();
     if n_refs == 0 {
@@ -3580,9 +3584,9 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     // Per-file Java package (extracted via SymbolKind::Package). Computed
     // in the same pass to avoid double-iterating the symbol vec.
     let mut per_file_pkg: HashMap<u32, String> = HashMap::new();
-    let mut pass1 = |s: scry_store::SymbolRecord| {
-        if matches!(s.kind, scry_store::SymbolKind::Package)
-            && matches!(s.lang, scry_walker::FileKind::Java) {
+    let mut pass1 = |s: SymbolRecord| {
+        if matches!(s.kind, SymbolKind::Package)
+            && matches!(s.lang, FileKind::Java) {
             per_file_pkg.insert(s.file_id, s.name.clone());
         }
         by_name.entry(s.name.clone()).or_default().push(ResolveDef {
@@ -3596,7 +3600,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     // without re-resolving file_id → pkg on every ref.
     for entries in by_name.values_mut() {
         for e in entries.iter_mut() {
-            if matches!(e.lang, scry_walker::FileKind::Java) {
+            if matches!(e.lang, FileKind::Java) {
                 if let Some(pkg) = per_file_pkg.get(&e.file_id) {
                     e.pkg = Some(pkg.clone());
                 }
@@ -3608,9 +3612,9 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     // --- Pass 2: per-file import lists (Java). ---
     let t2 = Instant::now();
     let mut per_file_imports: HashMap<u32, Vec<(String, Option<String>)>> = HashMap::new();
-    let mut process_import = |rr: &scry_store::RefRecord| {
+    let mut process_import = |rr: &RefRecord| {
         if !matches!(rr.kind, scry_store::RefKind::Import) { return; }
-        if !matches!(rr.lang, scry_walker::FileKind::Java) { return; }
+        if !matches!(rr.lang, FileKind::Java) { return; }
         // For Java, the importer emits the import ref with name = the full
         // qualified path. Split into pkg + simple name.
         let (pkg, simple) = match rr.name.rsplit_once('.') {
@@ -3629,7 +3633,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
     let mut resolved_count: u64 = 0;
     let mut narrowed_count: u64 = 0;
-    let mut resolve_ref = |rr: &scry_store::RefRecord| -> Result<()> {
+    let mut resolve_ref = |rr: &RefRecord| -> Result<()> {
         let chosen_id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
                                      &mut narrowed_count);
         if chosen_id != 0 { resolved_count += 1; }
@@ -3652,7 +3656,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
 /// Updates `narrowed_count` when Java-aware narrowing makes the choice (vs
 /// plain name-match fallback).
 fn resolve_one(
-    rr: &scry_store::RefRecord,
+    rr: &RefRecord,
     by_name: &std::collections::HashMap<String, Vec<ResolveDef>>,
     per_file_pkg: &std::collections::HashMap<u32, String>,
     per_file_imports: &std::collections::HashMap<u32, Vec<(String, Option<String>)>>,
@@ -3676,7 +3680,7 @@ fn resolve_one(
     if pool.len() == 1 { return pool[0].id; }
 
     // Java-aware narrowing: prefer (same package) > (imported) > (java.lang) > anything.
-    if matches!(rr.lang, scry_walker::FileKind::Java) {
+    if matches!(rr.lang, FileKind::Java) {
         let my_pkg = per_file_pkg.get(&rr.file_id);
         let imports = per_file_imports.get(&rr.file_id);
 
@@ -3738,7 +3742,7 @@ fn resolve_one(
 struct ResolveDef {
     id: u64,
     file_id: u32,
-    lang: scry_walker::FileKind,
+    lang: FileKind,
     pkg: Option<String>,
 }
 
@@ -3780,9 +3784,9 @@ fn cmd_build_trigrams(
     let total_batches = (n_files + batch_size - 1) / batch_size.max(1);
     let mut chunk_count: u32 = 0;
     let t_total = Instant::now();
-    let total_failed = std::sync::atomic::AtomicU64::new(0);
-    let total_skipped = std::sync::atomic::AtomicU64::new(0);
-    let total_trigram_pushes = std::sync::atomic::AtomicU64::new(0);
+    let total_failed = AtomicU64::new(0);
+    let total_skipped = AtomicU64::new(0);
+    let total_trigram_pushes = AtomicU64::new(0);
 
     let mut start = 0usize;
     let mut batch_no = 0usize;
@@ -3795,20 +3799,20 @@ fn cmd_build_trigrams(
         let t_batch = Instant::now();
         slice.par_iter().for_each(|fe| {
             if fe.size > max_file_bytes {
-                total_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                total_skipped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             let path = fe.display_path(&r.roots);
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
-                Err(_) => { total_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
+                Err(_) => { total_failed.fetch_add(1, Ordering::Relaxed); return; }
             };
             let trigrams = scry_store::trigram::extract_sorted(&bytes);
             if trigrams.is_empty() { return; }
             let mut s = sink.lock();
             s.reserve(trigrams.len());
             for t in &trigrams { s.push((*t, fe.id)); }
-            total_trigram_pushes.fetch_add(trigrams.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            total_trigram_pushes.fetch_add(trigrams.len() as u64, Ordering::Relaxed);
         });
         // Flush this batch's tuples to a sorted chunk file (same format the
         // writer's flush_trigrams_chunk uses, so kway_merge can consume them).
@@ -3836,9 +3840,9 @@ fn cmd_build_trigrams(
     eprintln!(
         "[trigrams] all batches done in {} ms. failed reads: {}, skipped (>max-file-bytes): {}, total tuples: {}",
         t_total.elapsed().as_millis(),
-        total_failed.load(std::sync::atomic::Ordering::Relaxed),
-        total_skipped.load(std::sync::atomic::Ordering::Relaxed),
-        total_trigram_pushes.load(std::sync::atomic::Ordering::Relaxed),
+        total_failed.load(Ordering::Relaxed),
+        total_skipped.load(Ordering::Relaxed),
+        total_trigram_pushes.load(Ordering::Relaxed),
     );
 
     // K-way merge into the final trigrams.fst + trigram_postings.bin
@@ -3991,7 +3995,7 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
     // Heuristic: in Soong .bp files, a src is recorded by basename (relative
     // to the .bp's package). So we look up refs whose name matches the
     // basename, restrict to lang=Soong + kind=import.
-    let pb = std::path::Path::new(&path);
+    let pb = Path::new(&path);
     let basename = pb.file_name().and_then(|s| s.to_str()).unwrap_or(&path);
     let refs = r.lookup_refs_exact(basename);
     let mut out: Vec<RefRecord> = refs.into_iter()
@@ -4006,7 +4010,7 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
         let file = r.files.get(rr.file_id as usize);
         let bp_path = file.map(|f| f.display_path(&r.roots)).unwrap_or_default();
         let module_name = rr.scope_path.get(1).cloned().unwrap_or_default();
-        let module_type = rr.scope_path.get(0).cloned().unwrap_or_default();
+        let module_type = rr.scope_path.first().cloned().unwrap_or_default();
         println!("{} ({})  declared in {}", module_name, module_type, bp_path);
     }
     eprintln!("\n{} module(s)", out.len());
@@ -4033,7 +4037,7 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
 
     // Required artifacts: anything an open() of StoreReader would
     // fail without.
-    let required_files: &[(&str, std::path::PathBuf)] = &[
+    let required_files: &[(&str, PathBuf)] = &[
         ("manifest.json", paths.manifest()),
         ("roots.bin",     paths.roots()),
         ("files.bin",     paths.files()),
@@ -4054,7 +4058,7 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
     }
 
     // Optional sidecars: report state but don't fail.
-    let optional_files: &[(&str, std::path::PathBuf)] = &[
+    let optional_files: &[(&str, PathBuf)] = &[
         ("trigrams.fst",         paths.trigram_fst()),
         ("trigram_postings.bin", paths.trigram_postings()),
         ("symbols_offsets.bin",  paths.symbol_offsets()),
@@ -4081,7 +4085,7 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
     // that pure existence checks miss.
     let mut reader_ok = false;
     let reader_status;
-    match scry_store::StoreReader::open(&index_dir) {
+    match StoreReader::open(&index_dir) {
         Ok(r) => {
             // Decode the first symbol + ref via the lazy paths; both
             // should succeed on any healthy index with >= 1 record.
@@ -4178,7 +4182,7 @@ fn cmd_owner(
     // Collect OWNERS files by walking up from the target.
     let mut layers: Vec<(PathBuf, Vec<String>, Vec<String>)> = Vec::new();
     let mut cur = if target_path.is_file() {
-        target_path.parent().map(|p| p.to_path_buf())
+        target_path.parent().map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("/"))
     } else {
         target_path.clone()
@@ -4242,7 +4246,7 @@ fn cmd_owner(
 ///
 /// Skipped: comments (`#…`), `set noparent`, `include …` (those would
 /// require following the include chain — out of scope for v1).
-fn parse_owners_file(path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+fn parse_owners_file(path: &Path) -> (Vec<String>, Vec<String>) {
     let txt = match std::fs::read_to_string(path) {
         Ok(s) => s, Err(_) => return (Vec::new(), Vec::new()),
     };
@@ -4292,7 +4296,7 @@ fn cmd_diff(
     // Collect changed (root_id, relpath) pairs from every git root.
     let mut changed: std::collections::HashSet<(u8, String)> = std::collections::HashSet::new();
     for root in &reader.roots {
-        let root_path = std::path::Path::new(&root.path);
+        let root_path = Path::new(&root.path);
         if !root_path.join(".git").exists() {
             eprintln!("[scry diff] skipping non-git root: {}", root.path);
             continue;
@@ -4379,7 +4383,7 @@ fn cmd_diff(
 /// as a list of repo-relative paths. Returns `Err` with stderr context
 /// if git fails (bad revision, not a repo, etc.) so the caller can
 /// report a clear message per-root.
-fn git_changed_files(root: &std::path::Path, since: &str) -> Result<Vec<String>> {
+fn git_changed_files(root: &Path, since: &str) -> Result<Vec<String>> {
     let out = std::process::Command::new("git")
         .arg("-C").arg(root)
         .arg("diff").arg("--name-only")
@@ -4394,7 +4398,7 @@ fn git_changed_files(root: &std::path::Path, since: &str) -> Result<Vec<String>>
     let stdout = String::from_utf8_lossy(&out.stdout);
     Ok(stdout.lines()
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+        .map(ToString::to_string)
         .collect())
 }
 
@@ -4420,7 +4424,7 @@ struct RecallEntry {
 /// (the indexer was SIGKILL'd mid-line) doesn't break recall.
 fn parse_recall_log<R: std::io::BufRead>(rd: R) -> Vec<RecallEntry> {
     let mut out = Vec::new();
-    for line in rd.lines().map_while(|r| r.ok()) {
+    for line in rd.lines().map_while(std::result::Result::ok) {
         let line = line.trim();
         if line.is_empty() { continue; }
         if let Ok(e) = serde_json::from_str::<RecallEntry>(line) {
@@ -4607,7 +4611,7 @@ fn mcp_dispatch(
     params: &serde_json::Value,
 ) -> serde_json::Value {
     let result = match method {
-        "initialize" => Ok(mcp_initialize_result()),
+        "initialize" => Ok(mcp_initialize_result(params)),
         "tools/list" => Ok(mcp_tools_list_result()),
         "tools/call" => mcp_tools_call(reader, params),
         // ping is part of the spec for liveness checks.
@@ -4624,12 +4628,32 @@ fn mcp_dispatch(
     }
 }
 
-/// Reply to MCP `initialize`. Reports our protocol version and the
-/// `tools` capability — we don't (yet) implement prompts, resources,
-/// or sampling, so we don't advertise them.
-fn mcp_initialize_result() -> serde_json::Value {
+/// MCP protocol versions this server supports. Listed newest first so
+/// `MCP_SUPPORTED_VERSIONS[0]` is our preferred latest. Our wire shape
+/// (initialize / tools/list / tools/call with text content parts) has
+/// been stable since 2024-11-05; the newer revisions add optional
+/// features (tasks, elicitation, output schemas) we don't yet emit, so
+/// declaring support is safe — we just don't use the new fields.
+const MCP_SUPPORTED_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Reply to MCP `initialize`. Per spec §lifecycle/Version Negotiation:
+/// if the server supports the version the client requested, it MUST
+/// respond with the same version; otherwise it MUST respond with its
+/// latest supported version (the client then decides whether to
+/// continue or disconnect).
+///
+/// `tools` is the only capability we advertise — we don't (yet)
+/// implement prompts, resources, sampling, logging, or tasks, so we
+/// don't claim them.
+fn mcp_initialize_result(params: &serde_json::Value) -> serde_json::Value {
+    let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+    let agreed = match requested {
+        Some(v) if MCP_SUPPORTED_VERSIONS.contains(&v) => v,
+        _ => MCP_SUPPORTED_VERSIONS[0],
+    };
     serde_json::json!({
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": agreed,
         "capabilities": {
             "tools": { "listChanged": false },
         },
@@ -4663,7 +4687,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
         })
     }
     // Shared property fragments.
-    let name_prop = serde_json::json!({"name": {"type": "string"}});
     let lang_prop = serde_json::json!({"type": "string", "description": "java|kotlin|cpp|rust|go|python|soong|aidl|..."});
     let in_prop = serde_json::json!({"type": "string", "description": "path substring filter (e.g. frameworks/base/)"});
     let limit_prop = serde_json::json!({"type": "integer", "default": 20});
@@ -4724,10 +4747,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "limit": limit_prop,
         }))),
     ];
-    // Silence the unused name_prop warning — it's kept for symmetry
-    // with the other shared property fragments above and may be
-    // referenced again as more tools land.
-    let _ = name_prop;
     serde_json::json!({ "tools": tools })
 }
 
@@ -5031,12 +5050,12 @@ fn serve_one_request<W: std::io::Write>(
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let limit = args.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(50) as usize;
     let lang = args.get("lang").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
     let in_ = args.get("in").and_then(|v| v.as_str());
-    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let budget = req.get("budget").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let stream = req.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let budget = req.get("budget").and_then(serde_json::Value::as_u64).map(|n| n as usize);
 
     // Per-command primary arg name. Each command also accepts "name"
     // as a fallback so existing callers don't break, but the
@@ -5056,7 +5075,7 @@ fn serve_one_request<W: std::io::Write>(
         "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, limit),
         "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, limit),
         "fuzzy"   => {
-            let dist = args.get("distance").and_then(|v| v.as_u64())
+            let dist = args.get("distance").and_then(serde_json::Value::as_u64)
                 .map(|n| n as u32).unwrap_or(2);
             serve_fuzzy_with_distance(reader, arg_str("substr"), in_, dist, limit)
         }
@@ -5065,7 +5084,7 @@ fn serve_one_request<W: std::io::Write>(
         "grep"    => serve_grep(reader, arg_str("pattern"), lang, in_, limit),
         "outline" => serve_outline(reader, arg_str("path"), limit),
         "coverage" => serve_coverage(reader, arg_str("path"),
-            args.get("by_kind").and_then(|v| v.as_bool()).unwrap_or(false)),
+            args.get("by_kind").and_then(serde_json::Value::as_bool).unwrap_or(false)),
         "stats"   => serve_stats(reader),
         "ask"     => serve_ask(reader, arg_str("query"), in_, limit),
         other     => {
@@ -5326,7 +5345,7 @@ fn serve_grep(
     // bad query (e.g. "the") from blocking the serve loop for seconds.
     const MAX_FILES_SCANNED: usize = 5000;
     let mut scanned = 0usize;
-    for fe in r.files.iter() {
+    for fe in &r.files {
         if out.len() >= limit { break; }
         if scanned >= MAX_FILES_SCANNED { break; }
         if let Some(ref tg) = candidates {
@@ -5722,11 +5741,11 @@ mod tests {
     use std::collections::HashMap;
     use scry_store::RefKind;
 
-    fn mk_def(id: u64, lang: scry_walker::FileKind, pkg: Option<&str>) -> ResolveDef {
+    fn mk_def(id: u64, lang: FileKind, pkg: Option<&str>) -> ResolveDef {
         ResolveDef { id, file_id: 0, lang, pkg: pkg.map(String::from) }
     }
-    fn mk_ref(name: &str, lang: scry_walker::FileKind, file_id: u32) -> scry_store::RefRecord {
-        scry_store::RefRecord {
+    fn mk_ref(name: &str, lang: FileKind, file_id: u32) -> RefRecord {
+        RefRecord {
             name: name.into(), kind: RefKind::Call, file_id,
             byte_start: 0, byte_end: 0, line: 1, col: 1,
             scope_path: vec![], lang, resolved_to: None,
@@ -5736,8 +5755,8 @@ mod tests {
     #[test]
     fn resolve_one_single_candidate_trivial() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
-        by_name.insert("Foo".into(), vec![mk_def(42, scry_walker::FileKind::Java, None)]);
-        let r = mk_ref("Foo", scry_walker::FileKind::Java, 0);
+        by_name.insert("Foo".into(), vec![mk_def(42, FileKind::Java, None)]);
+        let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
         let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
         assert_eq!(chosen, 42);
@@ -5747,7 +5766,7 @@ mod tests {
     #[test]
     fn resolve_one_no_match_returns_zero() {
         let by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
-        let r = mk_ref("Foo", scry_walker::FileKind::Java, 0);
+        let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 0);
     }
@@ -5756,11 +5775,11 @@ mod tests {
     fn resolve_one_same_lang_preference_wins_over_cross_lang() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("Foo".into(), vec![
-            mk_def(100, scry_walker::FileKind::Cpp, None),
-            mk_def(200, scry_walker::FileKind::Java, None),
-            mk_def(300, scry_walker::FileKind::Python, None),
+            mk_def(100, FileKind::Cpp, None),
+            mk_def(200, FileKind::Java, None),
+            mk_def(300, FileKind::Python, None),
         ]);
-        let r = mk_ref("Foo", scry_walker::FileKind::Java, 0);
+        let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 200);
     }
@@ -5772,13 +5791,13 @@ mod tests {
     fn resolve_one_java_same_package_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("Activity".into(), vec![
-            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
-            mk_def(22, scry_walker::FileKind::Java, Some("android.app")),
-            mk_def(33, scry_walker::FileKind::Java, Some("com.third")),
+            mk_def(11, FileKind::Java, Some("com.other")),
+            mk_def(22, FileKind::Java, Some("android.app")),
+            mk_def(33, FileKind::Java, Some("com.third")),
         ]);
         let mut pkg = HashMap::new();
         pkg.insert(5u32, "android.app".to_string());
-        let r = mk_ref("Activity", scry_walker::FileKind::Java, 5);
+        let r = mk_ref("Activity", FileKind::Java, 5);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1, "same-package narrowing should bump counter");
@@ -5790,12 +5809,12 @@ mod tests {
     fn resolve_one_java_import_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("Binder".into(), vec![
-            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
-            mk_def(22, scry_walker::FileKind::Java, Some("android.os")),
+            mk_def(11, FileKind::Java, Some("com.other")),
+            mk_def(22, FileKind::Java, Some("android.os")),
         ]);
         let mut imports = HashMap::new();
         imports.insert(5u32, vec![("Binder".to_string(), Some("android.os".to_string()))]);
-        let r = mk_ref("Binder", scry_walker::FileKind::Java, 5);
+        let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &mut n), 22);
         assert_eq!(n, 1, "explicit-import narrowing should bump counter");
@@ -5806,12 +5825,12 @@ mod tests {
     fn resolve_one_java_wildcard_import_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("Binder".into(), vec![
-            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
-            mk_def(22, scry_walker::FileKind::Java, Some("android.os")),
+            mk_def(11, FileKind::Java, Some("com.other")),
+            mk_def(22, FileKind::Java, Some("android.os")),
         ]);
         let mut imports = HashMap::new();
         imports.insert(5u32, vec![("*".to_string(), Some("android.os".to_string()))]);
-        let r = mk_ref("Binder", scry_walker::FileKind::Java, 5);
+        let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &mut n), 22);
         assert_eq!(n, 1);
@@ -5823,10 +5842,10 @@ mod tests {
     fn resolve_one_java_lang_fallback() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("String".into(), vec![
-            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
-            mk_def(22, scry_walker::FileKind::Java, Some("java.lang")),
+            mk_def(11, FileKind::Java, Some("com.other")),
+            mk_def(22, FileKind::Java, Some("java.lang")),
         ]);
-        let r = mk_ref("String", scry_walker::FileKind::Java, 5);
+        let r = mk_ref("String", FileKind::Java, 5);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1, "java.lang fallback should bump counter");
@@ -5838,10 +5857,10 @@ mod tests {
     fn resolve_one_java_no_narrowing_fallback() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("Foo".into(), vec![
-            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
-            mk_def(22, scry_walker::FileKind::Java, Some("com.third")),
+            mk_def(11, FileKind::Java, Some("com.other")),
+            mk_def(22, FileKind::Java, Some("com.third")),
         ]);
-        let r = mk_ref("Foo", scry_walker::FileKind::Java, 5);
+        let r = mk_ref("Foo", FileKind::Java, 5);
         let mut n = 0u64;
         let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
         assert_eq!(got, 11, "should pick first same-lang candidate");
@@ -6077,7 +6096,8 @@ mod tests {
 
     /// Empty-string arg → also flagged. The original bug:
     /// `{"name": ""}` silently coerced to "match all" and returned
-    /// garbage anonymous-enum hits from legacy C++ code.
+    /// garbage anonymous-enum hits from C++ code where the FST has
+    /// thousands of empty-name entries.
     #[test]
     fn mcp_validate_flags_empty_string_arg() {
         let args = serde_json::json!({"name": ""});
@@ -6117,7 +6137,58 @@ mod tests {
         let err = mcp_tool_error("kaboom".to_string());
         assert_eq!(err.pointer("/content/0/type").and_then(|v| v.as_str()), Some("text"));
         assert_eq!(err.pointer("/content/0/text").and_then(|v| v.as_str()), Some("kaboom"));
-        assert_eq!(err.get("isError").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(err.get("isError").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    // ------------------------------------------------------------------
+    // MCP version negotiation — per spec §lifecycle/Version Negotiation.
+    // ------------------------------------------------------------------
+
+    /// Client requests a version we support → server MUST echo it.
+    /// (Forward-compatibility: a 2024 client connecting to a 2025 server
+    /// still gets 2024 back so it can continue talking to us.)
+    #[test]
+    fn mcp_initialize_echoes_supported_version() {
+        for v in MCP_SUPPORTED_VERSIONS {
+            let req = serde_json::json!({"protocolVersion": v});
+            let r = mcp_initialize_result(&req);
+            assert_eq!(r.pointer("/protocolVersion").and_then(|x| x.as_str()), Some(*v),
+                       "must echo client-requested version '{v}' verbatim");
+        }
+    }
+
+    /// Client requests an unsupported version → server returns its
+    /// latest. (The client is then free to disconnect per spec; that's
+    /// not our problem.)
+    #[test]
+    fn mcp_initialize_returns_latest_on_unsupported_version() {
+        let req = serde_json::json!({"protocolVersion": "1999-01-01"});
+        let r = mcp_initialize_result(&req);
+        assert_eq!(r.pointer("/protocolVersion").and_then(|x| x.as_str()),
+                   Some(MCP_SUPPORTED_VERSIONS[0]),
+                   "unsupported version must fall back to our latest");
+    }
+
+    /// Missing protocolVersion field → also falls back to latest.
+    /// Some lightweight clients omit it entirely.
+    #[test]
+    fn mcp_initialize_handles_missing_version() {
+        let r = mcp_initialize_result(&serde_json::json!({}));
+        assert_eq!(r.pointer("/protocolVersion").and_then(|x| x.as_str()),
+                   Some(MCP_SUPPORTED_VERSIONS[0]));
+    }
+
+    /// Newest-first ordering on MCP_SUPPORTED_VERSIONS is load-bearing
+    /// — `[0]` is treated as "our latest" in the fallback path. Pin it.
+    #[test]
+    fn mcp_supported_versions_newest_first() {
+        let v = MCP_SUPPORTED_VERSIONS;
+        assert!(!v.is_empty(), "must support at least one MCP version");
+        let mut sorted: Vec<&&str> = v.iter().collect();
+        sorted.sort_by(|a, b| b.cmp(a));
+        let sorted_owned: Vec<&str> = sorted.iter().map(|s| **s).collect();
+        let actual: Vec<&str> = v.to_vec();
+        assert_eq!(actual, sorted_owned, "MCP_SUPPORTED_VERSIONS must be newest-first");
     }
 
     // ------------------------------------------------------------------
@@ -6157,7 +6228,7 @@ mod tests {
     /// Missing file → empty pair, never panics.
     #[test]
     fn parse_owners_missing_file_returns_empty() {
-        let (e, p) = parse_owners_file(std::path::Path::new("/no/such/OWNERS"));
+        let (e, p) = parse_owners_file(Path::new("/no/such/OWNERS"));
         assert!(e.is_empty());
         assert!(p.is_empty());
     }

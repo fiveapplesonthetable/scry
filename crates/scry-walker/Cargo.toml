@@ -12,3 +12,6 @@ ignore = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+
+[lints]
+workspace = true

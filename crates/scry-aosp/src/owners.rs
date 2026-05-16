@@ -59,7 +59,7 @@ pub fn parse(source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
                 let pattern = rest[..eq].trim();
                 let value = rest[eq + 1..].trim();
                 // Emit each value as an OwnersEmail symbol, scoped to the per-file pattern
-                for v in value.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                for v in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     syms.push(make_symbol(
                         v.to_string(), SymbolKind::OwnersEmail,
                         line_no, leading.saturating_add(1),

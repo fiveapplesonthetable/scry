@@ -297,9 +297,9 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
     let root = root.canonicalize()
         .map_err(|e| anyhow!("cannot resolve root {}: {e}", root.display()))?;
     let skiplist: std::collections::HashSet<String> =
-        profile.skiplist().iter().map(|s| s.to_string()).collect();
+        profile.skiplist().iter().map(|s| (*s).to_string()).collect();
 
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let threads = std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(8);
     let files: Arc<Mutex<Vec<RawFile>>> = Arc::new(Mutex::new(Vec::with_capacity(1_000_000)));
     let unknown = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
@@ -335,10 +335,10 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
         let root_for_strip = root_for_strip.clone();
         Box::new(move |dent| {
             if let Ok(e) = dent {
-                if e.file_type().map_or(false, |t| t.is_file()) {
+                if e.file_type().is_some_and(|t| t.is_file()) {
                     let p = e.path();
                     let md_ok = e.metadata().ok();
-                    let size = md_ok.as_ref().map_or(0, |m| m.len());
+                    let size = md_ok.as_ref().map_or(0, std::fs::Metadata::len);
                     bytes.fetch_add(size, Ordering::Relaxed);
                     match FileKind::classify(p) {
                         Some(kind) => {
@@ -385,7 +385,7 @@ pub fn walk_root(root: &Path, profile: Profile) -> Result<WalkResult> {
     let root = root.canonicalize()
         .map_err(|e| anyhow!("cannot resolve root {}: {e}", root.display()))?;
 
-    let skiplist: Vec<String> = profile.skiplist().iter().map(|s| s.to_string()).collect();
+    let skiplist: Vec<String> = profile.skiplist().iter().map(|s| (*s).to_string()).collect();
 
     let counts: Arc<Mutex<HashMap<FileKind, u64>>> = Arc::new(Mutex::new(HashMap::new()));
     let total = Arc::new(AtomicU64::new(0));
@@ -393,7 +393,7 @@ pub fn walk_root(root: &Path, profile: Profile) -> Result<WalkResult> {
     let bytes = Arc::new(AtomicU64::new(0));
 
     let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(8);
 
     let mut builder = WalkBuilder::new(&root);
@@ -434,7 +434,7 @@ pub fn walk_root(root: &Path, profile: Profile) -> Result<WalkResult> {
         let bytes = bytes_c.clone();
         Box::new(move |dent| {
             if let Ok(e) = dent {
-                if e.file_type().map_or(false, |t| t.is_file()) {
+                if e.file_type().is_some_and(|t| t.is_file()) {
                     total.fetch_add(1, Ordering::Relaxed);
                     if let Ok(md) = e.metadata() {
                         bytes.fetch_add(md.len(), Ordering::Relaxed);

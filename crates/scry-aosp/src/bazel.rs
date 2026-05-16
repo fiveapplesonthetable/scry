@@ -191,15 +191,14 @@ fn extract_kwarg_string(args: &str, key: &str) -> Option<String> {
             if j < bytes.len() && bytes[j] == b'=' && (j + 1 >= bytes.len() || bytes[j + 1] != b'=') {
                 j += 1;
                 while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') { j += 1; }
-                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
-                    if name == key {
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'')
+                    && name == key {
                         let q = bytes[j];
                         let str_start = j + 1;
                         let mut k = str_start;
                         while k < bytes.len() && bytes[k] != q { k += 1; }
                         return Some(args[str_start..k].to_string());
                     }
-                }
             }
         }
         i += 1;

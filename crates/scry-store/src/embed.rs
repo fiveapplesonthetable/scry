@@ -167,7 +167,7 @@ fn fnv1a_lower(bytes: &[u8]) -> u32 {
     const FNV_PRIME: u32 = 16_777_619;
     let mut h = FNV_OFFSET;
     for &b in bytes {
-        let lower = if (b'A'..=b'Z').contains(&b) { b + 32 } else { b };
+        let lower = if b.is_ascii_uppercase() { b + 32 } else { b };
         h ^= lower as u32;
         h = h.wrapping_mul(FNV_PRIME);
     }

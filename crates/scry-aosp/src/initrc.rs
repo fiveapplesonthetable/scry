@@ -2,16 +2,16 @@
 //!
 //! init.rc has two main top-level construct kinds:
 //!
-//!   - service NAME PATH ARGS...
-//!         user ...
-//!         group ...
-//!         class ...
+//! - `service NAME PATH ARGS...`
+//!   - `user ...`
+//!   - `group ...`
+//!   - `class ...`
 //!
-//!   - on EVENT
-//!         start NAME
-//!         stop NAME
-//!         setprop K V
-//!         ...
+//! - `on EVENT`
+//!   - `start NAME`
+//!   - `stop NAME`
+//!   - `setprop K V`
+//!   - ...
 //!
 //! Indented lines extend the previous top-level block. We emit one
 //! InitService symbol per `service` decl and Call refs for `start NAME` /
@@ -34,7 +34,7 @@ pub fn parse(source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
     for (i, raw_line) in src.lines().enumerate() {
         let line_no = (i + 1) as u32;
         let line_len = raw_line.len() as u32;
-        let indented = raw_line.starts_with(|c: char| c == ' ' || c == '\t');
+        let indented = raw_line.starts_with([' ', '\t']);
         let body = raw_line.trim();
 
         if body.is_empty() || body.starts_with('#') {
@@ -51,7 +51,7 @@ pub fn parse(source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
                         let col = raw_line.find(name).unwrap_or(0) as u32 + 1;
                         let path: Vec<&str> = words.collect();
                         let scope = if let Some(first) = path.first() {
-                            vec!["service".to_string(), first.to_string()]
+                            vec!["service".to_string(), (*first).to_string()]
                         } else {
                             vec!["service".to_string()]
                         };

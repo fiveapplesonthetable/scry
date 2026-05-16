@@ -153,8 +153,8 @@ impl ClangdSession {
         let mut out = Vec::with_capacity(arr.len());
         for loc in arr {
             let uri = loc.get("uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let line = loc.pointer("/range/start/line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let character = loc.pointer("/range/start/character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let line = loc.pointer("/range/start/line").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+            let character = loc.pointer("/range/start/character").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
             out.push(LspLocation {
                 uri,
                 line: line + 1,            // convert back to 1-based
@@ -191,7 +191,7 @@ impl ClangdSession {
                 continue;  // notification — ignore
             }
             // Response — match by id.
-            if msg.get("id").and_then(|v| v.as_i64()) == Some(id) {
+            if msg.get("id").and_then(serde_json::Value::as_i64) == Some(id) {
                 if let Some(err) = msg.get("error") {
                     return Err(anyhow!("lsp error on {method}: {err}"));
                 }

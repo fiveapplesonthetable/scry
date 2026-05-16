@@ -118,9 +118,9 @@ mod tests {
         let v = trigrams_of_query(b"hello");
         // "hel", "ell", "llo"
         assert_eq!(v.len(), 3);
-        assert!(v.contains(&[b'h', b'e', b'l']));
-        assert!(v.contains(&[b'e', b'l', b'l']));
-        assert!(v.contains(&[b'l', b'l', b'o']));
+        assert!(v.contains(b"hel"));
+        assert!(v.contains(b"ell"));
+        assert!(v.contains(b"llo"));
     }
 
     #[test]

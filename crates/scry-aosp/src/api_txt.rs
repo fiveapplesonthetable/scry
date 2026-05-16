@@ -80,7 +80,7 @@ pub fn parse(source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
                     // extends / implements -> InheritFrom refs
                     if let Some(pos) = header.find(" extends ") {
                         let rest = &header[pos + " extends ".len()..];
-                        for base in rest.split(|c: char| c == ',' || c == ' ').filter(|s| !s.is_empty()) {
+                        for base in rest.split([',', ' ']).filter(|s| !s.is_empty()) {
                             if base == "implements" { break; }
                             refs.push(make_ref(
                                 base.to_string(), RefKind::InheritFrom,
@@ -132,7 +132,7 @@ pub fn parse(source: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
 fn strip_annotations(mut s: &str) -> &str {
     while s.starts_with('@') {
         if let Some(p) = s.find(' ') {
-            s = &s[p + 1..].trim_start();
+            s = s[p + 1..].trim_start();
         } else { break; }
     }
     s
@@ -164,7 +164,7 @@ fn extract_member_name(rest: &str, is_method: bool) -> Option<String> {
     // Find token before '(' for methods, before '=' or ';' for fields.
     let mut s = rest.trim_end_matches(';').trim();
     if is_method {
-        let pidx = match s.find('(') { Some(p) => p, None => return None };
+        let pidx = s.find('(')?;
         s = &s[..pidx];
     } else {
         if let Some(eq) = s.find('=') {
@@ -172,7 +172,7 @@ fn extract_member_name(rest: &str, is_method: bool) -> Option<String> {
         }
     }
     let tokens: Vec<&str> = s.split(|c: char| c.is_whitespace()).filter(|t| !t.is_empty()).collect();
-    tokens.last().map(|s| s.to_string())
+    tokens.last().map(|s| (*s).to_string())
 }
 
 fn combined_scope(pkg: &[String], cls: &[String]) -> Vec<String> {

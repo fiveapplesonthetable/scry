@@ -90,13 +90,13 @@ fn safe_mmap(path: &Path) -> Result<memmap2::Mmap> {
 /// records. Eagerly loading into Vec at open() costs ~5-10 s of bincode
 /// deserialize + 10 GB RSS. With this, open() is ~10 ms (two mmap calls)
 /// and per-query memory is whatever the lookup decodes (usually a few KB).
-pub struct LazyVec<T: for<'de> serde::Deserialize<'de>> {
+pub struct LazyVec<T: for<'de> Deserialize<'de>> {
     data_mmap: memmap2::Mmap,
     offsets_mmap: memmap2::Mmap,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: for<'de> serde::Deserialize<'de>> LazyVec<T> {
+impl<T: for<'de> Deserialize<'de>> LazyVec<T> {
     pub fn open(data_path: &Path, offsets_path: &Path) -> Result<Self> {
         let data_mmap = safe_mmap(data_path)?;
         let offsets_mmap = safe_mmap(offsets_path)?;
@@ -289,9 +289,9 @@ pub struct RefRecord {
 impl RefRecord {
     /// See `SymbolRecord::estimated_bytes`.
     pub fn estimated_bytes(&self) -> usize {
-        let mut n = std::mem::size_of::<Self>();
+        let mut n = size_of::<Self>();
         n += self.name.capacity();
-        n += self.scope_path.capacity() * std::mem::size_of::<String>();
+        n += self.scope_path.capacity() * size_of::<String>();
         for s in &self.scope_path { n += s.capacity(); }
         n
     }
@@ -350,7 +350,7 @@ impl SymbolRecord {
             SymbolKind::Parameter => 20,
             SymbolKind::XmlId | SymbolKind::OwnersEmail | SymbolKind::Other => 10,
         };
-        let lang_penalty = if matches!(self.lang, scry_walker::FileKind::ApiTxt) {
+        let lang_penalty = if matches!(self.lang, FileKind::ApiTxt) {
             // api-txt declarations are useful for "is this in the SDK"
             // but should never crowd out real source definitions.
             40
@@ -365,10 +365,10 @@ impl SymbolRecord {
     /// (which lags real allocation by 100s of ms and counts shared pages).
     pub fn estimated_bytes(&self) -> usize {
         // fixed struct fields + String capacities + Vec<String> contents
-        let mut n = std::mem::size_of::<Self>();
+        let mut n = size_of::<Self>();
         n += self.name.capacity();
         if let Some(s) = self.fqn.as_ref() { n += s.capacity(); }
-        n += self.scope_path.capacity() * std::mem::size_of::<String>();
+        n += self.scope_path.capacity() * size_of::<String>();
         for s in &self.scope_path { n += s.capacity(); }
         n
     }
@@ -460,16 +460,15 @@ impl StorePaths {
     /// Per-file content digest: packed `[u8; 32]` per file_id (blake3).
     /// Indexed parallel to `files.bin`. Used by `scry index --incremental`
     /// to detect which files actually changed between two index builds.
-    /// Optional: indexes built before this sidecar landed (or without
-    /// `scry build-digests` having been run) simply lack the file; the
-    /// reader treats absent as "no digest known", and incremental
-    /// indexing falls back to full reindex.
+    /// Optional sidecar — produced by `scry build-digests`; absence
+    /// just means `--incremental` is unavailable until it's built.
     pub fn file_digests(&self) -> PathBuf { self.root.join("file_digests.bin") }
     /// Tombstone bitmap: 1 bit per file_id (rounded to bytes). Bit set
     /// means "this file_id has been deleted; filter its symbols and
     /// refs out of every query result". Produced by `scry index
-    /// --incremental` (when files are removed or replaced); cleared by
-    /// `scry compact`. Absent file = no tombstones (legacy indexes).
+    /// --incremental` when files are removed or replaced; cleared by
+    /// `scry compact`. Absent sidecar simply means no tombstones —
+    /// the common case on a fresh index.
     pub fn tombstones(&self) -> PathBuf { self.root.join("tombstones.bin") }
     /// Per-chunk metadata: bincode-encoded `Vec<ChunkEntry>` describing
     /// each ~100-line window the embedder broke the corpus into.
@@ -493,10 +492,11 @@ pub struct StoreWriter {
     pub symbols: Vec<SymbolRecord>,
     pub refs: Vec<RefRecord>,
     /// On-disk staging directory for streaming chunk flushes (under
-    /// `<index>.tmp/`). When `None`, the writer is in legacy all-RAM mode and
-    /// callers should invoke `finalize`. When `Some`, callers can invoke
-    /// `flush_symbols_chunk`/`flush_refs_chunk` and finish via
-    /// `finalize_streaming`.
+    /// `<index>.tmp/`). When `None`, the writer accumulates records in
+    /// RAM and callers invoke `finalize`. When `Some`, callers flush
+    /// chunks via `flush_symbols_chunk`/`flush_refs_chunk` and finish
+    /// via `finalize_streaming`. Streaming is the default path; the
+    /// all-RAM mode is used for tests and small in-memory builds.
     pub tmp_dir: Option<PathBuf>,
     /// Number of symbol chunks already flushed.
     pub symbol_chunk_count: u32,
@@ -587,7 +587,7 @@ impl StoreWriter {
                 // bincode 1.3 default config serializes Vec<T> as `u64 LE length`
                 // followed by encoded elements. We read just the header to get
                 // the chunk's record count without deserializing the records.
-                let mut f = std::fs::File::open(&p)
+                let mut f = File::open(&p)
                     .with_context(|| format!("open chunk {}", p.display()))?;
                 let mut hdr = [0u8; 8];
                 f.read_exact(&mut hdr)
@@ -741,7 +741,7 @@ impl StoreWriter {
         for (i, s) in self.symbols.iter().enumerate() {
             by_name.entry(s.name.clone()).or_default().push(i as u32);
         }
-        for r in self.refs.iter_mut() {
+        for r in &mut self.refs {
             let cands = match by_name.get(&r.name) {
                 Some(c) if !c.is_empty() => c,
                 _ => continue,
@@ -1474,25 +1474,22 @@ impl StoreReader {
         } else {
             read_bincode(&paths.symbols())?
         };
-        // refs.bin may be absent for very old indexes
+        // refs.bin is always emitted by finalize (possibly empty); we
+        // only read it when the lazy-refs sidecar isn't available.
         let refs: Vec<RefRecord> = if lazy_refs.is_some() {
             Vec::new()
-        } else if paths.refs().exists() {
-            read_bincode(&paths.refs())?
         } else {
-            Vec::new()
+            read_bincode(&paths.refs())?
         };
         let fst = fst::Map::new(safe_mmap(&paths.names_fst())?)?;
         let postings_mmap = safe_mmap(&paths.name_postings())?;
-        // Refs map is always written during finalize (even if empty). For
-        // backwards compatibility with pre-Phase-2 indexes that don't have
-        // it, callers should re-index.
         let ref_fst = fst::Map::new(safe_mmap(&paths.ref_names_fst())
             .with_context(|| format!("open {} (re-run \"scry index\" if missing)",
                                       paths.ref_names_fst().display()))?)?;
         let ref_postings_mmap = safe_mmap(&paths.ref_postings())?;
-        // Trigram index is optional — old indexes don't have it. Try to open,
-        // and silently fall through if missing.
+        // Trigram index is opt-in (built with `--build-trigrams`).
+        // Absent here just means the operator chose not to pay the
+        // build cost; queries fall back to the slower path.
         let (trigram_fst, trigram_postings_mmap) = if paths.trigram_fst().exists()
             && paths.trigram_postings().exists()
         {
@@ -1502,9 +1499,10 @@ impl StoreReader {
         } else {
             (None, None)
         };
-        // file_symbols sidecar — present only on newly built indexes or
-        // ones retrofitted via build-file-symbols. Optional everywhere
-        // (linear scan still works), so just attempt to open.
+        // file_symbols sidecar — produced by `scry build-file-symbols`
+        // (or written inline by `index` when --build-file-symbols is
+        // set). Optional everywhere (linear scan still works), so just
+        // attempt to open.
         let (file_symbols_mmap, file_symbols_offsets_mmap) = if
             paths.file_symbols().exists() && paths.file_symbols_offsets().exists()
         {
@@ -1654,9 +1652,9 @@ impl StoreReader {
     }
 
     /// O(1) lookup of all symbol indices defined in the given file.
-    /// Returns None when the index lacks the file_symbols sidecar
-    /// (old format) — caller should fall back to a linear scan of
-    /// lazy_symbols / symbols filtered by file_id.
+    /// Returns None when the file_symbols sidecar wasn't built —
+    /// caller falls back to a linear scan of lazy_symbols / symbols
+    /// filtered by file_id.
     pub fn symbols_for_file(&self, file_id: u32) -> Option<Vec<u32>> {
         let data = self.file_symbols_mmap.as_ref()?;
         let offs = self.file_symbols_offsets_mmap.as_ref()?;
@@ -1665,7 +1663,7 @@ impl StoreReader {
 
     /// Total number of symbol records, regardless of lazy/eager backing.
     pub fn n_symbols(&self) -> usize {
-        self.lazy_symbols.as_ref().map(|l| l.len()).unwrap_or(self.symbols.len())
+        self.lazy_symbols.as_ref().map(LazyVec::len).unwrap_or(self.symbols.len())
     }
 
     /// Iterate every symbol record, transparently using the lazy mmap
@@ -1694,7 +1692,7 @@ impl StoreReader {
     }
     /// Total number of ref records, regardless of lazy/eager backing.
     pub fn n_refs(&self) -> usize {
-        self.lazy_refs.as_ref().map(|l| l.len()).unwrap_or(self.refs.len())
+        self.lazy_refs.as_ref().map(LazyVec::len).unwrap_or(self.refs.len())
     }
     /// Get one symbol record by its global index. Owned because lazy mode
     /// decodes on-demand. Eager mode clones (cheap; ~50 bytes typically).
@@ -1761,7 +1759,7 @@ impl StoreReader {
             lists.push(read_trigram_posting(postings, off));
         }
         // Intersect smallest-first to minimize work.
-        lists.sort_by_key(|s| s.len());
+        lists.sort_by_key(std::collections::HashSet::len);
         let mut result = lists.swap_remove(0);
         for s in lists {
             result.retain(|f| s.contains(f));
@@ -1996,7 +1994,7 @@ fn fuzzy_sort_score(query: &[u8], name: &[u8], wf: u32) -> u32 {
 /// a single multi-GB binary blob the walker missed from blowing up
 /// the page cache.
 pub fn scan_file_literal(
-    path: &std::path::Path,
+    path: &Path,
     needle: &[u8],
     max_per_file: usize,
     max_file_bytes: u64,
@@ -2164,21 +2162,21 @@ mod tests {
     /// back to back; offsets file holds one u64-LE per record giving its
     /// byte offset within the data file. Matches the on-disk format
     /// produced by StoreWriter::finalize_streaming.
-    fn write_lazy_vec_files<T: serde::Serialize>(
+    fn write_lazy_vec_files<T: Serialize>(
         dir: &Path,
         items: &[T],
     ) -> (PathBuf, PathBuf) {
         let data_path = dir.join("data.bin");
         let off_path = dir.join("offsets.bin");
-        let mut data = std::fs::File::create(&data_path).unwrap();
-        let mut off = std::fs::File::create(&off_path).unwrap();
+        let mut data = File::create(&data_path).unwrap();
+        let mut off = File::create(&off_path).unwrap();
         let len = items.len() as u64;
-        std::io::Write::write_all(&mut data, &len.to_le_bytes()).unwrap();
+        Write::write_all(&mut data, &len.to_le_bytes()).unwrap();
         let mut byte_pos: u64 = 8;
         for it in items {
-            std::io::Write::write_all(&mut off, &byte_pos.to_le_bytes()).unwrap();
+            Write::write_all(&mut off, &byte_pos.to_le_bytes()).unwrap();
             let bytes = bincode::serialize(it).unwrap();
-            std::io::Write::write_all(&mut data, &bytes).unwrap();
+            Write::write_all(&mut data, &bytes).unwrap();
             byte_pos += bytes.len() as u64;
         }
         (data_path, off_path)
@@ -2259,9 +2257,9 @@ mod tests {
         let (d, o) = write_lazy_vec_files(&dir, &syms);
         let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
         assert_eq!(lv.len(), syms.len());
-        for i in 0..syms.len() {
+        for (i, expected) in syms.iter().enumerate() {
             let got = lv.get(i).expect("in-range get must succeed");
-            assert_symbol_eq(&got, &syms[i]);
+            assert_symbol_eq(&got, expected);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2624,9 +2622,7 @@ mod tests {
         // bail rather than overflow the shift.
         let mut bytes = 1u32.to_le_bytes().to_vec();
         // 6 bytes all with continuation bit; shift would reach 35 > 32.
-        for _ in 0..6 {
-            bytes.push(0x80);
-        }
+        bytes.extend(std::iter::repeat_n(0x80, 6));
         // Must not panic.
         let _got = read_trigram_posting(&bytes, 0);
     }
@@ -2785,7 +2781,8 @@ mod tests {
 
     /// A reader opened against an index dir with no `file_digests.bin`
     /// returns None for every file_digest query — confirms the
-    /// backwards-compat path doesn't crash on legacy indexes.
+    /// optional-sidecar path doesn't crash when the sidecar is absent
+    /// (the default state until `scry build-digests` runs).
     /// (Builds nothing; just exercises the accessor against a stub
     /// reader. The reader's open() is too heavyweight to construct
     /// inline; we verify the bare accessor logic via a focused unit.)
@@ -2836,7 +2833,7 @@ mod tests {
         assert!(m5.is_empty());
         // Missing file: empty (no panic).
         let m6 = scan_file_literal(
-            std::path::Path::new("/nonexistent/path/here"),
+            Path::new("/nonexistent/path/here"),
             b"foo", 10, 1 << 20,
         );
         assert!(m6.is_empty());
@@ -2845,7 +2842,7 @@ mod tests {
         let tmp2 = std::env::temp_dir().join(
             format!("scry-scan-2-{}", std::process::id())
         );
-        let mut f = std::fs::File::create(&tmp2).unwrap();
+        let mut f = File::create(&tmp2).unwrap();
         f.write_all(b"abcd").unwrap();
         let m7 = scan_file_literal(&tmp2, b"bc", 5, 1 << 20);
         assert_eq!(m7, vec![1]);

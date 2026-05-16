@@ -116,7 +116,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a (possibly + concatenated) value. Strings are unescaped only
     /// minimally (we just take the inner bytes).
-    fn parse_value(&mut self, name_field: &str) -> Vec<String> {
+    fn parse_value(&mut self) -> Vec<String> {
         // Returns a flat list of strings that the field accumulates.
         // For non-list fields we yield exactly one element (or zero on error).
         self.skip_ws_and_comments();
@@ -139,7 +139,7 @@ impl<'a> Parser<'a> {
                         if self.at_end() { return out; }
                         // Each element is itself a "value" but we flatten.
                         let pos_before = self.pos;
-                        let inner = self.parse_value(name_field);
+                        let inner = self.parse_value();
                         out.extend(inner);
                         self.skip_ws_and_comments();
                         if self.peek() == b',' { self.advance(); }
@@ -252,7 +252,7 @@ impl<'a> Parser<'a> {
                 }
                 b'=' => {
                     self.advance();
-                    let _ = self.parse_value("");
+                    let _ = self.parse_value();
                     // record as a Variable symbol so users can find them
                     syms.push(make_symbol(
                         ident, SymbolKind::Variable, mark_line, mark_col,
@@ -261,7 +261,7 @@ impl<'a> Parser<'a> {
                 }
                 b'+' if self.peek_at(1) == b'=' => {
                     self.advance(); self.advance();
-                    let _ = self.parse_value("");
+                    let _ = self.parse_value();
                 }
                 _ => {
                     // unknown; skip token
@@ -305,7 +305,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             self.advance();
-            let values = self.parse_value(&field_name);
+            let values = self.parse_value();
             if field_name == "name" {
                 if let Some(v) = values.first() {
                     module_name = Some(v.clone());

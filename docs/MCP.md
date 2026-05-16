@@ -28,9 +28,15 @@ without extra implementation effort.
 
 ## Protocol details
 
-scry implements **MCP protocol version `2024-11-05`** with the
-`tools` capability. The wire format is JSON-RPC 2.0 over stdio, one
-JSON message per line.
+scry supports every MCP protocol version from `2024-11-05` (the
+original) through the current `2025-11-25` revision. We negotiate
+per spec: if the client requests a version we support, we echo it;
+otherwise we reply with our latest. The client then decides whether
+to continue or disconnect.
+
+Only the `tools` capability is advertised — we don't implement
+prompts, resources, sampling, logging, or tasks. The wire format is
+JSON-RPC 2.0 over stdio, one JSON message per line.
 
 ### Supported methods
 
@@ -180,7 +186,7 @@ def call(method, params=None, id=None):
     p.stdin.flush()
     return json.loads(p.stdout.readline()) if id is not None else None
 
-call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}}, id=1)
+call("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}}, id=1)
 call("notifications/initialized")            # notification — no reply
 
 # Run a tool.

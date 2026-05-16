@@ -280,6 +280,22 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
     },
+    /// MCP (Model Context Protocol) server. Stdio JSON-RPC 2.0 over
+    /// the standard MCP request/response shape; one MCP tool per scry
+    /// command (def/ref/callers/prefix/fuzzy/grep/outline/coverage/
+    /// stats). Drop straight into Claude Desktop, Cursor, or any MCP-
+    /// aware agent without writing a custom shell-out wrapper.
+    ///
+    /// Implements:
+    ///   initialize             → server info + capabilities
+    ///   tools/list             → one entry per scry command with JSON schema
+    ///   tools/call             → run the named tool, return its JSON result
+    ///                           wrapped in MCP text-content shape
+    ///   notifications/*        → silently consumed (no response per spec)
+    Mcp {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
     /// JSON-RPC server. Reads newline-delimited requests, writes
     /// newline-delimited responses. Each request is
     /// {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|outline|coverage|stats", "args": {...}}.
@@ -449,6 +465,7 @@ fn main() -> Result<()> {
             max_file_bytes, mem_cap,
         ),
         Cmd::Serve { index, listen } => cmd_serve(index, listen),
+        Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Mod { name, index, limit, json } => {
             cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
@@ -2734,6 +2751,222 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
     }
     eprintln!("\n{} module(s)", out.len());
     Ok(())
+}
+
+/// Entry point for the `mcp` subcommand. MCP — Model Context Protocol
+/// — is a stdio JSON-RPC 2.0 protocol used by Claude Desktop, Cursor,
+/// and other agent runtimes to call out to external tools. scry's MCP
+/// surface exposes one tool per existing `serve` command.
+///
+/// Wire shape (one line per message):
+///   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}
+///   {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+///   {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"def","arguments":{...}}}
+///
+/// Notifications (no `id`) are consumed silently as the spec requires.
+fn cmd_mcp(index: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let reader = open_index(index)?;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let in_lock = stdin.lock();
+    for line in in_lock.lines() {
+        let line = match line { Ok(l) => l, Err(_) => break };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let req: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "error": {"code": -32700, "message": format!("parse error: {e}")},
+                });
+                writeln!(out, "{}", resp)?;
+                out.flush()?;
+                continue;
+            }
+        };
+        // Notifications carry no `id` per JSON-RPC 2.0; MCP uses them
+        // for `notifications/initialized` etc. Acknowledge by doing
+        // nothing — emitting a response would be a protocol violation.
+        if req.get("id").is_none() {
+            continue;
+        }
+        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let params = req.get("params").cloned().unwrap_or(serde_json::json!({}));
+        let resp = mcp_dispatch(&reader, &id, method, &params);
+        writeln!(out, "{}", resp)?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// MCP method dispatcher. Pure function of reader + method + params;
+/// returns the full JSON-RPC envelope (including `jsonrpc: "2.0"` and
+/// the echoed `id`) ready to be written to the wire.
+fn mcp_dispatch(
+    reader: &StoreReader,
+    id: &serde_json::Value,
+    method: &str,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let result = match method {
+        "initialize" => Ok(mcp_initialize_result()),
+        "tools/list" => Ok(mcp_tools_list_result()),
+        "tools/call" => mcp_tools_call(reader, params),
+        // ping is part of the spec for liveness checks.
+        "ping" => Ok(serde_json::json!({})),
+        // Anything else is unknown.
+        other => Err(format!("method not found: {other}")),
+    };
+    match result {
+        Ok(v) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
+        Err(msg) => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": {"code": -32601, "message": msg},
+        }),
+    }
+}
+
+/// Reply to MCP `initialize`. Reports our protocol version and the
+/// `tools` capability — we don't (yet) implement prompts, resources,
+/// or sampling, so we don't advertise them.
+fn mcp_initialize_result() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": { "listChanged": false },
+        },
+        "serverInfo": {
+            "name": "scry",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+/// Reply to MCP `tools/list`. One entry per scry command. The
+/// `inputSchema` is a small JSON Schema describing the args each
+/// tool accepts; MCP clients use it to validate arguments before
+/// calling and to render UI hints. We keep the schemas tight but
+/// not exhaustive — the agent's prompt teaches the semantic flags,
+/// the schema teaches the shape.
+fn mcp_tools_list_result() -> serde_json::Value {
+    fn tool(name: &str, desc: &str, schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "description": desc,
+            "inputSchema": schema,
+        })
+    }
+    fn obj(req: &[&str], props: serde_json::Value) -> serde_json::Value {
+        let req_arr: Vec<_> = req.iter().map(|s| serde_json::json!(*s)).collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": req_arr,
+        })
+    }
+    // Shared property fragments.
+    let name_prop = serde_json::json!({"name": {"type": "string"}});
+    let lang_prop = serde_json::json!({"type": "string", "description": "java|kotlin|cpp|rust|go|python|soong|aidl|..."});
+    let in_prop = serde_json::json!({"type": "string", "description": "path substring filter (e.g. frameworks/base/)"});
+    let limit_prop = serde_json::json!({"type": "integer", "default": 20});
+
+    let tools = vec![
+        tool("def", "Find exact-name symbol definitions.", obj(&["name"], serde_json::json!({
+            "name": {"type": "string"},
+            "lang": lang_prop,
+            "kind": {"type": "string", "description": "class|method|fn|aidl.iface|soong|init.svc|sepolicy|..."},
+            "in":   in_prop,
+            "limit": limit_prop,
+        }))),
+        tool("ref", "Find references to a name.", obj(&["name"], serde_json::json!({
+            "name": {"type": "string"},
+            "lang": lang_prop,
+            "kind": {"type": "string", "description": "call|ctor|inherit|import|..."},
+            "in":   in_prop,
+            "limit": limit_prop,
+        }))),
+        tool("callers", "Find call sites (references with kind=call).", obj(&["name"], serde_json::json!({
+            "name": {"type": "string"},
+            "lang": lang_prop,
+            "in":   in_prop,
+            "limit": limit_prop,
+        }))),
+        tool("prefix", "Symbols whose name starts with PREFIX.", obj(&["prefix"], serde_json::json!({
+            "prefix": {"type": "string"},
+            "in":    in_prop,
+            "limit": limit_prop,
+        }))),
+        tool("fuzzy", "Symbols whose name contains SUBSTR.", obj(&["substr"], serde_json::json!({
+            "substr": {"type": "string"},
+            "in":    in_prop,
+            "limit": limit_prop,
+        }))),
+        tool("grep", "Content search; literal pattern unless --regex is set on the request (default literal).", obj(&["pattern"], serde_json::json!({
+            "pattern": {"type": "string"},
+            "lang":    lang_prop,
+            "in":      in_prop,
+            "limit":   limit_prop,
+        }))),
+        tool("outline", "All symbols in a file, ordered by line.", obj(&["path"], serde_json::json!({
+            "path":  {"type": "string", "description": "full or suffix-style path (e.g. app_main.cpp)"},
+            "limit": limit_prop,
+        }))),
+        tool("coverage", "Subtree stats: files / bytes / symbols per language.", obj(&["path"], serde_json::json!({
+            "path":    {"type": "string", "description": "path prefix to scope (empty = whole index)"},
+            "by_kind": {"type": "boolean", "default": false},
+        }))),
+        tool("stats", "Index metadata (size, files, freshness).", serde_json::json!({
+            "type": "object", "properties": serde_json::json!({}),
+        })),
+    ];
+    // Silence the unused name_prop warning — it's kept for symmetry
+    // with the other shared property fragments above and may be
+    // referenced again as more tools land.
+    let _ = name_prop;
+    serde_json::json!({ "tools": tools })
+}
+
+/// Dispatch an MCP `tools/call`. Translates the MCP-shaped request
+/// into a `serve_one_request`-shaped one and wraps the JSON result
+/// in MCP's `{content: [{type: "text", text: ...}]}` envelope.
+///
+/// We deliberately reuse the serve_one_request code path rather than
+/// re-implementing the tool bodies: any future change to the serve
+/// commands (new arg names, ranking tweaks, schema changes) is picked
+/// up automatically by the MCP surface.
+fn mcp_tools_call(reader: &StoreReader, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| "missing 'name'".to_string())?;
+    let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+    // Build a serve_one_request-shaped envelope and route it through.
+    let req = serde_json::json!({
+        "id": 1, "cmd": name, "args": arguments,
+    });
+    let line = req.to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    serve_one_request(reader, &line, &mut buf)
+        .map_err(|e| format!("serve error: {e:#}"))?;
+    let resp_line = String::from_utf8(buf).map_err(|e| format!("utf8 error: {e}"))?;
+    let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+        .map_err(|e| format!("response parse error: {e}"))?;
+    if let Some(err) = resp.get("error") {
+        return Err(err.to_string());
+    }
+    // MCP requires content[] of typed parts. We use a single text
+    // part holding the pretty-printed JSON; clients are responsible
+    // for parsing it back if they want structure. (MCP doesn't yet
+    // have a standard "json content type"; text is the lowest common
+    // denominator.)
+    let result = resp.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    let text = serde_json::to_string(&result).map_err(|e| format!("encode: {e}"))?;
+    Ok(serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": false,
+    }))
 }
 
 /// Entry point for the `serve` subcommand. Dispatches to the requested

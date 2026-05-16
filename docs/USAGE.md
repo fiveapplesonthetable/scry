@@ -434,6 +434,50 @@ section.
 
 ---
 
+## MCP (Model Context Protocol): `scry mcp`
+
+Drop-in MCP server for Claude Desktop, Cursor, and other MCP-aware
+agent runtimes. No custom shell-out wrapper required.
+
+```sh
+$ printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"def","arguments":{"name":"Binder","limit":1}}}' \
+  | scry mcp --index /mnt/agent/scry-index
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"scry","version":"0.0.1"}}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"def",...},{"name":"ref",...},...]}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"[{\"name\":\"Binder\",...}]"}],"isError":false}}
+```
+
+Each scry command (def, ref, callers, prefix, fuzzy, grep, outline,
+coverage, stats) is exposed as one MCP tool with a JSON Schema for
+its arguments. The tool result is the JSON output of the underlying
+serve command, wrapped in MCP's `content[]` text-part format.
+
+**Notifications** (JSON-RPC messages without an `id`, e.g.
+`notifications/initialized`) are silently consumed per the MCP spec.
+
+**Configuration for Claude Desktop** (`~/Library/Application
+Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "scry": {
+      "command": "/mnt/agent/scry/target/release/scry",
+      "args": ["mcp", "--index", "/mnt/agent/scry-index"]
+    }
+  }
+}
+```
+
+The MCP server reuses the same `serve_one_request` code path as the
+non-MCP transports, so anything that works over stdio JSON-RPC works
+through MCP without extra implementation effort.
+
+---
+
 ## Index admin
 
 ```sh

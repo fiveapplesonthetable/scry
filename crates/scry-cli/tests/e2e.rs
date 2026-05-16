@@ -355,6 +355,69 @@ fn synthetic_tree_roundtrip() {
     daemon.wait().ok();
     let _ = std::fs::remove_file(&sock_path);
 
+    // 8. MCP server end-to-end. Spawn `scry mcp`, send the three
+    // MCP methods (initialize, tools/list, tools/call), assert
+    // each response. The MCP wrapper reuses serve_one_request
+    // under the hood, so this catches breakage in the protocol
+    // shim itself (envelope, method dispatch, tool result wrapping)
+    // independent of the serve-layer tests. `Write` is already in
+    // scope from the earlier serve test at the top of this fn.
+    let mut mcp_child = Command::new(scry_bin())
+        .args(["mcp", "--index"])
+        .arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn scry mcp");
+    {
+        let stdin = mcp_child.stdin.as_mut().unwrap();
+        // 1. initialize
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+        // 2. notification (no id) — must be silently consumed
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
+        // 3. tools/list
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
+        // 4. tools/call def Binder
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"def","arguments":{{"name":"Binder","limit":1}}}}}}"#).unwrap();
+    }
+    let mcp_out = mcp_child.wait_with_output().expect("mcp wait");
+    assert!(mcp_out.status.success(),
+            "mcp failed: {}", String::from_utf8_lossy(&mcp_out.stderr));
+    let mcp_lines: Vec<&str> = std::str::from_utf8(&mcp_out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty()).collect();
+    // Exactly 3 responses (no response to the notification per spec).
+    assert_eq!(mcp_lines.len(), 3,
+               "expected 3 MCP responses (init, tools/list, tools/call); got {}: {:?}",
+               mcp_lines.len(), mcp_lines);
+
+    let init: serde_json::Value = serde_json::from_str(mcp_lines[0]).unwrap();
+    assert_eq!(init["jsonrpc"], "2.0");
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["serverInfo"]["name"], "scry");
+    assert!(init["result"]["capabilities"]["tools"].is_object(),
+            "initialize must advertise the tools capability: {init}");
+
+    let tools: serde_json::Value = serde_json::from_str(mcp_lines[1]).unwrap();
+    assert_eq!(tools["id"], 2);
+    let tool_names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter()
+        .filter_map(|t| t["name"].as_str()).collect();
+    for must_exist in &["def", "ref", "callers", "grep", "outline", "stats"] {
+        assert!(tool_names.contains(must_exist),
+                "tools/list missing {must_exist}; got {tool_names:?}");
+    }
+
+    let call: serde_json::Value = serde_json::from_str(mcp_lines[2]).unwrap();
+    assert_eq!(call["id"], 3);
+    assert!(call["result"]["content"].is_array(), "tools/call must return content[]: {call}");
+    let text = call["result"]["content"][0]["text"].as_str()
+        .expect("first content part should be text");
+    // The text is itself JSON — the serve result re-encoded. Parse
+    // and confirm we got at least one Binder hit through.
+    let inner: serde_json::Value = serde_json::from_str(text).expect("text content is JSON");
+    assert!(inner.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "tools/call def Binder should return at least one hit: {inner}");
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

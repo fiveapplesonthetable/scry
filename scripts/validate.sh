@@ -51,6 +51,9 @@ $SCRY def system_server --index "$INDEX" --kind sepolicy --limit 5
 hr "scry grep TODO --lang Java --limit 5"
 $SCRY grep TODO --index "$INDEX" --lang Java --limit 5
 
+hr "scry outline app_process/app_main.cpp (file-symbols list)"
+$SCRY outline frameworks/base/cmds/app_process/app_main.cpp --index "$INDEX" --limit 10 || true
+
 hr "scry def Activity --in frameworks/base/ (subdir-scoped)"
 $SCRY def Activity --index "$INDEX" --in frameworks/base/ --limit 5 || true
 
@@ -63,7 +66,8 @@ printf '%s\n' \
   '{"id":2,"cmd":"callers","args":{"name":"transact","limit":3}}' \
   '{"id":3,"cmd":"def","args":{"name":"Activity","in":"frameworks/base/","limit":3}}' \
   '{"id":4,"cmd":"grep","args":{"name":"ZygoteInit","limit":3}}' \
-  '{"id":5,"cmd":"stats"}' \
+  '{"id":5,"cmd":"outline","args":{"path":"app_process/app_main.cpp","limit":3}}' \
+  '{"id":6,"cmd":"stats"}' \
   | $SCRY serve --index "$INDEX"
 
 echo

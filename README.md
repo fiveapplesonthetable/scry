@@ -56,6 +56,7 @@ cargo build --release              # ~20 s cold, ~10 s incremental
 ./target/release/scry fuzzy ParcelFile --limit 10
 ./target/release/scry grep "TODO\(.*\): " --regex --lang Java
 ./target/release/scry grep "ZygoteInit"                                  # trigram-accelerated literal
+./target/release/scry outline frameworks/base/cmds/app_process/app_main.cpp   # all symbols in one file
 ./target/release/scry stats
 ```
 
@@ -107,12 +108,14 @@ $ printf '%s\n' \
 {"id":3,"result":[{"path":"…","line":42,"col":7,"snippet":"…ZygoteInit…"}]}
 ```
 
-Supported commands: `def`, `ref`, `callers`, `prefix`, `fuzzy`, `grep`, `stats`.
-All search commands accept an optional `"in"` arg (root-relative subdir
-prefix) to narrow the search — same semantics as the CLI's `--in`.
-`grep` is literal-only (regex queries belong on the CLI where rayon
-parallelism is available); it shares the same trigram pre-filter for
-sub-ms matches on selective patterns.
+Supported commands: `def`, `ref`, `callers`, `prefix`, `fuzzy`, `grep`,
+`outline`, `stats`. All search commands accept an optional `"in"` arg
+(root-relative subdir prefix) to narrow the search — same semantics as
+the CLI's `--in`. `grep` is literal-only (regex queries belong on the
+CLI where rayon parallelism is available); it shares the same trigram
+pre-filter for sub-ms matches on selective patterns. `outline` takes
+a `"path"` arg (full path or suffix like `app_main.cpp`) and returns
+every symbol defined in that file, sorted by line.
 
 ## Architecture (one paragraph)
 

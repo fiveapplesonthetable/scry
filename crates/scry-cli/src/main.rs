@@ -211,6 +211,22 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// List every symbol defined in a single file (sorted by line).
+    ///
+    /// PATH is matched against the indexed file paths via suffix —
+    /// `outline frameworks/base/.../Activity.java` works, and so does
+    /// the full absolute form. If multiple files match, scry picks the
+    /// shortest match and warns; pass a longer suffix to disambiguate.
+    Outline {
+        path: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        /// Limit the number of symbols printed (0 = all).
+        #[arg(long, default_value = "0")]
+        limit: usize,
+    },
     /// Substring or regex search over indexed source files (rg-like).
     Grep {
         pattern: String,
@@ -362,6 +378,7 @@ fn main() -> Result<()> {
             cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
+        Cmd::Outline { path, index, json, limit } => cmd_outline(path, index, json, limit),
         Cmd::Grep {
             pattern, index, regex, lang, in_, limit, json, workers,
             max_file_bytes, mem_cap,
@@ -1286,6 +1303,98 @@ fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a path argument (full or suffix) to a single file_id.
+///
+/// Match rules:
+///   1. Exact match on full display_path → use it.
+///   2. Otherwise, any indexed path that ends with `/<arg>` matches —
+///      this is what makes `outline frameworks/base/.../Activity.java`
+///      work without having to spell out the host root.
+///   3. If multiple suffix matches, return the shortest one and emit a
+///      warning to stderr so the user knows to disambiguate.
+///   4. No match → None.
+fn resolve_file_id(r: &StoreReader, arg: &str) -> Option<u32> {
+    let arg = arg.trim();
+    let mut exact: Option<u32> = None;
+    let mut suffix_hits: Vec<(usize, u32, String)> = Vec::new();
+    let suf_pat = format!("/{}", arg.trim_start_matches('/'));
+    for fe in r.files.iter() {
+        let p = fe.display_path(&r.roots);
+        if p == arg {
+            exact = Some(fe.id);
+            break;
+        }
+        if p.ends_with(&suf_pat) || p == arg.trim_start_matches('/') {
+            suffix_hits.push((p.len(), fe.id, p));
+        }
+    }
+    if let Some(id) = exact { return Some(id); }
+    suffix_hits.sort_by_key(|t| t.0); // shortest first
+    if suffix_hits.len() > 1 {
+        eprintln!("[outline] {} files match '{}'; using shortest match {}",
+                  suffix_hits.len(), arg, suffix_hits[0].2);
+        for (_, _, p) in suffix_hits.iter().skip(1).take(5) {
+            eprintln!("  also: {}", p);
+        }
+    }
+    suffix_hits.first().map(|t| t.1)
+}
+
+fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -> Result<()> {
+    let r = open_index(index)?;
+    let file_id = match resolve_file_id(&r, &path) {
+        Some(id) => id,
+        None => anyhow::bail!("no indexed file matches '{}'", path),
+    };
+    let fe = r.files.get(file_id as usize)
+        .ok_or_else(|| anyhow::anyhow!("file_id {} out of range", file_id))?;
+    let display = fe.display_path(&r.roots);
+
+    // Iterate all symbols filtering by file_id. With ~22M symbols and the
+    // lazy reader, this is ~200ms cold on the live AOSP+Linux index — not
+    // sub-ms, but acceptable for a "show me everything in this file"
+    // query. A file→symbol sidecar would make it O(symbols-in-file) but
+    // requires a finalize-time index format change; not worth it yet.
+    let mut found: Vec<SymbolRecord> = Vec::new();
+    if let Some(lz) = r.lazy_symbols.as_ref() {
+        for s in lz.iter() {
+            if s.file_id == file_id { found.push(s); }
+        }
+    } else {
+        for s in &r.symbols {
+            if s.file_id == file_id { found.push(s.clone()); }
+        }
+    }
+    // Stable: sort by (line, col, name).
+    found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
+    let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
+
+    if json {
+        let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(&r, s)).collect();
+        let out = serde_json::json!({
+            "path": display,
+            "lang": format!("{:?}", fe.kind),
+            "symbols_total": found.len(),
+            "symbols_shown": take,
+            "symbols": arr,
+        });
+        println!("{}", out);
+    } else {
+        println!("# {}  ({:?})", display, fe.kind);
+        println!("# {} symbols", found.len());
+        for s in found.iter().take(take) {
+            let scope = if s.scope_path.is_empty() { String::new() }
+                        else { format!("  [{}]", s.scope_path.join("::")) };
+            println!("{:>5}:{:<3}  {:<12}  {}{}",
+                     s.line, s.col, s.kind.short(), s.name, scope);
+        }
+        if take < found.len() {
+            println!("... ({} more — pass --limit 0 to see all)", found.len() - take);
+        }
+    }
+    Ok(())
+}
+
 fn filter_results(
     syms: Vec<SymbolRecord>,
     lang: Option<&str>,
@@ -1846,8 +1955,11 @@ fn regex_literals_kind(
     Some(out)
 }
 
-/// Backwards-compatible prefix-only literal extraction. Kept because
-/// the regex_lit_* unit tests assert this shape directly.
+/// Prefix-only literal extraction; used only by the regex_lit_* unit
+/// tests that pin the prefix-direction extractor's output shape. The
+/// production grep path goes through grep_candidates_for_regex which
+/// calls regex_literals_kind for both directions directly.
+#[cfg(test)]
 fn regex_literals_for_trigram(pattern: &str) -> Option<Vec<Vec<u8>>> {
     regex_literals_kind(pattern, regex_syntax::hir::literal::ExtractKind::Prefix)
 }
@@ -1994,6 +2106,7 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
             "ref" => serve_ref(&reader, name, lang, kind, in_, limit),
             "callers" => serve_ref(&reader, name, lang, Some("call"), in_, limit),
             "grep" => serve_grep(&reader, name, lang, in_, limit),
+            "outline" => serve_outline(&reader, args.get("path").and_then(|v| v.as_str()).unwrap_or(""), limit),
             "stats" => serve_stats(&reader),
             other => serde_json::json!({"error": format!("unknown cmd: {other}")}),
         };
@@ -2158,6 +2271,44 @@ fn serve_grep(
         }
     }
     serde_json::Value::Array(out)
+}
+
+/// JSON-RPC outline: returns every symbol defined in the given file,
+/// sorted by line. Accepts a full or suffix-style path arg under "path"
+/// in the request. Single-threaded; one scan of the (lazy) symbol vec
+/// per call. Limit 0 means "no cap" (whole file).
+fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value {
+    if path.is_empty() {
+        return serde_json::json!({"error": "missing 'path' arg"});
+    }
+    let file_id = match resolve_file_id(r, path) {
+        Some(id) => id,
+        None => return serde_json::json!({"error": format!("no indexed file matches '{}'", path)}),
+    };
+    let fe = match r.files.get(file_id as usize) {
+        Some(f) => f,
+        None => return serde_json::json!({"error": "file_id out of range"}),
+    };
+    let mut found: Vec<SymbolRecord> = Vec::new();
+    if let Some(lz) = r.lazy_symbols.as_ref() {
+        for s in lz.iter() {
+            if s.file_id == file_id { found.push(s); }
+        }
+    } else {
+        for s in &r.symbols {
+            if s.file_id == file_id { found.push(s.clone()); }
+        }
+    }
+    found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
+    let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
+    let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(r, s)).collect();
+    serde_json::json!({
+        "path": fe.display_path(&r.roots),
+        "lang": format!("{:?}", fe.kind),
+        "symbols_total": found.len(),
+        "symbols_shown": take,
+        "symbols": arr,
+    })
 }
 
 fn serve_stats(r: &StoreReader) -> serde_json::Value {

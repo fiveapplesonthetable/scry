@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.20] — 2026-05-16
+
+`scry callgraph NAME` — recursive callers tree. LLM-shaped
+"how does control flow reach this function?" query, walking
+N levels up with cycle detection and a node-budget cap.
+
+**CLI:**
+
+- `scry callgraph NAME [--in PREFIX] [--depth N] [--max-nodes N]
+  [--reachable] [--json]`. Default depth 3, max-nodes 200.
+- Indented-tree output by default; `--json` returns a structured
+  `{callee, depth, max_nodes, callers}` tree for programmatic use.
+
+**JSON-RPC + MCP:**
+
+- New `callgraph` tool. Same args as the CLI.
+
+**Internals:**
+
+- New `StoreReader::enclosing_function(file_id, byte_offset)` —
+  finds the function/method-like symbol whose source body encloses
+  a byte offset. Uses the `file_symbols` sidecar + sort-and-
+  partition-point on `byte_start` because tree-sitter records the
+  identifier-only range for symbols (not the full body), so the
+  obvious `byte_start <= o < byte_end` check doesn't work directly.
+- Caller attribution prefers `enclosing_function` over
+  `RefRecord.scope_path.last()` (which on Java reports the
+  enclosing class, not the method).
+- E2E test (`callgraph_e2e_walks_caller_chain`) builds a 4-method
+  Java chain `d() → c() → b() → a()` and validates depth=1 vs
+  depth=3 expansion via both CLI and the implicit JSON shape.
+
 ## [0.1.19] — 2026-05-16
 
 `scry health` now reports the three precision sidecars

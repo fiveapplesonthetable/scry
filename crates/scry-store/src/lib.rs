@@ -1955,6 +1955,39 @@ impl StoreReader {
         if id != 0 { r.resolved_to = Some(id); }
     }
 
+    /// Function/method-like symbol whose source body encloses
+    /// `byte_offset` in `file_id`. Used by `scry callgraph` to
+    /// attribute a ref site to its containing routine.
+    ///
+    /// Implementation note: tree-sitter records each symbol's
+    /// `byte_start..byte_end` as the *identifier* node range, not
+    /// the full declaration body. So we can't just test for
+    /// `byte_start <= offset < byte_end`. Instead we collect every
+    /// function-like symbol in the file, sort by `byte_start`, and
+    /// pick the last one whose `byte_start <= offset` — which is
+    /// the enclosing routine for any non-nested layout. For nested
+    /// (lambda inside method) cases this returns the outer
+    /// routine, which is the conservative "best parent" choice.
+    ///
+    /// Returns None when the `file_symbols` sidecar is missing or
+    /// the file contains no function-like symbols at all.
+    pub fn enclosing_function(&self, file_id: u32, byte_offset: u32) -> Option<SymbolRecord> {
+        let idxs = self.symbols_for_file(file_id)?;
+        let mut fns: Vec<SymbolRecord> = idxs.into_iter()
+            .filter_map(|idx| self.get_symbol(idx))
+            .filter(|s| matches!(
+                s.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
+            ))
+            .collect();
+        fns.sort_by_key(|s| s.byte_start);
+        // partition_point: first index where byte_start > byte_offset;
+        // the enclosing routine is the entry just before that boundary.
+        let pp = fns.partition_point(|s| s.byte_start <= byte_offset);
+        if pp == 0 { return None; }
+        Some(fns[pp - 1].clone())
+    }
+
     /// O(1) lookup of all symbol indices defined in the given file.
     /// Returns None when the file_symbols sidecar wasn't built —
     /// caller falls back to a linear scan of lazy_symbols / symbols

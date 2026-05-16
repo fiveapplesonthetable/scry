@@ -283,6 +283,37 @@ enum Cmd {
         #[arg(long)]
         budget: Option<usize>,
     },
+    /// Recursive callers tree for NAME. Walks the call graph
+    /// upwards: for each caller, find ITS callers, up to `--depth`
+    /// levels. Cycle-safe (visited-set). Outputs an indented tree
+    /// or a JSON tree depending on --json. LLM-shaped query for
+    /// "how does control flow reach this function?".
+    ///
+    /// Caller identity is `RefRecord.scope_path.last()` — the
+    /// enclosing function the ref site is inside. Same scope
+    /// resolution as `subclasses`.
+    Callgraph {
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Restrict to call sites in files whose path contains SUBSTR.
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
+        /// How many levels of caller-of-caller to walk.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Soft cap on total tree nodes; stops expansion when hit.
+        /// Defaults to enough for typical traces, not for "expand
+        /// every reachable caller in AOSP".
+        #[arg(long, default_value_t = 200)]
+        max_nodes: usize,
+        /// Compose with build-graph reachability: keep only callers
+        /// whose owning module can reach NAME's module.
+        #[arg(long)]
+        reachable: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// "What breaks if I change NAME?" — composes callers +
     /// subclasses (transitive) into a single deduped impact set
     /// of files + symbols. Useful before refactors and as an LLM-
@@ -1054,6 +1085,8 @@ fn main() -> Result<()> {
         Cmd::ScipLookup { index, path, offset } => cmd_scip_lookup(index, &path, offset),
         Cmd::Impact { name, index, in_, subclass_depth, reachable, limit, json } =>
             cmd_impact(name, index, in_, subclass_depth, reachable, limit, json),
+        Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, json } =>
+            cmd_callgraph(name, index, in_, depth, max_nodes, reachable, json),
         Cmd::Subclasses { name, index, in_, depth, limit, json } =>
             cmd_subclasses(name, index, in_, depth, limit, json),
         Cmd::Implementations { name, index, in_, depth, limit, json } =>
@@ -2223,6 +2256,154 @@ fn cmd_def(
         print_results(&r, &filtered, limit, json);
     }
     log_query(&r, "def", &name, filtered.len(), filtered.len().min(limit), t);
+    Ok(())
+}
+
+/// `scry callgraph NAME` — recursive callers tree.
+///
+/// At each level we ask `lookup_refs_exact(name) → kind=call`,
+/// take the enclosing function (`scope_path.last()`) as the
+/// caller, and recurse on its name. A `BTreeMap<String, Node>`
+/// dedups repeats; a global node cap (`--max-nodes`) plus the
+/// `--depth` cap bound the work on hub functions (e.g. `log()`,
+/// `assert`).
+fn cmd_callgraph(
+    name: String,
+    index: Option<PathBuf>,
+    in_: Option<String>,
+    depth: usize,
+    max_nodes: usize,
+    reachable: bool,
+    json: bool,
+) -> Result<()> {
+    let t = Instant::now();
+    let r = open_index(index)?;
+
+    // Optional reachability pruning: precompute callee modules
+    // (set of modules that define `name`).
+    let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
+        r.module_graph.as_ref().map(|mg| {
+            r.lookup_exact(&name)
+                .iter()
+                .filter_map(|s| mg.module_of_file(s.file_id))
+                .collect()
+        })
+    } else { None };
+
+    /// One node in the callers tree. Children are callers of this
+    /// function (i.e. parents on the call stack).
+    #[derive(Debug, Default, serde::Serialize)]
+    struct Node {
+        /// Number of distinct call sites pointing at this name's parent.
+        call_sites: usize,
+        /// At most one example site for human-readable output.
+        first_site: Option<(String, u32, u32)>,
+        /// Callers of THIS function — same shape, recursive.
+        callers: std::collections::BTreeMap<String, Node>,
+    }
+
+    fn expand(
+        r: &StoreReader,
+        callee: &str,
+        depth_left: usize,
+        in_prefix: &str,
+        callee_modules: Option<&std::collections::HashSet<u32>>,
+        visited: &mut std::collections::HashSet<String>,
+        budget: &mut usize,
+    ) -> std::collections::BTreeMap<String, Node> {
+        if depth_left == 0 || *budget == 0 { return Default::default(); }
+        if !visited.insert(callee.to_string()) {
+            return Default::default();
+        }
+        let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
+        for rr in r.lookup_refs_exact(callee).into_iter() {
+            if rr.kind != scry_store::RefKind::Call { continue; }
+            if !in_prefix.is_empty() {
+                let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
+                if !fe.display_path(&r.roots).contains(in_prefix) { continue; }
+            }
+            // Reachability filter on the caller side.
+            if let (Some(mg), Some(cms)) =
+                (r.module_graph.as_ref(), callee_modules) {
+                if !cms.is_empty() {
+                    if let Some(caller_mod) = mg.module_of_file(rr.file_id) {
+                        if !cms.iter().any(|cm| mg.is_reachable(caller_mod, *cm)) {
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Prefer the byte-range enclosing function (more accurate
+            // than scope_path.last() which reports the class on Java).
+            // Fall back to scope_path when file_symbols is missing.
+            let caller_name = r.enclosing_function(rr.file_id, rr.byte_start)
+                .map(|s| s.name)
+                .or_else(|| rr.scope_path.last().cloned());
+            let Some(caller_name) = caller_name else { continue };
+            let entry = out.entry(caller_name.clone()).or_default();
+            entry.call_sites += 1;
+            if entry.first_site.is_none() {
+                let path = r.files.get(rr.file_id as usize)
+                    .map(|fe| fe.display_path(&r.roots))
+                    .unwrap_or_default();
+                entry.first_site = Some((path, rr.line, rr.col));
+            }
+            *budget = budget.saturating_sub(1);
+            if *budget == 0 { break; }
+        }
+        // Recurse into each caller, expanding their callers.
+        for (caller_name, node) in &mut out {
+            node.callers = expand(
+                r, caller_name, depth_left - 1, in_prefix,
+                callee_modules, visited, budget,
+            );
+        }
+        visited.remove(callee);
+        out
+    }
+
+    let mut budget = max_nodes;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let prefix = in_.as_deref().unwrap_or("");
+    let tree = expand(&r, &name, depth, prefix, callee_modules.as_ref(), &mut visited, &mut budget);
+
+    if json {
+        println!("{}", serde_json::json!({
+            "callee": name,
+            "depth": depth,
+            "max_nodes": max_nodes,
+            "callers": tree,
+        }));
+    } else {
+        println!("callgraph (incoming, depth {depth}) of {name:?}:");
+        fn render(
+            out: &std::collections::BTreeMap<String, Node>,
+            indent: usize,
+        ) {
+            for (k, v) in out {
+                let site = v.first_site.as_ref()
+                    .map(|(p, l, c)| format!(" — {p}:{l}:{c}"))
+                    .unwrap_or_default();
+                println!(
+                    "{:indent$}{} ({} call site{}){}",
+                    "", k, v.call_sites,
+                    if v.call_sites == 1 { "" } else { "s" },
+                    site,
+                    indent = indent,
+                );
+                render(&v.callers, indent + 2);
+            }
+        }
+        if tree.is_empty() {
+            println!("  (no callers found)");
+        } else {
+            render(&tree, 2);
+        }
+        eprintln!(
+            "[scry] cmd=callgraph q={:?} depth={} nodes_used={} elapsed={}ms",
+            name, depth, max_nodes - budget, t.elapsed().as_millis(),
+        );
+    }
     Ok(())
 }
 
@@ -6429,6 +6610,22 @@ fn mcp_tools_list_result() -> serde_json::Value {
             })),
         ),
         tool(
+            "callgraph",
+            "Recursive callers tree for NAME — \"how does control \
+             flow reach this function?\". Walks call refs upward N \
+             levels via `enclosing_function` resolution (more \
+             accurate than scope_path for Java/Kotlin where the \
+             scope is the class). `--max-nodes` caps total expansion \
+             on hub functions (logger, assert, etc.).",
+            obj(&["name"], serde_json::json!({
+                "name":  {"type": "string"},
+                "in":    in_prop,
+                "depth": {"type": "integer", "minimum": 1, "default": 3},
+                "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
+                "reachable": {"type": "boolean", "default": false},
+            })),
+        ),
+        tool(
             "impact",
             "\"What breaks if I change NAME?\" — composes callers + \
              transitive subclasses into one deduped impact set. \
@@ -6661,6 +6858,7 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "subclasses"      => &["name"],
         "implementations" => &["name"],
         "impact"          => &["name"],
+        "callgraph"       => &["name"],
         "prefix"   => &["prefix"],
         "fuzzy"    => &["substr"],
         "grep"     => &["pattern"],
@@ -7239,6 +7437,17 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_impact(reader, arg_str("name"), in_, depth, reachable, limit)
         }
+        "callgraph" => {
+            let depth = args.get("depth")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize).unwrap_or(3);
+            let max_nodes = args.get("max_nodes")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize).unwrap_or(200);
+            let reachable = args.get("reachable")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_callgraph(reader, arg_str("name"), in_, depth, max_nodes, reachable)
+        }
         "grep"    => {
             let ci = args.get("case_insensitive")
                 .and_then(serde_json::Value::as_bool)
@@ -7563,6 +7772,92 @@ fn serve_ref(
         out.push(ref_to_json(r, &rr));
     }
     serde_json::Value::Array(out)
+}
+
+/// `callgraph` JSON-RPC handler — returns the recursive callers
+/// tree. Same algorithm as [`cmd_callgraph`]; result shape mirrors
+/// the CLI's `--json` payload.
+fn serve_callgraph(
+    r: &StoreReader,
+    name: &str,
+    in_: Option<&str>,
+    depth: usize,
+    max_nodes: usize,
+    reachable: bool,
+) -> serde_json::Value {
+    let prefix = in_.unwrap_or("");
+    let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
+        r.module_graph.as_ref().map(|mg| {
+            r.lookup_exact(name).iter()
+                .filter_map(|s| mg.module_of_file(s.file_id)).collect()
+        })
+    } else { None };
+
+    #[derive(Debug, Default, serde::Serialize)]
+    struct Node {
+        call_sites: usize,
+        first_site: Option<(String, u32, u32)>,
+        callers: std::collections::BTreeMap<String, Node>,
+    }
+
+    fn expand(
+        r: &StoreReader,
+        callee: &str,
+        depth_left: usize,
+        in_prefix: &str,
+        callee_modules: Option<&std::collections::HashSet<u32>>,
+        visited: &mut std::collections::HashSet<String>,
+        budget: &mut usize,
+    ) -> std::collections::BTreeMap<String, Node> {
+        if depth_left == 0 || *budget == 0 { return Default::default(); }
+        if !visited.insert(callee.to_string()) { return Default::default(); }
+        let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
+        for rr in r.lookup_refs_exact(callee).into_iter() {
+            if rr.kind != scry_store::RefKind::Call { continue; }
+            if !in_prefix.is_empty() {
+                let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
+                if !fe.display_path(&r.roots).contains(in_prefix) { continue; }
+            }
+            if let (Some(mg), Some(cms)) = (r.module_graph.as_ref(), callee_modules) {
+                if !cms.is_empty() {
+                    if let Some(caller_mod) = mg.module_of_file(rr.file_id) {
+                        if !cms.iter().any(|cm| mg.is_reachable(caller_mod, *cm)) {
+                            continue;
+                        }
+                    }
+                }
+            }
+            let caller_name = r.enclosing_function(rr.file_id, rr.byte_start)
+                .map(|s| s.name)
+                .or_else(|| rr.scope_path.last().cloned());
+            let Some(caller_name) = caller_name else { continue };
+            let entry = out.entry(caller_name.clone()).or_default();
+            entry.call_sites += 1;
+            if entry.first_site.is_none() {
+                let path = r.files.get(rr.file_id as usize)
+                    .map(|fe| fe.display_path(&r.roots)).unwrap_or_default();
+                entry.first_site = Some((path, rr.line, rr.col));
+            }
+            *budget = budget.saturating_sub(1);
+            if *budget == 0 { break; }
+        }
+        for (caller_name, node) in &mut out {
+            node.callers = expand(r, caller_name, depth_left - 1, in_prefix,
+                callee_modules, visited, budget);
+        }
+        visited.remove(callee);
+        out
+    }
+
+    let mut budget = max_nodes;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let tree = expand(r, name, depth, prefix, callee_modules.as_ref(), &mut visited, &mut budget);
+    serde_json::json!({
+        "callee": name,
+        "depth": depth,
+        "max_nodes": max_nodes,
+        "callers": tree,
+    })
 }
 
 /// `impact` JSON-RPC handler — returns the composed callers +

@@ -1950,3 +1950,60 @@ public class Caller { public void run() { new Animal().speak(); } }
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn callgraph_e2e_walks_caller_chain() {
+    // 3-method chain: c() calls b() calls a(). callgraph(a, depth=2)
+    // should surface both b() and c() in the tree.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-callgraph-e2e-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("zoo")).unwrap();
+    std::fs::write(src.join("zoo/Tree.java"), r#"package zoo;
+public class Tree {
+  public void a() {}
+  public void b() { a(); }
+  public void c() { b(); }
+  public void d() { c(); }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // callgraph a --depth 1: just b.
+    let out = Command::new(scry_bin())
+        .args(["callgraph", "a", "--index"]).arg(&idx)
+        .args(["--depth", "1", "--json"])
+        .output().expect("spawn scry callgraph");
+    assert!(out.status.success(),
+            "callgraph a failed: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let callers = v["callers"].as_object().expect("callers object");
+    assert!(callers.contains_key("b"),
+            "callgraph a depth=1 should include caller b; got keys {:?}",
+            callers.keys().collect::<Vec<_>>());
+    assert!(callers["b"]["callers"].as_object().map_or(true, serde_json::Map::is_empty),
+            "depth=1 should NOT expand b's callers further");
+
+    // callgraph a --depth 3: b, c, d nested.
+    let out = Command::new(scry_bin())
+        .args(["callgraph", "a", "--index"]).arg(&idx)
+        .args(["--depth", "3", "--json"])
+        .output().expect("spawn scry callgraph --depth=3");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let b = &v["callers"]["b"];
+    assert!(b.is_object(), "tree should have a → b; got {v}");
+    let c = &b["callers"]["c"];
+    assert!(c.is_object(), "tree should have a → b → c; got {v}");
+    let d = &c["callers"]["d"];
+    assert!(d.is_object(), "tree should have a → b → c → d; got {v}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

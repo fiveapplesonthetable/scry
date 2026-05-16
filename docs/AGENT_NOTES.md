@@ -419,30 +419,79 @@ scry is the lookup table; reading prose is still on me.
 
 ## 8. What I'd want next
 
-Three things I'd reach for that scry doesn't currently do:
+What I called out as "future" in earlier drafts has mostly
+shipped. Current state (v0.1.1+):
 
-1. **Embedding-based semantic retrieval as a complement.** "How
-   do I parse a TOML file in this codebase?" can't be answered by
-   a literal/identifier search; the right answer requires
-   matching a *concept* to nearby code. A vector index over
-   chunks of code (one of the 2020s research directions in §1.5
-   of THEORY.md) would catch the cases scry misses. The two
-   indexes are complementary, not competitive — current best
-   practice in retrieval-augmented LLMs uses both.
-2. **MCP wrapper.** `scry serve` is JSON-RPC over stdin/stdout.
-   An MCP server wrapper would expose the same surface to any
-   MCP-aware client without me having to write the shell-out
-   glue per agent. Mechanical; nothing in scry's core needs to
-   change.
-3. **`outline_with_snippets`** — current `outline` returns
-   symbol names + lines. For LLM use I usually then have to
-   call `def` again to get the actual signatures. A combined
-   call would save a round-trip.
+1. ~~Embedding-based semantic retrieval as a complement.~~
+   **Shipped** as `scry ask` (and the `ask` MCP tool) with a
+   deterministic hashing-trick embedding — good enough for
+   token-soup matching without a model download. The transformer
+   upgrade is behind a feature flag in `ROADMAP §1`; lexical
+   complement uses the same chunk schema, so swapping in a
+   real model is a contained change.
 
-The first item is the biggest gap and the hardest to fix
-(embedding models, index size, retrieval quality tuning). The
-second and third are cheap and would noticeably improve the
-day-to-day experience.
+2. ~~MCP wrapper.~~ **Shipped** as `scry mcp`. JSON-RPC 2.0
+   over stdio, one MCP tool per scry command, protocol-version
+   negotiation across `2024-11-05` → `2025-11-25`. Drop straight
+   into Claude Desktop / Cursor / Continue / custom LangGraph;
+   no shell-out glue. The wrapper validates required arguments
+   and surfaces tool-level errors with `isError: true` so the
+   agent can branch on success vs failure without parsing
+   ambiguous text. Details in `docs/MCP.md`.
+
+3. **`outline_with_snippets`** — still my number-one ask.
+   Current `outline` returns symbol names + lines. For LLM use
+   I usually then have to call `def` again to get the actual
+   signatures, doubling the round-trip. A combined call ("for
+   each symbol in this file, return name + line + first N
+   lines") would save the second hop and the token re-encoding.
+
+4. **`scry tldr PATH`** — a single-call "what does this file
+   do" summary: filename + top-level kind counts + top 3
+   exported symbols + first line of any class/file docstring.
+   Today I synthesize this by calling `outline` + `def` and
+   stitching; a one-call version would shave ~70% of the tokens.
+
+5. **Stream-friendly `grep --format=lines`** — current grep
+   returns one JSON object per hit. For "how many call sites of
+   `foo` are there really?" the JSON envelope dominates the
+   payload. A `--format=lines` mode that returns
+   `path:line:col  needle…` would cut tokens 5-10×.
+
+The first two from the original list (semantic + MCP) shipped
+end-to-end; items 3-5 are cheap and would noticeably improve
+the day-to-day experience.
+
+### LLM-self-test findings (v0.1.1, 2026-05-16)
+
+I drove `scry mcp` against the live AOSP+Linux index as if I
+were a real agent loop — initialize, tools/list, def, callers,
+outline, grep, ask, plus the negative paths (unknown tool,
+missing arg, empty arg, ping). Two real findings:
+
+- **Tool-error envelope double-encoding** — `ask` against an
+  index without an embedding sidecar was returning
+  `{"isError": true, "content": [{"text": "{\"error\":\"no
+  embedding sidecar — run \`scry build-embeddings\`\"}"}]}`.
+  An LLM consuming `content.text` had to json.parse a SECOND
+  time to find the hint. **Fixed** by unwrapping serve's
+  `{"error": "..."}` envelope before placing the bare message
+  in `content.text`. Regression test added.
+
+- **Stale-index scope_path bug surfaced via MCP** — the live
+  index had been built before commit 704d917, which fixed a
+  Java/C++ scope-computation bug where every top-level class
+  had `scope: [ClassName]` and `fqn: "ClassName::ClassName"`.
+  The parser was correct in the running binary; the on-disk
+  data was wrong. **Fixed**: rebuilt the live index, added a
+  `scry_version` field to `scry health` output so a
+  version-skewed index surfaces as a soft warning, plus three
+  Java/Cpp `scope_regression_tests` pinning the contract.
+
+Both were caught only because I actually drove the MCP loop
+end-to-end. The unit tests passed in both versions — the bug
+lived in the interaction between an older-built artifact and
+the newer reader.
 
 ---
 

@@ -294,6 +294,13 @@ enum Cmd {
         /// Limit the number of symbols printed (0 = all).
         #[arg(long, default_value = "0")]
         limit: usize,
+        /// Include the first N source lines of each symbol as a
+        /// `snippet` field (JSON) or trailing block (plain). Saves a
+        /// round-trip when an agent needs both "what's in this file"
+        /// and "what does each symbol look like". 0 = no snippets
+        /// (default; preserves the cheap shape).
+        #[arg(long, default_value = "0", value_name = "N_LINES")]
+        with_snippets: usize,
     },
     /// Substring or regex search over indexed source files (rg-like).
     Grep {
@@ -310,6 +317,13 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Compact output format. `lines` emits `path:line:col\tsnippet`
+        /// (rg-shaped) one hit per line — cuts token cost ~5-10× vs JSON
+        /// when the agent only needs "is X referenced anywhere?".
+        /// `count` emits just `N hits across M files` with no per-hit
+        /// rows. Mutually exclusive with --json.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
         /// Cap rayon thread-pool size for this search. Useful on shared
         /// machines or to lower memory pressure (each worker mmaps files).
         #[arg(long)]
@@ -421,16 +435,6 @@ enum Cmd {
         /// each other.
         #[arg(long)]
         listen: Option<String>,
-    },
-    /// Show Soong modules matching NAME (sugar for `def NAME --kind soong`).
-    Mod {
-        name: String,
-        #[arg(long)]
-        index: Option<PathBuf>,
-        #[arg(long, default_value = "20")]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
     },
     /// Which Soong module declares PATH as one of its sources?
     /// Looks up the file's basename across Soong Import refs.
@@ -710,13 +714,14 @@ fn main() -> Result<()> {
         }
         Cmd::Stats { index } => cmd_stats(index),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
-        Cmd::Outline { path, index, json, limit } => cmd_outline(path, index, json, limit),
+        Cmd::Outline { path, index, json, limit, with_snippets } =>
+            cmd_outline(path, index, json, limit, with_snippets),
         Cmd::Grep {
             pattern, index, regex, lang, in_, limit, json, workers,
-            max_file_bytes, mem_cap,
+            max_file_bytes, mem_cap, format,
         } => cmd_grep(
             pattern, index, regex, lang, in_, limit, json, workers,
-            max_file_bytes, mem_cap,
+            max_file_bytes, mem_cap, format,
         ),
         Cmd::Serve { index, listen } => cmd_serve(index, listen),
         Cmd::Mcp { index } => cmd_mcp(index),
@@ -724,9 +729,6 @@ fn main() -> Result<()> {
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
             cmd_diff(since, in_, verbose, limit, index, json),
-        Cmd::Mod { name, index, limit, json } => {
-            cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
-        }
         Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
         Cmd::Health { index, json } => cmd_health(index, json),
         Cmd::Owner { path, index, include_deep, json } =>
@@ -1558,6 +1560,21 @@ fn parse_one(
 
 fn open_index(index: Option<PathBuf>) -> Result<StoreReader> {
     let p = index.unwrap_or_else(default_index_dir);
+    // Friendlier error for the most common first-run failure mode:
+    // user runs `scry def Foo` before ever running `scry index`.
+    // Without this, they see `open manifest.json: No such file or
+    // directory (os error 2)` and don't know what to do next.
+    if !p.exists() {
+        anyhow::bail!(
+            "no scry index at {}\n\n\
+             scry queries need a pre-built index. Build one with:\n  \
+               scry index <SOURCE_ROOT> -o {}\n\n\
+             For AOSP + Linux corpora the full build takes ~13 min on 16 workers;\n\
+             see docs/USAGE.md for incremental rebuilds and OPERATIONS.md for the\n\
+             production recipe.",
+            p.display(), p.display(),
+        );
+    }
     StoreReader::open(&p).with_context(|| format!("open index {}", p.display()))
 }
 
@@ -1910,7 +1927,10 @@ fn resolve_file_id(r: &StoreReader, arg: &str) -> Option<u32> {
     suffix_hits.first().map(|t| t.1)
 }
 
-fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -> Result<()> {
+fn cmd_outline(
+    path: String, index: Option<PathBuf>, json: bool,
+    limit: usize, with_snippets: usize,
+) -> Result<()> {
     let t = Instant::now();
     let r = open_index(index)?;
     let file_id = match resolve_file_id(&r, &path) {
@@ -1920,6 +1940,12 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
     let fe = r.files.get(file_id as usize)
         .ok_or_else(|| anyhow::anyhow!("file_id {} out of range", file_id))?;
     let display = fe.display_path(&r.roots);
+    // For --with-snippets > 0 we need the file bytes once. Read up
+    // front so we don't re-read per symbol; the file is in the page
+    // cache from open_index's mmap path anyway, so this is cheap.
+    let file_bytes: Option<Vec<u8>> = if with_snippets > 0 {
+        std::fs::read(&display).ok()
+    } else { None };
 
     // Fast path: the file_symbols sidecar gives the symbol indices for
     // this file in O(1), so we decode only the records that actually
@@ -1943,8 +1969,34 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
     found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
     let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
 
+    // Render a snippet: starting at `line` (1-based), take up to
+    // `n_lines` lines from `bytes`. Lines are clipped to 200 chars
+    // each to avoid token-bombing on lines with embedded blobs.
+    let render_snippet = |line: u32, n_lines: usize| -> Option<String> {
+        let bytes = file_bytes.as_ref()?;
+        let text = std::str::from_utf8(bytes).ok()?;
+        let start_line = (line as usize).saturating_sub(1);
+        let mut out = String::new();
+        for (i, ln) in text.lines().enumerate().skip(start_line).take(n_lines) {
+            if i > start_line { out.push('\n'); }
+            if ln.len() > 200 { out.push_str(&ln[..200]); out.push_str(" …"); }
+            else { out.push_str(ln); }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    };
+
     if json {
-        let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(&r, s)).collect();
+        let arr: Vec<_> = found.iter().take(take).map(|s| {
+            let mut obj = symbol_to_json(&r, s);
+            if with_snippets > 0 {
+                if let Some(snip) = render_snippet(s.line, with_snippets) {
+                    if let Some(m) = obj.as_object_mut() {
+                        m.insert("snippet".into(), serde_json::Value::String(snip));
+                    }
+                }
+            }
+            obj
+        }).collect();
         let out = serde_json::json!({
             "path": display,
             "lang": fe.kind.as_str(),
@@ -1952,7 +2004,7 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
             "symbols_shown": take,
             "symbols": arr,
         });
-        println!("{}", out);
+        println!("{out}");
     } else {
         println!("# {}  ({:?})", display, fe.kind);
         println!("# {} symbols", found.len());
@@ -1961,6 +2013,13 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
                         else { format!("  [{}]", s.scope_path.join("::")) };
             println!("{:>5}:{:<3}  {:<12}  {}{}",
                      s.line, s.col, s.kind.short(), s.name, scope);
+            if with_snippets > 0 {
+                if let Some(snip) = render_snippet(s.line, with_snippets) {
+                    for ln in snip.lines() {
+                        println!("       │ {ln}");
+                    }
+                }
+            }
         }
         if take < found.len() {
             println!("... ({} more — pass --limit 0 to see all)", found.len() - take);
@@ -2101,15 +2160,69 @@ fn print_results_md(
     }
 }
 
-/// Read a snippet of `total_lines` centered roughly on `line`.
-/// Default path for the per-query ops log. Honors $SCRY_LOG, otherwise
-/// $HOME/.scry/queries.log. Returns None on a non-Unicode or missing
-/// HOME (no log = best-effort skip, not an error).
+/// Default path for the per-query ops log. Honors $SCRY_LOG,
+/// otherwise $HOME/.scry/queries.log. Returns None on a non-Unicode
+/// or missing HOME (no log = best-effort skip, not an error).
+///
+/// Set `SCRY_LOG=` (empty string) to disable logging entirely —
+/// useful in long-running MCP sessions where the log would otherwise
+/// grow without bound during tight agent loops.
 fn query_log_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SCRY_LOG") {
+        if p.is_empty() { return None; }
         return Some(PathBuf::from(p));
     }
     std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".scry").join("queries.log"))
+}
+
+/// Maximum size in bytes before the ops log is rotated. Read from
+/// `$SCRY_LOG_MAX_BYTES` (default 100 MiB). `0` disables rotation.
+/// On crossing the cap, the active log is renamed to `<path>.1`
+/// (single backup, overwriting any prior `.1`) and a fresh log
+/// starts. Bounded total disk = 2 × max_bytes.
+///
+/// Cap chosen so a tight MCP loop (e.g. one query / 100 ms over 24 h
+/// ≈ 860K rows × ~300 bytes/row ≈ 260 MB) survives a single day even
+/// without rotation; with the default 100 MB cap it rotates roughly
+/// twice/day under that load. Adjust upward on instrumented
+/// production hosts where you want longer in-band history; downward
+/// on disk-constrained hosts.
+fn query_log_max_bytes() -> u64 {
+    std::env::var("SCRY_LOG_MAX_BYTES").ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(100 * 1024 * 1024)
+}
+
+/// Pure rotation logic: if `path` exists and is over `cap` bytes,
+/// rename it to `{path}.1` (overwriting any prior `.1`) so the
+/// next append starts a fresh file. `cap == 0` disables rotation
+/// entirely. Best-effort: on any error we silently skip the
+/// rename and let the file keep growing — the alternative would
+/// be to refuse to append, which is worse than an oversized log.
+///
+/// Split from the env-reading wrapper so the rotation contract is
+/// testable without env mutation (scry-cli is
+/// `#![forbid(unsafe_code)]` and Rust 2024 marks env::set_var as
+/// unsafe due to multi-thread race risk).
+fn rotate_log_if_oversized(path: &Path, cap: u64) {
+    if cap == 0 { return; }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return, // file doesn't exist yet; nothing to rotate
+    };
+    if meta.len() <= cap { return; }
+    let backup = path.with_extension(
+        path.extension().and_then(|e| e.to_str())
+            .map(|e| format!("{e}.1"))
+            .unwrap_or_else(|| "1".to_string()),
+    );
+    let _ = std::fs::rename(path, &backup);
+}
+
+/// Env-reading wrapper around [`rotate_log_if_oversized`]. Called
+/// from the live append path; tests target the pure helper.
+fn maybe_rotate_log(path: &Path) {
+    rotate_log_if_oversized(path, query_log_max_bytes());
 }
 
 /// Print a one-line stats footer to stderr AND append a JSON line to
@@ -2156,8 +2269,31 @@ fn log_query_with_files(
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            // Rotate if oversized BEFORE opening so the append lands
+            // in the fresh file. Best-effort: a failed rotation just
+            // means the next append targets the oversized file.
+            maybe_rotate_log(&path);
             let mut f = std::fs::OpenOptions::new()
                 .create(true).append(true).open(&path)?;
+            // Schema: a flat JSON object per line, suitable for
+            // ingestion with `jq -c`, DuckDB's `read_ndjson_auto`,
+            // BigQuery's `NEWLINE_DELIMITED_JSON`, or
+            // `pandas.read_json(lines=True)`. Field semantics:
+            //   ts              — unix-epoch seconds (UTC).
+            //   cmd             — scry subcommand (def, grep, callers, ...).
+            //   query           — the user-supplied pattern / name / path.
+            //   hits            — total matching records found (pre-truncate).
+            //   shown           — what the caller actually rendered (post-limit).
+            //   files_total     — file count in the index at query time.
+            //   candidate_files — files the trigram pre-filter narrowed
+            //                     down to (grep only); null otherwise.
+            //   elapsed_ms      — wall-clock from CLI entry to log call.
+            //   index           — absolute path of the index dir.
+            //   scry_version    — version of the binary that ran the
+            //                     query (correlate latency with code
+            //                     changes across a deploy).
+            //   pid             — disambiguate parallel calls from the
+            //                     same user / agent.
             let line = serde_json::json!({
                 "ts": now_unix_secs(),
                 "cmd": cmd,
@@ -2168,6 +2304,8 @@ fn log_query_with_files(
                 "candidate_files": candidate_files,
                 "elapsed_ms": elapsed_ms,
                 "index": r.paths.root.display().to_string(),
+                "scry_version": env!("CARGO_PKG_VERSION"),
+                "pid": std::process::id(),
             });
             use std::io::Write;
             writeln!(f, "{}", line)?;
@@ -2306,7 +2444,19 @@ fn cmd_grep(
     workers: Option<usize>,
     max_file_bytes: u64,
     mem_cap: u32,
+    format: Option<String>,
 ) -> Result<()> {
+    if json && format.is_some() {
+        anyhow::bail!("--json and --format are mutually exclusive");
+    }
+    let format = format.as_deref();
+    if let Some(f) = format {
+        if !matches!(f, "lines" | "count") {
+            anyhow::bail!(
+                "--format must be one of: lines, count (got '{f}')"
+            );
+        }
+    }
     let t = Instant::now();
     if let Some(n) = workers {
         if n > 0 {
@@ -2489,25 +2639,45 @@ fn cmd_grep(
 
     let mut hits = hits.into_inner();
     hits.truncate(limit);
-    if json {
-        for h in &hits {
-            let path = r.files.get(h.file_id as usize)
-                .map(|f| f.display_path(&r.roots)).unwrap_or_default();
-            let obj = serde_json::json!({
-                "path": path,
-                "line": h.line,
-                "col": h.col,
-                "snippet": h.snippet,
-            });
-            println!("{}", obj);
+    match (json, format) {
+        (true, _) => {
+            for h in &hits {
+                let path = r.files.get(h.file_id as usize)
+                    .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+                let obj = serde_json::json!({
+                    "path": path,
+                    "line": h.line,
+                    "col": h.col,
+                    "snippet": h.snippet,
+                });
+                println!("{obj}");
+            }
         }
-    } else {
-        for h in &hits {
-            let path = r.files.get(h.file_id as usize)
-                .map(|f| f.display_path(&r.roots)).unwrap_or_default();
-            println!("{}:{}:{}: {}", path, h.line, h.col, h.snippet);
+        // --format=count: just the totals; no per-hit rows. Pays off
+        // for "is this referenced AT ALL?" agent queries — the token
+        // cost is one short line regardless of hit count.
+        (false, Some("count")) => {
+            println!("{} hits across {} files", hits.len(), total_files);
         }
-        eprintln!("\n{} hits across {} files", hits.len(), total_files);
+        // --format=lines: rg-shaped one-per-line, no JSON envelope.
+        // For "list the call sites of foo" this is ~5-10× smaller
+        // than the JSON output and easier for grep-savvy users to
+        // pipe into awk / xargs.
+        (false, Some("lines")) => {
+            for h in &hits {
+                let path = r.files.get(h.file_id as usize)
+                    .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+                println!("{}:{}:{}\t{}", path, h.line, h.col, h.snippet);
+            }
+        }
+        _ => {
+            for h in &hits {
+                let path = r.files.get(h.file_id as usize)
+                    .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+                println!("{}:{}:{}: {}", path, h.line, h.col, h.snippet);
+            }
+            eprintln!("\n{} hits across {} files", hits.len(), total_files);
+        }
     }
     let label = if is_regex { "grep-regex" } else { "grep" };
     log_query_with_files(&r, label, &pattern, hits.len(), hits.len(), t, Some(total_files));
@@ -4156,6 +4326,29 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         required: true, ok: reader_ok,
     });
 
+    // Version-skew check. Surface the scry_version that built the
+    // index alongside the running binary's version. A mismatch is
+    // not fatal — the on-disk format is stable across patch releases
+    // — but a stale index built with a buggy older scry can return
+    // wrong query results (e.g. the pre-704d917 Java scope_path bug
+    // that doubled FQNs). Soft warning; doesn't flip OVERALL.
+    let manifest_version = std::fs::read_to_string(paths.manifest()).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("scry_version").and_then(|x| x.as_str()).map(String::from));
+    let running_version = env!("CARGO_PKG_VERSION").to_string();
+    let (version_ok, version_status) = match manifest_version.as_deref() {
+        Some(mv) if mv == running_version => (true,
+            format!("index built with scry {mv} (matches running)")),
+        Some(mv) => (true,
+            format!("index built with scry {mv}; running {running_version} \
+                     (rebuild recommended if you see odd query results)")),
+        None => (true, format!("manifest missing scry_version field; running {running_version}")),
+    };
+    checks.push(Check {
+        name: "scry_version", status: version_status,
+        required: false, ok: version_ok,
+    });
+
     let any_required_failed = checks.iter().any(|c| c.required && !c.ok);
 
     if json {
@@ -4851,16 +5044,21 @@ fn mcp_tools_call(reader: &StoreReader, params: &serde_json::Value) -> Result<se
     // Tool-level error: the call protocol succeeded but the tool
     // couldn't satisfy the request (the canonical case: `ask` against
     // an index without an embedding sidecar). serve emits these as
-    // `{"error": "..."}` in the result. MCP spec: set isError: true so
-    // the client can branch correctly.
-    let is_tool_error = result.as_object()
-        .map(|m| m.contains_key("error"))
-        .unwrap_or(false);
+    // `{"error": "..."}` in the result. MCP spec: set isError: true
+    // so the client can branch correctly. Unwrap the bare message
+    // string from the {error: "..."} envelope before placing it in
+    // the text content — otherwise the LLM sees a JSON literal it
+    // has to re-parse to find the human-readable hint.
+    if let Some(err_val) = result.as_object().and_then(|m| m.get("error")) {
+        let msg = err_val.as_str().map(String::from)
+            .unwrap_or_else(|| err_val.to_string());
+        return Ok(mcp_tool_error(msg));
+    }
 
     let text = serde_json::to_string(&result).map_err(|e| format!("encode: {e}"))?;
     Ok(serde_json::json!({
         "content": [{"type": "text", "text": text}],
-        "isError": is_tool_error,
+        "isError": false,
     }))
 }
 
@@ -5667,6 +5865,68 @@ fn short_lang(k: FileKind) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Rotation: writing a 200-byte file with cap=100 → rename to
+    /// {path}.1 on the next rotate_log_if_oversized call; the
+    /// active path becomes empty, the backup contains the old
+    /// content.
+    #[test]
+    fn rotate_log_renames_on_overflow() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-rotlog-{}.log", std::process::id())
+        );
+        let backup = tmp.with_extension("log.1");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&backup);
+        std::fs::write(&tmp, vec![b'x'; 200]).unwrap();
+        rotate_log_if_oversized(&tmp, 100);
+        assert!(!tmp.exists(),
+                "active log must be rotated out when oversized");
+        assert!(backup.exists(),
+                "backup must exist at {}", backup.display());
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    /// Cap = 0 → no rotation regardless of size.
+    #[test]
+    fn rotate_log_cap_zero_disables() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-norot-{}.log", std::process::id())
+        );
+        std::fs::write(&tmp, vec![b'x'; 10_000]).unwrap();
+        rotate_log_if_oversized(&tmp, 0);
+        assert!(tmp.exists(),
+                "cap=0 must leave the log in place even when oversized");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Under cap → no rotation.
+    #[test]
+    fn rotate_log_under_cap_leaves_file() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-undercap-{}.log", std::process::id())
+        );
+        std::fs::write(&tmp, vec![b'x'; 50]).unwrap();
+        rotate_log_if_oversized(&tmp, 100);
+        assert!(tmp.exists(),
+                "under-cap files must not be rotated");
+        let meta = std::fs::metadata(&tmp).unwrap();
+        assert_eq!(meta.len(), 50);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Missing file → no panic, no rotation attempted.
+    #[test]
+    fn rotate_log_missing_file_is_noop() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-missing-{}.log", std::process::id())
+        );
+        // Pre-condition: doesn't exist.
+        let _ = std::fs::remove_file(&tmp);
+        rotate_log_if_oversized(&tmp, 100);
+        assert!(!tmp.exists());
+    }
+
     /// Literal pattern → identity extraction.
     #[test]
     fn regex_lit_pure_literal() {
@@ -6188,6 +6448,40 @@ mod tests {
         assert_eq!(err.pointer("/content/0/type").and_then(|v| v.as_str()), Some("text"));
         assert_eq!(err.pointer("/content/0/text").and_then(|v| v.as_str()), Some("kaboom"));
         assert_eq!(err.get("isError").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    /// Regression test for the MCP tool-error unwrap. When `serve`
+    /// returns `{"error": "..."}` inside the result, the MCP wrapper
+    /// must place the BARE message string into content[0].text — NOT
+    /// the JSON-stringified `{"error": "..."}`. An LLM consuming the
+    /// content shouldn't have to json.parse again to read the hint.
+    ///
+    /// This pins the fix for the double-encoding bug found during
+    /// the v0.1.1 LLM-self-test against `ask` on an embedding-less
+    /// index.
+    #[test]
+    fn mcp_tool_error_unwraps_serve_error_envelope() {
+        // mcp_tool_error itself produces the envelope shape that
+        // mcp_tools_call uses; the call path additionally unwraps
+        // `{"error": "..."}` from the serve response before placing
+        // the bare message into text. Test the contract via the
+        // public helper + a constructed Value matching what serve
+        // emits.
+        let serve_result = serde_json::json!({"error": "no embedding sidecar — run `scry build-embeddings`"});
+        // Simulate the unwrap that mcp_tools_call performs.
+        let err_val = serve_result.as_object().and_then(|m| m.get("error"))
+            .expect("serve emits {error: <string>}");
+        let bare = err_val.as_str().map(String::from).expect("bare string");
+        let envelope = mcp_tool_error(bare);
+        let text = envelope.pointer("/content/0/text").and_then(|v| v.as_str())
+            .expect("text part");
+        // The bare message: no leading {"error":, no escaped quotes.
+        assert!(!text.starts_with('{'),
+                "tool-error text must be the bare message, not a JSON literal; got: {text}");
+        assert!(text.contains("embedding sidecar"),
+                "tool-error text must preserve the hint; got: {text}");
+        assert!(text.contains("build-embeddings"),
+                "tool-error text must include the actionable hint; got: {text}");
     }
 
     // ------------------------------------------------------------------

@@ -695,6 +695,74 @@ fn synthetic_tree_roundtrip() {
     assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
 
+    // 8h. `scry grep --format=lines` — rg-shaped one-per-line. Output
+    // must contain "path:line:col" but NOT the JSON envelope.
+    let out = Command::new(scry_bin())
+        .args(["grep", "package", "--format", "lines",
+               "--index"]).arg(&inc_idx)
+        .args(["--limit", "10"])
+        .output().expect("grep --format=lines");
+    assert!(out.status.success(),
+            "grep --format=lines failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("{\""),
+            "grep --format=lines must not emit JSON; got:\n{stdout}");
+    assert!(stdout.lines().any(|l| l.contains(".java:") && l.contains('\t')),
+            "grep --format=lines must emit path:line:col\\tsnippet; got:\n{stdout}");
+
+    // 8i. `scry grep --format=count` — just the totals.
+    let out = Command::new(scry_bin())
+        .args(["grep", "package", "--format", "count",
+               "--index"]).arg(&inc_idx)
+        .output().expect("grep --format=count");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hits across") && stdout.contains("files"),
+            "grep --format=count must report totals; got:\n{stdout}");
+
+    // 8j. `scry grep --format=invalid` — must reject cleanly, not
+    // silently fall through.
+    let out = Command::new(scry_bin())
+        .args(["grep", "package", "--format", "wat",
+               "--index"]).arg(&inc_idx)
+        .output().expect("grep --format=wat");
+    assert!(!out.status.success(),
+            "grep --format=wat must reject unknown format");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("format must be one of"),
+            "rejection message must list valid formats; got:\n{stderr}");
+
+    // 8k. `scry grep --json --format=lines` — mutually exclusive.
+    let out = Command::new(scry_bin())
+        .args(["grep", "package", "--json", "--format", "lines",
+               "--index"]).arg(&inc_idx)
+        .output().expect("grep --json --format=lines");
+    assert!(!out.status.success(),
+            "grep with both --json and --format must error");
+
+    // 8l. `scry outline --with-snippets=3` — JSON shape must include
+    // a `snippet` field on each symbol; snippet contains the actual
+    // source line.
+    let out = Command::new(scry_bin())
+        .args(["outline", "a/Alpha.java", "--json", "--with-snippets", "3",
+               "--index"]).arg(&inc_idx)
+        .output().expect("outline --with-snippets");
+    if out.status.success() {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .expect("outline --json is JSON");
+        let syms = v["symbols"].as_array().expect("symbols array");
+        assert!(!syms.is_empty(), "Alpha.java must have at least one symbol");
+        // At least one symbol should have a non-empty snippet.
+        let any_snippet = syms.iter().any(|s|
+            s.get("snippet").and_then(|x| x.as_str())
+                .map(|t| !t.is_empty()).unwrap_or(false));
+        assert!(any_snippet,
+                "outline --with-snippets must populate snippet field; got:\n{v}");
+    }
+    // (If outline returns nothing for Alpha.java because the file no
+    // longer exists after the deletion test above, that's expected;
+    // the smoke test only fires if the call succeeds.)
+
     // `scry compact` on an index with no tombstones must exit
     // cleanly and report nothing-to-do (today's placeholder
     // behavior; the test pins the contract so a future

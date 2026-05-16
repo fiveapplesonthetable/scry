@@ -7,6 +7,79 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-16
+
+The LLM-self-test drop: drove `scry mcp` end-to-end as an agent
+would, fixed every paper-cut it surfaced, hardened the queries.log
+for long-running MCP sessions, and pruned one sugar command that
+didn't earn its keep.
+
+### Added
+- **`scry grep --format=lines`** — `path:line:col\tsnippet` rg-shape,
+  one hit per line. 5–10× cheaper in tokens vs `--json` for
+  "list call sites of X" agent queries.
+- **`scry grep --format=count`** — just `N hits across M files`,
+  no per-hit rows. Cheapest possible "is X referenced AT ALL?"
+  reply.
+- **`scry outline --with-snippets N`** — inline the first N source
+  lines of each symbol so the agent doesn't need a per-symbol
+  `def` round-trip. JSON gets a `snippet` field; plain output
+  shows snippet blocks with `│` separators. Lines clip at 200
+  chars to bound the worst case.
+- **`SCRY_LOG_MAX_BYTES`** env var (default `100 MiB`) — rotates
+  `~/.scry/queries.log` to `<path>.1` when it crosses the cap,
+  bounding total disk to 2 × cap. `0` disables rotation.
+  **`SCRY_LOG=`** (empty) disables logging entirely for ephemeral
+  MCP sessions. Matters at MCP scale where a tight loop can
+  write ~6 M rows / week.
+- **`queries.log` schema** gains `scry_version` and `pid` fields
+  so usage analysis can disambiguate parallel callers and
+  correlate latency with code versions. Documented schema +
+  `jq` / DuckDB analysis recipes in USAGE.md "Ops log".
+- **`scry health`** now surfaces the `scry_version` that built
+  the index alongside the running binary's version. A mismatch
+  is a soft warning (rebuild recommended), not a failure.
+- **THEORY.md Chapter 14** — the LLM-agent surface (JSON-RPC,
+  MCP, token economy, persistence).
+- **THEORY.md Chapter 15** — scaling beyond the canonical
+  corpus, with concrete knobs for 3 M-file / 200 GB+
+  internal-master setups.
+
+### Fixed
+- **MCP tool-error envelope was double-encoded.** Found by
+  LLM-self-test: an `ask` against an index without embeddings
+  returned `content[0].text = "{\"error\":\"no embedding
+  sidecar…\"}"` — an LLM had to `json.parse` twice to find the
+  hint. Now unwraps to the bare message. Regression test
+  pinned.
+- **Java/C++ scope_path doubled the class's own name.** Pre-
+  704d917, every top-level class had `scope: [ClassName]` and
+  `fqn: "ClassName::ClassName"`. The parser fix shipped; this
+  release adds three `scope_regression_tests` (Java top-level,
+  Java nested, C++ top-level) pinning the contract so a
+  tree-sitter upgrade can't re-introduce the bug silently. Plus
+  the version-skew warning in `scry health` to surface stale-
+  index data built with the buggy older scry.
+- **Friendlier first-run error.** A user who runs `scry def Foo`
+  before ever building an index got `No such file or directory
+  (os error 2)`. Now they get a clear "no scry index at <path>"
+  + an actionable command to build one.
+- **TCP listener** now logs the actually-bound address
+  (`listener.local_addr()`) rather than the user-supplied
+  string. Matters when binding to port 0 — without this you
+  have no way to discover the resolved port.
+
+### Removed
+- **`scry mod NAME`** — pure sugar for `def NAME --kind soong`,
+  duplicated the API surface for marginal convenience. Use the
+  uniform `--kind` spelling instead.
+
+### Tests
+- 134 → **143 tests** across the workspace. New: scope-
+  regression suite (3 tests), MCP tool-error unwrap (1),
+  log rotation pure-helper (4), grep `--format` + outline
+  `--with-snippets` e2e blocks (4 assertions).
+
 ## [0.1.1] — 2026-05-16
 
 The release-polish drop: everything that should have been in v0.1.0
@@ -84,6 +157,7 @@ First tagged release. Full feature surface implemented and tested.
 - Zero clippy warnings under strict `[workspace.lints]` policy.
 - Pre-release discipline: no backward-compat shims carried.
 
-[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/fiveapplesonthetable/scry/releases/tag/v0.1.0

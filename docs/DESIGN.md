@@ -426,7 +426,6 @@ scry impls   IFACE
 scry overrides METHOD
 scry subtypes TYPE
 scry members  TYPE
-scry mod     NAME
 scry owner   PATH
 scry fuzzy   STR
 scry grep    PATTERN [filters...]   # rg-class speed
@@ -678,11 +677,14 @@ the status header reflects what shipped vs what was scoped down.
   f9a506f).
 - OWNERS parser → `scry owner PATH` (this commit).
 - Filters: `--in`, `--lang`, `--kind` shipped. `--module`,
-  `--owner` not shipped as filters but covered by `scry mod` and
-  `scry owner` sugar commands.
-- `scry mod`, `scry module-of`, `scry owner` shipped. ⏳ `scry
-  aidl-link`, `scry cflag` not shipped — same `def --kind` /
-  `ref --kind` story as Phase 2 sugar.
+  `--owner` not shipped as standalone filters; module info is
+  reachable via `def NAME --kind soong` and `scry module-of`,
+  ownership via `scry owner PATH`.
+- `scry module-of`, `scry owner` shipped. The earlier `scry mod`
+  sugar was removed in v0.1.2 — `def --kind soong` is the
+  uniform spelling. ⏳ `scry aidl-link`, `scry cflag` not
+  shipped — same `def --kind` / `ref --kind` story as Phase 2
+  sugar.
 - **Exit gate met for the core**.
 
 ### Phase 3.5 — AOSP platform configs ✅ shipped (parsers); ⏳ sugar commands

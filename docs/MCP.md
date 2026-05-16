@@ -101,8 +101,11 @@ just couldn't satisfy it. Cases:
   embeddings):
   ```json
   {"isError": true, "content": [{"type": "text",
-    "text": "{\"error\":\"no embedding sidecar — run `scry build-embeddings`\"}"}]}
+    "text": "no embedding sidecar — run `scry build-embeddings`"}]}
   ```
+  The bare error message is in `text` — clients (and LLMs reading
+  the content) don't need a second `json.parse()` to get the human
+  hint.
 
 ### Protocol-level errors (`error: {code, message}`)
 

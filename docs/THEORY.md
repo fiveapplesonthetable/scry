@@ -2646,7 +2646,7 @@ be right.
 |-----------------------------------|----------------------------------------|--------------------------------------|------------------------------|
 | query model                       | precomputed index, query-time read     | per-edit freshness                   | live editor integration      |
 | storage tier                      | mmap'd files, kernel page cache        | explicit cache control               | mlock'd hot path for QoS     |
-| index update                      | full rebuild                           | incremental                          | per-commit re-index          |
+| index update                      | selective-reparse + atomic swap (v0.1.1) | true in-place append-only writer  | hyper-scale corpora w/ tiny change rates |
 | trigram n                         | 3                                      | 2-byte queries excluded              | wider corpus, larger n       |
 | trigram posting position info     | file-level only                        | byte-level                           | exact-position queries       |
 | string dictionary                 | minimized FST                          | online updates                       | streaming new symbols        |
@@ -2677,3 +2677,278 @@ That's the L7 instinct in one paragraph: name the workload
 honestly, derive the constraints, pick the smallest design that
 satisfies them, and don't pay for capabilities the workload
 doesn't ask for.
+
+---
+
+## Chapter 14 — the LLM-agent surface (JSON-RPC, MCP, token economy)
+
+### 14.1 Why a separate agent interface at all
+
+scry has three classes of caller:
+
+1. **A human at a terminal.** Wants colored ASCII, friendly
+   error messages, sensible defaults. Latency tolerance: ~1 s.
+2. **A shell pipeline** (`scry grep | xargs ...`). Wants newline-
+   delimited rows, no envelope, exit codes that pipe right.
+3. **An LLM agent** (Claude, Cursor, custom LangGraph, ...).
+   Wants strict, schema-validated tool calls; structured replies
+   it can branch on without parsing prose; "is this an error or
+   a zero-result?" disambiguated at the protocol level. Token
+   cost matters more than wall-time for the agent's quality.
+
+A single output mode can't serve all three without compromise.
+scry exposes three on the same `serve_one_request` core:
+
+- **CLI** (`scry def`, `scry grep`, ...) for humans + shells.
+- **JSON-RPC** (`scry serve`) — newline-delimited requests on
+  stdin / Unix socket / TCP. Each request is
+  `{"id": N, "cmd": "def", "args": {...}}`, each reply
+  `{"id": N, "result": ...}` or `{"id": N, "error": "..."}`. The
+  long-lived form for shell agents that want to skip the per-
+  query mmap setup.
+- **MCP** (`scry mcp`) — the [Model Context Protocol] dialect of
+  JSON-RPC. Same tools, but wrapped in `tools/list` + `tools/call`
+  with JSON-Schema tool descriptors and `isError`-disciplined
+  responses. Drops directly into Claude Desktop, Cursor, Continue.
+
+[Model Context Protocol]: https://modelcontextprotocol.io
+
+### 14.2 The MCP protocol: what's load-bearing
+
+MCP is an opinionated dialect of JSON-RPC 2.0 that an LLM-host
+runtime understands without configuration. Three handshake
+messages establish the session:
+
+1. Client → Server `initialize` (requests a protocol version,
+   declares capabilities, names itself).
+2. Server → Client `initialize` reply (echoes the version it
+   supports, declares server capabilities, identifies itself).
+3. Client → Server `notifications/initialized` (one-way; no reply).
+
+After that, `tools/list` enumerates the surface, `tools/call`
+invokes one, `ping` is a liveness check. scry's MCP wrapper is
+~250 LOC; the bulk of the work was getting four things right:
+
+**a) Version negotiation per spec.** Per
+`§lifecycle/Version Negotiation`, the server MUST echo the
+client's requested version if it supports it, OTHERWISE reply
+with its own latest. scry supports `2024-11-05` → `2025-11-25`
+(the wire shape we care about is stable across that range; we
+just don't emit the optional newer fields). Hard-coding a
+version was a v0.1.0 bug — caught by LLM-self-test.
+
+**b) Tool-level vs protocol-level errors.** JSON-RPC `-32601`
+("method not found") says *the call didn't make it to a tool*.
+MCP's `isError: true` inside a successful result says *the tool
+ran, the call shape was fine, but the tool couldn't satisfy it*.
+The two are semantically distinct and most clients render them
+differently in their UI. scry sends `-32601` for unknown
+methods (`tools/foo`) and `isError: true` for tool-level
+failures (unknown tool name, missing arg, missing sidecar).
+
+**c) Required-arg validation.** The `inputSchema` on each tool
+declares required arguments. Without server-side enforcement, a
+client that omits or sends an empty string for `name` silently
+matches the empty needle and returns garbage. scry's
+`mcp_validate_required_args` rejects missing, null, and empty
+required args before they reach the tool body — and a unit test
+pins that the validator and the advertised schema can't drift
+apart.
+
+**d) Error-text unwrapping.** Tools emit their failures as
+`{"error": "<bare message>"}` in the result envelope. When
+wrapping that into MCP's `content[]`, the wrapper unwraps the
+inner string so the LLM reads the human-readable hint directly
+in `content[0].text` rather than having to `json.parse` it
+again. (Caught by the same LLM-self-test that surfaced version
+negotiation.)
+
+### 14.3 Token economy is a design constraint
+
+Every byte in a tool reply is a byte the agent's context window
+must hold. For an LLM with a 200k-token budget, a single 50KB
+grep reply costs ~12k tokens — six percent of the entire
+context for one tool call. scry's reply formats are tuned for
+this constraint:
+
+- **Default text output** is `path:line:col: snippet`, one line
+  per hit. Same shape as ripgrep — agents that already know
+  ripgrep's format learn nothing new.
+- **`--format=lines`** strips even the human-readable separator
+  to `path:line:col\tsnippet` — a tab-separated record per hit,
+  no JSON envelope. ~5-10× smaller than `--json` when "list
+  call sites of X" was the whole question.
+- **`--format=count`** emits one short line regardless of hit
+  count. The cheapest possible "is X referenced AT ALL?" reply.
+- **`outline --with-snippets N`** inlines the first N source
+  lines of each symbol so the agent doesn't need a second `def`
+  round-trip. Snippets clip to 200 chars/line to bound the
+  worst case.
+- **`def --budget BYTES`** stops emitting markdown blocks once
+  the cumulative byte count would exceed BYTES. The agent
+  controls its own token budget by passing the byte cap.
+- **`scry recall`** lets the agent ask "what have I already
+  searched this session?" rather than re-issuing the same query
+  and burning the same tokens twice.
+
+None of these are speculative — every one was added in response
+to a real token-overrun the AGENT_NOTES.md case studies named.
+
+### 14.4 Persistence for agent loops
+
+A naive agent shells out a fresh `scry` process per query. Each
+process pays ~50–100 ms of cold-open cost (mmap setup, FST page-
+in, manifest parse). For a tight loop ("did the change I made
+break callers of X? what about Y? and Z?") that overhead
+dominates.
+
+Three escape hatches, ordered by integration cost:
+
+1. **`scry serve --listen unix:/tmp/scry.sock`** — long-lived
+   daemon holding one `StoreReader` open. Each new client
+   connects, sends N requests over the same socket, disconnects.
+   Cold open paid once per daemon, not per query.
+2. **`scry serve --listen tcp:HOST:PORT`** — same, over TCP.
+   For language-runtime agents that find TCP cheaper than
+   Unix sockets. Bind to `127.0.0.1` or restrict via firewall —
+   no auth in either transport.
+3. **`scry mcp`** — stdio-only by spec, but the MCP host runtime
+   (Claude Desktop, Cursor) keeps the subprocess alive across
+   the session. Same one-warm-StoreReader benefit as serve.
+
+The shared core is `serve_one_request`: a pure function over
+`(StoreReader, request)` returning a JSON `Value`. Adding a new
+transport is one wiring file; the tool surface stays in lock-
+step automatically.
+
+### 14.5 Open questions on the agent surface
+
+- **Streaming results.** `serve` supports `stream: true` for
+  per-record incremental delivery; MCP currently doesn't (the
+  spec doesn't define streaming on `tools/call`). If an agent
+  hits 50k matching call sites, the right answer is to stream
+  the top-K then cut early. Today MCP forces materialization
+  of the full reply.
+- **Tool composition.** "Outline this file, then for each
+  method, call `callers` and tell me which ones have > 10
+  references" is three round-trips today. A compound-tool
+  primitive (`scry pipeline {...}`) would cut both latency and
+  tokens, but defining the pipeline grammar is hard to get
+  right without becoming a language.
+- **Authenticated MCP over network.** Today MCP is stdio-only
+  and the network transports (`serve --listen tcp:`) have no
+  auth. Multi-user agent hosting would want both.
+
+---
+
+## Chapter 15 — scaling beyond the canonical corpus
+
+scry's design assumes ~1M files. Real-world corpora can be
+larger — internal AOSP master with all vendor code is ~3M
+files, ~210GB source. This chapter is the honest accounting
+for what changes (and what doesn't) at 3× scale.
+
+### 15.1 What scales linearly
+
+The cost of indexing is dominated by tree-sitter parse time +
+file IO. Both are linear in file count and byte count. The
+13-min wall on 1M-files-70GB extrapolates to **~40 min on
+3M-files-210GB** at the same `--workers 16`, assuming you
+have the IO bandwidth (the indexer is IO-bound past worker
+~12 on this NVMe; see BENCHMARKS.md). With 32 workers and a
+parallel-IO storage backend, ~25 min is plausible.
+
+Sidecar sizes scale linearly too:
+
+| sidecar              | 1M files (live) | 3M files (estimated) |
+|----------------------|----------------:|---------------------:|
+| `files.bin`          | 103 MB          | ~310 MB              |
+| `symbols.bin`        | 2.7 GB          | ~8 GB                |
+| `refs.bin`           | 4.8 GB          | ~14 GB               |
+| `names.fst`          | 78 MB           | ~234 MB              |
+| `trigram_postings`   | 1.4 GB          | ~4.1 GB              |
+| total mmap surface   | ~10 GB          | ~30 GB               |
+
+Query latency stays sub-second up to several GB of mmap surface
+on a host with enough RAM to keep the FSTs hot (~1 GB of hot
+pages on the 1M-file corpus; ~3 GB on 3M).
+
+### 15.2 What needs revisiting at 3×
+
+- **`--mem-cap` default.** The shipped scripts pin
+  `MemoryMax=60G` for the indexer cgroup. At 3× corpus, peak
+  RSS during finalize crosses 60 G and the OOM-resume cycle
+  triggers. Bump to 90G–120G in production; the writer is
+  already streaming so per-batch peak is bounded, but the
+  finalize stage holds all chunk metadata briefly.
+- **Trigram FST.** The current single FST is 280 MB on 1M
+  files; ~850 MB on 3M. Sharding the FST per-root (one per
+  language family) keeps each cold-paged region small. Not
+  shipped — file an issue if you hit FST cold-page latency
+  measurably above 500 ms.
+- **Symbol ID stability.** `compute_id` is blake3(root_id ++
+  relpath ++ kind ++ scope_path ++ name ++ line). Collisions
+  are vanishingly unlikely at 8 GB of symbols, but if you index
+  *generated* files with similar shapes (e.g. protobuf
+  duplicates across 5 vendor subtrees) the same logical symbol
+  gets multiple ids. Mitigation: dedupe at the build profile
+  layer, or accept the redundancy.
+- **`scry serve` connection backlog.** The default `accept()`
+  loop is one-thread-per-connection. At ~50 concurrent agents,
+  consider a bounded thread pool. The Unix-socket transport
+  already handles this gracefully; TCP would benefit from
+  explicit backpressure.
+
+### 15.3 What does NOT scale
+
+- **The all-RAM mode of `StoreWriter::new`.** Reserved for
+  tests; holds every record in RAM until finalize. Never use
+  on a real corpus.
+- **`scry compact`.** Placeholder today; the in-place rewrite
+  isn't implemented. Until it is, "tombstoned" file_ids
+  accumulate forever. Workaround at 3× scale: full rebuild
+  weekly via `scry index --workers 32`; the 25-min cost is
+  acceptable as a maintenance window.
+- **Per-query trigram FST mmap.** Cold open on a 3× FST takes
+  longer to first-page-fault than the current single-shard
+  design implies. If you see > 2 s cold queries on 3M-files,
+  pre-warm the FST via `cat trigrams.fst > /dev/null` in your
+  service start script, or run a one-shot `scry stats` after
+  indexer finalize.
+
+### 15.4 Knobs you'll want at scale
+
+Set in your indexer invocation:
+
+```sh
+scry index ROOTS \
+  -o /mnt/index \
+  --workers 32 \
+  --max-file-bytes $((50 * 1024 * 1024)) \   # 50 MiB cap on generated headers
+  --mem-cap 120 \                            # 120 GB soft RSS ceiling
+  --flush-every 100000 \                     # larger batches = fewer chunks at 3×
+  --build-trigrams                           # always-on at 3M files (trigram win grows)
+```
+
+For the production daemon:
+
+```sh
+scry serve \
+  --index /mnt/index \
+  --listen unix:/run/scry.sock
+```
+
+with a systemd unit holding it under `MemoryMax=8G` (the reader
+itself is fixed-size; the cap is just to bound a pathological
+client). See `docs/OPERATIONS.md` for the full recipe.
+
+### 15.5 When to stop pushing scry
+
+If your corpus crosses ~10M files or ~1TB source, scry hits a
+single-host ceiling. The right answer at that point is sharded
+indexing — split by language or by repo, query each shard in
+parallel, merge results client-side. Sourcegraph's Zoekt is
+the existence proof; that's the design space scry doesn't try
+to compete in. Within the single-host envelope, 3-5M files is
+fine; beyond, the per-host RAM and the single-FST cold-page
+cost become the binding constraints.

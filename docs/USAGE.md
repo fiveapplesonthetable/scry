@@ -257,7 +257,32 @@ $ scry grep '\bZygoteInit\b' --regex --limit 2
 |       | `--workers N` / `-j`  | Rayon pool size for the per-file scan        |
 |       | `--max-file-bytes N`  | Skip files larger than N bytes (default 10 MiB) |
 |       | `--mem-cap N`         | Refuse to start if scan would exceed N GiB   |
-|       | `--json`              | NDJSON output                                |
+|       | `--json`              | NDJSON (one object per hit)                  |
+|       | `--format lines`      | `path:line:col\tsnippet`, one hit per line   |
+|       | `--format count`      | Just `N hits across M files` — no per-hit rows |
+
+### Compact output (`--format`)
+
+For agent loops that only need "is X referenced AT ALL?" the JSON
+envelope dominates the payload. `--format=lines` emits a rg-shaped
+tab-separated record per hit:
+
+```sh
+$ scry grep ZygoteInit --format=lines --limit 3
+/home/zim/dev/aosp/frameworks/base/cmds/app_process/app_main.cpp:92:20	virtual void onZygoteInit()
+/home/zim/dev/aosp/frameworks/base/cmds/app_process/app_main.cpp:336:48	    runtime.start("com.android.internal.os.ZygoteInit", args, zygote);
+/home/zim/dev/aosp/frameworks/base/core/java/android/app/AppOpsManager.java:100:18	import com.android.internal.os.ZygoteInit;
+```
+
+For "does this name exist anywhere" the cheapest form is
+`--format=count` — one short line regardless of hit count:
+
+```sh
+$ scry grep ZygoteInit --format=count --limit 10000
+50 hits across 27 files
+```
+
+`--json` and `--format` are mutually exclusive.
 
 ---
 
@@ -285,6 +310,29 @@ $ scry outline frameworks/base/cmds/app_process/app_main.cpp --limit 8
 `PATH` matches by suffix — `outline app_main.cpp` works too if the
 suffix is unique. Multiple matches print a disambiguation warning and
 pick the shortest match.
+
+### `--with-snippets N`
+
+For agent loops that usually follow `outline` with a per-symbol
+`def` to read the signature, pass `--with-snippets N` to inline
+the first N source lines of each symbol:
+
+```sh
+$ scry outline frameworks/base/.../Activity.java --with-snippets 2 --limit 3
+# /home/zim/dev/aosp/.../Activity.java  (Java)
+# 41 symbols
+   62:14   class         Activity  [Activity]
+       │ public class Activity extends ContextThemeWrapper
+       │         implements LayoutInflater.Factory2,
+  237:13   field         FRAGMENTS_TAG  [Activity]
+       │     private static final String FRAGMENTS_TAG = "android:fragments";
+  ...
+```
+
+JSON form adds a `snippet` field per symbol. Saves the second
+round-trip when "show me what's in this file AND what each thing
+looks like" was the whole question. Snippet lines are clipped to
+200 chars to bound token cost.
 
 ---
 
@@ -762,17 +810,98 @@ changing the sidecar layout or query API.
 
 ## Ops log
 
-Every CLI invocation appends one JSON line:
+Every CLI invocation appends one JSON line to `~/.scry/queries.log`
+(override via `SCRY_LOG=/path/to/log`). The line is a flat object
+suitable for `jq`, `DuckDB read_ndjson_auto`, BigQuery
+`NEWLINE_DELIMITED_JSON`, or `pandas.read_json(lines=True)`:
 
 ```sh
 $ tail -2 ~/.scry/queries.log
-{"ts":1778922191,"cmd":"def","query":"ActivityManagerService","hits":4,"shown":1,"files_total":1009166,"candidate_files":null,"elapsed_ms":321,"index":"/mnt/agent/scry-index"}
-{"ts":1778922192,"cmd":"grep","query":"Activity","hits":2,"shown":2,"files_total":1009166,"candidate_files":30482,"elapsed_ms":392,"index":"/mnt/agent/scry-index"}
+{"ts":1778922191,"cmd":"def","query":"ActivityManagerService","hits":4,"shown":1,"files_total":1009166,"candidate_files":null,"elapsed_ms":321,"index":"/mnt/agent/scry-index","scry_version":"0.1.2","pid":520994}
+{"ts":1778922192,"cmd":"grep","query":"Activity","hits":2,"shown":2,"files_total":1009166,"candidate_files":30482,"elapsed_ms":392,"index":"/mnt/agent/scry-index","scry_version":"0.1.2","pid":520994}
 ```
 
-Override path via `SCRY_LOG=/path/to/log`. The file is append-only;
-trim it yourself if it grows unbounded. The log is best-effort — a
-write failure never affects the query's exit status or stdout.
+### Fields
+
+| field            | meaning                                                                    |
+|------------------|----------------------------------------------------------------------------|
+| `ts`             | Unix-epoch seconds, UTC.                                                   |
+| `cmd`            | Subcommand (`def`, `grep`, `callers`, `outline`, …).                       |
+| `query`          | The pattern / name / path the user supplied.                               |
+| `hits`           | Total records matched before any `--limit` truncation.                     |
+| `shown`          | Records the caller actually rendered (after `--limit`).                    |
+| `files_total`    | Files in the index at query time.                                          |
+| `candidate_files`| Files surviving the trigram pre-filter (grep only); `null` otherwise.      |
+| `elapsed_ms`     | Wall-clock from CLI entry to log call.                                     |
+| `index`          | Absolute path of the index dir queried.                                    |
+| `scry_version`   | Version of the binary that ran the query (correlate perf with rollouts).   |
+| `pid`            | Process id (disambiguate parallel agent calls).                            |
+
+### Analyzing usage at scale
+
+Identify slow query patterns and which `cmd` to optimize:
+
+```sh
+# Slowest 10 invocations in the log:
+jq -s 'sort_by(.elapsed_ms) | reverse | .[0:10]' ~/.scry/queries.log
+
+# P95 latency per cmd:
+jq -s 'group_by(.cmd) | map({cmd: .[0].cmd,
+  p95: (sort_by(.elapsed_ms) | .[(length*0.95|floor)].elapsed_ms),
+  n: length})' ~/.scry/queries.log
+
+# Empty-result queries (suggest fuzzy / typo path):
+jq -c 'select(.hits == 0) | {ts, cmd, query}' ~/.scry/queries.log
+
+# Hits per cmd in the last day:
+jq -s --argjson cutoff $(date -d '1 day ago' +%s) \
+  'map(select(.ts >= $cutoff)) | group_by(.cmd) | map({cmd: .[0].cmd, n: length})' \
+  ~/.scry/queries.log
+
+# Version-skew check across a fleet (per-host log shipped centrally):
+jq -s 'group_by(.scry_version) | map({v: .[0].scry_version, n: length})' all-logs.jsonl
+```
+
+For DuckDB-driven dashboards:
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+SELECT cmd, COUNT(*) n, quantile(elapsed_ms, 0.95) p95_ms
+FROM read_ndjson_auto('~/.scry/queries.log')
+GROUP BY cmd ORDER BY p95_ms DESC;
+```
+
+### Operational notes
+
+The log is best-effort — a write failure never affects the
+query's exit status or stdout.
+
+**Built-in rotation.** Once the active log crosses
+`$SCRY_LOG_MAX_BYTES` (default `100MiB`), scry renames it to
+`<path>.1` (overwriting any prior `.1`) and starts a fresh file.
+Bounded total disk = 2 × the cap. Set `SCRY_LOG_MAX_BYTES=0` to
+disable rotation entirely.
+
+Why this matters: under a tight MCP loop (one query / 100 ms,
+24 h × 7 = ~6M queries × ~300 bytes/row ≈ 1.8 GB) the log would
+otherwise eat disk in days. With the default cap, you keep at
+most ~200 MB and roughly the last day or two of history per host.
+
+**Disabling the log entirely.** Set `SCRY_LOG=` (empty string).
+Useful for ephemeral MCP sessions where the activity log isn't
+load-bearing. With logging off, the stderr footer still prints
+(zero-disk-cost).
+
+**Custom paths / centralized logging.**
+
+```sh
+export SCRY_LOG=/var/log/scry/$USER.jsonl       # per-user under shared dir
+export SCRY_LOG_MAX_BYTES=$((500 * 1024 * 1024)) # 500 MiB cap
+```
+
+For multi-host fleets, ship the file via vector / filebeat /
+fluent-bit; the per-line JSON schema is stable across scry
+versions.
 
 ---
 

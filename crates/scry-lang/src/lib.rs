@@ -1405,3 +1405,71 @@ int BBinder::transact(int code) { return 0; }
         });
     }
 }
+
+#[cfg(test)]
+mod scope_regression_tests {
+    //! Pin the contract that a symbol's own enclosing declaration is
+    //! NOT pushed onto its scope_path. Pre-704d917, every top-level
+    //! Java class had scope_path = [ClassName] and FQN doubled to
+    //! `Foo::Foo`. The compute_scope check `n.id() != node.id()`
+    //! prevents the recursion; these tests catch any regression that
+    //! breaks that identity check (e.g. a tree-sitter upgrade that
+    //! changes node-id semantics).
+    use super::*;
+
+    #[test]
+    fn java_top_level_class_has_empty_scope() {
+        let src = br#"
+            package com.android.foo;
+            public class Foo {
+                public void bar() {}
+            }
+        "#;
+        let syms = extract(FileKind::Java, src).unwrap();
+        let foo = syms.iter().find(|s| s.name == "Foo" && s.kind == SymbolKind::Class)
+            .expect("Foo class extracted");
+        assert!(foo.scope_path.is_empty(),
+                "top-level class Foo must have empty scope; got {:?}", foo.scope_path);
+        let bar = syms.iter().find(|s| s.name == "bar" && s.kind == SymbolKind::Method)
+            .expect("bar method extracted");
+        assert_eq!(bar.scope_path, vec!["Foo".to_string()],
+                "method bar must be scoped under [Foo]; got {:?}", bar.scope_path);
+    }
+
+    #[test]
+    fn java_nested_class_has_outer_scope() {
+        let src = br#"
+            public class Outer {
+                public static class Inner {
+                    public void deep() {}
+                }
+            }
+        "#;
+        let syms = extract(FileKind::Java, src).unwrap();
+        let inner = syms.iter().find(|s| s.name == "Inner" && s.kind == SymbolKind::Class)
+            .expect("Inner extracted");
+        assert_eq!(inner.scope_path, vec!["Outer".to_string()],
+                "Inner must be scoped under [Outer], NOT [Outer, Inner]; got {:?}",
+                inner.scope_path);
+        let deep = syms.iter().find(|s| s.name == "deep")
+            .expect("deep extracted");
+        assert_eq!(deep.scope_path, vec!["Outer".to_string(), "Inner".to_string()],
+                "deep must be scoped under [Outer, Inner]; got {:?}",
+                deep.scope_path);
+    }
+
+    #[test]
+    fn cpp_top_level_class_has_empty_scope() {
+        let src = br#"
+            class Widget {
+            public:
+                void poke();
+            };
+        "#;
+        let syms = extract(FileKind::Cpp, src).unwrap();
+        let widget = syms.iter().find(|s| s.name == "Widget" && s.kind == SymbolKind::Class)
+            .expect("Widget extracted");
+        assert!(widget.scope_path.is_empty(),
+                "top-level class Widget must have empty scope; got {:?}", widget.scope_path);
+    }
+}

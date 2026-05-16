@@ -983,3 +983,315 @@ public class Binder {
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();
 }
+
+// ===========================================================================
+// TCP listener — covered separately so a network-restricted CI runner
+// can opt out via `-- --skip tcp_serve_roundtrip` without losing the
+// rest of the e2e suite.
+// ===========================================================================
+
+#[test]
+fn tcp_serve_roundtrip() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    // Build a fresh synthetic index dedicated to this test.
+    let base = std::env::temp_dir().join(format!("scry-tcp-e2e-{}", std::process::id()));
+    let src = base.join("src");
+    let idx = base.join("idx");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("Hello.java"),
+        "package x;\npublic class Hello {\n    public void wave() {}\n}\n").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("initial index for tcp test");
+    assert!(out.status.success(),
+            "tcp-test index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Spawn `scry serve --listen tcp:127.0.0.1:0` and parse the
+    // bound port from the listener's stderr line.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--listen", "tcp:127.0.0.1:0", "--index"])
+        .arg(&idx)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn().expect("spawn scry serve --listen tcp:");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut sreader = BufReader::new(stderr);
+    let mut announce = String::new();
+    sreader.read_line(&mut announce).expect("read announce line");
+    // Format: "[scry serve] listening on tcp:127.0.0.1:NNNNN\n"
+    let port: u16 = announce.split("tcp:127.0.0.1:")
+        .nth(1).and_then(|t| t.trim_end().parse().ok())
+        .unwrap_or_else(|| panic!("could not parse port from announce: {announce:?}"));
+
+    // Connect, send two requests, read two responses.
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .expect("connect to spawned tcp listener");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    writer.write_all(
+        b"{\"id\":1,\"cmd\":\"def\",\"args\":{\"name\":\"Hello\"}}\n"
+    ).unwrap();
+    writer.write_all(
+        b"{\"id\":2,\"cmd\":\"stats\",\"args\":{}}\n"
+    ).unwrap();
+    writer.flush().unwrap();
+    let mut buf = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut buf).expect("read response 1");
+    let mut buf2 = String::new();
+    reader.read_line(&mut buf2).expect("read response 2");
+
+    // Tear down the listener.
+    child.kill().ok();
+    child.wait().ok();
+
+    // Parse responses; both must have the matching id and a result.
+    let r1: serde_json::Value = serde_json::from_str(buf.trim())
+        .expect("response 1 is JSON");
+    assert_eq!(r1["id"].as_u64(), Some(1));
+    assert!(r1.get("result").is_some(),
+            "tcp response 1 must have a result: {r1}");
+    let r2: serde_json::Value = serde_json::from_str(buf2.trim())
+        .expect("response 2 is JSON");
+    assert_eq!(r2["id"].as_u64(), Some(2));
+
+    // Tee unread bytes into the void so the reader drops cleanly.
+    let mut sink = Vec::new();
+    let _ = reader.into_inner().take(1024).read_to_end(&mut sink);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+// ===========================================================================
+// Concurrent serve under load — 32 client threads × 10 queries each
+// against the same Unix-socket daemon. The mmap'd reader is shared
+// and immutable; this test pins that there are no synchronization
+// bugs around concurrent reads.
+// ===========================================================================
+
+#[test]
+fn unix_serve_concurrent_stress() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let base = std::env::temp_dir().join(format!("scry-cc-e2e-{}", std::process::id()));
+    let src = base.join("src");
+    let idx = base.join("idx");
+    let sock = base.join("scry.sock");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("Hello.java"),
+        "package x;\npublic class Hello {\n    public void wave() {}\n}\n").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("initial index for stress test");
+    assert!(out.status.success());
+
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--listen"])
+        .arg(format!("unix:{}", sock.display()))
+        .args(["--index"]).arg(&idx)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn().expect("spawn scry serve unix:");
+    // Wait for the announce line so we know the socket exists.
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut sreader = BufReader::new(stderr);
+    let mut announce = String::new();
+    sreader.read_line(&mut announce).expect("read announce line");
+    assert!(announce.contains("listening on unix:"),
+            "unexpected announce: {announce:?}");
+
+    // 32 threads × 10 queries each; every reply must parse, have a
+    // matching id, and a non-empty result for `def Hello`.
+    let n_threads = 32;
+    let queries_per_thread = 10;
+    let mut handles = Vec::with_capacity(n_threads);
+    for t in 0..n_threads {
+        let sock = sock.clone();
+        handles.push(std::thread::spawn(move || -> Result<usize, String> {
+            let stream = UnixStream::connect(&sock)
+                .map_err(|e| format!("thread {t} connect: {e}"))?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| format!("thread {t} timeout: {e}"))?;
+            let mut writer = stream.try_clone()
+                .map_err(|e| format!("thread {t} dup: {e}"))?;
+            let mut reader = BufReader::new(stream);
+            let mut ok = 0usize;
+            for q in 0..queries_per_thread {
+                let id = (t * 1000 + q) as u64;
+                let req = format!(
+                    "{{\"id\":{id},\"cmd\":\"def\",\"args\":{{\"name\":\"Hello\"}}}}\n");
+                writer.write_all(req.as_bytes())
+                    .map_err(|e| format!("thread {t} q{q} write: {e}"))?;
+                writer.flush()
+                    .map_err(|e| format!("thread {t} q{q} flush: {e}"))?;
+                let mut buf = String::new();
+                reader.read_line(&mut buf)
+                    .map_err(|e| format!("thread {t} q{q} read: {e}"))?;
+                let v: serde_json::Value = serde_json::from_str(buf.trim())
+                    .map_err(|e| format!("thread {t} q{q} parse: {e} body={buf:?}"))?;
+                if v["id"].as_u64() != Some(id) {
+                    return Err(format!("thread {t} q{q} id mismatch: got {v}"));
+                }
+                if v.get("result").and_then(|r| r.as_array()).map(Vec::is_empty) != Some(false) {
+                    return Err(format!("thread {t} q{q} empty result: {v}"));
+                }
+                ok += 1;
+            }
+            Ok(ok)
+        }));
+    }
+    let mut total_ok = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for h in handles {
+        match h.join() {
+            Ok(Ok(n)) => total_ok += n,
+            Ok(Err(e)) => failures.push(e),
+            Err(_) => failures.push("thread panicked".into()),
+        }
+    }
+    child.kill().ok();
+    child.wait().ok();
+    assert!(failures.is_empty(),
+            "{} of {} threads failed:\n{}",
+            failures.len(), n_threads, failures.join("\n"));
+    assert_eq!(total_ok, n_threads * queries_per_thread);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+// ===========================================================================
+// callers --precise with a malformed compile_commands.json. The test
+// asserts that scry fails CLEANLY (non-zero exit, recognizable error
+// message) without panicking or hanging — regardless of whether clangd
+// is present on the test runner.
+// ===========================================================================
+
+#[test]
+fn callers_precise_malformed_compile_commands() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let base = std::env::temp_dir().join(format!("scry-bad-cc-{}", std::process::id()));
+    let src = base.join("src");
+    let idx = base.join("idx");
+    std::fs::create_dir_all(&src).unwrap();
+    // Index needs a C++ symbol so callers_precise has something to
+    // anchor on. Without one it errors with "no definitions of ..."
+    // before ever touching compile_commands.json.
+    std::fs::write(src.join("a.cpp"),
+        "class Widget { public: void poke() {} };\n").unwrap();
+    // Deliberately malformed JSON — not even close to valid.
+    std::fs::write(src.join("compile_commands.json"),
+        "{ this is not json at all }").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("index for cc test");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Run with a wall-clock guard. If `scry callers --precise` were
+    // to hang on clangd parsing the malformed JSON, this loop would
+    // time out and we'd kill the child.
+    let start = Instant::now();
+    let mut child = Command::new(scry_bin())
+        .args(["callers", "Widget", "--precise", "--index"]).arg(&idx)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn callers --precise");
+    let mut exit_code = None;
+    while start.elapsed() < Duration::from_secs(30) {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => { exit_code = Some(s); break; }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    if exit_code.is_none() {
+        child.kill().ok();
+        panic!("`scry callers --precise` hung > 30 s on malformed compile_commands.json");
+    }
+    let out = child.wait_with_output().expect("collect output");
+    // Either we don't have clangd (error mentions clangd) or we do
+    // but the malformed cc.json prevented success — in both cases
+    // exit must be non-zero and stderr must explain why.
+    assert!(!out.status.success(),
+            "scry should NOT succeed on malformed compile_commands.json");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr);
+    assert!(
+        combined.contains("clangd")
+            || combined.contains("compile_commands")
+            || combined.contains("precise")
+            || combined.contains("no definitions"),
+        "error message should explain failure cleanly; got:\n{combined}",
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+// ===========================================================================
+// Parse-budget integration: set SCRY_PARSE_TIMEOUT_MS=1 (one
+// millisecond) on a synthetic pathological C++ file. The per-file
+// parse must time out, scry index must skip the file cleanly, and
+// the run as a whole must succeed (not panic, not hang).
+// ===========================================================================
+
+#[test]
+fn parse_timeout_skips_pathological_file() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let base = std::env::temp_dir().join(format!("scry-pt-{}", std::process::id()));
+    let src = base.join("src");
+    let idx = base.join("idx");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // A pathological 2 MB C++ file the grammar must plow through.
+    // Identical shape to the unit-test fixture in scry-lang.
+    let mut pathological = String::with_capacity(2_000_000);
+    for i in 0..30_000 {
+        pathological.push_str(&format!(
+            "template <class T{0}> struct S{0} {{ T{0} a, b, c, d, e; }};\n",
+            i,
+        ));
+    }
+    std::fs::write(src.join("evil.cpp"), &pathological).unwrap();
+
+    // A second normal file that MUST be picked up even though
+    // evil.cpp will time out.
+    std::fs::write(src.join("normal.cpp"),
+        "class Normal { public: void hello() {} };\n").unwrap();
+
+    let start = Instant::now();
+    let out = Command::new(scry_bin())
+        .env("SCRY_PARSE_TIMEOUT_MS", "1")        // 1 ms — guarantees abort
+        .args(["index"]).arg(&src).arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("scry index with tight parse budget");
+    let wall = start.elapsed();
+    assert!(out.status.success(),
+            "index must succeed even when individual files time out: {}",
+            String::from_utf8_lossy(&out.stderr));
+    // Index must finish in well under 60 s even though the pathological
+    // file alone could occupy tree-sitter for many seconds without
+    // the abort path.
+    assert!(wall < Duration::from_secs(60),
+            "index took {wall:?} — parse-budget abort path may be broken");
+
+    // The normal file's symbol must be queryable.
+    let v = query_def(&idx, "Normal");
+    let arr = v.as_array().expect("def returns array");
+    assert!(!arr.is_empty(),
+            "Normal must survive the budget-abort of evil.cpp: {v}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

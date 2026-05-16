@@ -609,6 +609,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Emit shell-completion script for the given shell to stdout.
+    /// Pipe to the shell's standard completion directory or source
+    /// inline. Example: `scry completions bash > /etc/bash_completion.d/scry`.
+    Completions {
+        /// Target shell. Accepts: bash, zsh, fish, powershell, elvish.
+        shell: clap_complete::Shell,
+    },
+    /// Emit a roff-formatted man page for `scry` to stdout. Pipe to
+    /// `gzip > /usr/local/share/man/man1/scry.1.gz` to install
+    /// system-wide.
+    Man,
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -730,7 +741,33 @@ fn main() -> Result<()> {
             cmd_build_embeddings(index, dim, chunk_lines, chunk_overlap, workers),
         Cmd::Ask { query, index, in_, limit, json } =>
             cmd_ask(query, index, in_, limit, json),
+        Cmd::Completions { shell } => cmd_completions(shell),
+        Cmd::Man => cmd_man(),
     }
+}
+
+/// Emit a shell-completion script for `shell` to stdout. Wraps
+/// `clap_complete::generate` against the live `Args` derivation —
+/// no manual sync needed when subcommands or flags change.
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    Ok(())
+}
+
+/// Emit a roff-formatted man page for `scry` (1) to stdout. Wraps
+/// `clap_mangen::Man` against the live `Args` derivation. Includes
+/// the top-level scry(1) page; per-subcommand pages can be derived
+/// from the same factory if a downstream packager wants them.
+fn cmd_man() -> Result<()> {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let man = clap_mangen::Man::new(cmd);
+    man.render(&mut std::io::stdout())
+        .map_err(|e| anyhow::anyhow!("render man page: {e}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4957,7 +4994,15 @@ fn serve_listener(reader: &StoreReader, spec: &str) -> Result<()> {
             use std::net::TcpListener;
             let listener = TcpListener::bind(addr)
                 .with_context(|| format!("bind tcp:{addr}"))?;
-            eprintln!("[scry serve] listening on tcp:{addr}");
+            // Print the actually-bound address — this matters when
+            // the caller passes port 0 ("OS picks one"): without
+            // logging the resolved port the user has no way to
+            // connect. Tests rely on parsing this line to discover
+            // the port.
+            let bound = listener.local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| addr.to_string());
+            eprintln!("[scry serve] listening on tcp:{bound}");
             for stream in listener.incoming() {
                 let stream = match stream {
                     Ok(s) => s,

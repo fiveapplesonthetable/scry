@@ -55,11 +55,7 @@ pub fn build_modgraph(kind: &str, root: &Path) -> Result<OutGraphV1> {
     match kind {
         "cargo" => cargo::build(root),
         "soong" => soong::build(root),
-        "kernel" => anyhow::bail!(
-            "--build kernel: not yet implemented (queued v0.1.12 follow-up). \
-             For now, hand-write module_graph.json or use --build cargo on \
-             Rust-only kernel subdirs."
-        ),
+        "kernel" => kernel::build(root),
         "gn" => anyhow::bail!(
             "--build gn: not yet implemented (queued v0.1.12 follow-up). \
              For now, hand-write module_graph.json from `gn gen --ide=json` \
@@ -250,6 +246,179 @@ mod cargo {
                     out.push(OutFile { path: s.to_string(), module_id });
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// kernel (Linux Kbuild)
+//
+// First-pass scope: each top-level subdir under the kernel source root
+// (drivers/, fs/, kernel/, mm/, net/, ipc/, security/, sound/, …) is a
+// module. Reachability is permissive (all-to-all within the kernel
+// linkage domain) because real EXPORT_SYMBOL-aware reachability needs
+// per-file symbol-export parsing — queued for a v0.1.13 follow-up.
+//
+// Even with permissive reachability, this delivers value: every
+// indexed file gets a meaningful module name (matching `drivers/net`,
+// `fs/btrfs`, `arch/x86`, …) that scry can surface in `--reachable`
+// diagnostics and that downstream tooling can use. When a follow-up
+// slice adds EXPORT_SYMBOL parsing + obj-m attribution, the file
+// attribution layer doesn't need to change — only the dep edges.
+// ---------------------------------------------------------------------
+
+mod kernel {
+    use super::*;
+
+    /// Top-level kernel source subdirs that the build system treats as
+    /// subsystem boundaries. We attribute every file under one of these
+    /// roots to a module named after the root. Anything outside this
+    /// list (e.g. `Documentation/`, `tools/`, `samples/`) is still
+    /// indexed but doesn't get a module attribution, which means the
+    /// `--reachable` filter passes it through unchanged.
+    const TOPLEVEL_SUBSYSTEMS: &[&str] = &[
+        "arch", "block", "certs", "crypto", "drivers", "fs", "include",
+        "init", "io_uring", "ipc", "kernel", "lib", "mm", "net",
+        "rust", "samples", "scripts", "security", "sound", "tools",
+        "usr", "virt",
+    ];
+
+    pub fn build(root: &Path) -> Result<OutGraphV1> {
+        let canon = root.canonicalize()
+            .with_context(|| format!("canonicalize kernel root {}", root.display()))?;
+        // Sanity check — kernel source root must have a `Makefile`
+        // and a `Kconfig` at top level. Catches the common mistake of
+        // pointing at a subsystem dir.
+        if !canon.join("Makefile").exists() || !canon.join("Kconfig").exists() {
+            anyhow::bail!(
+                "{}: doesn't look like a Linux kernel source root \
+                 (expected Makefile + Kconfig at top level)",
+                canon.display(),
+            );
+        }
+        // Modules: one per top-level subsystem that actually exists
+        // in this checkout. Some configs (tiny kernels, vendored
+        // forks) may omit subsystems we list as canonical.
+        let mut modules: Vec<OutModule> = Vec::new();
+        let mut subsys_to_id: HashMap<String, u32> = HashMap::new();
+        for sub in TOPLEVEL_SUBSYSTEMS {
+            if canon.join(sub).is_dir() {
+                let id = modules.len() as u32;
+                modules.push(OutModule {
+                    id,
+                    name: (*sub).to_string(),
+                    partition: Some("kernel".to_string()),
+                });
+                subsys_to_id.insert((*sub).to_string(), id);
+            }
+        }
+        if modules.is_empty() {
+            anyhow::bail!(
+                "{}: no recognized kernel subsystems found",
+                canon.display(),
+            );
+        }
+        // Edges: permissive — every subsystem reaches every other.
+        // In a static kernel build, any subsystem's non-static
+        // symbols are callable from any other. This produces a fully
+        // connected graph minus self-loops; `--reachable` becomes a
+        // useful filter only when external (non-kernel) callers exist
+        // in the same index. Real EXPORT_SYMBOL semantics ship in a
+        // follow-up (v0.1.13) along with obj-m awareness.
+        let mut deps: Vec<[u32; 2]> = Vec::new();
+        for i in 0..modules.len() {
+            for j in 0..modules.len() {
+                if i != j {
+                    deps.push([i as u32, j as u32]);
+                }
+            }
+        }
+        // File attribution: walk every subsystem dir, attributing
+        // .c/.h/.S/.rs files. The walk is shallow-recursive (no
+        // build-output exclusion needed — the kernel's `make
+        // mrproper` produces no .o files in source dirs).
+        let mut files: Vec<OutFile> = Vec::new();
+        for (sub, id) in &subsys_to_id {
+            walk_kernel_sources(&canon.join(sub), *id, &mut files);
+        }
+        Ok(OutGraphV1 { version: 1, modules, deps, files })
+    }
+
+    /// Walk a kernel subsystem subtree, emitting one OutFile per
+    /// source file (.c/.h/.S/.rs). Excludes generated dirs that
+    /// might appear in unclean trees.
+    fn walk_kernel_sources(dir: &Path, module_id: u32, out: &mut Vec<OutFile>) {
+        let rd = match std::fs::read_dir(dir) { Ok(rd) => rd, _ => return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name();
+            if let Some(n) = name.to_str() {
+                // Skip hidden + build-output dirs that occasionally
+                // leak into a "clean" tree.
+                if n.starts_with('.') || n == "build" || n == "obj" {
+                    continue;
+                }
+            }
+            if p.is_dir() {
+                walk_kernel_sources(&p, module_id, out);
+            } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if matches!(ext, "c" | "h" | "S" | "rs") {
+                    if let Some(s) = p.to_str() {
+                        out.push(OutFile { path: s.to_string(), module_id });
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rejects_non_kernel_root() {
+            let tmp = std::env::temp_dir().join(format!(
+                "scry-kernel-bad-{}", std::process::id(),
+            ));
+            std::fs::create_dir_all(&tmp).ok();
+            let err = build(&tmp).unwrap_err();
+            assert!(err.to_string().contains("doesn't look like a Linux kernel"),
+                    "expected kernel-root rejection, got: {err}");
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+
+        #[test]
+        fn synthetic_kernel_tree_produces_subsystem_modules() {
+            let tmp = std::env::temp_dir().join(format!(
+                "scry-kernel-fake-{}", std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            // Minimum kernel-root markers + two subsystems.
+            std::fs::write(tmp.join("Makefile"), "# fake\n").unwrap();
+            std::fs::write(tmp.join("Kconfig"),  "# fake\n").unwrap();
+            std::fs::create_dir_all(tmp.join("drivers/net")).unwrap();
+            std::fs::create_dir_all(tmp.join("fs/btrfs")).unwrap();
+            std::fs::write(tmp.join("drivers/net/dummy.c"), "int foo(void) { return 0; }\n").unwrap();
+            std::fs::write(tmp.join("drivers/net/dummy.h"), "int foo(void);\n").unwrap();
+            std::fs::write(tmp.join("fs/btrfs/btrfs.c"), "int bar(void) { return 0; }\n").unwrap();
+            std::fs::write(tmp.join("fs/btrfs/btrfs.rs"), "fn baz() {}\n").unwrap();
+
+            let g = build(&tmp).unwrap();
+            // Two subsystems present + the synthetic Makefile shouldn't count.
+            let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
+            assert!(names.contains(&"drivers"), "missing drivers: {names:?}");
+            assert!(names.contains(&"fs"), "missing fs: {names:?}");
+            assert_eq!(g.modules.len(), 2);
+            // Files: 2 in drivers (dummy.c, dummy.h), 2 in fs (btrfs.c, btrfs.rs).
+            assert_eq!(g.files.len(), 4, "got: {:?}", g.files);
+            // Reachability: dense (each pair reachable both ways).
+            assert_eq!(g.deps.len(), 2); // 2 modules → 2 directed edges
+            // Every module is marked "kernel" partition.
+            for m in &g.modules {
+                assert_eq!(m.partition.as_deref(), Some("kernel"));
+            }
+            std::fs::remove_dir_all(&tmp).ok();
         }
     }
 }

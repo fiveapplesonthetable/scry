@@ -440,9 +440,17 @@ fn cmd_index(
 ) -> Result<()> {
     if let Some(n) = workers {
         if n > 0 {
-            let _ = rayon::ThreadPoolBuilder::new()
+            if let Err(e) = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
-                .build_global();
+                .build_global()
+            {
+                // build_global errors if invoked a second time in one
+                // process (the global pool is set-once). For the CLI
+                // that's never a real bug (each invocation is a fresh
+                // process), but in a future in-process driver it would
+                // silently drop the --workers flag. Surface it.
+                eprintln!("[warn] rayon global pool already initialized: {e}; --workers ignored");
+            }
             eprintln!("[index] rayon pool: {} workers", n);
         }
     }
@@ -1514,7 +1522,9 @@ fn print_results_md(
     budget: Option<usize>,
 ) {
     let mut emitted_bytes: usize = 0;
-    for s in syms.iter().take(limit) {
+    let mut emitted_count: usize = 0;
+    let cap = syms.len().min(limit);
+    for s in syms.iter().take(cap) {
         let file = reader.files.get(s.file_id as usize);
         let path = file.map(|f| f.display_path(&reader.roots)).unwrap_or_default();
         let snippet = read_snippet(&path, s.line, 8);
@@ -1537,12 +1547,16 @@ fn print_results_md(
         );
         if let Some(b) = budget {
             if emitted_bytes + section.len() > b {
+                // Actually-correct remaining count: total - what we emitted.
+                // The previous expression (syms.len() - syms.iter().take_while(|_|false).count())
+                // was always syms.len() - 0, lying about the number omitted.
                 println!("\n_(budget {} bytes reached, {} more results omitted)_",
-                    b, syms.len().saturating_sub(syms.iter().take_while(|_| false).count()));
+                    b, cap.saturating_sub(emitted_count));
                 break;
             }
         }
         emitted_bytes += section.len();
+        emitted_count += 1;
         print!("{}", section);
     }
 }
@@ -1669,9 +1683,17 @@ fn cmd_grep(
 ) -> Result<()> {
     if let Some(n) = workers {
         if n > 0 {
-            let _ = rayon::ThreadPoolBuilder::new()
+            if let Err(e) = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
-                .build_global();
+                .build_global()
+            {
+                // build_global errors if invoked a second time in one
+                // process (the global pool is set-once). For the CLI
+                // that's never a real bug (each invocation is a fresh
+                // process), but in a future in-process driver it would
+                // silently drop the --workers flag. Surface it.
+                eprintln!("[warn] rayon global pool already initialized: {e}; --workers ignored");
+            }
         }
     }
     // Internal cap (no /proc polling). Each candidate file may temporarily
@@ -2181,7 +2203,9 @@ fn cmd_build_trigrams(
 ) -> Result<()> {
     if let Some(n) = workers {
         if n > 0 {
-            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+            if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(n).build_global() {
+                eprintln!("[warn] rayon global pool already initialized: {e}; --workers ignored");
+            }
             eprintln!("[trigrams] rayon pool: {} workers", n);
         }
     }
@@ -2397,7 +2421,11 @@ fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {
     let line_start = (last_nl + 1) as usize;
     let snippet = String::from_utf8_lossy(&bytes[line_start..line_end]).to_string();
     let snippet = if snippet.len() > 200 {
-        format!("{}…", &snippet[..200])
+        // Truncate at a char boundary — naive `&snippet[..200]` panics
+        // when the 200th byte falls mid-codepoint (real-world hit on
+        // UTF-8 source files with non-ASCII identifiers or comments).
+        let cut = (0..=200).rev().find(|i| snippet.is_char_boundary(*i)).unwrap_or(0);
+        format!("{}…", &snippet[..cut])
     } else {
         snippet
     };
@@ -2880,5 +2908,142 @@ mod tests {
                 "prefix should mention 'frameworks', got {:?}", p);
         assert!(s.iter().any(|l| l.windows(15).any(|w| w == b"ActivityManager")),
                 "suffix should mention 'ActivityManager', got {:?}", s);
+    }
+
+    // ---------------- Layer 2 resolution (resolve_one) ----------------
+    //
+    // resolve_one is the heart of the build-resolutions sidecar — it
+    // picks the def-id for each ref using same-lang preference and
+    // Java pkg/import narrowing. Until these tests it had zero
+    // assertions; a refactor of the narrowing rules would have shipped
+    // with no signal.
+
+    use std::collections::HashMap;
+    use scry_store::RefKind;
+
+    fn mk_def(id: u64, lang: scry_walker::FileKind, pkg: Option<&str>) -> ResolveDef {
+        ResolveDef { id, file_id: 0, lang, pkg: pkg.map(String::from) }
+    }
+    fn mk_ref(name: &str, lang: scry_walker::FileKind, file_id: u32) -> scry_store::RefRecord {
+        scry_store::RefRecord {
+            name: name.into(), kind: RefKind::Call, file_id,
+            byte_start: 0, byte_end: 0, line: 1, col: 1,
+            scope_path: vec![], lang, resolved_to: None,
+        }
+    }
+
+    #[test]
+    fn resolve_one_single_candidate_trivial() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Foo".into(), vec![mk_def(42, scry_walker::FileKind::Java, None)]);
+        let r = mk_ref("Foo", scry_walker::FileKind::Java, 0);
+        let mut n = 0u64;
+        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
+        assert_eq!(chosen, 42);
+        assert_eq!(n, 0, "single-cand shortcut shouldn't count as a Java-narrowed win");
+    }
+
+    #[test]
+    fn resolve_one_no_match_returns_zero() {
+        let by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        let r = mk_ref("Foo", scry_walker::FileKind::Java, 0);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 0);
+    }
+
+    #[test]
+    fn resolve_one_same_lang_preference_wins_over_cross_lang() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Foo".into(), vec![
+            mk_def(100, scry_walker::FileKind::Cpp, None),
+            mk_def(200, scry_walker::FileKind::Java, None),
+            mk_def(300, scry_walker::FileKind::Python, None),
+        ]);
+        let r = mk_ref("Foo", scry_walker::FileKind::Java, 0);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 200);
+    }
+
+    /// Java narrowing: file's package matches ONE candidate's package →
+    /// that candidate wins even when other same-lang Java candidates
+    /// exist. Counts as a "narrowed" win.
+    #[test]
+    fn resolve_one_java_same_package_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Activity".into(), vec![
+            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
+            mk_def(22, scry_walker::FileKind::Java, Some("android.app")),
+            mk_def(33, scry_walker::FileKind::Java, Some("com.third")),
+        ]);
+        let mut pkg = HashMap::new();
+        pkg.insert(5u32, "android.app".to_string());
+        let r = mk_ref("Activity", scry_walker::FileKind::Java, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &mut n), 22);
+        assert_eq!(n, 1, "same-package narrowing should bump counter");
+    }
+
+    /// Java narrowing: no same-package match, but an explicit
+    /// `import x.y.Foo;` resolves it.
+    #[test]
+    fn resolve_one_java_import_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Binder".into(), vec![
+            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
+            mk_def(22, scry_walker::FileKind::Java, Some("android.os")),
+        ]);
+        let mut imports = HashMap::new();
+        imports.insert(5u32, vec![("Binder".to_string(), Some("android.os".to_string()))]);
+        let r = mk_ref("Binder", scry_walker::FileKind::Java, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &mut n), 22);
+        assert_eq!(n, 1, "explicit-import narrowing should bump counter");
+    }
+
+    /// Wildcard `import x.y.*;` resolves any class in x.y.
+    #[test]
+    fn resolve_one_java_wildcard_import_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Binder".into(), vec![
+            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
+            mk_def(22, scry_walker::FileKind::Java, Some("android.os")),
+        ]);
+        let mut imports = HashMap::new();
+        imports.insert(5u32, vec![("*".to_string(), Some("android.os".to_string()))]);
+        let r = mk_ref("Binder", scry_walker::FileKind::Java, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &mut n), 22);
+        assert_eq!(n, 1);
+    }
+
+    /// java.lang fallback: name like "String" with no same-pkg or import
+    /// match should land on the java.lang.String candidate.
+    #[test]
+    fn resolve_one_java_lang_fallback() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("String".into(), vec![
+            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
+            mk_def(22, scry_walker::FileKind::Java, Some("java.lang")),
+        ]);
+        let r = mk_ref("String", scry_walker::FileKind::Java, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(n, 1, "java.lang fallback should bump counter");
+    }
+
+    /// When NO Java context narrows, falls back to the first same-lang
+    /// candidate (Layer 1 behavior). Counter should NOT bump.
+    #[test]
+    fn resolve_one_java_no_narrowing_fallback() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Foo".into(), vec![
+            mk_def(11, scry_walker::FileKind::Java, Some("com.other")),
+            mk_def(22, scry_walker::FileKind::Java, Some("com.third")),
+        ]);
+        let r = mk_ref("Foo", scry_walker::FileKind::Java, 5);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
+        assert_eq!(got, 11, "should pick first same-lang candidate");
+        assert_eq!(n, 0, "no narrowing happened");
     }
 }

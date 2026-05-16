@@ -644,14 +644,15 @@ impl StoreWriter {
                 Some(c) if !c.is_empty() => c,
                 _ => continue,
             };
-            // Prefer same-lang match; otherwise unique; otherwise first.
+            // Prefer same-lang. If no same-lang match, fall back to the
+            // first candidate (Layer 1 best-effort). The previous
+            // `or_else(|| if cands.len() == 1 { Some(cands[0]) } else { Some(cands[0]) })`
+            // was dead code — both branches returned the same value.
             let chosen = cands.iter()
                 .find(|&&idx| self.symbols[idx as usize].lang == r.lang)
                 .copied()
-                .or_else(|| if cands.len() == 1 { Some(cands[0]) } else { Some(cands[0]) });
-            if let Some(idx) = chosen {
-                r.resolved_to = Some(self.symbols[idx as usize].id);
-            }
+                .unwrap_or(cands[0]);
+            r.resolved_to = Some(self.symbols[chosen as usize].id);
         }
     }
 
@@ -1281,10 +1282,42 @@ fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let hms = secs % 86_400;
-    let (h, m, s) = (hms / 3600, (hms / 60) % 60, hms % 60);
-    format!("{secs}-unixT{h:02}:{m:02}:{s:02}Z")
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    epoch_to_iso8601(secs)
+}
+
+/// Convert seconds-since-Unix-epoch to a proper ISO-8601 timestamp.
+///
+/// Hand-rolled (no chrono dep) using Howard Hinnant's days-from-civil
+/// algorithm so the manifest's indexed_at field actually parses as
+/// ISO-8601. Replaced an earlier ad-hoc format `"{secs}-unixT{HH:MM:SS}Z"`
+/// which kept a unix epoch in the year position and wasn't ISO at all.
+fn epoch_to_iso8601(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let h = time_of_day / 3600;
+    let m = (time_of_day / 60) % 60;
+    let s = time_of_day % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Howard Hinnant's "days from civil" inverse: days since 1970-01-01
+/// → (year, month, day). Handles any year in the proleptic Gregorian
+/// calendar; widely used reference algorithm, see
+/// https://howardhinnant.github.io/date_algorithms.html .
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,8 +1600,7 @@ impl StoreReader {
 fn read_trigram_posting(buf: &[u8], off: u64) -> std::collections::HashSet<u32> {
     let start = off as usize;
     let mut out = std::collections::HashSet::new();
-    if start + 4 > buf.len() { return out; }
-    let count = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
+    let count = match read_u32_le(buf, start) { Some(n) => n as usize, None => return out };
     out.reserve(count);
     let mut p = start + 4;
     let mut prev: u32 = 0;
@@ -1623,16 +1655,27 @@ pub fn read_file_symbols_entry(data: &[u8], offsets: &[u8], file_id: u32) -> Vec
 
 fn read_posting(buf: &[u8], off: u64) -> Vec<u32> {
     let start = off as usize;
-    if start + 4 > buf.len() { return Vec::new(); }
-    let count = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
+    let count = match read_u32_le(buf, start) { Some(n) => n as usize, None => return Vec::new() };
     let mut v = Vec::with_capacity(count);
     let mut p = start + 4;
     for _ in 0..count {
-        if p + 4 > buf.len() { break; }
-        v.push(u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()));
+        match read_u32_le(buf, p) {
+            Some(n) => v.push(n),
+            None => break,
+        }
         p += 4;
     }
     v
+}
+
+/// Read a little-endian u32 from `buf` at `pos`, returning None for any
+/// out-of-bounds access. Single source of truth for the "bounds check
+/// then decode" pattern so a future refactor of the buffer-size guard
+/// can't reintroduce a `try_into().unwrap()` panic on a corrupt mmap.
+#[inline]
+fn read_u32_le(buf: &[u8], pos: usize) -> Option<u32> {
+    let arr: [u8; 4] = buf.get(pos..pos + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(arr))
 }
 
 
@@ -1987,6 +2030,40 @@ mod tests {
     /// ARE the canonical definition in their domain, so a generic Class
     /// of the same name shouldn't crowd them out when an agent is
     /// explicitly looking for a build module or AIDL interface.
+    /// Epoch 0 = the canonical ISO-8601 sample. Pins the algorithm
+    /// against the bug that was actually shipped (a non-ISO string of
+    /// shape `"{secs}-unixT{HH:MM:SS}Z"` with a unix epoch in the year
+    /// position).
+    #[test]
+    fn epoch_iso_known_values() {
+        assert_eq!(epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch_to_iso8601(86_400), "1970-01-02T00:00:00Z");
+        // A famous "year 2000" round number: 2000-01-01T00:00:00Z =
+        // 946684800. Catches off-by-one in the days-from-civil math.
+        assert_eq!(epoch_to_iso8601(946_684_800), "2000-01-01T00:00:00Z");
+        // 2026-05-16T04:51:51Z = the live index's finalize timestamp.
+        assert_eq!(epoch_to_iso8601(1_778_907_111), "2026-05-16T04:51:51Z");
+    }
+
+    /// Leap-year handling — Feb 29 must exist in 2024, not 2023.
+    #[test]
+    fn epoch_iso_leap_year() {
+        // 2024-02-29T00:00:00Z = 1709164800
+        assert_eq!(epoch_to_iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+        // 2023-03-01T00:00:00Z = 1677628800 (no Feb 29 in 2023)
+        assert_eq!(epoch_to_iso8601(1_677_628_800), "2023-03-01T00:00:00Z");
+    }
+
+    /// Pre-epoch dates should still produce a syntactically valid
+    /// ISO-8601 string (negative year prefixed with - if needed).
+    /// We don't promise correctness, just non-panic.
+    #[test]
+    fn epoch_iso_pre_epoch_does_not_panic() {
+        let s = epoch_to_iso8601(-86_400);
+        assert!(s.ends_with('Z'), "got {s}");
+        assert_eq!(s, "1969-12-31T00:00:00Z");
+    }
+
     #[test]
     fn rank_aosp_kinds_keep_boost() {
         let aidl = mk_symbol("IFoo", SymbolKind::AidlInterface, FileKind::Aidl, vec![]);

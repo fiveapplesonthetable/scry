@@ -5833,7 +5833,11 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "Find all references to a name (any ref kind — call, ctor, \
              type-use, import, inherit). Use `callers` for the common \
              call-only case. Pass `format: 'count'` if you only need \
-             the total.",
+             the total. Set `reachable: true` to drop refs in modules \
+             that can't actually link to a definition of `name` per \
+             the build graph — eliminates cross-module false positives \
+             on AOSP / kernel / GN-based projects when the index was \
+             built with `scry index --build <system>`.",
             obj(&["name"], serde_json::json!({
                 "name": {"type": "string"},
                 "lang": lang_prop,
@@ -5842,6 +5846,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "in":   in_prop,
                 "limit": limit_prop,
                 "format": format_count_prop,
+                "reachable": {"type": "boolean", "default": false,
+                    "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar."},
             })),
         ),
         tool(
@@ -5849,13 +5855,17 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "Find call sites of NAME (shorthand for `ref` with \
              kind=call). For 'does X get called anywhere?' or 'how \
              many?', pass `format: 'count'` — it returns just `N \
-             callers` and costs almost nothing.",
+             callers` and costs almost nothing. Set `reachable: true` \
+             to drop call sites in modules the build graph proves \
+             can't actually invoke a definition of NAME.",
             obj(&["name"], serde_json::json!({
                 "name": {"type": "string"},
                 "lang": lang_prop,
                 "in":   in_prop,
                 "limit": limit_prop,
                 "format": format_count_prop,
+                "reachable": {"type": "boolean", "default": false,
+                    "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present."},
             })),
         ),
         tool(
@@ -6458,8 +6468,16 @@ fn serve_one_request<W: std::io::Write>(
                 .map(|n| n as u32).unwrap_or(2);
             serve_fuzzy_with_distance(reader, arg_str("substr"), in_, dist, limit)
         }
-        "ref"     => serve_ref(reader, arg_str("name"), lang, kind, in_, limit),
-        "callers" => serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit),
+        "ref"     => {
+            let reachable = args.get("reachable")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable)
+        }
+        "callers" => {
+            let reachable = args.get("reachable")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable)
+        }
         "grep"    => {
             let ci = args.get("case_insensitive")
                 .and_then(serde_json::Value::as_bool)
@@ -6692,8 +6710,23 @@ fn serve_ref(
     kind: Option<&str>,
     in_: Option<&str>,
     limit: usize,
+    reachable: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
+    // Precompute the callee module set ONCE if --reachable + sidecar.
+    // Same shape as cmd_ref's filter. No graph or no defs → no filter
+    // (callers pass through unchanged; the daemon doesn't emit a
+    // diagnostic line per request to keep the wire-stream clean).
+    let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
+        r.module_graph.as_ref().map(|mg| {
+            r.lookup_exact(name)
+                .iter()
+                .filter_map(|s| mg.module_of_file(s.file_id))
+                .collect()
+        })
+    } else {
+        None
+    };
     let mut out = Vec::new();
     for rr in r.lookup_refs_exact(name).into_iter() {
         if out.len() >= limit { break; }
@@ -6704,6 +6737,18 @@ fn serve_ref(
             if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
         }
         if !file_in_prefix(r, rr.file_id, prefix) { continue; }
+        // Reachability filter: keep only refs whose owning module can
+        // reach at least one module that defines `name`.
+        if let (Some(mg), Some(cms)) = (r.module_graph.as_ref(), callee_modules.as_ref()) {
+            if !cms.is_empty() {
+                if let Some(caller_mod) = mg.module_of_file(rr.file_id) {
+                    if !cms.iter().any(|cm| mg.is_reachable(caller_mod, *cm)) {
+                        continue;
+                    }
+                }
+                // Unattributed caller: pass through (same as CLI).
+            }
+        }
         out.push(ref_to_json(r, &rr));
     }
     serde_json::Value::Array(out)

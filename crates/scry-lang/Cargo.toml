@@ -29,6 +29,8 @@ tree-sitter-html = "0.23"        # perfetto UI template files + general HTML
 tree-sitter-css = "0.25"         # perfetto UI stylesheets
 tree-sitter-scss = "1.0"         # perfetto UI uses SCSS — the dominant style format
 tree-sitter-md = "0.5"           # markdown headings — docs/*.md navigation
+tree-sitter-toml-ng = "0.7"      # Cargo.toml + pyproject.toml — package + dep names
+tree-sitter-yaml = "0.7"         # CI workflows + k8s + ansible — job/step/key names
 
 [lints]
 workspace = true

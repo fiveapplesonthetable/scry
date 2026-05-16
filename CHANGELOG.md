@@ -7,6 +7,47 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-05-16
+
+The "walked-but-not-symbolized" cleanup. Two more tree-sitter parsers
+wired so the small leftover gap on scry's own repo (and any Rust
+project + any CI-driven repo) goes away.
+
+### Added
+
+- **TOML** (`tree-sitter-toml-ng 0.7`) — captures table headers
+  (`[package]`, `[dependencies]`) as Module-kind plus every key
+  (`name`, `serde`, `anyhow`, ...) as Field-kind. `scry def serde
+  --lang Toml` lands on every Cargo.toml that declares it.
+- **YAML** (`tree-sitter-yaml 0.7`) — captures every mapping key
+  as Field-kind. `scry def jobs --lang Yaml` lands on
+  `.github/workflows/ci.yml`; `scry def lint --lang Yaml` lands
+  on the job that defines it. Covers GitHub Actions workflows,
+  k8s manifests, ansible playbooks with the same generic flow.
+- `short_lang()` chips for `toml` and `yaml` so result rows
+  display `(field toml)` instead of `(field ?)`.
+
+### Improved — coverage of scry's own repo
+
+| file kind  | v0.1.7 syms | v0.1.8 syms |
+|------------|------------:|------------:|
+| Toml       |           0 |         213 |
+| Yaml       |           0 |          40 |
+| License    |           0 |           0 |
+
+License files (LICENSE, NOTICE, METADATA) stay unsymbolized
+intentionally — they're legalese / attribution text, not
+structured. The 0-symbol entry in coverage output isn't a gap;
+it's "scry knows what this file is and has nothing useful to
+extract from it." That distinction is the whole point of running
+the classifier even when the parser stays a no-op.
+
+### Migration notes
+
+None. Existing AOSP indexes can be reused; rebuild only if you
+want symbol coverage on TOML / YAML files that were
+walked-but-not-symbolized before.
+
 ## [0.1.7] — 2026-05-16
 
 The "works on non-Android repos too" drop. Wires six new tree-sitter

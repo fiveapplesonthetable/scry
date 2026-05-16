@@ -157,6 +157,8 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
         Css => css_spec(),
         Scss => scss_spec(),
         Markdown => markdown_spec(),
+        Toml => toml_spec(),
+        Yaml => yaml_spec(),
         _ => return Ok(Vec::new()),
     };
     let mut syms = extract_with(spec, source)?;
@@ -1343,6 +1345,87 @@ fn markdown_spec() -> &'static LangSpec {
     })
 }
 
+// ---------------------------------------------------------------------------
+// TOML — Cargo.toml + pyproject.toml + Cargo workspace manifests.
+//
+// Captures table headers (`[package]`, `[dependencies]`, etc.) and the
+// LEFT-HAND-SIDE of every key-value pair. That covers what an agent
+// asking after a Rust project would want: "where is `serde` declared
+// as a dep", "what's the workspace member set" — both fall out of
+// indexing TOML keys.
+// ---------------------------------------------------------------------------
+
+fn toml_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_toml_ng::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (table (dotted_key) @name) @def.module
+                (table (bare_key) @name) @def.module
+                (table_array_element (dotted_key) @name) @def.module
+                (table_array_element (bare_key) @name) @def.module
+                (pair (bare_key) @name) @def.field
+                (pair (dotted_key) @name) @def.field
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(document) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.module", SymbolKind::Module),
+                ("def.field", SymbolKind::Field),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &["table", "table_array_element"],
+            package_node_kind: None,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// YAML — GitHub Actions workflows, k8s manifests, ansible playbooks.
+//
+// Captures top-level keys as Module-kind. The high-value pattern is
+// `jobs: <name>: ...` in a workflow file: `scry def my-job-name`
+// should land on the workflow that defines it.
+// ---------------------------------------------------------------------------
+
+fn yaml_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_yaml::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (block_mapping_pair key: (flow_node) @name) @def.field
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(stream) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.field", SymbolKind::Field),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &["block_mapping_pair"],
+            package_node_kind: None,
+        }
+    })
+}
+
 // ===========================================================================
 // REF QUERIES — one per language. Phase 2 focuses on call sites + ctors +
 // inheritance edges, which gives us callers/callees/impls cheaply. Generic
@@ -1654,6 +1737,8 @@ pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
         Box::new(FnAdapter { name: "ts-css", kinds: &[FileKind::Css], f: ts_unified }),
         Box::new(FnAdapter { name: "ts-scss", kinds: &[FileKind::Scss], f: ts_unified }),
         Box::new(FnAdapter { name: "ts-markdown", kinds: &[FileKind::Markdown], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-toml", kinds: &[FileKind::Toml], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-yaml", kinds: &[FileKind::Yaml], f: ts_unified }),
     ]
 }
 
@@ -2266,6 +2351,65 @@ int BBinder::transact(int code) { return 0; }
         for must_have in &["app-root", "submit-btn", "search-input"] {
             assert!(names.contains(must_have),
                     "html attribute value `{must_have}` missing; got: {names:?}");
+        }
+    }
+
+    /// TOML extraction — Cargo.toml table headers + key names. The
+    /// canonical case is "where is `serde` declared as a workspace
+    /// dep" — answered by `scry def serde --lang Toml`.
+    #[test]
+    fn toml_cargo_manifest_extraction() {
+        let src = br#"
+            [package]
+            name = "my-crate"
+            version = "0.1.0"
+
+            [dependencies]
+            serde = "1"
+            anyhow = "1"
+
+            [dependencies.tokio]
+            version = "1"
+            features = ["full"]
+
+            [workspace]
+            members = ["a", "b"]
+        "#;
+        let syms = extract(FileKind::Toml, src).unwrap();
+        let names: std::collections::HashSet<&str> =
+            syms.iter().map(|s| s.name.as_str()).collect();
+        for must_have in &["package", "dependencies", "workspace", "name", "version", "serde", "anyhow"] {
+            assert!(names.contains(must_have),
+                    "toml extraction missing `{must_have}`; got: {names:?}");
+        }
+    }
+
+    /// YAML extraction — top-level + nested mapping keys. The
+    /// canonical case is "find the job named `lint` in
+    /// .github/workflows/ci.yml" — answered by `scry def lint --lang Yaml`.
+    #[test]
+    fn yaml_workflow_extraction() {
+        let src = br#"
+name: CI
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: run-tests
+        run: cargo test --release
+"#;
+        let syms = extract(FileKind::Yaml, src).unwrap();
+        let names: std::collections::HashSet<&str> =
+            syms.iter().map(|s| s.name.as_str()).collect();
+        for must_have in &["jobs", "lint", "test", "steps", "runs-on"] {
+            assert!(names.contains(must_have),
+                    "yaml extraction missing `{must_have}`; got: {names:?}");
         }
     }
 

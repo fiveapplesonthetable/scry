@@ -6570,6 +6570,8 @@ fn short_lang(k: FileKind) -> &'static str {
         Css => "css",
         Scss => "scss",
         Markdown => "md",
+        Toml => "toml",
+        Yaml => "yaml",
         Proto => "proto",
         Aidl => "aidl",
         _ => "?",

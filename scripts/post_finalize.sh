@@ -64,7 +64,6 @@ REPO=/mnt/agent/scry
 CRATES=$(ls -d "$REPO"/crates/*/ 2>/dev/null | awk -F/ '{print "  - " $(NF-1)}')
 DOC_FILES=$(ls "$REPO"/docs/*.md "$REPO"/README.md 2>/dev/null | awk -F/ '{print "  - " $(NF-1) "/" $NF}' | sed "s|/mnt/agent/scry/||")
 LATEST_COMMITS=$(git -C "$REPO" log --oneline -10 2>/dev/null)
-LANG_COUNTS=$($SCRY stats --index "$INDEX" --json 2>/dev/null | head -200 || echo "(stats unavailable)")
 
 # Sample queries to demonstrate the API to whoever reads the email.
 SAMPLES=$(

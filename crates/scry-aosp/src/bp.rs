@@ -138,10 +138,18 @@ impl<'a> Parser<'a> {
                         if self.peek() == b']' { self.advance(); break; }
                         if self.at_end() { return out; }
                         // Each element is itself a "value" but we flatten.
+                        let pos_before = self.pos;
                         let inner = self.parse_value(name_field);
                         out.extend(inner);
                         self.skip_ws_and_comments();
                         if self.peek() == b',' { self.advance(); }
+                        // Defensive: parse_value's `_ => return out` branch
+                        // returns without advancing on unrecognized chars. If
+                        // we then aren't on `,` or `]`, this loop would spin
+                        // forever on the same byte. Force progress.
+                        if self.pos == pos_before {
+                            self.advance();
+                        }
                     }
                 }
                 b'{' => {

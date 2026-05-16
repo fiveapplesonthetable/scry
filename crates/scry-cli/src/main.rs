@@ -772,9 +772,9 @@ fn cmd_index(
             // BEFORE parse; if the cgroup OOM-kills us mid-parse, the next
             // --resume run reads this and adds the file to oom_skiplist
             // (self-healing — pathological files exclude themselves after
-            // one OOM, instead of looping forever on the same batch).
-            // Parallel small files don't bother — too much contention on
-            // the sidecar write, and the small bucket rarely OOMs alone.
+            // one OOM, instead of looping forever on the same batch). When
+            // workers=1 (the safest defensive config), small-bucket files
+            // also mark_attempted since there's no concurrent write contention.
             let last_attempted_path = writer.tmp_dir.as_ref()
                 .map(|t| t.join("last_attempted.txt"));
             let process_one = |rf: &RawFile, fe: &FileEntry, mark_attempted: bool| {
@@ -823,7 +823,10 @@ fn cmd_index(
             };
 
             // 1. Parallel pass over small files (the bulk of the corpus).
-            small_items.par_iter().for_each(|(rf, fe)| process_one(rf, fe, false));
+            // At workers=1 there's no concurrent write race on last_attempted,
+            // so small files mark too — needed to identify single-worker OOMs.
+            let small_marks_attempted = rayon::current_num_threads() == 1;
+            small_items.par_iter().for_each(|(rf, fe)| process_one(rf, fe, small_marks_attempted));
 
             // 2. Serial pass over big files — guarantees ONE big tree-sitter
             //    parse in flight at a time. Peak transient RAM ≈ one big

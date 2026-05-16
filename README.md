@@ -1,29 +1,40 @@
 # scry
 
-Semantic code search and cross-reference engine for AOSP and the Linux kernel.
+Semantic code search and cross-reference engine for AOSP and the Linux
+kernel. A single static Rust binary that indexes ~1 million source
+files in ~13 minutes, then answers symbol, reference, and content
+queries at interactive latency — **30–45× faster than ripgrep**,
+**>700× faster than POSIX grep** — with one warm `mmap`'d index.
 
-**Status:** Phases 0–4 implemented + resumable production indexing. Live
-on `/mnt/agent/scry-index` against `~/dev/aosp` + `/mnt/agent/dev/linux`.
-Full design in `docs/DESIGN.md`; production knob + systemd recipe in
-`docs/OPERATIONS.md`.
+Coverage:
+- **Source languages**: C, C++, Java, Kotlin, Rust, Go, Python, shell,
+  assembly — via tree-sitter.
+- **Build systems**: Android.bp (Soong), Android.mk, Bazel BUILD,
+  Kconfig, Makefile, CMake, GN, Gradle, *.bzl.
+- **Android platform config**: aconfig flags, init.rc services,
+  SELinux .te policy, AndroidManifest.xml components,
+  `api/*.txt` SDK surface.
+- **IPC**: AIDL interfaces + methods + parcelables, HIDL interfaces.
+- **Ownership**: OWNERS files.
 
-## What it is
+Driven by both humans at a terminal and LLM agents over JSON-RPC.
+Every CLI query has a `--json` variant; `scry serve` reads
+newline-delimited JSON on stdin and replies on stdout. Every CLI
+invocation prints a stats footer and appends one line to
+`~/.scry/queries.log` for after-the-fact introspection.
 
-A single static Rust binary, ripgrep-fast, build-aware code intelligence
-tool that indexes a full AOSP checkout (~350 GB / ~925k files) plus a
-Linux kernel tree (~37 GB / ~85k files) — combined **~1.01M files / ~70 GB
-of indexed source** (the rest is binaries / build outputs the walker
-filters out) — and answers semantic and substring queries at interactive
-latency on a warm mmap index.
-
-Coverage spans source languages (C, C++, Java, Kotlin, Rust, Go, Python,
-shell), build systems (Android.bp, Android.mk, Bazel BUILD, Kconfig,
-Makefile), Android-specific configs (aconfig flags, init.rc services,
-SELinux .te policy, AndroidManifest.xml components), and AIDL interfaces.
-
-Built to be driven by **both humans at a terminal and LLM agents over
-JSON-RPC** — every query has a `--json` variant and `scry serve` reads
-newline-delimited JSON on stdin.
+Docs:
+- `docs/USAGE.md` — exhaustive examples with real output from the live
+  AOSP master + Linux 7.0-rc7 index.
+- `docs/DESIGN.md` — full design, including the cgroup envelope that
+  keeps indexing inside its memory budget.
+- `docs/OPERATIONS.md` — production knobs + the systemd recipe for
+  long-running indexing.
+- `docs/FAST_PATH.md` — the trigram + lazy-mmap optimization design.
+- `docs/BENCHMARKS.md` — measured numbers vs ripgrep and POSIX grep,
+  index-time vs `--workers` matrix, perf-stat decomposition.
+- `docs/DEVELOPMENT.md` — workspace layout, how to test / bench /
+  contribute, and remaining roadmap items.
 
 ## Quickstart
 
@@ -137,19 +148,24 @@ grep / prefix / fuzzy / outline still work.
 
 ## Architecture (one paragraph)
 
-A parallel `ignore`-crate walker classifies files into 38 categories
-(source langs / build files / AOSP configs / OWNERS), then rayon pumps
-each file through either a tree-sitter parser (for source languages) or
-a tiny custom parser (for `.bp`, `.aidl`, `.aconfig`, `.te`, `.rc`,
-`AndroidManifest.xml`, `OWNERS`). Definitions and references are
-collected with scope paths, blake3-hashed for stable ids, and resolved
-by name to candidate definitions (best-effort Layer 1). The index ships
-as bincode columns + an FST over symbol names + posting lists, all
-atomically swapped into place. The `StoreReader` mmaps everything for
-zero-copy reads.
+A parallel `ignore`-crate walker classifies files into 40 categories
+(source langs, build files, AOSP configs, OWNERS), then rayon pumps
+each file through either a tree-sitter parser (for source languages,
+with a per-file 60 s parse budget enforced via the `parse_with_options`
+progress callback) or a tiny custom parser (for `.bp`, `.aidl`,
+`.aconfig`, `.te`, `.rc`, `AndroidManifest.xml`, `OWNERS`, …).
+Definitions and references are collected with scope paths,
+blake3-hashed for stable ids; a streaming finalize pass builds the
+per-record byte-offset sidecars, the FSTs over symbol + ref names,
+the file → symbol-ids reverse index, the trigram FST for grep, and
+the Layer 2 ref-to-def resolution sidecar — all written to `.tmp/`
+and atomically renamed into place. The `StoreReader` `mmap`'s every
+sidecar; queries decode one record at a time without ever loading
+the full 10 GB columnar payload.
 
-See `docs/DESIGN.md` for the full design and `notes/AOSP_SCALE.md` for
-the source-tree scale numbers.
+See `docs/DESIGN.md` for the full design including the cgroup
+envelope, `docs/FAST_PATH.md` for the trigram + lazy-reader
+optimizations, and `docs/BENCHMARKS.md` for measured numbers.
 
 ## Why not just $existing_tool
 

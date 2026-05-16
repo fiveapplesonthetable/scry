@@ -1,0 +1,225 @@
+# scry — development
+
+How the workspace is laid out, how to build / test / benchmark, and
+where the not-yet-finished work lives.
+
+## Workspace layout
+
+```
+scry/
+├── crates/
+│   ├── scry-walker/   gitignore-aware parallel file walker + FileKind classification
+│   ├── scry-lang/     tree-sitter integration + per-language symbol/ref queries
+│   ├── scry-aosp/     AOSP-specific format parsers (Soong, AIDL, HIDL, OWNERS,
+│   │                  aconfig, init.rc, sepolicy, AndroidManifest.xml, Bazel,
+│   │                  CMake, GN, api/*.txt — 12 parsers, each in its own file)
+│   ├── scry-store/    on-disk index format: bincode columns + FST + trigram
+│   │                  postings + lazy/mmap reader. THE ONLY crate with unsafe.
+│   └── scry-cli/      the `scry` binary: CLI + JSON-RPC + build-* utilities
+├── docs/
+│   ├── DESIGN.md      as-built design (cgroup envelope, format, ranking)
+│   ├── OPERATIONS.md  knobs + recipe for production indexing
+│   ├── USAGE.md       exhaustive command examples with real output
+│   ├── BENCHMARKS.md  matrix numbers + perf decomposition
+│   ├── FAST_PATH.md   trigram + lazy-reader optimization design
+│   └── DEVELOPMENT.md (you are here)
+├── scripts/
+│   ├── run_index.sh          production indexer wrapper (cgroup + resume)
+│   ├── await_finalize.sh     post-finalize watcher; fires post_finalize.sh
+│   ├── post_finalize.sh      build-offsets + build-file-symbols + build-trigrams
+│   │                         + build-resolutions + validate + bench + email
+│   ├── validate.sh           sanity-check every command against a real index
+│   ├── bench_grep.sh         scry-vs-rg-vs-grep latency matrix
+│   ├── bench_index.sh        index-time vs --workers matrix
+│   ├── auto_recover.sh       5-min cron that restarts the indexer on failure
+│   └── status_email.sh       hourly status email cron
+├── Cargo.toml         workspace manifest
+└── README.md          one-paragraph project pitch + quickstart
+```
+
+## Build
+
+The whole workspace builds with stable Rust 1.73+ (uses `div_ceil`,
+otherwise vanilla 2021 edition):
+
+```sh
+. ./env.sh                  # CARGO_HOME / RUSTUP_HOME under /mnt/agent/cargo
+cargo build --release       # ~20 s cold, ~5 s incremental
+```
+
+Two pre-existing warnings (a dead-code `write_postings_and_fst` in
+scry-store and an `unused_assignments` in scry-aosp::aidl) are
+tolerated; everything else compiles clean.
+
+## Test
+
+```sh
+cargo test --release        # 68 tests, ~1 s total
+```
+
+Breakdown:
+
+| crate       | tests | what they cover                                                                                              |
+|-------------|------:|--------------------------------------------------------------------------------------------------------------|
+| scry-aosp   |    15 | one happy-path per format parser (Soong, AIDL, HIDL, OWNERS, aconfig, init.rc, sepolicy, manifest, Bazel, CMake, GN, api-txt) plus the `cmake_comments_with_unbalanced_paren` regression that took down indexing |
+| scry-cli    |    18 | regex literal extractor (7), file_symbols + lazy + epoch_iso (refactor-out tests), Layer 2 resolve_one (8 branches), Java pkg/import narrowing edge cases |
+| scry-cli e2e |   1 | end-to-end: synthetic 5-file tree → real `scry index` subprocess → `def` / `outline` / `grep` / `callers` queries via CLI and JSON-RPC, assertions on every shape |
+| scry-lang   |     6 | per-language minimal extraction (Java / Cpp / Rust), parse_with_options abort, Kotlin extension receiver scoping |
+| scry-store  |    23 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder (round-trip / OOB / empty / truncated), rank_score tier ordering, epoch_to_iso8601 known values + leap year, trigram extraction + intersection |
+| scry-walker |     2 | FileKind classification |
+
+The e2e test is the strongest single signal — it runs the just-built
+binary against a synthetic source tree, exercises writer + reader +
+CLI + JSON-RPC + Layer 2 resolution + trigram grep, finishes in 0.4 s.
+Any cross-crate API drift surfaces there.
+
+### Adding a test
+
+For a new file format parser: add a fixture inline as `&str`, parse
+it, assert on the resulting `RawSymbol` list. See
+`crates/scry-aosp/src/bp.rs` for the pattern.
+
+For a new tree-sitter language pattern: add a minimal source snippet,
+call `extract(FileKind::X, src)`, assert the names + scope_path. See
+the `kotlin_extension_receiver_scoping` test for a working example
+that pinned a real bug (compute_scope was pushing a function's own
+name onto its own scope_path).
+
+For a new end-to-end behavior: extend `crates/scry-cli/tests/e2e.rs`.
+The fixture builder is `build_index(src, idx)`; add files there and
+call the new query through `Command::new(scry_bin())`.
+
+## Bench
+
+```sh
+# Query latency (scry vs rg vs POSIX grep) — best-of-3 for scry+rg,
+# single run for POSIX grep (otherwise dominates total time).
+SCRY_INDEX_DIR=/mnt/agent/scry-index ./scripts/bench_grep.sh
+# BENCH_INCLUDE_GREP=0 to skip POSIX grep for quick iteration.
+
+# Index throughput vs --workers — sweep against the Linux kernel
+# corpus (~85k files; full AOSP is too slow for a matrix sweep).
+./scripts/bench_index.sh
+# BENCH_ROOT=/path BENCH_WORKERS="4 16 32" BENCH_MEM_CAP=16 to tune.
+```
+
+See `docs/BENCHMARKS.md` for the captured numbers + interpretation.
+
+## CPU / memory profile
+
+```sh
+# perf stat summary (no symbols needed)
+/usr/bin/perf stat -e task-clock,cycles,instructions,cache-references,\
+cache-misses,page-faults,context-switches \
+  target/release/scry grep "ActivityManagerService" --index /mnt/agent/scry-index
+
+# perf record with full call graph (DWARF unwind; binary should not be stripped)
+RUSTFLAGS="-C strip=none -C force-frame-pointers=yes" cargo build --release
+/usr/bin/perf record --call-graph dwarf -o grep.perf.data -- \
+  target/release/scry grep "..." --index /mnt/agent/scry-index
+/usr/bin/perf report -i grep.perf.data --stdio --no-children --percent-limit 1.0
+```
+
+Default release build has stripped symbols; for hot-path investigation
+add the RUSTFLAGS above and re-build.
+
+## Operations log
+
+Every CLI invocation appends one JSON line to `~/.scry/queries.log`
+(override with `SCRY_LOG=…`). Useful for:
+
+- "What did I search for in this session?"
+- "Which queries were slow?" — sort by `elapsed_ms`.
+- "Which queries returned zero hits?" — filter `hits == 0`.
+
+```sh
+# Slow queries:
+jq -s 'sort_by(-.elapsed_ms)[:10]' ~/.scry/queries.log
+
+# Empty results:
+jq -c 'select(.hits == 0)' ~/.scry/queries.log
+
+# Throughput per command kind:
+jq -r '.cmd' ~/.scry/queries.log | sort | uniq -c | sort -rn
+```
+
+## Code quality posture
+
+- `#![forbid(unsafe_code)]` on every crate EXCEPT scry-store. See the
+  module-level "Unsafe policy" doc at the top of
+  `crates/scry-store/src/lib.rs` for the contract. All 11 mmap call
+  sites go through one `safe_mmap(path)` helper.
+- Result-first error handling. The few `unwrap`s remaining are either
+  on hardcoded tree-sitter queries (panic = malformed compile-time
+  string, programmer bug) or on slice bounds that the immediately-
+  preceding check guarantees (provably safe).
+- Defensive decoders. Every on-disk reader (read_posting,
+  read_trigram_posting, read_file_symbols_entry) returns an empty
+  Vec / None on truncated or out-of-range input rather than panicking.
+  The lone `read_u32_le` helper is the single source of truth for
+  bounded LE-u32 reads.
+- Bench-protected hot paths. The trigram pre-filter has tests pinning
+  the intersection-by-smallest-first invariant; the lazy reader has
+  random-access round-trip tests. A future refactor that subtly
+  breaks either gets caught at `cargo test`.
+
+## What's left (real follow-ups, not blockers)
+
+The project is in production use against the live AOSP + Linux index;
+everything in `README.md` and `USAGE.md` works. The following items
+exist but aren't critical-path:
+
+- **Incremental indexing.** Today every run is a full re-parse. A
+  per-file mtime-based incremental pass would save the ~13 min cost
+  when a single AOSP module changes. Requires per-file digest in the
+  index format.
+- **Layer 2: wider language coverage.** The build-resolutions sidecar
+  has a Java-aware narrowing path (same-package → explicit import →
+  wildcard import → java.lang fallback). Kotlin and C++ have the
+  framework in place but no language-specific narrowing yet — the
+  fallback to "first same-lang candidate" is what they get.
+- **MCP server wrapper.** `scry serve` is stdin/stdout JSON-RPC; an
+  MCP wrapper would expose the same surface to any MCP-aware client.
+  Mechanical port; nothing in the core needs to change.
+- **`posix_fadvise(WILLNEED)` on grep candidate lists.** The perf
+  decomposition in `BENCHMARKS.md` shows the dominant cost is
+  page-faulting cold mmap'd file contents (1.37 s sys vs 0.6 s user
+  on the 680 ms test query). Pre-faulting could shave another
+  30-50% off the cold-cache case. Single syscall per file.
+- **Subprocess-per-parse isolation.** A single rogue tree-sitter
+  parse can't OOM the host (parse_with_options + cgroup MemoryMax
+  catch it), but it can still chew CPU for the budgeted 60 s. A
+  subprocess-per-parse model would let us SIGKILL just the bad
+  worker. Significant work; mitigated by the existing safeguards.
+- **More AOSP-specific kinds.** ArtCompiler annotations, SDK
+  extension version stamps, AIDL versioning — there are corners of
+  AOSP that would have niche but real LLM use. Add one parser per
+  format, mirror what `crates/scry-aosp/src/sepolicy.rs` does.
+
+None of these are blocking real LLM-agent use today; the next item
+to actually start is "whichever delivers the most leverage for an
+agent task you currently run scry for."
+
+## Contributing
+
+The standard Rust loop:
+
+```sh
+. ./env.sh
+cargo fmt
+cargo build --release
+cargo test --release
+```
+
+A change is mergeable when:
+- `cargo test --release` is green workspace-wide.
+- New behavior has at least one assertion pinning it (a per-crate
+  unit test, or an extension to `tests/e2e.rs`).
+- The L7 review heuristics in this doc still hold: no new unsafe
+  outside scry-store, no `.unwrap()` on user/FS input without a
+  defensive guard, on-disk format additions are backwards-compatible
+  via the optional-sidecar pattern (see `file_symbols_mmap`,
+  `ref_resolutions_mmap`).
+- If the change touches CLI shape, `docs/USAGE.md` is updated to
+  reflect the new flag / command with at least one real-output
+  example.

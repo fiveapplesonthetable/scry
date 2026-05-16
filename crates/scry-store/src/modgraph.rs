@@ -111,59 +111,46 @@ impl ModuleGraph {
     pub fn from_json_v1(
         v: ModuleGraphJsonV1,
         total_files: usize,
+        resolve_file_id: impl FnMut(&str) -> Option<u32>,
+    ) -> Self {
+        Self::from_json_v1_with_cache(v, total_files, resolve_file_id, None)
+    }
+
+    /// Same as [`from_json_v1`] but consults an on-disk reachability
+    /// bitmap cache. The cache stores the full Warshall closure
+    /// (the ~1GB hot loop) keyed by a hash bound to the input. On
+    /// hit we skip Warshall entirely and proceed straight to file
+    /// attribution; on miss we compute as usual AND write the cache
+    /// for the next reader. The Warshall closure is the only slow
+    /// part of [`from_json_v1`] — everything else is sub-second
+    /// even on AOSP-scale graphs.
+    pub fn from_json_v1_with_cache(
+        v: ModuleGraphJsonV1,
+        total_files: usize,
         mut resolve_file_id: impl FnMut(&str) -> Option<u32>,
+        cache: Option<ReachCache<'_>>,
     ) -> Self {
         let modules = v.modules;
         let n_modules = modules.len();
         let stride = n_modules.div_ceil(64);
-        // Allocate the reachability bitmap. Start with the
-        // reflexive closure (every module reaches itself) and the
-        // direct edges; we'll compute the transitive closure below.
-        let mut reach = vec![0u64; n_modules * stride.max(1)];
-        for m in &modules {
-            set_bit(&mut reach, stride, m.id as usize, m.id as usize);
-        }
-        for [from, to] in &v.deps {
-            let (from, to) = (*from as usize, *to as usize);
-            if from == to || from >= n_modules || to >= n_modules {
-                continue;
-            }
-            set_bit(&mut reach, stride, from, to);
-        }
-        // Transitive closure via repeated dep-frontier propagation.
-        // For each module `from`, OR in the reach-set of every
-        // module currently reachable. Repeat until stable. This is
-        // Warshall's algorithm in bitmap form (O(n³/64), but n
-        // is in the thousands and the per-row OR is wide-SIMD-
-        // friendly, so it's plenty fast for AOSP-scale graphs).
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for from in 0..n_modules {
-                // Snapshot the current row (avoid borrow conflict
-                // while ORing in other rows).
-                let snapshot: Vec<u64> = reach[from * stride..(from + 1) * stride].to_vec();
-                for (w, &word) in snapshot.iter().enumerate() {
-                    let mut bits = word;
-                    while bits != 0 {
-                        let to = w * 64 + bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        if to >= n_modules || to == from {
-                            continue;
-                        }
-                        for k in 0..stride {
-                            let new = reach[from * stride + k] | reach[to * stride + k];
-                            if new != reach[from * stride + k] {
-                                reach[from * stride + k] = new;
-                                changed = true;
-                            }
-                        }
+
+        let reach = match cache.as_ref().and_then(|c| c.try_load(n_modules, stride)) {
+            Some(loaded) => loaded,
+            None => {
+                let reach = compute_reach_bitmap(&modules, &v.deps, stride);
+                if let Some(c) = cache.as_ref() {
+                    if let Err(e) = c.write(&reach, n_modules, stride) {
+                        eprintln!(
+                            "[modgraph] failed to write reach cache to {}: {e} \
+                             (queries still work; next open will re-Warshall)",
+                            c.path.display(),
+                        );
                     }
                 }
+                reach
             }
-        }
+        };
 
-        // Build the file→module table.
         let mut file_module = vec![None; total_files];
         for fa in &v.files {
             if let Some(fid) = resolve_file_id(&fa.path) {
@@ -264,6 +251,128 @@ impl ModuleGraph {
 
 fn set_bit(reach: &mut [u64], stride: usize, from: usize, to: usize) {
     reach[from * stride + (to / 64)] |= 1u64 << (to % 64);
+}
+
+/// Compute the reachability bitmap via bitmap-Warshall. Extracted
+/// from the constructor so the cache path can skip it. O(n³/64)
+/// but the per-row OR is SIMD-friendly; ~30s on AOSP's 91k modules,
+/// which is exactly why we cache it on disk.
+fn compute_reach_bitmap(
+    modules: &[Module],
+    deps: &[[u32; 2]],
+    stride: usize,
+) -> Vec<u64> {
+    let n_modules = modules.len();
+    let mut reach = vec![0u64; n_modules * stride.max(1)];
+    for m in modules {
+        set_bit(&mut reach, stride, m.id as usize, m.id as usize);
+    }
+    for [from, to] in deps {
+        let (from, to) = (*from as usize, *to as usize);
+        if from == to || from >= n_modules || to >= n_modules { continue; }
+        set_bit(&mut reach, stride, from, to);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for from in 0..n_modules {
+            let snapshot: Vec<u64> = reach[from * stride..(from + 1) * stride].to_vec();
+            for (w, &word) in snapshot.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let to = w * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if to >= n_modules || to == from { continue; }
+                    for k in 0..stride {
+                        let new = reach[from * stride + k] | reach[to * stride + k];
+                        if new != reach[from * stride + k] {
+                            reach[from * stride + k] = new;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    reach
+}
+
+/// On-disk cache for the reachability bitmap. The bitmap dominates
+/// `ModuleGraph` construction cost on AOSP-scale graphs (Warshall
+/// is ~30s; everything else is sub-second), so caching it shaves
+/// the same 30s off every cold `--reachable` query.
+///
+/// File layout (little-endian):
+///   bytes  0..  9   magic = b"scryREAC1"
+///   bytes  9.. 13   format version (u32)
+///   bytes 13.. 21   n_modules (u64)
+///   bytes 21.. 29   stride (u64)
+///   bytes 29.. 61   binding hash (32 bytes) — bound to the
+///                   producing module_graph.json's contents
+///   bytes 61..      raw u64 bitmap (n_modules * stride * 8 bytes)
+///
+/// On load we verify magic + version + binding hash + dimensions.
+/// Any mismatch is silent: load returns None and the caller falls
+/// back to a full Warshall compute (and writes a fresh cache).
+pub struct ReachCache<'a> {
+    pub path: &'a std::path::Path,
+    /// Binding hash from the input. Typically `blake3(module_graph.json)`;
+    /// any 32-byte value works as long as it changes when the graph
+    /// changes. Stored in the cache header and compared on load.
+    pub binding_hash: [u8; 32],
+}
+
+const REACH_CACHE_MAGIC: &[u8; 9] = b"scryREAC1";
+const REACH_CACHE_VERSION: u32 = 1;
+const REACH_CACHE_HEADER_LEN: usize = 9 + 4 + 8 + 8 + 32;
+
+impl ReachCache<'_> {
+    /// Attempt to load the bitmap. Returns None on any mismatch
+    /// (missing file, wrong magic / version / hash / dims). The
+    /// caller treats all these the same: recompute Warshall.
+    fn try_load(&self, n_modules: usize, stride: usize) -> Option<Vec<u64>> {
+        let bytes = std::fs::read(self.path).ok()?;
+        if bytes.len() < REACH_CACHE_HEADER_LEN { return None; }
+        if &bytes[..9] != REACH_CACHE_MAGIC { return None; }
+        let version = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+        if version != REACH_CACHE_VERSION { return None; }
+        let cached_n = u64::from_le_bytes(bytes[13..21].try_into().ok()?) as usize;
+        let cached_stride = u64::from_le_bytes(bytes[21..29].try_into().ok()?) as usize;
+        if cached_n != n_modules || cached_stride != stride { return None; }
+        if bytes[29..61] != self.binding_hash { return None; }
+        let payload_bytes = n_modules.checked_mul(stride)?.checked_mul(8)?;
+        let payload = bytes.get(REACH_CACHE_HEADER_LEN..REACH_CACHE_HEADER_LEN + payload_bytes)?;
+        // Decode the raw u64 LE words.
+        let mut reach = Vec::with_capacity(n_modules * stride);
+        for chunk in payload.chunks_exact(8) {
+            reach.push(u64::from_le_bytes(chunk.try_into().ok()?));
+        }
+        Some(reach)
+    }
+
+    /// Atomically write the cache. Uses tmp + rename so a partial
+    /// write doesn't leave a corrupt file behind.
+    fn write(&self, reach: &[u64], n_modules: usize, stride: usize) -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = self.path.with_extension("bin.tmp");
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(f);
+        w.write_all(REACH_CACHE_MAGIC)?;
+        w.write_all(&REACH_CACHE_VERSION.to_le_bytes())?;
+        w.write_all(&(n_modules as u64).to_le_bytes())?;
+        w.write_all(&(stride as u64).to_le_bytes())?;
+        w.write_all(&self.binding_hash)?;
+        for &word in reach {
+            w.write_all(&word.to_le_bytes())?;
+        }
+        w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, self.path)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +507,87 @@ mod tests {
         assert!(g.is_reachable(0, 1));
         assert!(!g.is_reachable(1, 0));
         assert_eq!(g.modules[0].partition.as_deref(), Some("system"));
+    }
+
+    /// Build a 3-module graph A → B → C, write its reach bitmap
+    /// to disk via ReachCache, round-trip-load it, and assert
+    /// the bitmap matches.
+    #[test]
+    fn reach_cache_roundtrip_loads_same_bitmap() {
+        let tmp_dir = std::env::temp_dir().join(format!("scry-reachcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cache_path = tmp_dir.join("reach.bin");
+        let json = ModuleGraphJsonV1 {
+            version: 1,
+            modules: vec![m(0, "A"), m(1, "B"), m(2, "C")],
+            deps: vec![[0, 1], [1, 2]],
+            files: vec![],
+        };
+        let binding_hash = *blake3::hash(b"v1").as_bytes();
+
+        // First build: cache miss → compute Warshall, write cache.
+        let cache = ReachCache { path: &cache_path, binding_hash };
+        let g1 = ModuleGraph::from_json_v1_with_cache(json, 0, |_| None, Some(cache));
+        assert!(g1.is_reachable(0, 2), "A reaches C transitively");
+        assert!(cache_path.exists(), "first build must write the cache");
+
+        // Second build: same hash → cache hit. Use a JSON with the
+        // SAME shape (deps don't matter once cache hits) but flip
+        // the deps to confirm the loader actually used the cached
+        // bitmap (if it recomputed it would lose A → C).
+        let json2 = ModuleGraphJsonV1 {
+            version: 1,
+            modules: vec![m(0, "A"), m(1, "B"), m(2, "C")],
+            deps: vec![],       // recompute would give NO transitive reach
+            files: vec![],
+        };
+        let cache2 = ReachCache { path: &cache_path, binding_hash };
+        let g2 = ModuleGraph::from_json_v1_with_cache(json2, 0, |_| None, Some(cache2));
+        assert!(g2.is_reachable(0, 2),
+            "cache hit should preserve the A→C edge from g1");
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    // Local clone helper for tests (kept inside the test module
+    // so it doesn't add an impl after the test module — clippy
+    // bans that as "items after a test module").
+    fn clone_json(j: &ModuleGraphJsonV1) -> ModuleGraphJsonV1 {
+        ModuleGraphJsonV1 {
+            version: j.version,
+            modules: j.modules.clone(),
+            deps: j.deps.clone(),
+            files: j.files.clone(),
+        }
+    }
+
+    /// A cache built for a different binding hash must be ignored.
+    /// Confirms automatic invalidation when module_graph.json
+    /// content changes.
+    #[test]
+    fn reach_cache_wrong_binding_hash_is_ignored() {
+        let tmp_dir = std::env::temp_dir().join(format!("scry-reachhash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cache_path = tmp_dir.join("reach.bin");
+        let json = ModuleGraphJsonV1 {
+            version: 1,
+            modules: vec![m(0, "A"), m(1, "B"), m(2, "C")],
+            deps: vec![[0, 1], [1, 2]],
+            files: vec![],
+        };
+        let cache1 = ReachCache { path: &cache_path, binding_hash: *blake3::hash(b"v1").as_bytes() };
+        let _g1 = ModuleGraph::from_json_v1_with_cache(clone_json(&json), 0, |_| None, Some(cache1));
+
+        // Open with a DIFFERENT hash + empty deps: should recompute,
+        // and the recomputed bitmap reflects empty deps (no A→C).
+        let json_empty = ModuleGraphJsonV1 { deps: vec![], ..json };
+        let cache2 = ReachCache { path: &cache_path, binding_hash: *blake3::hash(b"v2").as_bytes() };
+        let g2 = ModuleGraph::from_json_v1_with_cache(json_empty, 0, |_| None, Some(cache2));
+        assert!(!g2.is_reachable(0, 2),
+            "wrong binding hash should force recompute; with empty deps A doesn't reach C");
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
     }
 }

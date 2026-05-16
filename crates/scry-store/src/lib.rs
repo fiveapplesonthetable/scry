@@ -546,6 +546,11 @@ impl StorePaths {
     /// Powers `--precise` queries that filter results by build-graph
     /// reachability instead of name-match alone.
     pub fn module_graph_json(&self) -> PathBuf { self.root.join("module_graph.json") }
+    /// On-disk cache for the Warshall reachability bitmap derived
+    /// from `module_graph.json`. ~1GB on AOSP. Skips the ~30s
+    /// Warshall compute on cold opens; invalidated automatically
+    /// when the source JSON changes (binding hash mismatch).
+    pub fn module_graph_reach(&self) -> PathBuf { self.root.join("module_graph_reach.bin") }
     /// Optional Path B sidecar: per-symbol clang USRs from
     /// `scry-clang-index`. Present when the user has run the helper
     /// against a compile_commands.json. v0.1.13+.
@@ -1877,9 +1882,21 @@ impl StoreReader {
                 .map(|fe| (fe.display_path(&self.roots), fe.id))
                 .collect();
             let total_files = self.files.len();
-            Some(modgraph::ModuleGraph::from_json_v1(v, total_files, |p| {
-                path_to_id.get(p).copied()
-            }))
+            // Hash the raw JSON bytes (cheap on blake3 — ~30ms for
+            // 256MB) so we can bind a reach cache to this specific
+            // source. If module_graph.json changes, the hash flips
+            // and the old cache is silently ignored on next open.
+            let binding_hash: [u8; 32] = *blake3::hash(&raw).as_bytes();
+            let cache_path = self.paths.module_graph_reach();
+            let cache = modgraph::ReachCache {
+                path: &cache_path,
+                binding_hash,
+            };
+            Some(modgraph::ModuleGraph::from_json_v1_with_cache(
+                v, total_files,
+                |p| path_to_id.get(p).copied(),
+                Some(cache),
+            ))
         }).as_ref()
     }
 

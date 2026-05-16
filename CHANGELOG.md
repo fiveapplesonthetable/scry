@@ -7,6 +7,43 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.24] — 2026-05-17
+
+`--reachable` cold latency 22s → 4.7s (~5×) via an on-disk
+cache for the Warshall reachability bitmap. The bitmap itself
+(~1GB on AOSP's 91k modules) is what made `--reachable`
+unaffordable on every cold CLI invocation; computing it from
+scratch was the only slow part of building `ModuleGraph` from
+`module_graph.json`. Now we compute once, write to
+`<index>/module_graph_reach.bin`, and read it back on every
+later open.
+
+**Cache layout (locked v1):**
+
+```
+bytes  0..  9  magic = b"scryREAC1"
+bytes  9.. 13  format version (u32)
+bytes 13.. 21  n_modules (u64)
+bytes 21.. 29  stride (u64)
+bytes 29.. 61  binding hash (32 bytes; blake3 of source JSON)
+bytes 61..     raw u64 reachability bitmap
+```
+
+Any header mismatch (missing file, wrong magic / version /
+hash / dimensions) silently falls back to a full Warshall +
+fresh cache write — corruption is self-healing. Atomic
+tmp + rename for the write path.
+
+**End-to-end on AOSP `/mnt/agent/scry-index` (cold cache):**
+
+| Query                                     | v0.1.23 | v0.1.24 |
+|-------------------------------------------|---------|---------|
+| `ref bindService` (default)               |   333ms |   333ms |
+| `ref bindService --reachable` (first)     | 22 s    | 22 s (writes cache) |
+| `ref bindService --reachable` (later)     | 22 s    |  **4.7 s** |
+
+Two new unit tests cover round-trip and binding-hash invalidation.
+
 ## [0.1.23] — 2026-05-17
 
 Three connected fixes, all from a cold-start eval agent's critique

@@ -38,6 +38,7 @@ because every later chapter rests on them.
 - [Chapter 0 — prerequisites and notation](#chapter-0--prerequisites-and-notation)
 - [Chapter 0.5 — Rust, the language and how scry uses it](#chapter-05--rust-the-language-and-how-scry-uses-it)
 - [Chapter 1 — the workload, in numbers](#chapter-1--the-workload-in-numbers)
+- [Chapter 1.5 — a brief history of code indexing](#chapter-15--a-brief-history-of-code-indexing)
 - [Chapter 2 — the memory hierarchy and the external-memory model](#chapter-2--the-memory-hierarchy-and-the-external-memory-model)
 - [Chapter 3 — virtual memory, mmap, and the page cache](#chapter-3--virtual-memory-mmap-and-the-page-cache)
 - [Chapter 4 — trigram inverted indices](#chapter-4--trigram-inverted-indices)
@@ -449,6 +450,397 @@ need significant rework to host arbitrary user repos at scale.
   Lin, 2013) shows the per-commit cost is small but the
   consistency model is delicate. We've left this for v2; the
   rebuild is fast enough for now.
+
+---
+
+## Chapter 1.5 — a brief history of code indexing
+
+Nothing in scry is new. Every load-bearing decision below was made
+by some predecessor 5, 15, or 50 years ago, and the field has
+been refining the same handful of ideas the whole time. Reading
+the lineage is the fastest way to internalize *which decisions
+are forced by the problem* and *which are scry's pick from
+several defensible options* — because the ones that are forced
+keep showing up across the decades. This chapter walks the
+history straight through. Each section names the tool, what it
+shipped, what it left for its successor, and which chapter of
+this doc revisits the technique.
+
+### 1960s — the inverted index, before code
+
+The inverted index was a library-science idea before it was a
+computer-science one. Mooers (1949) used the term "information
+retrieval" for the first time in a paper on punched-card systems.
+By the time SMART (Salton, Cornell, 1960s) was running, the
+shape was settled: a sorted dictionary of terms, a posting list
+per term holding document IDs, set intersection for AND queries.
+Salton's *Information Retrieval Service Center* paper (1968) and
+his book *Automatic Information Organization and Retrieval*
+(1968) are the canonical references; everything since rearranges
+the same three primitives.
+
+What was true then is still true now: the bottleneck is the
+posting list, not the dictionary. A useful indexing system spends
+its bytes on postings. (We'll see scry repeat this exactly in
+ch. 4.)
+
+### 1970s — `ctags` and `grep`: the first generation that actually shipped
+
+In 1979 Ken Arnold wrote `ctags` for BSD Unix. The format was
+trivial — one line per tag, three space-separated fields: `name
+path pattern`. `vi` and its descendants read the file and let you
+jump to a definition with `^]`. There was no scope, no
+references, no fuzzy match; just *exact identifier → location*.
+
+Two things make `ctags` historically pivotal:
+
+1. **It established the indexing/querying split.** Run `ctags`
+   once over your tree to produce a tag file; thereafter, every
+   editor uses it instantly. This is the same split scry uses:
+   `scry index` produces the artifacts, `scry def` reads them.
+   Every code-search tool since has followed the pattern.
+2. **It established the "one file per identifier" failure
+   mode.** When two unrelated codebases both define `init`, the
+   `ctags` file has two lines and the editor jumps to whichever
+   came first. Disambiguation is the user's problem. Every
+   modern tool — including scry — has to answer the question
+   "which definition is most relevant" that ctags ducked.
+
+`grep` had been around since 1973 (Thompson, Unix V4) and
+remained the answer to "show me every file containing this
+literal". Throughput was filesystem-bound; selectivity was the
+user's problem. `grep` is what every text-search tool has been
+trying to beat ever since by *not reading the whole tree on every
+query*. (Ch. 4: the trigram index is the canonical answer.)
+
+### 1980s — `cscope` and the first cross-reference databases
+
+`cscope`, written at Bell Labs in 1979 and widely deployed by
+the mid-80s, was the first tool to index *references* in addition
+to definitions. The database was a custom flat-file format — file
+table, line table, symbol table, cross-reference table — that
+covered C only. Querying offered eight predicates: callers,
+callees, references, file-includes-this, etc. The same shape
+scry's query model has, 40 years later.
+
+What `cscope` got right:
+
+- The query model with composable predicates (callers / callees
+  / refs) maps onto what programmers actually want to know.
+- A single host index, queried interactively, is the right
+  scope. Distributed code search wasn't even an idea yet.
+- Per-line precision in the output is non-negotiable. The
+  format records byte offsets.
+
+What `cscope` left for successors:
+
+- C only. No notion of "language plugin"; every supported
+  language meant a custom parser inside the tool.
+- No scope or type awareness. `transact` would return every
+  `transact` regardless of which class.
+- Re-indexing was full-corpus from scratch. Incremental updates
+  came much later.
+
+The two big architectural choices we've seen so far —
+indexing/querying split, composable predicates over a custom
+on-disk format — are *forced* by the problem. Tools that drop
+either fail. Tools that keep them both are still in the lineage
+that scry sits in.
+
+### 1990s — Glimpse, agrep, and approximate matching
+
+Manber & Wu's `agrep` (1991) introduced fast approximate
+matching: edit-distance search over a corpus in `O(n)` rather
+than `O(n*k)` for small `k`. Glimpse (1994) layered an inverted
+index on top so the approximate scan only ran on *candidate*
+files — exactly the trigram / scan two-step that everyone uses
+now. The Glimpse paper ("GLIMPSE: A Tool to Search Through
+Entire File Systems", Manber & Wu, Usenix 1994) is essentially a
+preview of what livegrep and Zoekt would re-derive 20 years
+later.
+
+Two ideas Glimpse pioneered that scry uses verbatim:
+
+- **Sound over-approximation as the design pattern**. The index
+  returns a superset; the scan filters to the exact set. This is
+  the same shape as a Bloom filter, but the architectural insight
+  predates the Bloom-filter-as-a-tool-for-grep framing.
+- **Multi-pattern indexing**. Glimpse indexed file blocks, not
+  full files, to keep posting lists small for blocks that
+  appeared in many files. The same kind of granularity choice
+  shows up in modern systems (Zoekt's "shards", Sourcegraph's
+  "subindexes").
+
+(Ch. 4 picks up the trigram thread. Ch. 7 — Levenshtein
+automaton — is the modern descendant of `agrep`'s approximate
+matching.)
+
+### Late 1990s — Excite, AltaVista, and the web-scale shock
+
+The web search engines of the late 90s scaled the inverted index
+to billions of documents. The shape stayed the same; the
+engineering changed:
+
+- Posting lists got *huge*, so compression mattered for the
+  first time. The variable-byte (varint), Simple9, PForDelta
+  families of integer encodings all came out of this era.
+- Distribution became unavoidable. AltaVista famously had one
+  giant machine; Google made the case that many small ones
+  beat one big one (the cluster-as-computer thesis).
+- Query latency budgets dropped to single-digit milliseconds at
+  P99. This forced caching and warm-up strategies.
+
+For code search this period contributed exactly two things:
+(a) the realization that compressed postings were table-stakes
+for any inverted index above ~10^6 documents, and (b) the
+ranking-as-first-class-citizen mindset. PageRank doesn't
+directly apply to code, but the *idea* that the index returns a
+*ranked* set (not just an unordered match set) is what makes a
+code-search UI actually usable. Every modern code search ranks;
+scry's `rank_score` (`crates/scry-store/src/lib.rs:303`)
+combines exactness, depth, and path penalties for the same
+reason AltaVista ranked by term frequency.
+
+### 2000s — OpenGrok and the first wave of web-shaped code search
+
+OpenGrok (Sun Microsystems, 2007) was the first widely-deployed
+web-shaped code search. Built on Lucene, it indexed many
+languages syntactically (one tokenizer per language) and
+exposed a browser UI. The architectural template is what
+Sourcegraph and others picked up:
+
+```
+indexer (per-repo, per-language)
+  → Lucene segments
+    → web frontend over HTTP
+```
+
+OpenGrok's contribution wasn't algorithmic; it was social. It
+proved that "code search across many repos, by many users, in a
+browser" was a workflow people wanted, and that Lucene's
+inverted-index machinery could be repurposed for it. The
+limitations of Lucene for code (token boundaries are wrong for
+identifiers; no n-gram indexing in the default tokenizer)
+became the explicit problem that Zoekt and Sourcegraph would
+solve.
+
+### 2012 — Google Code Search and the trigram revolution
+
+In 2006 Google launched Code Search, a public service for
+searching open-source code. It worked. It got shut down in 2012
+("Code Search" the product, not the technology). Russ Cox, who
+worked on it, wrote up the design in a four-part essay series
+that is still required reading for anyone in this field:
+
+- [Part 1][cox1]: Brute Force — why grep over a tree is slow.
+- [Part 2][cox2]: Thompson's 1968 NFA-to-DFA construction —
+  the regex theory that any practical implementation rests on.
+- [Part 3][cox3]: Implementation — building a regex engine
+  whose worst case is bounded.
+- [Part 4][cox4]: **Trigram indices** — the algorithm scry's
+  ch. 4 derives from first principles.
+
+[cox1]: https://swtch.com/~rsc/regexp/regexp1.html
+[cox2]: https://swtch.com/~rsc/regexp/regexp2.html
+[cox3]: https://swtch.com/~rsc/regexp/regexp3.html
+[cox4]: https://swtch.com/~rsc/regexp/regexp4.html
+
+The Cox 2012 essay codified what Glimpse had implemented:
+
+- For a literal regex `R`, extract the trigrams that any
+  matching file must contain.
+- Intersect the posting lists; scan the candidates with the
+  full regex.
+- For regexes without literal anchors, fall back to full scan.
+
+This is the design that livegrep, Zoekt, Hound, Sourcegraph, and
+scry have all reimplemented, varying only in the literal-
+extraction strategy and the on-disk encoding. (Ch. 5 picks up
+the literal-extraction question; scry uses the `regex-syntax`
+HIR walker, which is essentially the algorithm in part 4 of
+Cox's essay.)
+
+The deeper contribution: Cox 2012 was the moment "code search"
+acquired its own canonical algorithm. Before, it was "Lucene
+applied to code". After, it was "trigram-narrowed grep with
+language-aware extraction". The field consolidated around this
+pretty quickly.
+
+### 2010s — Sourcegraph, Zoekt, Hound, livegrep
+
+Four open-source-ish code search engines reached production in
+this decade:
+
+| year | tool       | what it added                                                    |
+|------|------------|------------------------------------------------------------------|
+| 2014 | livegrep   | regex-to-trigram with `\b`-boundary-aware extraction; web UI    |
+| 2014 | Hound      | Etsy-internal; multi-repo aggregation across a fleet            |
+| 2015 | Zoekt      | Sourcegraph-internal; sharded trigram index; very fast warm queries |
+| 2016 | Sourcegraph (public) | Multi-tenant code search-as-a-service                  |
+
+Architecturally they all share the trigram-pre-filter + scan
+shape. The differences are operational:
+
+- **Zoekt** is a single-process indexer + searcher. Each "shard"
+  is one file group's index; searches fan out across shards in
+  parallel; results are merged. The shard format is essentially
+  trigram FST + posting lists + record sidecar — the same three
+  components scry has. (The shape is genuinely forced once you
+  pick trigram-narrowed grep; everyone arrives at the same
+  three-part layout independently.)
+- **Sourcegraph** wraps Zoekt with a web frontend, multi-repo
+  routing, and authn/authz. The query path goes browser → API
+  → Zoekt shards → result merge. The core code search is still
+  Zoekt; the rest is web plumbing.
+- **livegrep** focuses on *interactive* search — every keystroke
+  triggers a new query. The trigram index has to support sub-
+  100ms warm queries to feel live, which forces aggressive
+  in-memory caching of postings.
+- **Hound** is the simplest of the four; a single Go binary that
+  re-shells `grep` against a candidate set. Useful as a
+  reference implementation, not as a fast indexer.
+
+The two things scry takes from this generation:
+
+1. **Lazy mmap of the entire index** (Zoekt's "open shard ==
+   mmap the file" pattern). Cold open of a Zoekt shard is one
+   `mmap` and a manifest read; the rest is demand-paged. scry
+   does the same.
+2. **One process, one index** as a forcing function for
+   simplicity. Zoekt's no-network-no-RPC default is what made it
+   embeddable.
+
+What this generation left for the next:
+
+- **No symbol model.** Zoekt, livegrep, and Hound are all
+  content-only. They can find a string; they can't find a
+  definition. ctags-style "where is `Foo` defined" requires a
+  separate index entirely. (This is half of what scry adds —
+  the FST over symbol names from ch. 6.)
+- **No cross-language references.** AIDL → Java/C++/Rust
+  generated bindings are invisible to a trigram index;
+  generated code lives in `out/` and is ignored, but the
+  *reference* from a Java caller to the AIDL source isn't
+  recoverable without semantic parsing.
+- **Build-system blindness.** "Show me callers of `transact`
+  only inside `frameworks/base/services`" requires
+  understanding the Soong module graph, which content search
+  doesn't see.
+
+### Late 2010s — SCIP, LSIF, and the precision uplift
+
+The Language Server Protocol (Microsoft, 2016) gave IDEs a
+language-agnostic interface to per-language semantic engines:
+`clangd`, `rust-analyzer`, `gopls`, `pylsp`, etc. The "semantic"
+side of code intelligence consolidated around LSP.
+
+LSIF (Language Server Index Format, 2019) was the first attempt
+to *serialize* LSP responses to disk so a code-search system
+could replay them. SCIP (Source Code Intelligence Protocol,
+Sourcegraph, 2022) is the second-generation cleaner protobuf
+form. The idea: run the real per-language indexer (`scip-clang`,
+`scip-java`) once, emit a SCIP file, and load it as an *override*
+for the heuristic resolution scry / Zoekt / etc. would otherwise
+do.
+
+The tradeoff is sharp:
+
+- **Heuristic + tree-sitter** (scry's default): 80-90% accurate
+  on the queries that matter, ~13 min for a 1 M-file index,
+  zero per-language toolchain dependencies.
+- **SCIP**: 99% accurate, requires the real per-language
+  compiler to run (clangd needs `compile_commands.json`;
+  scip-java needs a working JVM build), and the index emit
+  takes longer than the actual build for most projects.
+
+scry leaves SCIP as a phase-5 opt-in path (DESIGN.md §13). The
+implementation is straightforward: a SCIP record wins over a
+tree-sitter heuristic where they overlap; everything else stays
+unchanged. We haven't shipped it because AOSP's build is large
+and the SCIP indexers aren't currently configured for it.
+
+### 2020s — Sourcegraph Code Intelligence, GitHub Code Search v2, embeddings
+
+Three threads in the current decade:
+
+1. **Github Code Search v2 (2021-23)** is a complete rebuild
+   over a sparse n-gram index that's claimed to outperform
+   trigrams for short queries. The technical writeup
+   ("Github Code Search Architecture", 2023) suggests the
+   underlying ideas are familiar: inverted index over content,
+   with engineering tuning for the GitHub-scale corpus (200 M
+   repos). The core algorithm is the same lineage.
+2. **Embedding-based code search** (Sourcegraph Cody, GitHub
+   Copilot retrieval, etc.) builds dense vector indexes over
+   chunks of code and answers semantic queries ("how do I
+   parse a TOML file in this codebase?") via nearest-neighbor
+   search. This is genuinely orthogonal to trigram/FST
+   indexing; the two are complementary. scry doesn't do it.
+   The state of the art in 2026 has retrieval-augmented LLMs
+   using *both* lexical (trigram-narrowed) and semantic
+   (embedding-narrowed) retrieval, each catching what the
+   other misses.
+3. **Streaming/incremental indexers** (Sourcegraph zoekt-mirror,
+   GitHub's per-commit re-index). Per-commit updates are
+   tractable when the index format supports tombstones and
+   compaction (LSM-tree shape rather than the fully-sorted-FST
+   shape scry uses). scry's rebuild-per-hour cadence sidesteps
+   this.
+
+### 2026 — where scry fits
+
+scry is **2010s lineage** (trigram-narrowed grep, mmap'd shards,
+language-aware tokenization) **with a 2020s LLM-friendly
+interface layer** (stable symbol IDs, JSON-RPC, stats footer
+per query for token accounting). The core algorithms are 2014-
+2016 Zoekt-shape; the things that make scry *new* are:
+
+- **AOSP-specific coverage.** aconfig flags, init.rc services,
+  SELinux types, AIDL interfaces with cross-language linking,
+  Soong module graph as a first-class filter. None of the
+  general code search tools index these; an AOSP engineer
+  asking "who reads this aconfig flag" can't get an answer
+  from Sourcegraph today.
+- **LLM-shaped output.** Every result has a stable ID, a scope
+  path, a snippet, a path. Every query emits stats so an
+  agent can budget tokens. The JSON-RPC server reads one
+  request per line and writes one response per line — designed
+  to be driven from a tool-using LLM loop, not a browser.
+- **Single host, one user, opinionated defaults.** Sourcegraph
+  ships for the multi-tenant case; scry ships for the
+  "one engineer on one Skylake host" case, and the design
+  drops everything the multi-tenant case requires (auth,
+  sharding, replication, network). The drop simplifies
+  enough that the codebase is ~7500 lines.
+
+### What history tells you about scry's tradeoffs
+
+Reading the 60-year arc gives a hard test for any new
+decision: **has someone in this lineage tried this before, and
+what happened?** The answers for scry's main decisions:
+
+| scry decision                | precedent                       | outcome of precedent              |
+|------------------------------|----------------------------------|------------------------------------|
+| trigram-narrowed grep        | Glimpse 1994, Cox 2012, Zoekt 2015 | standard pattern; works           |
+| FST for symbol names         | `fst` crate (Gallant), rooted in Daciuk 2000 | works; production-grade       |
+| mmap'd on-disk format        | Zoekt 2015, Lucene segments      | works; standard                    |
+| heuristic resolution + opt-in SCIP | Sourcegraph default, kythe at Google | works; SCIP is the precision-when-you-need-it lever |
+| single host, no daemon       | ctags 1979, cscope 1979, livegrep 2014 (mostly) | works for one user, fails at scale |
+| LLM-shaped JSON-RPC          | new — no precedent              | unknown but designed conservatively |
+
+The first four entries are "stand on the shoulders of giants".
+The fifth is "the small-scale design is forced by the one-user
+assumption". The sixth is the only genuinely new thing scry
+ships, and it's a thin interface layer over a well-trodden
+core.
+
+The lesson: when you build a system in a 60-year-old field, the
+*algorithms* are mostly settled and the *engineering decisions*
+are mostly forced. The novelty, if any, is in **what you
+choose to index and what shape you serve the answer in**. Scry
+indexes AOSP idioms that nobody else covers and serves answers
+LLM-shaped. The rest is the same trigram-narrowed inverted-
+index shape Glimpse shipped in 1994.
 
 ---
 

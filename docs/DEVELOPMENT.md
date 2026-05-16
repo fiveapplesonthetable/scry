@@ -91,19 +91,129 @@ call the new query through `Command::new(scry_bin())`.
 
 ## Bench
 
-```sh
-# Query latency (scry vs rg vs POSIX grep) — best-of-3 for scry+rg,
-# single run for POSIX grep (otherwise dominates total time).
-SCRY_INDEX_DIR=/mnt/agent/scry-index ./scripts/bench_grep.sh
-# BENCH_INCLUDE_GREP=0 to skip POSIX grep for quick iteration.
+All bench numbers in `docs/BENCHMARKS.md` come from one of the
+scripts below. Every script is in-tree at `scripts/` and runnable
+against your own index — change `SCRY_INDEX_DIR` to point at it.
+The scripts are the source of truth; the markdown is a snapshot.
 
-# Index throughput vs --workers — sweep against the Linux kernel
-# corpus (~85k files; full AOSP is too slow for a matrix sweep).
-./scripts/bench_index.sh
-# BENCH_ROOT=/path BENCH_WORKERS="4 16 32" BENCH_MEM_CAP=16 to tune.
+### Query latency: scry vs ripgrep vs POSIX grep
+
+```sh
+# Best-of-3 for scry + rg, single run for POSIX grep
+# (grep takes 5+ min per pattern, so one run only).
+SCRY_INDEX_DIR=/mnt/agent/scry-index ./scripts/bench_grep.sh
+
+# Skip POSIX grep entirely (saves ~25 min on the 5-pattern run):
+BENCH_INCLUDE_GREP=0 SCRY_INDEX_DIR=/mnt/agent/scry-index \
+  ./scripts/bench_grep.sh
 ```
 
-See `docs/BENCHMARKS.md` for the captured numbers + interpretation.
+The script prints a markdown table with columns `pattern | scry(s)
+| rg -j4 (s) | grep -rF (s)`. Five patterns spanning rare → common
+literals, matching the table in `docs/BENCHMARKS.md`.
+
+For cold-cache measurement (to validate `posix_fadvise(WILLNEED)`
+wins on your hardware), drop the page cache between runs:
+
+```sh
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+/usr/bin/time -f "wall=%e sys=%S user=%U" \
+  /mnt/agent/scry/target/release/scry grep PATTERN \
+    --index /mnt/agent/scry-index --limit 100 > /dev/null
+```
+
+### Index throughput vs `--workers`
+
+```sh
+# Default sweep: 2, 8, 16, 32 workers on the Linux kernel only
+# (~85k files; ~3 min total).
+./scripts/bench_index.sh
+
+# Custom sweep:
+BENCH_ROOT=/path/to/repo \
+  BENCH_WORKERS="4 8 16 32 64" \
+  BENCH_MEM_CAP=16 \
+  ./scripts/bench_index.sh
+```
+
+The script captures wall time, peak RSS (via `/usr/bin/time -v`),
+index size, and files/sec; produces a markdown table matching the
+"Indexing: throughput vs --workers" section of
+`docs/BENCHMARKS.md`.
+
+### Full-corpus production index
+
+The production wrapper, with cgroup envelope + auto-resume +
+post-finalize chain:
+
+```sh
+systemd-run --user --unit=scry-index --collect \
+  -p MemoryMax=60G -p MemorySwapMax=0 \
+  -p Restart=on-failure -p RestartSec=3 \
+  -p StandardOutput=append:/mnt/agent/scry-index.log \
+  -p StandardError=append:/mnt/agent/scry-index.log \
+  /mnt/agent/scry/scripts/run_index.sh
+```
+
+This is what produced the "13.3 min for 1 M files" number in
+`docs/BENCHMARKS.md`. `scripts/await_finalize.sh` runs as a
+sibling job and fires `scripts/post_finalize.sh` automatically when
+the writer exits, chaining build-offsets → build-file-symbols →
+build-trigrams → build-resolutions → validate → bench → email.
+
+### `perf stat` decomposition
+
+```sh
+sudo sysctl -w kernel.perf_event_paranoid=1     # allow user perf
+
+/usr/bin/perf stat \
+  -e task-clock,cycles,instructions,cache-references,cache-misses,page-faults,context-switches \
+  /mnt/agent/scry/target/release/scry grep "ActivityManagerService" \
+    --index /mnt/agent/scry-index --limit 100 > /dev/null
+```
+
+Reproduces the "CPU + memory profile" section of
+`docs/BENCHMARKS.md` (the 38% cache-miss / IO-bound finding).
+
+For a flamegraph-quality `perf record`, rebuild with frame
+pointers so DWARF unwind succeeds:
+
+```sh
+RUSTFLAGS="-C strip=none -C force-frame-pointers=yes" \
+  cargo build --release
+/usr/bin/perf record --call-graph dwarf -- \
+  target/release/scry grep ... > /dev/null
+/usr/bin/perf report --stdio --no-children --percent-limit 1.0
+```
+
+### Sanity-check the index
+
+`scripts/validate.sh` exercises every CLI command + JSON-RPC
+shape against a real index; useful after an indexer change to
+catch regressions before the bench scripts run:
+
+```sh
+SCRY_INDEX_DIR=/mnt/agent/scry-index /mnt/agent/scry/scripts/validate.sh
+```
+
+### Script reference
+
+| script                       | purpose                                                                |
+|------------------------------|------------------------------------------------------------------------|
+| `scripts/run_index.sh`       | production indexer wrapper (cgroup + resume + post-finalize trigger)   |
+| `scripts/await_finalize.sh`  | watches for indexer exit; fires `post_finalize.sh`                     |
+| `scripts/post_finalize.sh`   | build-offsets + build-file-symbols + build-trigrams + build-resolutions + validate + bench + email |
+| `scripts/validate.sh`        | sanity-checks every CLI / JSON-RPC command shape                       |
+| `scripts/bench_grep.sh`      | scry vs rg vs POSIX grep query-latency matrix                          |
+| `scripts/bench_index.sh`     | indexing throughput vs `--workers`                                     |
+| `scripts/auto_recover.sh`    | 5-min cron; restarts the indexer if the unit fails or stalls           |
+| `scripts/status_email.sh`    | hourly status email cron (last-finalize timestamp + index size + uptime) |
+
+All scripts are POSIX shell, idempotent where it makes sense,
+and tolerant of missing optional env vars (sensible defaults).
+Read the script before running on shared infrastructure — most
+write to `/mnt/agent/` paths that are specific to this host's
+layout.
 
 ## CPU / memory profile
 

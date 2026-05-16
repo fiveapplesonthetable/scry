@@ -49,6 +49,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/USAGE.md`]            | every command, every flag, real output snippets, the LLM-agent comparison  |
 | [`docs/BENCHMARKS.md`]       | scry vs `rg` vs `grep` numbers, index-time scaling, perf-stat decomposition, reproducibility recipe |
 | [`docs/DESIGN.md`]           | system design including the 8-layer cgroup envelope keeping the indexer inside 60 GiB |
+| [`docs/THEORY.md`]           | from-scratch course on the CS behind scry — Rust, EM model, page cache, FST, trigram, work-stealing |
 | [`docs/FAST_PATH.md`]        | Russ Cox-style trigram pre-filter + lazy/mmap reader design                |
 | [`docs/OPERATIONS.md`]       | production knobs, the systemd recipe, troubleshooting                      |
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
@@ -56,6 +57,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 [`docs/USAGE.md`]: docs/USAGE.md
 [`docs/BENCHMARKS.md`]: docs/BENCHMARKS.md
 [`docs/DESIGN.md`]: docs/DESIGN.md
+[`docs/THEORY.md`]: docs/THEORY.md
 [`docs/FAST_PATH.md`]: docs/FAST_PATH.md
 [`docs/OPERATIONS.md`]: docs/OPERATIONS.md
 [`docs/DEVELOPMENT.md`]: docs/DEVELOPMENT.md

@@ -66,6 +66,14 @@ cargo build --release                            # ~20 s cold, ~5 s incremental
 ./target/release/scry grep ZygoteInit                              # ~580 ms (rg: 21.2 s — 36×)
 ./target/release/scry outline frameworks/base/cmds/app_process/app_main.cpp   # ~600 ms
 ./target/release/scry coverage frameworks/base/services            # ~250 ms
+
+# Precision-aware queries (v0.1.12+):
+./target/release/scry subclasses Activity --in frameworks/base/    # 597 subclasses
+./target/release/scry impact bindService                           # callers + subclasses + files touched
+./target/release/scry callgraph bindService --depth 3              # recursive caller tree
+./target/release/scry callers bindService --reachable              # build-graph pruned
+./target/release/scry callers Foo --clang-precise                  # USR-identity pruned (C/C++/ObjC)
+./target/release/scry callers Bar --scip-precise                   # SCIP-symbol pruned (any SCIP language)
 ```
 
 Times above are warm-cache P50 on the live AOSP + Linux index
@@ -104,6 +112,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
 | [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
 | [`docs/MCP.md`]              | Model Context Protocol integration — wire shape, error semantics, client recipes (Claude Desktop / Cursor / Continue / custom) |
+| [`docs/SCIP_PRODUCERS.md`]   | which SCIP indexers scry's `scip-import` consumes (Java / Kotlin / Go / Rust / TS / Python / Ruby / C#), with the exact CLI per producer |
 | [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (transformer embeddings, in-place incremental writer, persistent clangd) plus a measured-and-rejected io_uring write-up |
 
 [`docs/USAGE.md`]: docs/USAGE.md

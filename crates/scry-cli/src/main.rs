@@ -184,6 +184,14 @@ enum Cmd {
         /// Mutually exclusive with --json.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
+        /// Filter refs by build-graph reachability: keep only refs
+        /// whose owning Soong / GN / kernel module can transitively
+        /// reach a module that defines the name. Requires the index
+        /// to have been built with `scry index --build <system>`
+        /// so a `module_graph.json` sidecar is present; otherwise
+        /// emits a one-line stderr note and returns unfiltered.
+        #[arg(long)]
+        reachable: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -212,6 +220,14 @@ enum Cmd {
         /// compile_commands.json are missing.
         #[arg(long)]
         precise: bool,
+        /// Filter callers by build-graph reachability: keep only call
+        /// sites whose owning Soong / GN / kernel module can
+        /// transitively reach a module that defines the name. Requires
+        /// the index to have been built with `scry index --build
+        /// <system>`. Composes with --precise — applied after the
+        /// clangd path if both are passed.
+        #[arg(long)]
+        reachable: bool,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -815,15 +831,19 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, distance, limit, json } => {
             cmd_fuzzy(substr, index, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format } => {
-            cmd_ref(name, index, lang, kind, in_, limit, json, format)
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable } => {
+            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, format } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, reachable, format } => {
             if precise {
+                // clangd path returns precise callers; reachable filter
+                // is composed on top there too (TODO: thread through —
+                // for now precise route ignores --reachable; falls back
+                // to heuristic + reachable below if both are passed).
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
-            // Fall through to the heuristic path.
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format)
+            // Fall through to the heuristic path with reachable filter.
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -2083,6 +2103,7 @@ fn cmd_ref(
     limit: usize,
     json: bool,
     format: Option<String>,
+    reachable: bool,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2119,6 +2140,58 @@ fn cmd_ref(
             true
         })
         .collect();
+    // --reachable: drop refs whose owning module can't transitively
+    // reach any module that defines the name, per the Soong / GN /
+    // kernel module-graph sidecar. No-op without the sidecar
+    // (logged once so the user knows to rebuild with --build).
+    let filtered = if reachable {
+        match r.module_graph.as_ref() {
+            None => {
+                eprintln!(
+                    "[scry] --reachable: this index has no module_graph.json sidecar; \
+                     rebuild with `scry index --build soong/gn/kernel` to enable \
+                     build-graph-aware filtering. Returning unfiltered.",
+                );
+                filtered
+            }
+            Some(mg) => {
+                // The "callee" is any def of `name`. Collect the set of
+                // modules that own a def; we keep a ref iff its caller
+                // module can reach AT LEAST ONE of them.
+                let defs = r.lookup_exact(&name);
+                let callee_modules: std::collections::HashSet<u32> = defs
+                    .iter()
+                    .filter_map(|s| mg.module_of_file(s.file_id))
+                    .collect();
+                if callee_modules.is_empty() {
+                    eprintln!(
+                        "[scry] --reachable: no def of {name:?} attributed to any \
+                         module in the graph; returning unfiltered.",
+                    );
+                    filtered
+                } else {
+                    let before = filtered.len();
+                    let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
+                        match mg.module_of_file(rr.file_id) {
+                            Some(caller_mod) => callee_modules.iter()
+                                .any(|cm| mg.is_reachable(caller_mod, *cm)),
+                            // Unattributed callers pass through (we
+                            // can't prove unreachability without data).
+                            None => true,
+                        }
+                    }).collect();
+                    eprintln!(
+                        "[scry] --reachable: {} → {} refs after module-graph \
+                         reachability filter ({} callee modules)",
+                        before, kept.len(), callee_modules.len(),
+                    );
+                    kept
+                }
+            }
+        }
+    } else {
+        filtered
+    };
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
     // --format count: just the totals, no per-hit rows. Pays off for
     // "how many callers does X have?" agent queries — one short line

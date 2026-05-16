@@ -163,6 +163,33 @@ jq -r '.cmd' ~/.scry/queries.log | sort | uniq -c | sort -rn
   random-access round-trip tests. A future refactor that subtly
   breaks either gets caught at `cargo test`.
 
+## Known coverage gaps
+
+- **C++ out-of-line method definitions** (`Foo::bar() { ... }` outside
+  the class body) are not currently captured as symbols. tree-sitter-cpp
+  parses them, but the symbol query in `crates/scry-lang/src/lib.rs`
+  only catches in-class declarations. Effect: `scry def transact
+  --lang Cpp` returns only the in-header declaration, not the cpp
+  implementation. Workaround: use `scry grep "::transact("` for now.
+  Fix: extend the cpp query with a `(function_definition declarator:
+  (function_declarator declarator: (qualified_identifier ...)))`
+  pattern.
+- **Kotlin extension functions** are scoped correctly to their receiver
+  type (e.g. `String.shouted` scope = `["String"]`), but the Kotlin
+  symbol query doesn't yet cover `companion object` members, sealed
+  class hierarchies, or `inline reified` fns. Tracked in the same
+  area as the cpp gap above.
+- **AIDL versioning** (frozen `Vn.aidl` interfaces) isn't surfaced
+  distinctly from the live interface — both get the same `aidl.iface`
+  kind. An agent asking "what's the V3 frozen surface of IFoo" has
+  to filter by path. Easy fix: detect the `frozen/` path segment in
+  the AIDL parser and emit a separate `aidl.frozen` kind.
+- **Per-language Layer 2 narrowing** beyond Java. The resolver
+  framework (build-resolutions) is in place and the Java
+  pkg/import path works; Kotlin and C++ fall back to "first
+  same-lang candidate" without scope/import awareness. Adding each
+  language is a self-contained ~200 LOC extension in `resolve_one`.
+
 ## What's left (real follow-ups, not blockers)
 
 The project is in production use against the live AOSP + Linux index;

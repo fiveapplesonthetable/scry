@@ -321,3 +321,95 @@ $ tail -2 ~/.scry/queries.log
 Override path via `SCRY_LOG=/path/to/log`. The file is append-only;
 trim it yourself if it grows unbounded. The log is best-effort — a
 write failure never affects the query's exit status or stdout.
+
+---
+
+## Worked example: why scry vs. raw rg + Read
+
+Real task: *"find where `ActivityManagerService.setProcessLimit` is
+implemented and what code calls it."*
+
+### Without scry — agent's normal approach
+
+```sh
+$ rg -n "setProcessLimit" /home/zim/dev/aosp -t java --max-count 3 | head
+frameworks/base/services/.../ActivityManagerService.java:5937:    public void setProcessLimit(int max) {
+frameworks/base/services/.../ActivityManagerService.java:5939:                "setProcessLimit()");
+frameworks/base/tests/permission/.../ActivityManagerPermissionTests.java:83:            mAm.setProcessLimit(10);
+packages/apps/TvSettings/.../DevelopmentFragment.java:1666:            ActivityManager.getService().setProcessLimit(limit);
+packages/apps/Settings/.../BackgroundProcessLimitPreferenceController.java:93:            getActivityManagerService().setProcessLimit(limit);
+... 4 more ...
+```
+
+- Wall: **3.25 s** for one `rg` pass.
+- Output mixes the **definition** with the **call sites** — the agent
+  can't tell which line is the `public void setProcessLimit(int max) {`
+  declaration vs the `.setProcessLimit(10)` invocations without
+  reading each file.
+- To verify what the method does + what callers expect, the agent
+  must `Read` each candidate file. At ~5–15 k tokens per typical
+  AOSP source file × 4–5 files = **roughly 30–60 k tokens consumed**
+  just to ground the answer.
+
+### With scry — two structured queries
+
+```sh
+$ scry def setProcessLimit --kind method --lang Java --limit 3
+frameworks/base/services/.../ActivityManagerService.java:5937:17  (method java)  [ActivityManagerService]  setProcessLimit
+1 results (showing 1)
+[scry] cmd=def q="setProcessLimit" hits=1 shown=1 files=1009166 elapsed=324ms
+
+$ scry callers setProcessLimit --lang Java --limit 10
+frameworks/base/tests/permission/.../ActivityManagerPermissionTests.java:83:17  (call java)  [ActivityManagerPermissionTests]  setProcessLimit  → def:f3720ef78a480b7e
+packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:130:34  (call java)  [BackgroundProcessLimitPreferenceControllerTest]  setProcessLimit  → def:f3720ef78a480b7e
+packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:81:34  (call java)  [...]  setProcessLimit  → def:f3720ef78a480b7e
+packages/apps/Settings/.../BackgroundProcessLimitPreferenceController.java:93:41  (call java)  [BackgroundProcessLimitPreferenceController]  setProcessLimit  → def:f3720ef78a480b7e
+packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [DevelopmentFragment]  setProcessLimit  → def:f3720ef78a480b7e
+... 1 more ...
+6 refs (showing 6)
+[scry] cmd=callers q="setProcessLimit" hits=6 shown=6 files=1009166 elapsed=332ms
+```
+
+- Wall: **0.36 s + 0.38 s = 0.74 s total** (≈ 4.4× faster end-to-end).
+- The first query is unambiguous: exactly ONE method, in the
+  `[ActivityManagerService]` scope, kind = `method`. The agent now
+  knows precisely where the definition lives without reading a byte
+  of source.
+- The second query gives every call site with its **enclosing scope**
+  inline (`[BackgroundProcessLimitPreferenceController]`,
+  `[DevelopmentFragment]`, …) AND the Layer 2 `→ def:HEX` proves all
+  6 callers really do invoke the same definition (no false positives
+  from another class accidentally named `setProcessLimit`).
+- Total output is ~ 1 k tokens of structured data the agent can
+  reason about directly. No follow-up `Read` is needed unless the
+  agent wants the surrounding code body — and even then it can read
+  the right line range (5937 ± 20) rather than the whole 6000-line
+  file.
+
+### Net for an LLM agent
+
+| metric                       | rg + Read                | scry                  | win        |
+|------------------------------|--------------------------|-----------------------|------------|
+| wall time                    | ~3 s + N × Read latency  | ~0.7 s                | **4×+**    |
+| tokens consumed              | ~30–60 k                 | ~1 k                  | **30–60×** |
+| def vs ref disambiguation    | manual (Read each file)  | structural (kind)     | qualitative |
+| scope of each hit            | not in output            | `[Foo::Bar]` inline   | qualitative |
+| same-def confirmation        | not possible from rg     | `→ def:HEX` shared    | qualitative |
+
+The latency win comes from the index. The **token win comes from the
+structure** — scry returns what an agent actually needs (which symbol,
+which scope, which definition it resolves to) instead of a raw text
+match the agent has to ground itself. This is the leverage scry was
+built for.
+
+### Caveats
+
+- The C++ side has a known coverage gap: out-of-line method definitions
+  (`Foo::bar()` outside the class body) aren't captured by the
+  symbol query yet. For the C++ Binder.transact path the workaround is
+  `scry grep '::transact('`. See `docs/DEVELOPMENT.md` for the
+  outstanding parser-query work.
+- Scope filters (`--lang`, `--kind`, `--in`) make the win bigger
+  the more concrete your question. `scry def Foo` alone may still
+  return many hits (Foo is overloaded in real corpora); adding
+  `--kind class --lang Java` narrows to one in most cases.

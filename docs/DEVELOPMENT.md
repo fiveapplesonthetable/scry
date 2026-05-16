@@ -70,21 +70,70 @@ Soft requirements (optional but recommended):
 
 ## First-time setup
 
+### Toolchain install
+
+scry needs stable Rust 1.79+ plus `clippy` and `rustfmt`. The
+canonical installer is [rustup](https://rustup.rs); on every
+supported OS the one-liner is identical:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+. "$HOME/.cargo/env"
+rustup component add clippy rustfmt
+```
+
+**Linux (Ubuntu / Debian).** Beyond rustup you'll want the C
+toolchain for the tree-sitter grammars' build.rs scripts plus
+`pkg-config`:
+
+```sh
+sudo apt update
+sudo apt install -y build-essential pkg-config git curl
+# (optional) for the precise C++ path: clangd >= 14
+sudo apt install -y clangd
+# (optional) for the comparison benches:
+sudo apt install -y ripgrep
+```
+
+Fedora / RHEL / Rocky use `dnf install gcc gcc-c++ make
+pkgconfig clang-tools-extra ripgrep`; Arch uses `pacman -S
+base-devel pkgconf clang ripgrep`.
+
+**macOS.** Xcode Command Line Tools (or the full Xcode) supply
+the C toolchain rustup needs:
+
+```sh
+xcode-select --install
+# rustup as above. Homebrew clangd + ripgrep (optional):
+brew install llvm ripgrep
+```
+
+The Apple system clangd is older than what scry's `--precise`
+path expects; either install `brew install llvm` and prefix
+`PATH="$(brew --prefix llvm)/bin:$PATH"`, or skip `--precise`.
+
+**Windows** is not officially supported (no production users on
+Windows today). It should compile under the MSVC toolchain but
+Unix-socket transport and SIGPIPE handling no-op out, and
+nothing in CI covers it. PRs welcome.
+
+### Building scry
+
 ```sh
 git clone https://github.com/fiveapplesonthetable/scry
 cd scry
 
 # env.sh pins CARGO_HOME / RUSTUP_HOME under /mnt/agent so the
 # build artifacts don't compete with the host's `~/` (the host's
-# rootfs is the small partition on this layout). On any other host
-# you can skip sourcing it and use your default cargo location.
+# rootfs is the small partition on this layout). On any other
+# host you can skip sourcing it and use your default cargo
+# location.
 . ./env.sh
 
-# Install the toolchain if you don't already have it. rustup will
-# read rust-toolchain (none committed; uses your default) — bump
-# to ≥ 1.79 if it picks something older.
-rustup show active-toolchain || rustup default stable
-rustup component add clippy rustfmt
+# Confirm the toolchain. rustup picks rust-toolchain (none
+# committed; uses your default) — bump to ≥ 1.79 if older.
+rustup show active-toolchain
+rustup component add clippy rustfmt   # idempotent
 
 # Build + test. ~20 s cold for build; tests finish in ~3 s.
 cargo build --release

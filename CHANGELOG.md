@@ -7,6 +7,58 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-16
+
+The capacity-caps + agent-affordances drop. Address the
+explicit ask "do the CPU/mem caps work for query, not just
+indexing?" plus the long-deferred `scry tldr` and a
+counter-intuitive finding from the small-model retest.
+
+### Added
+- **`scry serve --max-conns N`** — bound concurrent connections
+  to the daemon. Each accepted connection runs grep with its
+  own rayon pool, so unbounded fan-in × per-query fan-out can
+  OOM a host. `0` (default) preserves prior unlimited
+  behavior. Over-cap accepts receive a JSON-RPC error
+  (`code: -32004`, `data.retryable: true`) before the server
+  closes the connection — clients see an actionable hint, not
+  silent EOF. An RAII `ConnSlot` guard releases the slot even
+  on panic. USAGE.md "Index admin" gets a new subsection
+  documenting the cap reply + the standard Unix tools for
+  inspecting / killing the daemon (`ss`, `lsof`, `pkill`). New
+  e2e regression `unix_serve_max_conns_drops_over_cap` asserts
+  the error code, the `retryable: true` flag, and the stderr
+  log line.
+- **`scry tldr PATH`** — one-call file summary: language,
+  total symbol count, per-kind histogram, top 3 ranked symbols
+  (by `rank_score`), and the first non-blank line of the file
+  (typically the package decl or leading docstring). Cuts ~70%
+  of the tokens vs `outline + 3×def` for "what does this file
+  do?" agent queries. Exposed as the `tldr` MCP tool. New e2e
+  block exercises both JSON and plain output shapes.
+- **Strengthened MCP tool descriptions.** Every tool's
+  description now leads with the most common failure mode an
+  agent will hit (e.g. `def` opens with "If a name is common
+  (Activity, Binder), ALWAYS pass `kind` and/or `lang`";
+  `limit` reminds "Do NOT pass placeholders like 'N'"). Helps
+  ≥3B-class models meaningfully; see AGENT_NOTES §6.5 for the
+  honest counter-finding on ≤1B models.
+- **DESIGN §6.5 — Ranking and narrowing heuristics.** Full
+  documentation of `rank_score` (kind tiers, lang penalty,
+  scope penalty), grep candidate path-quality penalty, Layer 2
+  resolver narrowing rules per language (Java's pkg → import →
+  wildcard → fallback chain), trigram intersection ordering,
+  and fuzzy ranking composition. Tied to the source files that
+  implement each.
+- **DEVELOPMENT.md toolchain install commands** for Ubuntu /
+  Debian / Fedora / Arch / macOS. rustup one-liner + the
+  optional clang / ripgrep packages.
+
+### Tests
+- 144 → **146 tests** across the workspace. New: serve
+  `--max-conns` over-cap drop regression, `scry tldr` JSON +
+  plain output assertions.
+
 ## [0.1.4] — 2026-05-16
 
 The small-model-comparison drop. Ran Qwen 2.5 0.5B (Ollama, CPU)
@@ -210,7 +262,8 @@ First tagged release. Full feature surface implemented and tested.
 - Zero clippy warnings under strict `[workspace.lints]` policy.
 - Pre-release discipline: no backward-compat shims carried.
 
-[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.1...v0.1.2

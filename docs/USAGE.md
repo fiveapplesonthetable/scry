@@ -328,6 +328,35 @@ $ scry outline frameworks/base/cmds/app_process/app_main.cpp --limit 8
 suffix is unique. Multiple matches print a disambiguation warning and
 pick the shortest match.
 
+### `scry tldr PATH` — one-call file summary
+
+For "what does this file do?" agent queries, `outline` returns
+too much (all N symbols) and `def NAME` returns too little (no
+file shape). `scry tldr` collapses both into a single call:
+
+```sh
+$ scry tldr frameworks/base/core/java/android/os/Binder.java
+# /home/zim/dev/aosp/frameworks/base/core/java/android/os/Binder.java  (Java)
+# 111 symbols
+#
+# first line: /*
+#
+# kinds:  4×class  2×ctor  25×field  1×iface  79×method
+#
+# top 3:
+   85:14   class         Binder
+  133:26   class         NoImagePreloadHolder  [Binder::NoImagePreloadHolder]
+  311:26   class         TransactionTraceNamesCacheHolder  [Binder::TransactionTraceNamesCacheHolder]
+```
+
+JSON form (`--json`) emits a flat object with `path`, `lang`,
+`symbols_total`, `by_kind: [{kind, count}]`, `top: [{name, kind,
+line, col, scope}]`, and `first_line`. Cuts ~70% of the tokens
+vs `outline + 3×def` for the same answer.
+
+Same PATH-matching rules as `outline`. Exposed as the `tldr`
+tool in MCP.
+
 ### `--with-snippets N`
 
 For agent loops that usually follow `outline` with a per-symbol
@@ -517,6 +546,75 @@ queries don't serialize on any internal lock — query latency under load
 is the same as single-client. The socket file is best-effort cleaned up
 on bind (stale sockets from a crashed prior run are replaced); SIGKILL
 will leave the file behind but the next start reclaims it.
+
+### Capacity caps (`--max-conns`)
+
+Default is unlimited concurrent connections. On a shared host or
+when the workload could fan a thousand agents at the daemon, cap
+it explicitly:
+
+```sh
+$ scry serve --index /mnt/agent/scry-index \
+    --listen tcp:127.0.0.1:9999 --max-conns 64
+[scry serve] listening on tcp:127.0.0.1:9999
+[scry serve] max_conns=64; over-cap accepts will be dropped
+```
+
+Each accepted connection can run grep with its own rayon worker
+pool — so unbounded fan-in × unbounded per-query fan-out can OOM
+under stress. A safe ceiling for a 16-core box is 32-64; for a
+72-core box, 128-256. Over-cap accepts are logged to stderr and
+the connection is dropped immediately (clients see a TCP RST or
+Unix-socket EOF). Workers release their slot via an RAII guard
+so a panic still frees capacity.
+
+`--max-conns 0` (default) preserves the v0.1.3 behavior:
+unlimited.
+
+#### Cap-rejected connections get an actionable error
+
+When the cap is hit, scry writes a single JSON-RPC error line
+to the rejected connection before closing it (rather than
+silently dropping). MCP-aware clients can branch on
+`error.code == -32004`; non-MCP clients see the human-readable
+`message`:
+
+```json
+{"jsonrpc":"2.0","id":null,"error":{
+  "code":-32004,
+  "message":"scry serve at capacity (max_conns=64); retry after current requests complete",
+  "data":{"max_conns":64,"retryable":true}
+}}
+```
+
+`data.retryable: true` signals that backing off and reconnecting
+will likely succeed once load drains — no exponential backoff
+needed beyond a short jitter.
+
+#### Inspecting and killing the daemon
+
+scry doesn't ship its own connection-list or kill subcommand —
+the standard Unix tools already do this well:
+
+```sh
+# Find the PID of the running daemon:
+pidof scry            # or: pgrep -f 'scry serve'
+
+# Live connection count + per-connection state (TCP):
+ss -p -t state established '( sport = :9999 )'
+
+# Live connection count (Unix socket):
+ss -p -x state established 'src /tmp/scry.sock'
+
+# Open file descriptors held by the daemon (Unix socket FDs included):
+lsof -p $(pidof scry) | grep -E 'sock|TCP'
+
+# Clean shutdown (SIGTERM — gives in-flight queries time to finish):
+kill $(pidof scry)
+
+# Force-kill after the grace period:
+kill -9 $(pidof scry)
+```
 
 ### Streaming responses (`"stream": true`)
 

@@ -313,6 +313,121 @@ Key engineering choices:
   rather than rewritten eagerly (deferred compaction).
 - Background compaction reclaims tombstoned postings periodically.
 
+## 6.5 Ranking and narrowing heuristics
+
+Most queries return more than one candidate. scry's heuristics
+decide what surfaces first, how broad a search starts, and which
+narrowing rules each language gets.
+
+### Symbol ranking — `rank_score`
+
+Implementation: `SymbolRecord::rank_score()` in
+`crates/scry-store/src/lib.rs`. Composite integer score; callers
+typically `sort_by_key(|s| Reverse(s.rank_score()))`. Three
+components:
+
+**1. Kind tier (base score).** Higher = surfaces earlier.
+
+| Tier | Score | SymbolKinds |
+|------|------:|-------------|
+| Top  | 100   | Class · Interface · Trait · Struct · Enum · Union |
+| Call | 90    | Method · Function · Constructor |
+| IPC  | 85    | AidlInterface · AidlMethod · AidlParcelable · ProtoMessage · ProtoService · ProtoEnum |
+| Build| 80    | SoongModule |
+| Shadow| 78   | AidlShadow · HidlShadow (derived bindings — below the real .aidl) |
+| Platform| 75 | InitService · SepolicyType |
+| Module| 70   | Module · Namespace · Package |
+| Config| 65   | AconfigFlag · ManifestComponent |
+| Value | 50   | Field · Variable · Constant · EnumVariant · Type |
+| Macro | 40   | Macro · Annotation · Decorator |
+| Param | 20   | Parameter |
+| Misc  | 10   | XmlId · OwnersEmail · Other |
+
+**2. Language penalty.** `FileKind::ApiTxt` gets `-40` so SDK
+surface declarations never crowd out the actual source
+definition for "where is X?".
+
+**3. Scope penalty.** `min(scope_depth, 10) * 3`. Top-level
+symbols outrank deeply nested ones. Catches the common case
+where you want the outer `Activity`, not an inner helper.
+
+Pinned by `tests::rank_score_orders_tiers_correctly` in
+`scry-store`. Bench-protected: a refactor that subtly reorders
+tiers gets caught at `cargo test`.
+
+### Grep-candidate ranking — path-quality penalty
+
+Implementation: `score_path` in `crates/scry-cli/src/main.rs`.
+Applied to grep hits to push noise paths down:
+
+- **Generated paths.** `/generated/`, `/gen/`, `.pb.`, `_pb2.`
+  in the path → `-PENALTY_GENERATED_PATH` (~50). Catches
+  proto-generated stubs that would otherwise drown out the
+  hand-written source.
+- **Path depth.** `(depth - 3).clamp(0, 30)` — files more than
+  3 directories deep get penalized linearly, capped at 30.
+  Surfaces the root-level service over its 10-deep test
+  variant.
+
+### Layer 2 resolver — narrow callers / refs to one def
+
+Implementation: `resolve_one` in `crates/scry-cli/src/main.rs`
+(see `build-resolutions`). Per-language narrowing rules,
+applied in order until one candidate remains:
+
+**Java**:
+  1. Same package as the caller.
+  2. Explicit `import a.b.C;` in the caller's file.
+  3. Wildcard `import a.b.*;` in the caller's file.
+  4. `java.lang.*` implicit import.
+  5. If still > 1, return all (the reader picks by `rank_score`).
+
+**Kotlin / C++**: framework in place; today falls back to
+"first same-lang candidate." Language-specific narrowing
+queued in DEVELOPMENT.md "What's left."
+
+**Cross-language** (e.g. AIDL → Java Stub): handled by the
+AIDL/HIDL shadow-symbol pass at index time, not the resolver.
+The shadow symbols (`AidlShadow`, `HidlShadow` kinds) live in
+the same lookup table as their real declarations and rank
+~78 — below the real `.aidl` but above plain fields, so a
+search for `IFoo.Stub` lands on something useful even when
+the agent doesn't know which file it's in.
+
+### Trigram candidate selection — `grep_candidates`
+
+Implementation: `crates/scry-store/src/trigram.rs` +
+`grep_candidates` in `crates/scry-cli/src/main.rs`. Russ-Cox
+style: extract every overlapping 3-byte trigram of the literal
+needle, intersect their per-trigram file-id sets. The
+smallest-first intersection order is bench-pinned (smaller set
+× larger set = O(small)). Regex patterns route through HIR
+literal extraction (`regex-syntax`) to find required substrings
+before the trigram step.
+
+Pinned by `tests::trigram_intersection_smallest_first` in
+`scry-store`. A regression that reordered the intersection
+would silently 5-10× the grep candidate set.
+
+### Fuzzy ranking — composite
+
+Implementation: `cmd_fuzzy` in `crates/scry-cli/src/main.rs`.
+Two candidate sources merged (FST prefix substring + Levenshtein
+automaton), re-ranked by Wagner-Fischer edit distance. Substring
+matches outrank pure-typo matches at equal distance; closer
+matches outrank farther ones. Pinned by ranking tests in
+`scry-cli/src/main.rs::tests` (search for `fuzzy_ranks_substring`).
+
+### What's deliberately NOT a heuristic
+
+- **`def NAME` does NOT auto-narrow by `--kind`.** Without a
+  filter, you see every kind. The principle: the heuristic
+  ranks, but it doesn't hide. An agent that wants the class
+  passes `--kind class`; the tool doesn't guess.
+- **Symbol ID is content-hash, not heuristic-ranked.** Two
+  symbols with the same `(root_id, relpath, kind, scope, name,
+  line)` get the same `id`. Stable across rebuilds.
+
 ## 7. Per-file-type strategy
 
 Coverage is **everything that drives a build, ships in an image, or

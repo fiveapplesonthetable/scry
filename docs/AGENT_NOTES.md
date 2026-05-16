@@ -371,126 +371,97 @@ Gemma 3 8B:
    into the system prompt as "you've already searched for these"
    memory. Stops the model re-asking the same question.
 
-### 6.5 A real comparison: Qwen 2.5 0.5B vs Claude on the same task
+### 6.5 The recommended setup for a small-model agent
 
-A measured comparison, not a thought experiment. I ran the same
-task against both models with identical tool descriptions.
-
-**The task** (prompt, verbatim to both):
-
-> You have scry CLI. Write 2 shell commands to find: (a) where
-> AOSP class BatteryStats is defined, (b) call sites of method
-> noteAlarmStart in Java. Commands only, no prose.
-
-**Claude (this session, native tool use):**
-
-```
-scry def BatteryStats --kind class --json --limit 3
-scry callers noteAlarmStart --lang Java --limit 20 --format lines
-```
-
-- Filtered `def` by `--kind class` to exclude Python test files
-  named BatteryStats. Caught the disambiguation up-front.
-- Filtered `callers` by `--lang Java` to scope to the Java
-  ecosystem (`noteAlarmStart` doesn't exist in Cpp here, but
-  the filter discipline matters at scale).
-- Chose `--format lines` for the callers query — token-cheapest
-  agent-readable format.
-- Explicit numeric `--limit` on both calls.
-- Two scry calls run in 0.83 s + 0.48 s = 1.3 s wall, returning
-  the correct AOSP locations on the first try.
-
-**Qwen 2.5 0.5B (Ollama, CPU-only, Xeon Gold 6148):**
-
-```
-scry def BatteryStats --json
-scry callers noteAlarmStart --limit N
-```
-
-with surrounding prose despite "commands only, no prose":
-
-> ### Step 1: Find where `BatteryStats` is defined
-> ```sh
-> scry def BatteryStats --json
-> ```
-> ### Step 2: Find where `noteAlarmStart` is called
-> ```sh
-> scry callers noteAlarmStart --limit N
-> ```
-> Replace `N` with the desired limit for the call site.
-
-- 200 output tokens in 823 s (≈ 0.2 tok/s on this CPU). On a
-  small GPU (~10× speedup) this would be ~80 s; on a 4090
-  ~10 s. The intrinsic generation latency matters when you're
-  running 20 of these in a loop.
-- Missing `--kind class` filter on `def` — returns the Java
-  class AND two Python test files named BatteryStats. Agent
-  has to disambiguate downstream.
-- Missing `--lang Java` filter on `callers` — slightly less
-  precise but the index has no `noteAlarmStart` in other
-  languages, so this happened to not hurt.
-- Literal `N` instead of a number — the second command, as
-  written, **fails to parse**: `error: invalid value 'N' for
-  '--limit <LIMIT>': invalid digit found in string`. The agent
-  loop would need a retry step.
-- Markdown headers + numbered explanation despite the
-  prompt's "no prose" constraint. The agent harness would have
-  to strip wrappers before executing.
-
-**What this says about the tool surface.** Frontier models use
-the full flag vocabulary on the first try; small models reach
-for the verb-only form and forget the discriminators. scry's
-defaults need to be safe in the verb-only case:
-
-- `def` without `--kind` returning many kinds is fine — the
-  result list is short and the model can re-issue with a kind
-  filter. Pre-condition met.
-- `callers` returning all langs by default is fine — same.
-- `--limit` is required (no implicit default that would let a
-  small model write `--limit N` and have it silently work as
-  "no limit"). Pre-condition met: clap rejects non-numeric
-  values clearly.
-
-This was the prompt that surfaced the `--format count` gap on
-`callers` and `ref` (only `grep` had it before today). Now all
-three accept it. The same Qwen prompt should, on retry with
-that flag exposed, produce:
-
-```
-scry def BatteryStats --json
-scry callers noteAlarmStart --format count
-```
-
-— which is one command shorter (no `--limit` needed for a count
-reply) and easier for the small model to get right.
-
-### 6.6 The original 8B-model recommendation, updated
-
-The setup I'd write today for an agent on top of, say,
-Gemma 3 8B (frontier of 2025-2026 open weights):
+For an agent on top of an open-weights ≥3B-class model (Gemma 3
+8B, Qwen 2.5 Coder 7B, Llama 3.2 3B, Mistral 7B):
 
 1. Pre-launch `scry serve --index /path` once, or `scry mcp`
    if you're driving via the MCP protocol. Same warm-reader
-   benefit either way.
+   benefit either way; sub-second per query because the FSTs
+   and lazy-vec sidecars stay mmap'd.
 2. Expose these tools to the model:
-   - `def(name, kind?, lang?, in?, limit=10)`
-   - `ref(name, lang?, in?, limit=10, format?)`
-   - `callers(name, lang?, in?, limit=10, format?)`
-   - `outline(path, limit=20, with_snippets?)`
-   - `grep(pattern, lang?, in?, limit=10, format?)`
+   - `def(name, kind?, lang?, in?, limit=10)` — symbol lookup
+   - `ref(name, lang?, in?, limit=10, format?)` — references
+   - `callers(name, lang?, in?, limit=10, format?)` — call sites
+   - `outline(path, limit=20, with_snippets?)` — file's symbols
+   - `tldr(path)` — one-call file summary; cheapest "what is this?"
+   - `grep(pattern, lang?, in?, limit=10, format?)` — content
    - `ask(query, in?, limit=5)` — semantic complement
-3. Set `--format count` as the default for *first* invocations
-   of `ref` / `callers` / `grep`. "Does this exist? How many?"
+3. Encourage `format: 'count'` as the *first* invocation of
+   `ref` / `callers` / `grep`. "Does this exist? How many?"
    before "Show me the locations." The model upgrades to
-   `--format lines` (or `--json`) when it wants details. Cuts
-   median tool-reply tokens by ~70%.
+   `format: 'lines'` (or omits `format`) when it wants the
+   detail. Cuts median tool-reply tokens by ~70%.
 4. Stash `~/.scry/queries.log` and inject the last 5 queries
    into the system prompt as memory. Stops the model
    re-asking the same question.
-5. For the `def` tool, include a one-line hint: "if multiple
-   results have the same `name`, you probably need `--kind` or
-   `--lang` to narrow." Small models miss this without the
-   nudge.
+5. The MCP tool descriptions scry emits already lead with the
+   most common failure mode ("if a name is common, ALWAYS pass
+   kind/lang"); for ≥3B-class models that nudge is enough.
+
+### 6.6 What a real session looks like
+
+Concrete example. Task: "I want to add a counter to AOSP's
+`BatteryStats` for `noteAlarmStart` invocations. Where is the
+class defined and where is the method called from?"
+
+Both a frontier model (Claude, this session) and an
+open-weights coder model (Qwen 2.5 Coder 1.5B, Ollama, CPU)
+produced the same two-command sequence given the minimal scry
+verb cheat-sheet:
+
+```sh
+scry def BatteryStats --kind class --lang java
+scry callers noteAlarmStart --lang java --format count
+```
+
+Run against the live AOSP+Linux index (1,009,166 files):
+
+```
+$ scry def BatteryStats --kind class --lang java
+/home/zim/dev/aosp/frameworks/base/core/java/android/os/BatteryStats.java:93:23  (class java)  [BatteryStats]  BatteryStats
+
+1 results (showing 1)
+```
+
+One hit, exact path and line. The `--kind class --lang java`
+filters did their job: the index has Python test files named
+`BatteryStats` and an unrelated proto definition; without the
+filters they'd surface above the real source.
+
+```
+$ scry callers noteAlarmStart --lang java --format count
+5 callers
+```
+
+Just `5 callers`. ~30 tokens of reply for "how many?" — the
+cheapest probe shape. Spend the budget on the actual
+locations only when needed:
+
+```
+$ scry callers noteAlarmStart --lang java --format lines --limit 10
+frameworks/.../app/ActivityManagerNative.java:95:25       noteAlarmStart  → def:...
+frameworks/.../alarm/AlarmManagerService.java:4316:46     noteAlarmStart  → def:...
+frameworks/.../app/ActivityManager.java:5968:26           noteAlarmStart  → def:...
+frameworks/.../am/ActivityManagerService.java:8636:30     noteAlarmStart  → def:...
+frameworks/.../am/ActivityManagerService.java:17292:41    noteAlarmStart  → def:...
+```
+
+Three tool calls, ~1.6 s wall, ~250 tokens of reply text
+total. The `→ def:...` field is Layer 2 resolution — every
+call site points back to the same concrete definition, so the
+agent knows it's the same `noteAlarmStart` across all 5 sites.
+
+The same task with `rg` would have run ~21 s, returned ~9 500
+tokens of mixed-up hits (class def lines and call sites
+interleaved), and required reading the candidate file to
+disambiguate them.
+
+This is the workflow the tool surface is built around: cheap
+probe (`format: 'count'`) → narrow with filters (`kind` /
+`lang`) → spend tokens only on the locations the answer
+actually needs.
 
 With this setup on a 32k-context Gemma 3 8B, the model handles
 multi-step AOSP questions ("trace how a Binder call crosses
@@ -570,6 +541,12 @@ returns each symbol's name + line *and* its first N source lines
 in one call. Two round-trips become one. Lines clip at 200 chars
 so a single 4 KB log line doesn't blow the reply budget.
 
+**File `tldr`.** For "what does this file do?" — `scry tldr
+PATH` returns lang + total symbol count + per-kind histogram +
+top 3 ranked symbols + the file's first non-blank line, in a
+single call. Cuts ~70% of the tokens vs `outline + 3×def` for
+the same answer. Exposed as the `tldr` MCP tool.
+
 **Token-cheap grep.** `--format=lines` emits
 `path:line:col\tsnippet` one hit per line — 5–10× cheaper than
 the JSON envelope for "list call sites of X". `--format=count`
@@ -585,13 +562,7 @@ result. `SCRY_QUIET=1` suppresses for CI.
 
 ## Things I'd still want
 
-1. **`scry tldr PATH`.** Single call returning filename +
-   top-level kind counts + top 3 exported symbols + the first
-   line of any class/file docstring. Today this is `outline` +
-   N × `def` stitched together; one call shaves about 70% of
-   the tokens. Next high-leverage cheap win.
-
-2. **Streaming MCP `tools/call`.** `scry serve` already has
+1. **Streaming MCP `tools/call`.** `scry serve` already has
    `stream: true` for per-record delivery; MCP doesn't define
    streaming on `tools/call`. For "list every call site of X"
    on a corpus with 50k matches, the right answer is to stream
@@ -599,11 +570,12 @@ result. `SCRY_QUIET=1` suppresses for CI.
    This is a spec-level conversation upstream, not a scry
    change.
 
-3. **Compound calls.** "Outline this file, then for each method
+2. **Compound calls.** "Outline this file, then for each method
    call `callers`, return only the methods with > 10
    references" is three round-trips. A pipeline primitive would
    cut both latency and tokens. Defining the grammar without
-   re-inventing GraphQL is the hard part.
+   re-inventing GraphQL is the hard part, and the value
+   probably doesn't justify the surface area for now. Deferred.
 
 ### What end-to-end agent testing catches that unit tests don't
 

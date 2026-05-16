@@ -312,6 +312,22 @@ enum Cmd {
         #[arg(long, default_value = "0", value_name = "N_LINES")]
         with_snippets: usize,
     },
+    /// One-call file summary: filename, language, total symbol count,
+    /// per-kind breakdown, top 3 ranked symbols, and the first
+    /// non-blank line of the file (often the package decl or a leading
+    /// docstring). Designed for "what does this file do?" agent
+    /// queries where `outline + N × def` would otherwise burn 5-10×
+    /// the tokens.
+    ///
+    /// PATH matches by suffix (same as `outline`); on multiple
+    /// matches scry picks the shortest and notes the others.
+    Tldr {
+        path: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Substring or regex search over indexed source files (rg-like).
     Grep {
         pattern: String,
@@ -445,6 +461,16 @@ enum Cmd {
         /// each other.
         #[arg(long)]
         listen: Option<String>,
+        /// Cap simultaneous client connections. New `accept()`s past
+        /// the cap wait briefly then are dropped with a one-line
+        /// stderr log. 0 = unlimited (default). Set this on shared
+        /// hosts or when the workload could fan a thousand agents at
+        /// the daemon — each connection runs grep with rayon
+        /// concurrency, so unbounded fan-in × unbounded fan-out
+        /// can OOM. A safe ceiling for a single 16-core box is
+        /// 32-64. Ignored in stdin/stdout mode.
+        #[arg(long, default_value_t = 0)]
+        max_conns: u32,
     },
     /// Which Soong module declares PATH as one of its sources?
     /// Looks up the file's basename across Soong Import refs.
@@ -725,6 +751,7 @@ fn main() -> Result<()> {
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
         Cmd::Outline { path, index, json, limit, with_snippets } =>
             cmd_outline(path, index, json, limit, with_snippets),
+        Cmd::Tldr { path, index, json } => cmd_tldr(path, index, json),
         Cmd::Grep {
             pattern, index, regex, lang, in_, limit, json, workers,
             max_file_bytes, mem_cap, format,
@@ -732,7 +759,7 @@ fn main() -> Result<()> {
             pattern, index, regex, lang, in_, limit, json, workers,
             max_file_bytes, mem_cap, format,
         ),
-        Cmd::Serve { index, listen } => cmd_serve(index, listen),
+        Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
@@ -2082,6 +2109,119 @@ fn cmd_outline(
         }
     }
     log_query(&r, "outline", &path, found.len(), take, t);
+    Ok(())
+}
+
+/// One-call file summary. Built from the same per-file symbol set
+/// `outline` uses, but compressed to "what's the shape of this
+/// file?" — language, total symbol count, per-kind breakdown,
+/// top 3 ranked symbols (using `SymbolRecord::rank_score`), and
+/// the file's first non-blank line (often a package decl or
+/// leading docstring).
+///
+/// Saves a round-trip when the agent's question is "what does
+/// this file do?" rather than "show me every symbol." Cuts ~70%
+/// of the tokens vs `outline + N×def` for the same answer.
+fn cmd_tldr(path: String, index: Option<PathBuf>, json: bool) -> Result<()> {
+    let t = Instant::now();
+    let r = open_index(index)?;
+    let file_id = match resolve_file_id(&r, &path) {
+        Some(id) => id,
+        None => anyhow::bail!("no indexed file matches '{}'", path),
+    };
+    let fe = r.files.get(file_id as usize)
+        .ok_or_else(|| anyhow::anyhow!("file_id {} out of range", file_id))?;
+    let display = fe.display_path(&r.roots);
+
+    // Gather this file's symbols via the file_symbols sidecar (O(1)
+    // per file) with a fallback to the linear scan.
+    let mut syms: Vec<SymbolRecord> = match r.symbols_for_file(file_id) {
+        Some(ids) => {
+            let mut v = Vec::with_capacity(ids.len());
+            if let Some(lz) = r.lazy_symbols.as_ref() {
+                for i in ids { if let Some(s) = lz.get(i as usize) { v.push(s); } }
+            } else {
+                for i in ids {
+                    if let Some(s) = r.symbols.get(i as usize) { v.push(s.clone()); }
+                }
+            }
+            v
+        }
+        None => r.iter_symbols().filter(|s| s.file_id == file_id).collect(),
+    };
+
+    // Per-kind histogram. Stable order (kind short name) so the same
+    // file gives the same output across runs.
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for s in &syms {
+        *by_kind.entry(s.kind.short()).or_default() += 1;
+    }
+
+    // Top 3 ranked symbols. rank_score handles the (Class > Method >
+    // Field) tier ordering + scope penalty; we don't re-rank by
+    // file-shape because every symbol here lives in the same file.
+    syms.sort_by_key(|s| std::cmp::Reverse(s.rank_score()));
+    let top: Vec<&SymbolRecord> = syms.iter().take(3).collect();
+
+    // First non-blank line. Often the package declaration in Java/Go/
+    // Kotlin, the leading `//` doc comment in Rust, or the `#!`
+    // shebang in scripts. A real docstring extractor would be
+    // language-aware; this is the 90%-good heuristic.
+    let first_line = std::fs::read_to_string(&display).ok()
+        .and_then(|src| src.lines().find(|l| !l.trim().is_empty())
+            .map(|l| {
+                if l.len() > 200 { format!("{}…", &l[..200]) }
+                else { l.to_string() }
+            }));
+
+    if json {
+        let kinds: Vec<_> = by_kind.iter()
+            .map(|(k, n)| serde_json::json!({"kind": k, "count": n}))
+            .collect();
+        let top_arr: Vec<_> = top.iter()
+            .map(|s| serde_json::json!({
+                "name": s.name, "kind": s.kind.short(),
+                "line": s.line, "col": s.col,
+                "scope": s.scope_path,
+            }))
+            .collect();
+        let out = serde_json::json!({
+            "path": display,
+            "lang": fe.kind.as_str(),
+            "symbols_total": syms.len(),
+            "by_kind": kinds,
+            "top": top_arr,
+            "first_line": first_line,
+        });
+        println!("{out}");
+    } else {
+        println!("# {}  ({:?})", display, fe.kind);
+        println!("# {} symbols", syms.len());
+        if let Some(fl) = &first_line {
+            println!("#");
+            println!("# first line: {fl}");
+        }
+        if !by_kind.is_empty() {
+            println!("#");
+            print!("# kinds:");
+            for (k, n) in &by_kind {
+                print!("  {n}×{k}");
+            }
+            println!();
+        }
+        if !top.is_empty() {
+            println!("#");
+            println!("# top {}:", top.len());
+            for s in &top {
+                let scope = if s.scope_path.is_empty() { String::new() }
+                            else { format!("  [{}]", s.scope_path.join("::")) };
+                println!("  {:>5}:{:<3}  {:<12}  {}{}",
+                         s.line, s.col, s.kind.short(), s.name, scope);
+            }
+        }
+    }
+    log_query(&r, "tldr", &path, syms.len(), top.len(), t);
     Ok(())
 }
 
@@ -4977,66 +5117,172 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "required": req_arr,
         })
     }
-    // Shared property fragments.
-    let lang_prop = serde_json::json!({"type": "string", "description": "java|kotlin|cpp|rust|go|python|soong|aidl|..."});
-    let in_prop = serde_json::json!({"type": "string", "description": "path substring filter (e.g. frameworks/base/)"});
-    let limit_prop = serde_json::json!({"type": "integer", "default": 20});
+    // Shared property fragments. Each description is one short
+    // sentence written for a 1B-class model: it has to land the hint
+    // without depending on the model "knowing what to do" from
+    // surrounding context.
+    let lang_prop = serde_json::json!({"type": "string",
+        "description": "Language filter — narrow results to one of: java, kotlin, cpp, rust, go, python, soong, aidl. Always pass this when you know the language; cuts noise on cross-language names."});
+    let in_prop = serde_json::json!({"type": "string",
+        "description": "Path substring filter (e.g. 'frameworks/base/' to scope to a subtree). Useful when one name lives in many directories."});
+    let limit_prop = serde_json::json!({"type": "integer", "default": 20,
+        "description": "Max records returned. Pass a small integer (5-20). Do NOT pass placeholders like 'N' — they fail to parse."});
+    let format_count_prop = serde_json::json!({"type": "string",
+        "description": "Optional. Set to 'count' to get just `N callers` / `N hits` instead of per-record output — ~50× cheaper in tokens when you only need to know IF or HOW MANY. Mutually exclusive with json output mode."});
 
     let tools = vec![
-        tool("def", "Find exact-name symbol definitions.", obj(&["name"], serde_json::json!({
-            "name": {"type": "string"},
-            "lang": lang_prop,
-            "kind": {"type": "string", "description": "class|method|fn|aidl.iface|soong|init.svc|sepolicy|..."},
-            "in":   in_prop,
-            "limit": limit_prop,
-        }))),
-        tool("ref", "Find references to a name.", obj(&["name"], serde_json::json!({
-            "name": {"type": "string"},
-            "lang": lang_prop,
-            "kind": {"type": "string", "description": "call|ctor|inherit|import|..."},
-            "in":   in_prop,
-            "limit": limit_prop,
-        }))),
-        tool("callers", "Find call sites (references with kind=call).", obj(&["name"], serde_json::json!({
-            "name": {"type": "string"},
-            "lang": lang_prop,
-            "in":   in_prop,
-            "limit": limit_prop,
-        }))),
-        tool("prefix", "Symbols whose name starts with PREFIX.", obj(&["prefix"], serde_json::json!({
-            "prefix": {"type": "string"},
-            "in":    in_prop,
-            "limit": limit_prop,
-        }))),
-        tool("fuzzy", "Typo-tolerant symbol search, ranked by edit distance.", obj(&["substr"], serde_json::json!({
-            "substr": {"type": "string"},
-            "in":    in_prop,
-            "distance": {"type": "integer", "default": 2,
-                "description": "Levenshtein bound for typo tolerance (1–3 is sensible)."},
-            "limit": limit_prop,
-        }))),
-        tool("grep", "Content search; literal pattern unless --regex is set on the request (default literal).", obj(&["pattern"], serde_json::json!({
-            "pattern": {"type": "string"},
-            "lang":    lang_prop,
-            "in":      in_prop,
-            "limit":   limit_prop,
-        }))),
-        tool("outline", "All symbols in a file, ordered by line.", obj(&["path"], serde_json::json!({
-            "path":  {"type": "string", "description": "full or suffix-style path (e.g. app_main.cpp)"},
-            "limit": limit_prop,
-        }))),
-        tool("coverage", "Subtree stats: files / bytes / symbols per language.", obj(&["path"], serde_json::json!({
-            "path":    {"type": "string", "description": "path prefix to scope (empty = whole index)"},
-            "by_kind": {"type": "boolean", "default": false},
-        }))),
-        tool("stats", "Index metadata (size, files, freshness).", serde_json::json!({
-            "type": "object", "properties": serde_json::json!({}),
-        })),
-        tool("ask", "Semantic retrieval: find code chunks whose content is most similar to the natural-language query. Use when the agent doesn't know which identifier to search for. Requires `scry build-embeddings` to have run on the index.", obj(&["query"], serde_json::json!({
-            "query": {"type": "string"},
-            "in":    in_prop,
-            "limit": limit_prop,
-        }))),
+        tool(
+            "def",
+            "Find exact-name symbol definitions. If a name is common \
+             (e.g. 'Activity', 'Binder', 'Buffer'), you will get hits \
+             from multiple kinds and languages — ALWAYS pass `kind` \
+             (e.g. 'class') and/or `lang` to narrow the search; \
+             otherwise the top hits may be Python test files or \
+             unrelated structs.",
+            obj(&["name"], serde_json::json!({
+                "name": {"type": "string", "description": "Exact symbol name (case-sensitive)."},
+                "lang": lang_prop,
+                "kind": {"type": "string",
+                    "description": "Kind filter. Common values: class, method, fn (Rust/Go function), interface, struct, enum, aidl.iface, soong (Soong module), init.svc, sepolicy. Strongly recommended when name is ambiguous."},
+                "in":   in_prop,
+                "limit": limit_prop,
+            })),
+        ),
+        tool(
+            "ref",
+            "Find all references to a name (any ref kind — call, ctor, \
+             type-use, import, inherit). Use `callers` for the common \
+             call-only case. Pass `format: 'count'` if you only need \
+             the total.",
+            obj(&["name"], serde_json::json!({
+                "name": {"type": "string"},
+                "lang": lang_prop,
+                "kind": {"type": "string",
+                    "description": "Ref-kind filter. Common: call, ctor, inherit, import, type-use, field-access."},
+                "in":   in_prop,
+                "limit": limit_prop,
+                "format": format_count_prop,
+            })),
+        ),
+        tool(
+            "callers",
+            "Find call sites of NAME (shorthand for `ref` with \
+             kind=call). For 'does X get called anywhere?' or 'how \
+             many?', pass `format: 'count'` — it returns just `N \
+             callers` and costs almost nothing.",
+            obj(&["name"], serde_json::json!({
+                "name": {"type": "string"},
+                "lang": lang_prop,
+                "in":   in_prop,
+                "limit": limit_prop,
+                "format": format_count_prop,
+            })),
+        ),
+        tool(
+            "prefix",
+            "Symbols whose name starts with PREFIX (FST-backed \
+             completion). Useful for 'what's everything starting \
+             with Activity?'.",
+            obj(&["prefix"], serde_json::json!({
+                "prefix": {"type": "string"},
+                "in":    in_prop,
+                "limit": limit_prop,
+            })),
+        ),
+        tool(
+            "fuzzy",
+            "Typo-tolerant symbol search, ranked by edit distance. \
+             Use when you're not sure of the exact spelling. If you \
+             ARE sure, use `def` (exact match, cheaper).",
+            obj(&["substr"], serde_json::json!({
+                "substr": {"type": "string"},
+                "in":    in_prop,
+                "distance": {"type": "integer", "default": 2,
+                    "description": "Levenshtein bound for typo tolerance (1-3 is sensible; higher = noisier results)."},
+                "limit": limit_prop,
+            })),
+        ),
+        tool(
+            "grep",
+            "Content search across indexed source. Literal pattern \
+             unless `regex: true`. For 'is X mentioned at all?' \
+             prefer `format: 'count'`; for 'list all hits' use \
+             `format: 'lines'` (rg-shape, much cheaper in tokens \
+             than the default JSON envelope).",
+            obj(&["pattern"], serde_json::json!({
+                "pattern": {"type": "string"},
+                "regex":   {"type": "boolean", "default": false,
+                    "description": "Treat pattern as a regex. Default is literal substring."},
+                "lang":    lang_prop,
+                "in":      in_prop,
+                "limit":   limit_prop,
+                "format":  {"type": "string",
+                    "description": "Optional. 'lines' = rg-shape `path:line:col\\tsnippet` per hit (cheapest list form). 'count' = just `N hits across M files`. Mutually exclusive with json output."},
+            })),
+        ),
+        tool(
+            "outline",
+            "Every symbol defined in one file, ordered by line. PATH \
+             matches by suffix (e.g. 'Activity.java' works if \
+             unambiguous). Set `with_snippets: N` to also include \
+             the first N source lines of each symbol — saves a \
+             round-trip when you'd otherwise call `def` per name.",
+            obj(&["path"], serde_json::json!({
+                "path":  {"type": "string",
+                    "description": "Full or suffix-style path (e.g. 'app_main.cpp' if no ambiguity, or the full /home/... path)."},
+                "limit": limit_prop,
+                "with_snippets": {"type": "integer", "default": 0,
+                    "description": "If > 0, attach the first N source lines of each symbol as a `snippet` field. Lines clip at 200 chars."},
+            })),
+        ),
+        tool(
+            "tldr",
+            "One-call file summary: language, total symbol count, \
+             per-kind breakdown, top 3 ranked symbols, and the file's \
+             first non-blank line. Use this FIRST when the question \
+             is 'what does this file do?' — saves ~70% of the tokens \
+             vs `outline + N×def`.",
+            obj(&["path"], serde_json::json!({
+                "path": {"type": "string",
+                    "description": "Full or suffix-style path (same matching rules as `outline`)."},
+            })),
+        ),
+        tool(
+            "coverage",
+            "Subtree stats: files / bytes / symbols per language for \
+             any directory inside the index. Useful for 'what \
+             fraction of $repo did scry actually parse?'.",
+            obj(&["path"], serde_json::json!({
+                "path":    {"type": "string",
+                    "description": "Path prefix to scope (empty string = whole index)."},
+                "by_kind": {"type": "boolean", "default": false,
+                    "description": "Also break down per SymbolKind within each language."},
+            })),
+        ),
+        tool(
+            "stats",
+            "Index metadata (size, files, freshness, scry_version). \
+             No arguments. Useful as a first probe before harder \
+             queries.",
+            serde_json::json!({
+                "type": "object", "properties": serde_json::json!({}),
+            }),
+        ),
+        tool(
+            "ask",
+            "Semantic retrieval: find code chunks whose content is \
+             most similar to a natural-language query. Use when you \
+             DON'T know an identifier name to grep / def for (e.g. \
+             'how is process priority computed?'). Requires `scry \
+             build-embeddings` to have run on the index; returns a \
+             tool-level error otherwise.",
+            obj(&["query"], serde_json::json!({
+                "query": {"type": "string",
+                    "description": "Natural-language description of what you're looking for."},
+                "in":    in_prop,
+                "limit": limit_prop,
+            })),
+        ),
     ];
     serde_json::json!({ "tools": tools })
 }
@@ -5143,6 +5389,7 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "fuzzy"    => &["substr"],
         "grep"     => &["pattern"],
         "outline"  => &["path"],
+        "tldr"     => &["path"],
         "coverage" => &["path"],
         "stats"    => &[],
         "ask"      => &["query"],
@@ -5177,11 +5424,11 @@ fn mcp_validate_required_args(tool: &str, args: &serde_json::Value) -> Option<St
 /// The shared `StoreReader` lives for the whole process and is borrowed
 /// by every connection; mmap-backed and immutable, so no synchronization
 /// is needed across concurrent clients.
-fn cmd_serve(index: Option<PathBuf>, listen: Option<String>) -> Result<()> {
+fn cmd_serve(index: Option<PathBuf>, listen: Option<String>, max_conns: u32) -> Result<()> {
     let reader = open_index(index)?;
     match listen.as_deref() {
         None => serve_stdio(&reader),
-        Some(spec) => serve_listener(&reader, spec),
+        Some(spec) => serve_listener(&reader, spec, max_conns),
     }
 }
 
@@ -5221,12 +5468,55 @@ fn serve_stdio(reader: &StoreReader) -> Result<()> {
 /// stale sockets from a crashed prior run) and cleaned up on the most
 /// common exit paths. SIGINT/SIGKILL still leave it behind; the next
 /// start will reclaim it.
-fn serve_listener(reader: &StoreReader, spec: &str) -> Result<()> {
+fn serve_listener(reader: &StoreReader, spec: &str, max_conns: u32) -> Result<()> {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
     let reader = Arc::new(reader_clone_for_share(reader)?);
+    // Live count of in-flight connections. Each accepted connection
+    // increments before spawning the worker; the worker decrements
+    // in its drop guard so a panic still releases the slot.
+    let inflight = Arc::new(AtomicU32::new(0));
+    let cap = max_conns;
+    if cap > 0 {
+        eprintln!("[scry serve] max_conns={cap}; over-cap accepts will be dropped");
+    }
+
+    // RAII guard: increment on construction, decrement on drop.
+    // Prevents a panic in serve_connection from leaking a slot.
+    struct ConnSlot(Arc<AtomicU32>);
+    impl Drop for ConnSlot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    // Reply written when a connection is rejected for hitting the
+    // cap. JSON-RPC-style shape so MCP-aware clients can branch on
+    // `error.code` without ambiguity (-32004 is the canonical
+    // "server busy" range in JSON-RPC custom-code space; we use it
+    // here to mean "scry serve at capacity"). Non-MCP clients see
+    // the human-readable `message`. Single line, newline-terminated
+    // so any line-based client picks it up cleanly.
+    let make_cap_reply = |cap: u32| -> Vec<u8> {
+        let v = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": serde_json::Value::Null,
+            "error": {
+                "code": -32004,
+                "message": format!(
+                    "scry serve at capacity (max_conns={cap}); \
+                     retry after current requests complete"
+                ),
+                "data": {"max_conns": cap, "retryable": true},
+            },
+        });
+        format!("{v}\n").into_bytes()
+    };
+
     match spec.split_once(':') {
         Some(("unix", path)) => {
+            use std::io::Write;
             use std::os::unix::net::UnixListener;
             // Best-effort cleanup of a stale socket from a prior crashed
             // run. If the file isn't actually a socket we'll fail to bind
@@ -5236,12 +5526,30 @@ fn serve_listener(reader: &StoreReader, spec: &str) -> Result<()> {
                 .with_context(|| format!("bind unix:{path}"))?;
             eprintln!("[scry serve] listening on unix:{path}");
             for stream in listener.incoming() {
-                let stream = match stream {
+                let mut stream = match stream {
                     Ok(s) => s,
                     Err(e) => { eprintln!("[scry serve] accept: {e}"); continue; }
                 };
+                // Reserve a slot if a cap is in effect. fetch_add returns
+                // the PREVIOUS value, so >= cap means we just pushed
+                // over and must back out + tell the client why.
+                if cap > 0 {
+                    let prev = inflight.fetch_add(1, Ordering::AcqRel);
+                    if prev >= cap {
+                        inflight.fetch_sub(1, Ordering::Release);
+                        eprintln!("[scry serve] over cap ({cap}); rejecting conn");
+                        // Best-effort write; if the client already
+                        // hung up we don't care.
+                        let _ = stream.write_all(&make_cap_reply(cap));
+                        let _ = stream.flush();
+                        drop(stream);
+                        continue;
+                    }
+                }
                 let r = Arc::clone(&reader);
+                let slot = if cap > 0 { Some(ConnSlot(Arc::clone(&inflight))) } else { None };
                 thread::spawn(move || {
+                    let _slot = slot;
                     if let Err(e) = serve_connection(&r, &stream, &stream) {
                         eprintln!("[scry serve] connection: {e:#}");
                     }
@@ -5250,6 +5558,7 @@ fn serve_listener(reader: &StoreReader, spec: &str) -> Result<()> {
             Ok(())
         }
         Some(("tcp", addr)) => {
+            use std::io::Write;
             use std::net::TcpListener;
             let listener = TcpListener::bind(addr)
                 .with_context(|| format!("bind tcp:{addr}"))?;
@@ -5263,12 +5572,25 @@ fn serve_listener(reader: &StoreReader, spec: &str) -> Result<()> {
                 .unwrap_or_else(|_| addr.to_string());
             eprintln!("[scry serve] listening on tcp:{bound}");
             for stream in listener.incoming() {
-                let stream = match stream {
+                let mut stream = match stream {
                     Ok(s) => s,
                     Err(e) => { eprintln!("[scry serve] accept: {e}"); continue; }
                 };
+                if cap > 0 {
+                    let prev = inflight.fetch_add(1, Ordering::AcqRel);
+                    if prev >= cap {
+                        inflight.fetch_sub(1, Ordering::Release);
+                        eprintln!("[scry serve] over cap ({cap}); rejecting conn");
+                        let _ = stream.write_all(&make_cap_reply(cap));
+                        let _ = stream.flush();
+                        drop(stream);
+                        continue;
+                    }
+                }
                 let r = Arc::clone(&reader);
+                let slot = if cap > 0 { Some(ConnSlot(Arc::clone(&inflight))) } else { None };
                 thread::spawn(move || {
+                    let _slot = slot;
                     let read = match stream.try_clone() {
                         Ok(s) => s,
                         Err(e) => { eprintln!("[scry serve] dup: {e}"); return; }
@@ -5387,6 +5709,7 @@ fn serve_one_request<W: std::io::Write>(
         "callers" => serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit),
         "grep"    => serve_grep(reader, arg_str("pattern"), lang, in_, limit),
         "outline" => serve_outline(reader, arg_str("path"), limit),
+        "tldr"    => serve_tldr(reader, arg_str("path")),
         "coverage" => serve_coverage(reader, arg_str("path"),
             args.get("by_kind").and_then(serde_json::Value::as_bool).unwrap_or(false)),
         "stats"   => serve_stats(reader),
@@ -5733,6 +6056,67 @@ fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value
         "symbols_total": found.len(),
         "symbols_shown": take,
         "symbols": arr,
+    })
+}
+
+/// JSON-RPC `tldr`: one-call file summary. Mirrors `cmd_tldr`'s
+/// shape — `{path, lang, symbols_total, by_kind:[{kind,count}],
+/// top:[{name,kind,line,col,scope}], first_line}`. Same per-file
+/// symbol set as `outline` but compressed for the "what does this
+/// file do?" question.
+fn serve_tldr(r: &StoreReader, path: &str) -> serde_json::Value {
+    if path.is_empty() {
+        return serde_json::json!({"error": "missing 'path' arg"});
+    }
+    let file_id = match resolve_file_id(r, path) {
+        Some(id) => id,
+        None => return serde_json::json!({"error": format!("no indexed file matches '{}'", path)}),
+    };
+    let fe = match r.files.get(file_id as usize) {
+        Some(f) => f,
+        None => return serde_json::json!({"error": "file_id out of range"}),
+    };
+    let mut syms: Vec<SymbolRecord> = match r.symbols_for_file(file_id) {
+        Some(ids) => {
+            let mut v = Vec::with_capacity(ids.len());
+            if let Some(lz) = r.lazy_symbols.as_ref() {
+                for i in ids { if let Some(s) = lz.get(i as usize) { v.push(s); } }
+            } else {
+                for i in ids {
+                    if let Some(s) = r.symbols.get(i as usize) { v.push(s.clone()); }
+                }
+            }
+            v
+        }
+        None => r.iter_symbols().filter(|s| s.file_id == file_id).collect(),
+    };
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for s in &syms {
+        *by_kind.entry(s.kind.short()).or_default() += 1;
+    }
+    syms.sort_by_key(|s| std::cmp::Reverse(s.rank_score()));
+    let top: Vec<_> = syms.iter().take(3)
+        .map(|s| serde_json::json!({
+            "name": s.name, "kind": s.kind.short(),
+            "line": s.line, "col": s.col, "scope": s.scope_path,
+        }))
+        .collect();
+    let display = fe.display_path(&r.roots);
+    let first_line = std::fs::read_to_string(&display).ok()
+        .and_then(|src| src.lines().find(|l| !l.trim().is_empty())
+            .map(|l| if l.len() > 200 { format!("{}…", &l[..200]) }
+                    else { l.to_string() }));
+    let kinds: Vec<_> = by_kind.iter()
+        .map(|(k, n)| serde_json::json!({"kind": k, "count": n}))
+        .collect();
+    serde_json::json!({
+        "path": display,
+        "lang": fe.kind.as_str(),
+        "symbols_total": syms.len(),
+        "by_kind": kinds,
+        "top": top,
+        "first_line": first_line,
     })
 }
 

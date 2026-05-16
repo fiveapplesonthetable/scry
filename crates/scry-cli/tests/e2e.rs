@@ -695,6 +695,31 @@ fn synthetic_tree_roundtrip() {
     assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
 
+    // 8h-bis. `scry tldr PATH` — one-call file summary. JSON shape
+    // must include path, lang, symbols_total, by_kind, top, first_line.
+    let out = Command::new(scry_bin())
+        .args(["tldr", "a/Alpha.java", "--json", "--index"]).arg(&inc_idx)
+        .output().expect("tldr --json");
+    if out.status.success() {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .expect("tldr --json is JSON");
+        for k in &["path", "lang", "symbols_total", "by_kind", "top"] {
+            assert!(v.get(*k).is_some(),
+                    "tldr JSON missing field '{k}': {v}");
+        }
+    }
+    // Plain output must have the # comment header shape.
+    let out = Command::new(scry_bin())
+        .args(["tldr", "b/Bravo.java", "--index"]).arg(&inc_idx)
+        .output().expect("tldr plain");
+    assert!(out.status.success(),
+            "tldr failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("# "),
+            "tldr plain output must lead with `# `; got:\n{stdout}");
+    assert!(stdout.contains("symbols"),
+            "tldr plain output must mention symbols; got:\n{stdout}");
+
     // 8i. `scry grep --format=lines` — rg-shaped one-per-line. Output
     // must contain "path:line:col" but NOT the JSON envelope.
     let out = Command::new(scry_bin())
@@ -1496,5 +1521,100 @@ fn stale_index_emits_warning_on_every_open() {
     assert!(!stderr.contains("WARNING"),
             "matching version must NOT warn; stderr:\n{stderr}");
 
+    std::fs::remove_dir_all(&base).ok();
+}
+
+// ===========================================================================
+// `scry serve --max-conns N` rejects connections past the cap and
+// keeps the cap announce line in stderr. Pins the operability gap
+// caught by the v0.1.4 cap audit — without this, a thousand
+// concurrent agents could fan-in × fan-out each grep's rayon pool
+// and OOM the daemon host.
+// ===========================================================================
+
+#[test]
+fn unix_serve_max_conns_drops_over_cap() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let base = std::env::temp_dir().join(format!("scry-mc-{}", std::process::id()));
+    let src = base.join("src");
+    let idx = base.join("idx");
+    let sock = base.join("scry.sock");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("Hi.java"),
+        "package x;\npublic class Hi {\n}\n").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("index for max-conns test");
+    assert!(out.status.success());
+
+    // Cap at 1 so the second connection MUST be rejected.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--listen"]).arg(format!("unix:{}", sock.display()))
+        .args(["--max-conns", "1", "--index"]).arg(&idx)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn().expect("spawn scry serve --max-conns 1");
+    let stderr = child.stderr.take().expect("piped");
+    let mut srd = BufReader::new(stderr);
+    // Order: max_conns announce prints first (before bind), then
+    // the listening-on line. Read both so subsequent reads pick up
+    // the over-cap drop log line.
+    let mut cap_line = String::new();
+    srd.read_line(&mut cap_line).expect("max_conns line");
+    assert!(cap_line.contains("max_conns=1"),
+            "first stderr line should announce max_conns; got: {cap_line}");
+    let mut announce = String::new();
+    srd.read_line(&mut announce).expect("listen line");
+    assert!(announce.contains("listening on unix:"),
+            "second stderr line should be 'listening on unix:'; got: {announce}");
+
+    // First connection: open and hold it (don't close) so it occupies
+    // the single slot. Send one query to make sure it's live.
+    let s1 = UnixStream::connect(&sock).expect("conn 1");
+    s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut w1 = s1.try_clone().unwrap();
+    w1.write_all(b"{\"id\":1,\"cmd\":\"def\",\"args\":{\"name\":\"Hi\"}}\n").unwrap();
+    w1.flush().unwrap();
+    let mut r1 = BufReader::new(s1);
+    let mut buf = String::new();
+    r1.read_line(&mut buf).expect("reply 1");
+    assert!(buf.contains("\"id\":1"), "first conn must work; got: {buf}");
+
+    // Give the server a moment to spawn the worker thread + register
+    // the slot as in-flight.
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Second connection: must receive a JSON-RPC cap-exceeded
+    // error line, then close. The client should see an actionable
+    // message (not silent EOF) so it can back off + retry.
+    let s2 = UnixStream::connect(&sock).expect("conn 2 accepted by kernel");
+    s2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut r2 = BufReader::new(s2);
+    let mut cap_reply = String::new();
+    let n = r2.read_line(&mut cap_reply).unwrap_or(0);
+    assert!(n > 0, "over-cap conn must receive a reply before close");
+    let v: serde_json::Value = serde_json::from_str(cap_reply.trim())
+        .unwrap_or_else(|e| panic!("cap reply must be JSON: {e}; got: {cap_reply}"));
+    assert_eq!(v["error"]["code"].as_i64(), Some(-32004),
+            "cap-exceeded reply must use JSON-RPC code -32004; got: {v}");
+    assert!(v["error"]["message"].as_str()
+            .map(|m| m.contains("max_conns=1")).unwrap_or(false),
+            "cap message must name the limit; got: {v}");
+    assert_eq!(v["error"]["data"]["retryable"].as_bool(), Some(true),
+            "cap reply must mark retryable: true; got: {v}");
+
+    // Check that the cap-exceeded log line appears on stderr too.
+    let mut over_line = String::new();
+    let _ = srd.read_line(&mut over_line);
+    assert!(over_line.contains("over cap"),
+            "stderr should log the rejection; got: {over_line}");
+
+    child.kill().ok();
+    child.wait().ok();
     std::fs::remove_dir_all(&base).ok();
 }

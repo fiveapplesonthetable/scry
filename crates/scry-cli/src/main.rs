@@ -131,6 +131,9 @@ enum Cmd {
         lang: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        /// Restrict to refs whose file path starts with PREFIX (subdir scope).
+        #[arg(long, value_name = "PREFIX")]
+        in_: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -143,6 +146,9 @@ enum Cmd {
         index: Option<PathBuf>,
         #[arg(long)]
         lang: Option<String>,
+        /// Restrict to callers whose file path starts with PREFIX (subdir scope).
+        #[arg(long, value_name = "PREFIX")]
+        in_: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -157,6 +163,11 @@ enum Cmd {
         lang: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        /// Restrict to symbols whose file path starts with PREFIX.
+        /// Lets you query a subdir of an indexed root, e.g.
+        /// `scry def Activity --in frameworks/base/services/`.
+        #[arg(long, value_name = "PREFIX")]
+        in_: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -300,8 +311,8 @@ fn main() -> Result<()> {
             roots, profile, out, count_only, limit, no_refs, workers,
             max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes, resume,
         ),
-        Cmd::Def { name, index, lang, kind, limit, json, md, budget } => {
-            cmd_def(name, index, lang, kind, limit, json, md, budget)
+        Cmd::Def { name, index, lang, kind, in_, limit, json, md, budget } => {
+            cmd_def(name, index, lang, kind, in_, limit, json, md, budget)
         }
         Cmd::Prefix { prefix, index, limit, json } => {
             cmd_prefix(prefix, index, limit, json)
@@ -309,11 +320,11 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, limit, json } => {
             cmd_fuzzy(substr, index, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, limit, json } => {
-            cmd_ref(name, index, lang, kind, limit, json)
+        Cmd::Ref { name, index, lang, kind, in_, limit, json } => {
+            cmd_ref(name, index, lang, kind, in_, limit, json)
         }
-        Cmd::Callers { name, index, lang, limit, json } => {
-            cmd_ref(name, index, lang, Some("call".to_string()), limit, json)
+        Cmd::Callers { name, index, lang, in_, limit, json } => {
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
         Cmd::Grep {
@@ -325,7 +336,7 @@ fn main() -> Result<()> {
         ),
         Cmd::Serve { index } => cmd_serve(index),
         Cmd::Mod { name, index, limit, json } => {
-            cmd_def(name, index, None, Some("soong".into()), limit, json, false, None)
+            cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
         Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
     }
@@ -1080,6 +1091,7 @@ fn cmd_def(
     index: Option<PathBuf>,
     lang: Option<String>,
     kind: Option<String>,
+    in_: Option<String>,
     limit: usize,
     json: bool,
     md: bool,
@@ -1087,7 +1099,13 @@ fn cmd_def(
 ) -> Result<()> {
     let r = open_index(index)?;
     let results = r.lookup_exact(&name);
-    let filtered: Vec<&SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
+    let mut filtered: Vec<&SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
+    if let Some(prefix) = in_.as_deref() {
+        filtered.retain(|s| match r.files.get(s.file_id as usize) {
+            Some(fe) => fe.display_path(&r.roots).contains(prefix),
+            None => false,
+        });
+    }
     if md {
         print_results_md(&r, &filtered, limit, budget);
     } else {
@@ -1115,6 +1133,7 @@ fn cmd_ref(
     index: Option<PathBuf>,
     lang: Option<String>,
     kind: Option<String>,
+    in_: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
@@ -1123,6 +1142,14 @@ fn cmd_ref(
     let filtered: Vec<&RefRecord> = results
         .into_iter()
         .filter(|rr| {
+            if let Some(prefix) = &in_ {
+                match r.files.get(rr.file_id as usize) {
+                    Some(fe) => if !fe.display_path(&r.roots).contains(prefix.as_str()) {
+                        return false;
+                    },
+                    None => return false,
+                }
+            }
             if let Some(l) = &lang {
                 if !format!("{:?}", rr.lang).eq_ignore_ascii_case(l) {
                     return false;

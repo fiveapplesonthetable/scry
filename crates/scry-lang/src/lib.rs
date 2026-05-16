@@ -152,7 +152,59 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
         Python => python_spec(),
         _ => return Ok(Vec::new()),
     };
-    extract_with(spec, source)
+    let mut syms = extract_with(spec, source)?;
+    if kind == Kotlin {
+        inject_anonymous_companions(source, &mut syms);
+    }
+    Ok(syms)
+}
+
+/// Anonymous Kotlin `companion object { ... }` lacks an identifier
+/// child, so the symbol query can't capture it as a Class. The members'
+/// scope is already fixed up by [`scope_label_for`] (which synthesizes
+/// "Companion"), but agents asking `def Companion` or browsing an
+/// outline expect a Class entry too. This walker injects one synthetic
+/// Class symbol named "Companion" per anonymous companion_object, at
+/// the companion's start position.
+fn inject_anonymous_companions(source: &[u8], syms: &mut Vec<RawSymbol>) {
+    PARSER.with(|cell| {
+        let mut parser = cell.borrow_mut();
+        if parser.set_language(kotlin_spec().language).is_err() { return; }
+        let tree = match parser.parse(source, None) {
+            Some(t) => t,
+            None => return,
+        };
+        visit_companions(tree.root_node(), source, syms);
+    });
+}
+
+fn visit_companions(node: tree_sitter::Node, source: &[u8], syms: &mut Vec<RawSymbol>) {
+    if node.kind() == "companion_object" {
+        let mut w = node.walk();
+        let has_name = node.named_children(&mut w).any(|c| c.kind() == "identifier");
+        if !has_name {
+            let start = node.start_position();
+            let scope = compute_scope(
+                node,
+                source,
+                kotlin_spec().scope_node_kinds,
+                kotlin_spec().package_node_kind,
+            );
+            syms.push(RawSymbol {
+                name: "Companion".to_string(),
+                kind: SymbolKind::Class,
+                line: (start.row + 1) as u32,
+                col: (start.column + 1) as u32,
+                byte_start: node.start_byte() as u32,
+                byte_end:   node.end_byte()   as u32,
+                scope_path: scope,
+            });
+        }
+    }
+    let mut w = node.walk();
+    for c in node.named_children(&mut w) {
+        visit_companions(c, source, syms);
+    }
 }
 
 pub fn extract_refs(kind: FileKind, source: &[u8]) -> Result<Vec<RawRef>> {
@@ -440,22 +492,50 @@ fn compute_scope(
     while let Some(p) = cur {
         let k = p.kind();
         if scope_kinds.contains(&k) || Some(k) == package_kind {
-            if let Some(n) = p.child_by_field_name("name") {
-                // Don't push our own name as our own scope step — for a
-                // function/class declaration where the captured @name IS
-                // p's "name" field, the symbol belongs INSIDE p but
-                // p doesn't enclose it scope-wise.
-                if n.id() != node.id() {
-                    if let Ok(s) = n.utf8_text(src) {
-                        scope.push(s.to_string());
-                    }
-                }
+            if let Some(label) = scope_label_for(p, node, src) {
+                scope.push(label);
             }
         }
         cur = p.parent();
     }
     scope.reverse();
     scope
+}
+
+/// Resolve a scope-bearing parent to the string that should appear on
+/// the scope_path. Most grammars expose a "name" field on the scope
+/// node and we lift its text verbatim. Two special cases:
+///
+/// 1. Kotlin `companion_object` carries the name as a plain `identifier`
+///    named child (no "name" field). When the identifier is absent
+///    (anonymous companion — by far the common case), synthesize the
+///    name "Companion" so members get scoped consistently with the
+///    JVM convention (`Holder.Companion.foo()`).
+///
+/// 2. If the matched child IS the queried `node` itself, return None —
+///    a declaration is not its own scope.
+fn scope_label_for(
+    parent: tree_sitter::Node,
+    node: tree_sitter::Node,
+    src: &[u8],
+) -> Option<String> {
+    if let Some(n) = parent.child_by_field_name("name") {
+        if n.id() == node.id() { return None; }
+        return n.utf8_text(src).ok().map(String::from);
+    }
+    if parent.kind() == "companion_object" {
+        // Named companion: `companion object Builder { ... }` exposes the
+        // name as the first `identifier` named child.
+        let mut w = parent.walk();
+        for c in parent.named_children(&mut w) {
+            if c.kind() == "identifier" && c.id() != node.id() {
+                return c.utf8_text(src).ok().map(String::from);
+            }
+        }
+        // Anonymous companion: synthesize the JVM-default `Companion`.
+        return Some("Companion".to_string());
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +612,7 @@ fn kotlin_spec() -> &'static LangSpec {
                 r#"
                 (class_declaration (identifier) @name) @def.class
                 (object_declaration (identifier) @name) @def.class
+                (companion_object (identifier) @name) @def.class
                 (function_declaration (identifier) @name) @def.function
                 (property_declaration (variable_declaration (identifier) @name)) @def.field
                 (type_alias (identifier) @name) @def.type
@@ -552,7 +633,12 @@ fn kotlin_spec() -> &'static LangSpec {
                 ("def.module", SymbolKind::Module),
             ],
             name_capture: "name",
-            scope_node_kinds: &["class_declaration", "object_declaration", "function_declaration"],
+            scope_node_kinds: &[
+                "class_declaration",
+                "object_declaration",
+                "companion_object",
+                "function_declaration",
+            ],
             package_node_kind: Some("package_header"),
         }
     })
@@ -1409,6 +1495,157 @@ int BBinder::transact(int code) { return 0; }
                 let text = n.utf8_text(src).unwrap_or("?");
                 let snippet = if text.len() < 60 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
                 println!("{:indent$}{} = {:?}", "", n.kind(), snippet, indent = depth*2);
+                let mut w = n.walk();
+                for c in n.named_children(&mut w) { walk(c, src, depth + 1); }
+            }
+            walk(tree.root_node(), src.as_ref(), 0);
+        });
+    }
+
+    /// Kotlin companion-object coverage: anonymous + named.
+    ///
+    /// Anonymous `companion object { ... }` injects a synthetic
+    /// Class symbol named "Companion" scoped to the enclosing class,
+    /// and members get scope = [Outer, "Companion"]. Named
+    /// `companion object Builder { ... }` is captured by the query
+    /// directly as a Class, and members scope to the explicit name.
+    #[test]
+    fn kotlin_companion_object_coverage() {
+        let src = br#"
+            package x
+            class H {
+                companion object {
+                    fun anon() {}
+                    const val MAX = 100
+                }
+            }
+            class H2 {
+                companion object Builder {
+                    fun named() {}
+                }
+            }
+        "#;
+        let syms = extract(FileKind::Kotlin, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}/{:?}", s.kind, s.name, s.scope_path);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        assert!(
+            syms.iter().any(|s| s.name == "Companion"
+                && s.kind == SymbolKind::Class
+                && s.scope_path == vec!["H".to_string()]),
+            "anonymous companion must surface as Companion class under H. all:\n  {}",
+            all.join("\n  "),
+        );
+        assert!(
+            syms.iter().any(|s| s.name == "anon"
+                && s.kind == SymbolKind::Function
+                && s.scope_path == vec!["H".to_string(), "Companion".to_string()]),
+            "anonymous companion fun `anon` must scope to [H, Companion]. all:\n  {}",
+            all.join("\n  "),
+        );
+        assert!(
+            syms.iter().any(|s| s.name == "MAX"
+                && s.scope_path == vec!["H".to_string(), "Companion".to_string()]),
+            "anonymous companion const MAX must scope to [H, Companion]. all:\n  {}",
+            all.join("\n  "),
+        );
+
+        assert!(
+            syms.iter().any(|s| s.name == "Builder"
+                && s.kind == SymbolKind::Class
+                && s.scope_path == vec!["H2".to_string()]),
+            "named companion `Builder` must surface as Class under H2. all:\n  {}",
+            all.join("\n  "),
+        );
+        assert!(
+            syms.iter().any(|s| s.name == "named"
+                && s.kind == SymbolKind::Function
+                && s.scope_path == vec!["H2".to_string(), "Builder".to_string()]),
+            "named companion fun must scope to [H2, Builder]. all:\n  {}",
+            all.join("\n  "),
+        );
+    }
+
+    /// Sealed-class hierarchies and inline reified fns are already
+    /// covered by the standard class_declaration / function_declaration
+    /// captures. Pin that behavior so a future query refactor doesn't
+    /// silently drop them.
+    #[test]
+    fn kotlin_sealed_and_inline_reified_coverage() {
+        let src = br#"
+            package x
+            sealed class Result {
+                class Ok : Result()
+                class Err(val msg: String) : Result()
+                object Pending : Result()
+            }
+            inline fun <reified T> printType() { println(T::class.simpleName) }
+        "#;
+        let syms = extract(FileKind::Kotlin, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}/{:?}", s.kind, s.name, s.scope_path);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        assert!(syms.iter().any(|s| s.name == "Result" && s.kind == SymbolKind::Class
+                                 && s.scope_path.is_empty()),
+                "sealed parent `Result` must be top-level Class. all:\n  {}",
+                all.join("\n  "));
+        for sub in &["Ok", "Err", "Pending"] {
+            assert!(syms.iter().any(|s| s.name == *sub && s.scope_path == vec!["Result".to_string()]),
+                    "sealed subtype `{sub}` must scope under [Result]. all:\n  {}",
+                    all.join("\n  "));
+        }
+
+        assert!(syms.iter().any(|s| s.name == "printType"
+                                 && s.kind == SymbolKind::Function
+                                 && s.scope_path.is_empty()),
+                "inline reified fn `printType` must be top-level Function. all:\n  {}",
+                all.join("\n  "));
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture"]
+    fn dump_kotlin_modern_features() {
+        // Probe what extract() currently does for companion / sealed / inline reified.
+        for (label, src) in &[
+            ("companion-anonymous", b"package x\nclass H { companion object { fun create() = H() } }\n" as &[u8]),
+            ("companion-named",     b"package x\nclass H { companion object Builder { fun build() = H() } }\n" as &[u8]),
+            ("sealed-with-children", b"package x\nsealed class R { class Ok : R(); class Err : R(); object Pending : R() }\n" as &[u8]),
+            ("inline-reified",       b"package x\ninline fun <reified T> printType() { println(T::class.simpleName) }\n" as &[u8]),
+        ] {
+            println!("--- {label} ---");
+            let syms = extract(FileKind::Kotlin, src).unwrap();
+            for s in &syms {
+                println!("  {:?} name={:?} scope={:?}", s.kind, s.name, s.scope_path);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture to see companion AST"]
+    fn dump_kotlin_companion_ast() {
+        let src = b"package x\nclass H {\n  companion object {\n    fun anon() {}\n  }\n}\nclass H2 {\n  companion object Builder {\n    fun named() {}\n  }\n}\n";
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(kotlin_spec().language).unwrap();
+            let tree = parser.parse(src.as_ref(), None).unwrap();
+            fn walk(n: tree_sitter::Node, src: &[u8], depth: usize) {
+                let text = n.utf8_text(src).unwrap_or("?");
+                let snippet = if text.len() < 50 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
+                let by_name_field = n.parent()
+                    .and_then(|p| {
+                        let mut w = p.walk();
+                        let mut fname = None;
+                        for (i, c) in p.named_children(&mut w).enumerate() {
+                            if c.id() == n.id() {
+                                fname = p.field_name_for_named_child(i as u32).map(String::from);
+                                break;
+                            }
+                        }
+                        fname
+                    })
+                    .map(|s| format!(" [field={s}]"))
+                    .unwrap_or_default();
+                println!("{:indent$}{}{} = {:?}", "", n.kind(), by_name_field, snippet, indent = depth*2);
                 let mut w = n.walk();
                 for c in n.named_children(&mut w) { walk(c, src, depth + 1); }
             }

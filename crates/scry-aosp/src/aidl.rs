@@ -330,6 +330,35 @@ pub(crate) fn emit_aidl_shadows(
     }
 }
 
+/// Frozen-version detection. Returns true for any path that lives under
+/// AOSP's `aidl_api/` convention — that's where every frozen API surface
+/// for an AIDL package lands (`aidl_api/<pkg>/<N>/<file>.aidl` for
+/// version N, plus `aidl_api/<pkg>/current/<file>.aidl` for the working
+/// copy that becomes the next frozen snapshot). The development source
+/// lives under plain `aidl/` and is not flagged.
+///
+/// Detection is path-substring; the indexer calls it after parse and
+/// flips every `AidlInterface` symbol on a frozen file to `AidlFrozen`
+/// (via [`apply_frozen_post`]). This lets agents ask "what is the V3
+/// surface of IFoo" with `--kind aidl.frozen` while the live development
+/// source stays under `--kind aidl.iface`.
+pub fn is_frozen_path(path: &str) -> bool {
+    path.contains("/aidl_api/") || path.starts_with("aidl_api/")
+}
+
+/// Post-process: flip every AidlInterface in `syms` to AidlFrozen.
+/// Called by the indexer when [`is_frozen_path`] matched the source
+/// file. AidlMethod / AidlParcelable / AidlShadow are intentionally
+/// left untouched — only the top-level interface symbol changes kind,
+/// matching how Gerrit's "what frozen interfaces exist" view groups by.
+pub fn apply_frozen_post(syms: &mut [RawSymbol]) {
+    for s in syms.iter_mut() {
+        if s.kind == SymbolKind::AidlInterface {
+            s.kind = SymbolKind::AidlFrozen;
+        }
+    }
+}
+
 /// The fixed set of generated-binding names for an AIDL interface,
 /// in a stable order. Extracted into a free function so tests can
 /// pin the exact list without exercising the parser.
@@ -423,5 +452,51 @@ mod tests {
         for must_have in &["IBinder.Stub", "IBinder.Stub.Proxy", "BpIBinder", "BnIBinder"] {
             assert!(names.contains(must_have), "missing shadow {must_have} in {names:?}");
         }
+    }
+
+    /// is_frozen_path pins the AOSP `aidl_api/` convention.
+    #[test]
+    fn frozen_path_detection() {
+        // Real frozen versions under aidl_api/<pkg>/<N>/
+        assert!(is_frozen_path("hardware/interfaces/foo/aidl/aidl_api/android.hardware.foo/3/android/hardware/foo/IFoo.aidl"));
+        assert!(is_frozen_path("aidl_api/android.os/2/android/os/IBinder.aidl"));
+        // The current/ working copy that becomes the next freeze.
+        assert!(is_frozen_path("hardware/interfaces/foo/aidl/aidl_api/android.hardware.foo/current/android/hardware/foo/IFoo.aidl"));
+        // Live development source — not frozen.
+        assert!(!is_frozen_path("hardware/interfaces/foo/aidl/android/hardware/foo/IFoo.aidl"));
+        assert!(!is_frozen_path("frameworks/base/core/java/android/os/IBinder.aidl"));
+        // Adjacent-but-not-matching paths should not false-positive.
+        assert!(!is_frozen_path("hardware/notaidl_api/foo.aidl"));
+    }
+
+    /// apply_frozen_post promotes AidlInterface → AidlFrozen without
+    /// touching methods, parcelables, or shadows.
+    #[test]
+    fn frozen_post_processing_promotes_only_interface() {
+        let src = br#"
+            package android.os;
+            interface IFoo {
+                void doThing();
+            }
+            parcelable Bar;
+        "#;
+        let (mut syms, _) = parse(src);
+        // Sanity: parser emits AidlInterface, AidlMethod, AidlParcelable, AidlShadow.
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::AidlInterface));
+        let pre_methods = syms.iter().filter(|s| s.kind == SymbolKind::AidlMethod).count();
+        let pre_parcels = syms.iter().filter(|s| s.kind == SymbolKind::AidlParcelable).count();
+        let pre_shadows = syms.iter().filter(|s| s.kind == SymbolKind::AidlShadow).count();
+        let pre_ifaces  = syms.iter().filter(|s| s.kind == SymbolKind::AidlInterface).count();
+
+        apply_frozen_post(&mut syms);
+
+        // Interface gets promoted; everything else is untouched.
+        assert_eq!(syms.iter().filter(|s| s.kind == SymbolKind::AidlInterface).count(), 0,
+                   "AidlInterface must be promoted to AidlFrozen");
+        assert_eq!(syms.iter().filter(|s| s.kind == SymbolKind::AidlFrozen).count(), pre_ifaces,
+                   "every prior AidlInterface should now be AidlFrozen");
+        assert_eq!(syms.iter().filter(|s| s.kind == SymbolKind::AidlMethod).count(), pre_methods);
+        assert_eq!(syms.iter().filter(|s| s.kind == SymbolKind::AidlParcelable).count(), pre_parcels);
+        assert_eq!(syms.iter().filter(|s| s.kind == SymbolKind::AidlShadow).count(), pre_shadows);
     }
 }

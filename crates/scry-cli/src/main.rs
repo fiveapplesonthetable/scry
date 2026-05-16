@@ -1531,10 +1531,18 @@ fn parse_one(
         .with_context(|| format!("read {}", rf.path.display()))?;
     // Stamp the filename on the worker thread so tree-sitter timeout /
     // abort logs can name the offending file. Cleared after the call.
-    let (raw_syms, raw_refs) = scry_lang::with_current_file(
+    let (mut raw_syms, raw_refs) = scry_lang::with_current_file(
         rf.path.display().to_string(),
         || registry.parse(rf.kind, &bytes),
     );
+    // Path-aware post-processing. Today only AIDL needs it: a parse
+    // emits AidlInterface; if the source lives under aidl_api/<pkg>/<N>/
+    // it's actually a frozen-version snapshot, which we promote to
+    // AidlFrozen so agents can filter by surface version vs the live
+    // development copy. The parser doesn't see the path, hence here.
+    if rf.kind == FileKind::Aidl && scry_aosp::aidl::is_frozen_path(&path_str) {
+        scry_aosp::aidl::apply_frozen_post(&mut raw_syms);
+    }
     let mut syms = Vec::with_capacity(raw_syms.len());
     let relpath = fe.relpath.clone();
     for r in raw_syms {

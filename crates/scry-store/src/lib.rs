@@ -203,6 +203,13 @@ pub enum SymbolKind {
     AidlInterface,
     AidlMethod,
     AidlParcelable,
+    /// Live `aidl/` interface declaration whose source lives under
+    /// `aidl_api/<pkg>/<N>/`, i.e. a frozen version snapshot. Same rank
+    /// as `AidlInterface` but distinguishable from the development copy:
+    /// agents asking "what is the V3 frozen surface of IFoo" can filter
+    /// `--kind aidl.frozen`, while changes to the live development source
+    /// stay under `--kind aidl.iface`.
+    AidlFrozen,
     /// Synthetic shadow symbol for an AIDL-generated language binding.
     /// Emitted at AIDL parse time so `scry def IFoo.Stub` (Java) or
     /// `scry def BpIFoo` (C++) finds the AIDL source location instead
@@ -252,6 +259,7 @@ impl SymbolKind {
             SymbolKind::AidlInterface => "aidl.iface",
             SymbolKind::AidlMethod => "aidl.method",
             SymbolKind::AidlParcelable => "aidl.parcel",
+            SymbolKind::AidlFrozen => "aidl.frozen",
             SymbolKind::AidlShadow => "aidl.shadow",
             SymbolKind::HidlShadow => "hidl.shadow",
             SymbolKind::ProtoMessage => "proto.msg",
@@ -358,7 +366,7 @@ impl SymbolRecord {
             SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait
             | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Union => 100,
             SymbolKind::Method | SymbolKind::Function | SymbolKind::Constructor => 90,
-            SymbolKind::AidlInterface | SymbolKind::AidlMethod | SymbolKind::AidlParcelable => 85,
+            SymbolKind::AidlInterface | SymbolKind::AidlMethod | SymbolKind::AidlParcelable | SymbolKind::AidlFrozen => 85,
             // Shadows are derived bindings; rank below the real AIDL/HIDL
             // declaration but above plain fields so they surface for the
             // common "find IFoo.Stub" question without burying the .aidl.

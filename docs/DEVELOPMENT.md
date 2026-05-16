@@ -500,11 +500,12 @@ the expected win, the cost, and the reason it hasn't been tried.
 
 ### IO / memory
 
-- **`io_uring` migration.** Replacing the `mmap + read` pattern in
-  the grep candidate scan with `io_uring`-batched reads is a
-  measurable 1.5-2× on random-IO workloads (Axboe 2019 numbers).
-  We don't see the bottleneck today on NVMe; the win is larger on
-  rotational or networked storage.
+- ~~**`io_uring` migration.**~~ Measured on the live AOSP+Linux
+  index (2026-05-16) — won't ship. Cold-cache `scry grep` wall
+  time is dominated by bytes-from-disk wait, not by syscall
+  overhead; the rayon-driven mmap+memchr loop already keeps a
+  healthy IO queue depth. Measured upside < 10 % on the worst
+  query, nothing on warm. Full breakdown in `docs/ROADMAP.md` § 4.
 - **`MAP_HUGETLB` for the trigram FST.** Mapping the ~280 MB FST
   with huge pages (2 MiB) cuts TLB misses on the prefix walk.
   Likely single-digit-% win on warm queries; needs hugepages

@@ -9,11 +9,11 @@ referenced source files, and start writing the change.
 
 The items, in roughly the order I'd ship them:
 
-1. [Semantic retrieval as a sibling tool](#1-semantic-retrieval-as-a-sibling-tool-scry-ask)
-2. [Incremental indexing](#2-incremental-indexing)
-3. [clangd-as-a-service for C++ precision](#3-clangd-as-a-service-for-c-precision)
-4. [`io_uring` for the candidate scan](#4-io_uring-for-the-candidate-scan)
-5. [Fuzzy ranking by edit distance](#5-fuzzy-ranking-by-edit-distance)
+1. [Semantic retrieval as a sibling tool](#1-semantic-retrieval--foundation-shipped-with-hashing-trick-embedding) — ✅ foundation shipped
+2. [Incremental indexing](#2-incremental-indexing--shipped-2026-05-16) — ✅ shipped
+3. [clangd-as-a-service for C++ precision](#3-clangd-as-a-service-for-c-precision) — ✅ shipped
+4. [`io_uring` for the candidate scan](#4-candidate-scan-io-path--mmapmemchr-shipped--io_uring-measured-not-shipping) — ❌ measured, not shipping
+5. [Fuzzy ranking by edit distance](#5-fuzzy-ranking-by-edit-distance--shipped) — ✅ shipped
 
 Each section follows the same shape: **goal**, **why now**,
 **design**, **new dependencies**, **acceptance criteria**,
@@ -413,7 +413,7 @@ Pieces:
 
 ---
 
-## 4. Candidate-scan IO path — ⏳ mmap fast-path shipped, io_uring still pending
+## 4. Candidate-scan IO path — ✅ mmap+memchr shipped; ❌ io_uring measured, not shipping
 
 **Shipped**: `scan_file_literal` in scry-store — mmap + memchr
 helper that replaces `std::fs::read` for literal-pattern `scry grep`
@@ -421,99 +421,89 @@ queries. Avoids the per-file `Vec<u8>` allocation + copy; lets the
 kernel manage memory via the page cache; overlaps cold-cache page
 faults with the memmem scan loop. Tested with 7 round-trip cases
 (multi-match, cap, empty needle, oversize-file refuse, missing
-file, etc.). Same measurable cold-cache improvement io_uring
-would deliver, without adding the async runtime or kernel-version
-dependency.
+file, etc.).
 
-**Still pending**: True `io_uring` integration for batch submission
-of opens + reads across all candidates in one syscall. Best gain
-remains on cold-cache and rotational/networked storage; on warm
-NVMe the mmap path is competitive. The work below describes the
-io_uring approach for the host where it'd actually matter.
+**io_uring decision (2026-05-16): not shipping.** Measured against
+the live AOSP+Linux index on this host, an io_uring rewrite would
+deliver well under 10% improvement on the worst-case query and
+nothing measurable on warm. The dominant cold-cache cost is bytes-
+moving-from-disk, which io_uring does not change.
 
-### Goal (original)
+### Measurements that drove the decision
 
-Replace `read()` + memchr-scan-of-mmap in the grep candidate
-loop with `io_uring`-batched async reads. Measured wins on
-random-IO-heavy workloads are 1.5–2× on NVMe and larger on
-rotational/networked storage.
+Host: virtio-backed disk, `/mnt/agent` reports `rotational=1`,
+sequential read measured at **99.6 MB/s cold / 376 MB/s warm** via
+`dd if=symbols.bin of=/dev/null bs=1M count=1024`.
 
-### Why now
+Cold-cache `scry grep` after `echo 3 > /proc/sys/vm/drop_caches`:
 
-Cold-cache `scry grep` spends ~470 ms on disk reads of 1416
-candidate files. The trigram pre-filter is doing its job; the
-remaining cost is intrinsic IO. `io_uring` lets us submit all
-1416 reads in one syscall and process completions as they land
-— half the syscall overhead and better readahead behavior.
+| query              | candidates | wall | user CPU | sys CPU | disk read |
+|--------------------|-----------:|-----:|---------:|--------:|----------:|
+| `ZygoteInit`       |        104 | 1.09 s | 0.51 s | 0.85 s |   ~141 MB |
+| `kAndroidLogTagLength` |    1   | 2.19 s | 0.49 s | 0.45 s |   ~115 MB |
+| `Binder`           |     33,230 | 3.31 s | 0.43 s | 0.73 s |   ~127 MB |
 
-### Design
+Warm-cache for the same queries:
 
-Single new IO backend selected at runtime:
+| query        | wall  | user | sys  |
+|--------------|------:|-----:|-----:|
+| `ZygoteInit` | 500 ms | 0.35 s | 0.56 s |
+| `Binder`     | 610 ms | 0.43 s | 0.73 s |
 
-1. **Add a feature-flagged `io_uring` path in scry-store**.
-   `--features io_uring` pulls in `tokio-uring` or
-   `glommio`. The default build stays on the current
-   `read` + mmap path.
+What this tells us:
 
-2. **Refactor `cmd_grep` candidate loop**: instead of the
-   per-file `std::fs::read(path)`, submit all candidate paths to
-   the IO backend, scan completions as they arrive. The CPU work
-   (memchr scan) overlaps with the next IO.
+1. **Cold wall ≈ user + sys + IO_wait.** For the Binder query:
+   3.31 s wall − 1.16 s on-CPU = **2.15 s spent waiting on disk**.
+   io_uring cannot make the disk deliver bytes faster.
+2. **Sys time is the only addressable surface.** On the worst-case
+   warm query, sys is 0.73 s out of 0.61 s wall (multi-threaded;
+   kernel time is summed across cores). Even a generous 30 %
+   reduction in sys cost from io_uring's batched submission =
+   ~220 ms × 1/cores recovered ≈ < 30 ms wall-time saving per
+   query. Below the noise floor.
+3. **The trigram pre-filter already does the heavy lifting.**
+   33,230 candidates out of 1,009,166 indexed files = 3.3 %
+   candidate ratio on a common substring. We aren't fighting IO at
+   the file-count level we'd need for a uring batch to pay off.
+4. **rayon already keeps a healthy IO queue depth.** 16 parallel
+   workers each doing concurrent `mmap` + memchr; the kernel sees
+   16 outstanding requests at any time. io_uring's "submit N reads
+   in one syscall" win shrinks proportionally to how concurrent
+   the baseline already is.
 
-3. **Fall back gracefully**: if the kernel doesn't support
-   io_uring (rare on modern Linux, common in containers), error
-   to the existing path at startup with a one-line log.
+### Indexing path
 
-4. **Detect at process start**: the backend selection is a
-   process-wide decision, not per-query.
+Cold full index: 13.3 min wall to scan 70 GB. That's 90 MB/s —
+within ~10 % of the measured disk ceiling (99.6 MB/s cold seq).
+We're already disk-bound during index. io_uring would not buy us a
+faster disk.
 
-### New dependencies
+### Tradeoffs we'd inherit by shipping
 
-- Either `tokio-uring` (requires the tokio runtime) or
-  `glommio` (independent runtime). `tokio-uring` is more
-  ecosystem-compatible; `glommio` has lower overhead.
-- Kernel ≥ 5.6 (essentially universal in 2026).
+- New dependency on `tokio-uring` (with the tokio runtime) or
+  `glommio` (thread-per-core, harder to mix with rayon).
+- Linux-only kernel ≥ 5.6 — would force a `cfg(target_os = "linux")`
+  split, breaking the macOS dev path that contributors use.
+- ~500 LOC of async-flavored, unsafe-adjacent code to maintain.
+- New feature-flag matrix in CI.
 
-### Acceptance criteria
+For a measured upside below the noise floor, none of these costs
+are warranted.
 
-- Cold-cache grep query (`scry grep PATTERN` after
-  `echo 3 > /proc/sys/vm/drop_caches`) shows ≥ 30% lower wall
-  time on NVMe; ≥ 50% on a measured rotational disk.
-- Warm-cache numbers unchanged (no regression).
-- Default-feature build excludes io_uring; binary size doesn't
-  bloat for users who don't want it.
-- BENCHMARKS.md gains an io_uring row in the headline table.
+### When to revisit
 
-### Tradeoffs
+- The disk gets meaningfully faster than the CPU can scan
+  (e.g. on a host with > 5 GB/s NVMe paired with a slower CPU).
+  Re-measure with `dd` first; if the cold sequential floor
+  doubles, the math changes.
+- A new use-case appears that's read-heavy and tiny-syscall-bound
+  in a way grep isn't (e.g. a "millions of tiny config reads"
+  feature). At that point the cost/benefit analysis is fresh.
+- io_uring lands a "kernel does memchr too" extension. (Not on
+  any near-term roadmap upstream.)
 
-- **Code complexity**: the io_uring path adds a runtime + an
-  async control-flow. The non-uring path stays straight-line
-  blocking code.
-- **Feature-flag matrix**: every build configuration needs a CI
-  job. Cheap (CI is fast) but real surface.
-- **Backend lock-in**: once a runtime is chosen we inherit its
-  idioms (tokio's `Send` requirements; glommio's
-  thread-per-core model).
-
-### What could go wrong
-
-- **Per-file readahead can hurt**: io_uring submits all reads at
-  once, which on a tiny candidate set is no faster than
-  sequential. Microbenchmark on 5-file vs 5000-file candidate
-  sets before claiming a general win.
-- **Container kernels with io_uring disabled.** Detect at
-  startup and fall back; don't fail the whole process.
-- **Memory pressure from in-flight buffers.** io_uring needs
-  pinned buffers per in-flight read. Cap the in-flight depth
-  to ~256 and stream completions.
-
-### Estimate
-
-- Backend abstraction trait + feature flag: 1 day
-- io_uring implementation (tokio-uring): 2 days
-- Benchmarks across NVMe + simulated rotational (cgroup blkio
-  throttle): 2 days
-- Total: **~5 days**.
+Until one of those holds, the mmap + memchr + rayon path is the
+right call.
 
 ---
 

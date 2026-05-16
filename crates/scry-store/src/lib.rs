@@ -325,6 +325,13 @@ impl StorePaths {
     pub fn trigram_postings(&self) -> PathBuf { self.root.join("trigram_postings.bin") }
     pub fn symbol_offsets(&self) -> PathBuf { self.root.join("symbols_offsets.bin") }
     pub fn ref_offsets(&self) -> PathBuf { self.root.join("refs_offsets.bin") }
+    /// file_id → list of symbol indices. Packed: per file_id (in order),
+    /// a u32 count followed by `count` u32 indices into symbols.bin.
+    pub fn file_symbols(&self) -> PathBuf { self.root.join("file_symbols.bin") }
+    /// Sidecar: one u64-LE byte offset per file_id giving where that
+    /// file's entry begins in file_symbols.bin. Allows random access
+    /// without scanning the whole packed file.
+    pub fn file_symbols_offsets(&self) -> PathBuf { self.root.join("file_symbols_offsets.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -626,12 +633,14 @@ impl StoreWriter {
         write_bincode(&tmp_paths.roots(), &self.roots)?;
         write_bincode(&tmp_paths.files(), &self.files)?;
 
-        // -- symbols.bin + symbols_offsets.bin --
-        //    Concatenate chunks into a single bincode Vec<SymbolRecord>, and
-        //    in parallel write a u64-LE byte-offset per record into the
-        //    sidecar offsets file. The lazy/mmap reader can then look up
-        //    record N via offsets[N] -> seek into symbols.bin -> decode one.
+        // -- symbols.bin + symbols_offsets.bin + file_symbols.bin --
+        //    Concatenate chunks into a single bincode Vec<SymbolRecord>,
+        //    write a u64-LE byte-offset per record into the offsets sidecar
+        //    (lazy reader), and accumulate a file_id → [symbol_idx] map
+        //    that we serialize as file_symbols.bin afterwards (outline
+        //    fast path: O(symbols-in-file) instead of O(corpus)).
         let total_syms: u64 = self.symbol_chunk_lens.iter().sum();
+        let mut file_symbols: Vec<Vec<u32>> = vec![Vec::new(); self.files.len()];
         {
             let mut w = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.symbols())?);
             let mut ow = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.symbol_offsets())?);
@@ -640,6 +649,7 @@ impl StoreWriter {
             // chunk's records back out one by one without rebuilding a Vec.
             w.write_all(&total_syms.to_le_bytes())?;
             let mut byte_pos: u64 = 8; // past the length prefix
+            let mut sym_idx: u32 = 0;
             for n in 0..self.symbol_chunk_count {
                 let p = Self::chunk_path(&tmp, "symbols", n);
                 let chunk: Vec<SymbolRecord> = read_bincode(&p)?;
@@ -649,7 +659,33 @@ impl StoreWriter {
                         .with_context(|| "serialize symbol")?;
                     w.write_all(&bytes)?;
                     byte_pos += bytes.len() as u64;
+                    let fid = s.file_id as usize;
+                    if fid < file_symbols.len() {
+                        file_symbols[fid].push(sym_idx);
+                    }
+                    sym_idx += 1;
                 }
+            }
+            w.flush()?;
+            ow.flush()?;
+        }
+
+        // -- file_symbols.bin + file_symbols_offsets.bin --
+        //    Packed per-file: u32 count then `count` u32 indices into
+        //    symbols.bin. The offsets sidecar is one u64-LE per file_id
+        //    giving its starting byte in file_symbols.bin.
+        {
+            let mut w = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.file_symbols())?);
+            let mut ow = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.file_symbols_offsets())?);
+            let mut byte_pos: u64 = 0;
+            for ids in &file_symbols {
+                ow.write_all(&byte_pos.to_le_bytes())?;
+                let count = ids.len() as u32;
+                w.write_all(&count.to_le_bytes())?;
+                for id in ids {
+                    w.write_all(&id.to_le_bytes())?;
+                }
+                byte_pos += 4 + 4 * (ids.len() as u64);
             }
             w.flush()?;
             ow.flush()?;
@@ -1232,6 +1268,11 @@ pub struct StoreReader {
     /// or old indexes retrofitted via `scry build-offsets`).
     pub lazy_symbols: Option<LazyVec<SymbolRecord>>,
     pub lazy_refs: Option<LazyVec<RefRecord>>,
+    /// file_id → symbol indices (into symbols.bin). Mmap'd. None for
+    /// indexes built before this sidecar was added; callers fall back
+    /// to the linear scan path then. Retrofit via build-file-symbols.
+    pub file_symbols_mmap: Option<memmap2::Mmap>,
+    pub file_symbols_offsets_mmap: Option<memmap2::Mmap>,
 }
 
 impl StoreReader {
@@ -1291,12 +1332,36 @@ impl StoreReader {
             }
             _ => (None, None),
         };
+        // file_symbols sidecar — present only on newly built indexes or
+        // ones retrofitted via build-file-symbols. Optional everywhere
+        // (linear scan still works), so just attempt to open.
+        let (file_symbols_mmap, file_symbols_offsets_mmap) = match
+            (File::open(paths.file_symbols()), File::open(paths.file_symbols_offsets()))
+        {
+            (Ok(d), Ok(o)) => {
+                let dm = unsafe { memmap2::Mmap::map(&d)? };
+                let om = unsafe { memmap2::Mmap::map(&o)? };
+                (Some(dm), Some(om))
+            }
+            _ => (None, None),
+        };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
             trigram_fst, trigram_postings_mmap,
             lazy_symbols, lazy_refs,
+            file_symbols_mmap, file_symbols_offsets_mmap,
         })
+    }
+
+    /// O(1) lookup of all symbol indices defined in the given file.
+    /// Returns None when the index lacks the file_symbols sidecar
+    /// (old format) — caller should fall back to a linear scan of
+    /// lazy_symbols / symbols filtered by file_id.
+    pub fn symbols_for_file(&self, file_id: u32) -> Option<Vec<u32>> {
+        let data = self.file_symbols_mmap.as_ref()?;
+        let offs = self.file_symbols_offsets_mmap.as_ref()?;
+        Some(read_file_symbols_entry(data, offs, file_id))
     }
 
     /// Total number of symbol records, regardless of lazy/eager backing.
@@ -1452,6 +1517,35 @@ fn read_trigram_posting(buf: &[u8], off: u64) -> std::collections::HashSet<u32> 
         let f = prev.wrapping_add(delta);
         out.insert(f);
         prev = f;
+    }
+    out
+}
+
+/// Decode the file_symbols entry for `file_id` from a (data, offsets) byte
+/// slice pair. Layout: offsets[file_id] is a u64-LE byte position into
+/// data; at that position is a u32-LE count followed by `count` u32-LE
+/// symbol indices. Out-of-range or truncated reads return an empty Vec
+/// rather than panicking — same defensive posture as read_posting.
+pub fn read_file_symbols_entry(data: &[u8], offsets: &[u8], file_id: u32) -> Vec<u32> {
+    let o = (file_id as usize) * 8;
+    if o + 8 > offsets.len() { return Vec::new(); }
+    let start = match offsets[o..o + 8].try_into() {
+        Ok(b) => u64::from_le_bytes(b) as usize,
+        Err(_) => return Vec::new(),
+    };
+    if start + 4 > data.len() { return Vec::new(); }
+    let count = match data[start..start + 4].try_into() {
+        Ok(b) => u32::from_le_bytes(b) as usize,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(count);
+    let mut p = start + 4;
+    for _ in 0..count {
+        if p + 4 > data.len() { break; }
+        if let Ok(b) = data[p..p + 4].try_into() {
+            out.push(u32::from_le_bytes(b));
+        }
+        p += 4;
     }
     out
 }
@@ -1701,5 +1795,76 @@ mod tests {
             assert_eq!(got.resolved_to, expected.resolved_to);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Helper: build the file_symbols.bin + offsets.bin pair in memory
+    /// for direct testing of read_file_symbols_entry. Layout exactly
+    /// mirrors what finalize_streaming + build-file-symbols write.
+    fn build_fs_pair(by_file: &[Vec<u32>]) -> (Vec<u8>, Vec<u8>) {
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        let mut pos: u64 = 0;
+        for ids in by_file {
+            offsets.extend_from_slice(&pos.to_le_bytes());
+            let count = ids.len() as u32;
+            data.extend_from_slice(&count.to_le_bytes());
+            for id in ids {
+                data.extend_from_slice(&id.to_le_bytes());
+            }
+            pos += 4 + 4 * (ids.len() as u64);
+        }
+        (data, offsets)
+    }
+
+    /// Round-trip: write the packed format, decode it back per-file,
+    /// assert all entries match the input.
+    #[test]
+    fn file_symbols_entry_roundtrip() {
+        let by_file = vec![
+            vec![0u32, 5, 10, 999],
+            vec![],
+            vec![42],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        ];
+        let (data, offs) = build_fs_pair(&by_file);
+        for (fid, expected) in by_file.iter().enumerate() {
+            let got = read_file_symbols_entry(&data, &offs, fid as u32);
+            assert_eq!(&got, expected, "file_id {} mismatch", fid);
+        }
+    }
+
+    /// Out-of-range file_id returns empty Vec (defensive, never panics).
+    /// Matters because outline against a stale path could pass a file_id
+    /// that doesn't exist in this index.
+    #[test]
+    fn file_symbols_entry_oob_returns_empty() {
+        let by_file = vec![vec![1u32, 2, 3]];
+        let (data, offs) = build_fs_pair(&by_file);
+        assert!(read_file_symbols_entry(&data, &offs, 1).is_empty());
+        assert!(read_file_symbols_entry(&data, &offs, 999).is_empty());
+        assert!(read_file_symbols_entry(&data, &offs, u32::MAX).is_empty());
+    }
+
+    /// Empty corpus: zero files = empty offsets + empty data, any lookup
+    /// returns empty. Covers the edge where StoreWriter writes the sidecar
+    /// for an index with no files.
+    #[test]
+    fn file_symbols_entry_empty_corpus() {
+        let (data, offs) = build_fs_pair(&[]);
+        assert!(data.is_empty());
+        assert!(offs.is_empty());
+        assert!(read_file_symbols_entry(&data, &offs, 0).is_empty());
+    }
+
+    /// Truncated data file (last entry's indices got chopped) — we should
+    /// return what we can parse, never panic. Matches the defensive
+    /// posture of read_posting.
+    #[test]
+    fn file_symbols_entry_truncated() {
+        let by_file = vec![vec![1u32, 2, 3, 4, 5]];
+        let (mut data, offs) = build_fs_pair(&by_file);
+        data.truncate(data.len() - 8); // chop the last two indices
+        let got = read_file_symbols_entry(&data, &offs, 0);
+        assert_eq!(got, vec![1, 2, 3]);
     }
 }

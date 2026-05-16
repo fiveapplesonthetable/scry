@@ -306,6 +306,14 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Build the file→symbol-ids sidecar (file_symbols.bin +
+    /// file_symbols_offsets.bin) for an existing index. Makes `outline`
+    /// O(symbols-in-file) instead of O(total-symbols). Walks the lazy
+    /// symbol vec once, grouping by file_id; no re-parsing needed.
+    BuildFileSymbols {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -395,6 +403,7 @@ fn main() -> Result<()> {
             cmd_build_trigrams(index, workers, max_file_bytes)
         }
         Cmd::BuildOffsets { index } => cmd_build_offsets(index),
+        Cmd::BuildFileSymbols { index } => cmd_build_file_symbols(index),
     }
 }
 
@@ -1350,21 +1359,36 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
         .ok_or_else(|| anyhow::anyhow!("file_id {} out of range", file_id))?;
     let display = fe.display_path(&r.roots);
 
-    // Iterate all symbols filtering by file_id. With ~22M symbols and the
-    // lazy reader, this is ~200ms cold on the live AOSP+Linux index — not
-    // sub-ms, but acceptable for a "show me everything in this file"
-    // query. A file→symbol sidecar would make it O(symbols-in-file) but
-    // requires a finalize-time index format change; not worth it yet.
-    let mut found: Vec<SymbolRecord> = Vec::new();
-    if let Some(lz) = r.lazy_symbols.as_ref() {
-        for s in lz.iter() {
-            if s.file_id == file_id { found.push(s); }
+    // Fast path: the file_symbols sidecar gives the symbol indices for
+    // this file in O(1), so we decode only the records that actually
+    // belong to it — ~1ms on the live 22.8 M-symbol index. Falls back to
+    // a linear scan on old indexes lacking the sidecar.
+    let mut found: Vec<SymbolRecord> = match r.symbols_for_file(file_id) {
+        Some(ids) => {
+            let mut v = Vec::with_capacity(ids.len());
+            if let Some(lz) = r.lazy_symbols.as_ref() {
+                for i in ids { if let Some(s) = lz.get(i as usize) { v.push(s); } }
+            } else {
+                for i in ids {
+                    if let Some(s) = r.symbols.get(i as usize) { v.push(s.clone()); }
+                }
+            }
+            v
         }
-    } else {
-        for s in &r.symbols {
-            if s.file_id == file_id { found.push(s.clone()); }
+        None => {
+            let mut v: Vec<SymbolRecord> = Vec::new();
+            if let Some(lz) = r.lazy_symbols.as_ref() {
+                for s in lz.iter() {
+                    if s.file_id == file_id { v.push(s); }
+                }
+            } else {
+                for s in &r.symbols {
+                    if s.file_id == file_id { v.push(s.clone()); }
+                }
+            }
+            v
         }
-    }
+    };
     // Stable: sort by (line, col, name).
     found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
     let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
@@ -1798,6 +1822,81 @@ fn cmd_build_offsets(index: Option<PathBuf>) -> Result<()> {
     eprintln!(
         "[offsets] DONE.  {} symbols + {} refs offsets written in {} ms",
         n_syms, n_refs, t_total.elapsed().as_millis(),
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// build-file-symbols (standalone — file→symbol-ids sidecar)
+// ---------------------------------------------------------------------------
+
+fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    eprintln!("[fsyms] target index: {}", index_dir.display());
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+
+    // Need the file count + the symbol vec (lazy is fine — we walk it
+    // exactly once). Open through StoreReader so the offsets sidecar is
+    // available and we avoid loading the whole 10 GB symbols.bin into RAM.
+    let r = scry_store::StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+    let n_files = r.files.len();
+    eprintln!("[fsyms] {} files, {} symbols — building reverse map", n_files, r.n_symbols());
+
+    let t = Instant::now();
+    let mut by_file: Vec<Vec<u32>> = vec![Vec::new(); n_files];
+    let mut sym_idx: u32 = 0;
+    if let Some(lz) = r.lazy_symbols.as_ref() {
+        for s in lz.iter() {
+            let fid = s.file_id as usize;
+            if fid < by_file.len() {
+                by_file[fid].push(sym_idx);
+            }
+            sym_idx += 1;
+            if sym_idx % 1_000_000 == 0 {
+                eprintln!("[fsyms] grouped {} M symbols ({} ms)", sym_idx / 1_000_000, t.elapsed().as_millis());
+            }
+        }
+    } else {
+        for s in &r.symbols {
+            let fid = s.file_id as usize;
+            if fid < by_file.len() {
+                by_file[fid].push(sym_idx);
+            }
+            sym_idx += 1;
+        }
+    }
+    eprintln!("[fsyms] grouping done in {} ms; writing sidecars", t.elapsed().as_millis());
+
+    // Atomic-ish: write to .tmp paths then rename. The reader picks up
+    // whichever pair is present at open time, so an interrupted run
+    // leaves the old (or no) sidecar — never a torn one.
+    let data_tmp = paths.file_symbols().with_extension("bin.tmp");
+    let off_tmp = paths.file_symbols_offsets().with_extension("bin.tmp");
+    {
+        let mut w = BufWriter::with_capacity(8 << 20, std::fs::File::create(&data_tmp)?);
+        let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&off_tmp)?);
+        let mut byte_pos: u64 = 0;
+        for ids in &by_file {
+            ow.write_all(&byte_pos.to_le_bytes())?;
+            let count = ids.len() as u32;
+            w.write_all(&count.to_le_bytes())?;
+            for id in ids {
+                w.write_all(&id.to_le_bytes())?;
+            }
+            byte_pos += 4 + 4 * (ids.len() as u64);
+        }
+        w.flush()?;
+        ow.flush()?;
+    }
+    std::fs::rename(&data_tmp, paths.file_symbols())?;
+    std::fs::rename(&off_tmp, paths.file_symbols_offsets())?;
+
+    eprintln!("[fsyms] DONE in {} ms. file_symbols={} offsets={}",
+        t.elapsed().as_millis(),
+        human_bytes(std::fs::metadata(paths.file_symbols()).map(|m| m.len()).unwrap_or(0)),
+        human_bytes(std::fs::metadata(paths.file_symbols_offsets()).map(|m| m.len()).unwrap_or(0)),
     );
     Ok(())
 }
@@ -2289,16 +2388,32 @@ fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value
         Some(f) => f,
         None => return serde_json::json!({"error": "file_id out of range"}),
     };
-    let mut found: Vec<SymbolRecord> = Vec::new();
-    if let Some(lz) = r.lazy_symbols.as_ref() {
-        for s in lz.iter() {
-            if s.file_id == file_id { found.push(s); }
+    let mut found: Vec<SymbolRecord> = match r.symbols_for_file(file_id) {
+        Some(ids) => {
+            let mut v = Vec::with_capacity(ids.len());
+            if let Some(lz) = r.lazy_symbols.as_ref() {
+                for i in ids { if let Some(s) = lz.get(i as usize) { v.push(s); } }
+            } else {
+                for i in ids {
+                    if let Some(s) = r.symbols.get(i as usize) { v.push(s.clone()); }
+                }
+            }
+            v
         }
-    } else {
-        for s in &r.symbols {
-            if s.file_id == file_id { found.push(s.clone()); }
+        None => {
+            let mut v: Vec<SymbolRecord> = Vec::new();
+            if let Some(lz) = r.lazy_symbols.as_ref() {
+                for s in lz.iter() {
+                    if s.file_id == file_id { v.push(s); }
+                }
+            } else {
+                for s in &r.symbols {
+                    if s.file_id == file_id { v.push(s.clone()); }
+                }
+            }
+            v
         }
-    }
+    };
     found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
     let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
     let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(r, s)).collect();

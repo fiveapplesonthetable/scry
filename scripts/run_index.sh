@@ -7,8 +7,10 @@ set -euo pipefail
 . /mnt/agent/scry/env.sh
 
 # jemalloc: aggressive return-to-OS so RSS tracks workload instead of
-# accumulating a high-water mark across batches.
-export MALLOC_CONF="dirty_decay_ms:100,muzzy_decay_ms:100,narenas:1"
+# accumulating a high-water mark across batches. narenas defaults to
+# 4*ncpu — fine for our worker pool size; previous narenas:1 caused
+# allocator-side serialization under multi-worker pressure.
+export MALLOC_CONF="dirty_decay_ms:100,muzzy_decay_ms:100"
 # tree-sitter parse timeout per file. VERY generous (60 s) so legitimate
 # parses are never the cause of a timeout — if this fires, it's a real
 # pathology worth investigating, and scry-lang logs the file path loudly
@@ -38,10 +40,10 @@ fi
 exec /mnt/agent/scry/target/release/scry index \
   "${USE_ROOTS[@]}" \
   --resume \
-  --workers 16 \
+  --workers 4 \
   --flush-bytes 1024 \
   --flush-every 1000 \
-  --mem-cap 40 \
-  --big-file-bytes 65536 \
+  --mem-cap 30 \
+  --big-file-bytes 16384 \
   --max-file-bytes 5242880 \
   -o /mnt/agent/scry-index

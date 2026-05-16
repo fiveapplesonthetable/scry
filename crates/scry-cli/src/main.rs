@@ -524,6 +524,51 @@ fn cmd_index(
         });
     }
 
+    // -- OOM auto-skiplist --
+    // After each cgroup OOM-kill, on resume we read last_attempted.txt
+    // (written by parse_one for big-bucket files before tree-sitter is
+    // invoked). If present, that's the file we crashed on. We append it
+    // to oom_skiplist.txt and remove it; subsequent parse_one calls
+    // [skip-oomed] it. This makes the restart loop self-healing: each
+    // OOM teaches scry one more file to avoid, and progress eventually
+    // unblocks. The user can clear oom_skiplist.txt to retry.
+    let mut oom_skiplist: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(tmp) = writer.tmp_dir.as_ref() {
+        let last_attempted = tmp.join("last_attempted.txt");
+        let skiplist_path = tmp.join("oom_skiplist.txt");
+        if last_attempted.exists() {
+            if let Ok(s) = std::fs::read_to_string(&last_attempted) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    eprintln!(
+                        "[resume] previous run OOM-killed while parsing: {}\n\
+                         [resume] adding to OOM skiplist so the loop can advance",
+                        s,
+                    );
+                    let mut existing = std::fs::read_to_string(&skiplist_path).unwrap_or_default();
+                    if !existing.lines().any(|l| l == s) {
+                        if !existing.is_empty() && !existing.ends_with('\n') {
+                            existing.push('\n');
+                        }
+                        existing.push_str(s);
+                        existing.push('\n');
+                        let _ = std::fs::write(&skiplist_path, existing);
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&last_attempted);
+        }
+        if let Ok(s) = std::fs::read_to_string(&skiplist_path) {
+            for line in s.lines() {
+                let line = line.trim();
+                if !line.is_empty() { oom_skiplist.insert(line.to_string()); }
+            }
+            if !oom_skiplist.is_empty() {
+                eprintln!("[resume] OOM skiplist loaded: {} file(s)", oom_skiplist.len());
+            }
+        }
+    }
+
     // -- Resume watermark + orphan-chunk cleanup --
     // Watermark = number of file_ids that are fully done. file_ids [0, watermark)
     // are flushed to chunk files on disk. progress.json is written atomically
@@ -712,11 +757,22 @@ fn cmd_index(
 
             // Helper closure — inlined parse + sink push + diagnostics.
             // Called from both the parallel small pass and the serial big pass.
-            let process_one = |rf: &RawFile, fe: &FileEntry| {
+            // Big-bucket files get their path recorded to a tmp sidecar
+            // BEFORE parse; if the cgroup OOM-kills us mid-parse, the next
+            // --resume run reads this and adds the file to oom_skiplist
+            // (self-healing — pathological files exclude themselves after
+            // one OOM, instead of looping forever on the same batch).
+            // Parallel small files don't bother — too much contention on
+            // the sidecar write, and the small bucket rarely OOMs alone.
+            let last_attempted_path = writer.tmp_dir.as_ref()
+                .map(|t| t.join("last_attempted.txt"));
+            let process_one = |rf: &RawFile, fe: &FileEntry, mark_attempted: bool| {
                 await_memory_headroom();
                 let t_file = Instant::now();
+                let attempted = if mark_attempted { last_attempted_path.as_deref() } else { None };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
+                    parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry,
+                              &oom_skiplist, attempted)
                 }));
                 let elapsed_file_ms = t_file.elapsed().as_millis();
                 match result {
@@ -756,7 +812,7 @@ fn cmd_index(
             };
 
             // 1. Parallel pass over small files (the bulk of the corpus).
-            small_items.par_iter().for_each(|(rf, fe)| process_one(rf, fe));
+            small_items.par_iter().for_each(|(rf, fe)| process_one(rf, fe, false));
 
             // 2. Serial pass over big files — guarantees ONE big tree-sitter
             //    parse in flight at a time. Peak transient RAM ≈ one big
@@ -764,7 +820,12 @@ fn cmd_index(
             //    than N × that. This is the actual fix for the 100ms-burst
             //    OOM that polling-backpressure can't catch.
             for (rf, fe) in &big_items {
-                process_one(rf, fe);
+                process_one(rf, fe, true);
+            }
+            // Clear the last-attempted marker after the batch's big files
+            // finished — only an UNCLEARED marker on resume means OOM.
+            if let Some(p) = last_attempted_path.as_ref() {
+                let _ = std::fs::remove_file(p);
             }
 
             writer.symbols = syms_sink.into_inner();
@@ -909,6 +970,8 @@ fn parse_one(
     no_refs: bool,
     max_file_bytes: u64,
     registry: &FormatRegistry,
+    oom_skiplist: &std::collections::HashSet<String>,
+    last_attempted_path: Option<&Path>,
 ) -> Result<(Vec<SymbolRecord>, Vec<RefRecord>)> {
     if !registry.supports(rf.kind) {
         return Ok((Vec::new(), Vec::new()));
@@ -925,6 +988,28 @@ fn parse_one(
             human_bytes(rf.size), human_bytes(max_file_bytes),
         );
         return Ok((Vec::new(), Vec::new()));
+    }
+    let path_str = rf.path.display().to_string();
+    if oom_skiplist.contains(&path_str) {
+        // We OOM-killed previously while parsing this exact file. Skip
+        // it permanently so the restart loop can make forward progress.
+        // The user can re-enable by deleting the oom_skiplist.txt file
+        // under <index>.tmp/.
+        eprintln!(
+            "[skip-oomed] {} kind={:?} size={} (previous run OOMed on this file)",
+            rf.path.display(), rf.kind, human_bytes(rf.size),
+        );
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Stamp the path to disk BEFORE we touch tree-sitter, so if the cgroup
+    // OOM-kills us mid-parse the next --resume run can identify the culprit.
+    // Only for serial-bucket files where we'd otherwise have ambiguity over
+    // which of the concurrent workers crashed us.
+    if let Some(p) = last_attempted_path {
+        let tmp = p.with_extension("txt.tmp");
+        if std::fs::write(&tmp, path_str.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
     }
     let bytes = std::fs::read(&rf.path)
         .with_context(|| format!("read {}", rf.path.display()))?;

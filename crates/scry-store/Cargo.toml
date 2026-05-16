@@ -19,3 +19,9 @@ blake3 = "1"
 memmap2 = "0.9"
 memchr = { workspace = true }
 serde_json = { workspace = true }
+# Only used inside the audited unsafe surface (see module-level
+# "Unsafe policy"). libc::posix_fadvise lets us hint the page cache
+# for grep candidate prefetch — measurable on cold-cache queries.
+# Already in the transitive dep tree (memmap2 / jemallocator) so this
+# is essentially free.
+libc = "0.2"

@@ -165,15 +165,14 @@ jq -r '.cmd' ~/.scry/queries.log | sort | uniq -c | sort -rn
 
 ## Known coverage gaps
 
-- **C++ out-of-line method definitions** (`Foo::bar() { ... }` outside
-  the class body) are not currently captured as symbols. tree-sitter-cpp
-  parses them, but the symbol query in `crates/scry-lang/src/lib.rs`
-  only catches in-class declarations. Effect: `scry def transact
-  --lang Cpp` returns only the in-header declaration, not the cpp
-  implementation. Workaround: use `scry grep "::transact("` for now.
-  Fix: extend the cpp query with a `(function_definition declarator:
-  (function_declarator declarator: (qualified_identifier ...)))`
-  pattern.
+- ~~**C++ out-of-line method definitions** (`Foo::bar() { ... }` outside
+  the class body) are not currently captured as symbols.~~ **Fixed**
+  in commit `704d917`. The cpp query already matched the
+  qualified_identifier; the bug was storing the whole `Foo::bar` as
+  the symbol NAME. `drill_qualified_identifier` now extracts the
+  bare name (`bar`) and prepends the qualifiers to `scope_path`.
+  Existing indexes need a re-parse to pick up the fix
+  (parser-side, not sidecar-retrofittable).
 - **Kotlin extension functions** are scoped correctly to their receiver
   type (e.g. `String.shouted` scope = `["String"]`), but the Kotlin
   symbol query doesn't yet cover `companion object` members, sealed

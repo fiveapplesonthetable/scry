@@ -2036,6 +2036,24 @@ fn cmd_grep(
     let tg_label = if trigram_candidates.is_some() { " (trigram-filtered)" } else { "" };
     eprintln!("[grep] scanning {} files{}", total_files, tg_label);
 
+    // Prefault the candidate files into the page cache before kicking
+    // off the scan loop. perf stat decomposition shows cold grep is
+    // page-fault dominated (1.37s sys vs 0.6s user on a 680ms query);
+    // hinting the kernel to start pulling pages NOW lets disk IO
+    // overlap with the parallel memchr-scan loop below. Best-effort,
+    // bounded — only fires when the trigram pre-filter narrowed
+    // enough that prefaulting all candidates is cheap (≤ 8k files).
+    // Past that, the bookkeeping cost > the prefetch win.
+    if total_files > 0 && total_files <= 8000 {
+        let t_pf = Instant::now();
+        candidates.par_iter().for_each(|fe| {
+            let path = fe.display_path(&r.roots);
+            scry_store::prefault_path(std::path::Path::new(&path));
+        });
+        eprintln!("[grep] prefaulted {} files in {} ms",
+                  total_files, t_pf.elapsed().as_millis());
+    }
+
     let hits: parking_lot::Mutex<Vec<Hit>> = parking_lot::Mutex::new(Vec::new());
     let hit_count = std::sync::atomic::AtomicUsize::new(0);
     candidates.par_iter().for_each(|fe| {

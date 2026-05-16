@@ -38,6 +38,27 @@ use std::path::{Path, PathBuf};
 
 pub mod trigram;
 
+/// Tell the kernel we plan to read every byte of `path` soon, so it
+/// can start pulling pages into the page cache while we do other
+/// work. Best-effort: the open() and the fadvise() are both Result-
+/// less for the caller — a path we can't open just won't get
+/// prefetched. Used by `cmd_grep` after the trigram pre-filter to
+/// overlap candidate-file IO with the per-file scan loop.
+pub fn prefault_path(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(f) = File::open(path) {
+        // SAFETY: posix_fadvise on a valid fd is documented as
+        // always-safe; the hint is advisory and ignored if the kernel
+        // doesn't support it. We don't observe the result.
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
+        // `f` drops here — close() runs, but the WILLNEED hint stays
+        // in the kernel's page-cache scheduler. The page-cache state
+        // is what we wanted, not the fd.
+    }
+}
+
 /// Open `path` and mmap it. Single source of truth for the only
 /// `unsafe` block in the workspace; see the module-level "Unsafe
 /// policy" docs for the contract callers must uphold (no concurrent

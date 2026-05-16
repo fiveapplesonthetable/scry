@@ -578,6 +578,7 @@ dependencies = [
  "bincode",
  "blake3",
  "fst",
+ "libc",
  "memchr",
  "memmap2",
  "parking_lot",

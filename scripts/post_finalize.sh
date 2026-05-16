@@ -29,25 +29,18 @@ if [ ! -d "$INDEX" ]; then
   exit 1
 fi
 
-echo "=== step 1: build-offsets (lazy reader sidecars) ==="
+echo "=== steps 1–4 + build-modgraph soong: scry finalize (v0.1.21+) ==="
 t1=$(date +%s)
-$SCRY build-offsets --index "$INDEX"
-echo "step 1 took $(($(date +%s) - t1)) sec"
-
-echo "=== step 1b: build-file-symbols (outline fast path) ==="
-t1b=$(date +%s)
-$SCRY build-file-symbols --index "$INDEX"
-echo "step 1b took $(($(date +%s) - t1b)) sec"
-
-echo "=== step 2: build-trigrams ==="
-t2=$(date +%s)
-$SCRY build-trigrams --index "$INDEX" --workers 16
-echo "step 2 took $(($(date +%s) - t2)) sec"
-
-echo "=== step 2b: build-resolutions (Layer 2 ref→def overrides) ==="
-t2b=$(date +%s)
-$SCRY build-resolutions --index "$INDEX"
-echo "step 2b took $(($(date +%s) - t2b)) sec"
+# Discovers all four core sidecar builds (offsets, file-symbols,
+# trigrams, resolutions) + the Soong module_graph in one pass.
+# Per-stage timings echo to stderr; we still wrap the whole thing
+# in a single timer so the high-level "step X took Y sec" lines
+# stay consistent with the previous step-by-step layout.
+$SCRY finalize \
+  --index "$INDEX" \
+  --workers 16 \
+  --build-soong /home/zim/dev/aosp
+echo "finalize took $(($(date +%s) - t1)) sec"
 
 echo "=== final index layout ==="
 ls -la "$INDEX"

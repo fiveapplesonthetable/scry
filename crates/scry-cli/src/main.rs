@@ -1818,20 +1818,14 @@ fn cmd_build_trigrams(
     Ok(())
 }
 
-/// For a regex pattern, return the trigram candidate set if any can be
-/// extracted via regex-syntax HIR analysis. Returns None ⇒ caller should
-/// fall back to a full scan (rg-class).
+/// Extract the literal substrings from a regex pattern that are worth
+/// trigram-indexing. Returns None if the pattern has no extractable
+/// literals or extraction produced a result that would over-broaden
+/// (too many alternatives, or any literal shorter than 3 bytes).
 ///
-/// Algorithm: parse → extract a finite Seq of prefix literals → for each
-/// literal that's ≥ 3 bytes, intersect its per-trigram posting lists,
-/// then UNION across alternatives (the regex matches if ANY alternative
-/// matches). Bails when extraction yields infinite Seq, an empty set, or
-/// any literal too short to trigram — over-broad pre-filters are worse
-/// than no pre-filter because they pay both costs.
-fn grep_candidates_for_regex(
-    r: &StoreReader,
-    pattern: &str,
-) -> Option<std::collections::HashSet<u32>> {
+/// Caller treats None as "fall back to full scan" — over-broad pre-
+/// filters are worse than no pre-filter because they pay both costs.
+fn regex_literals_for_trigram(pattern: &str) -> Option<Vec<Vec<u8>>> {
     use regex_syntax::hir::literal::{Extractor, ExtractKind};
     let hir = regex_syntax::parse(pattern).ok()?;
     let seq = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
@@ -1840,11 +1834,30 @@ fn grep_candidates_for_regex(
     // Cap: too many alternatives means the union is going to be most of
     // the corpus anyway. 64 is generous; livegrep uses similar bounds.
     if lits.len() > 64 { return None; }
-    let mut union: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(lits.len());
     for lit in lits {
         let bytes = lit.as_bytes();
         if bytes.len() < 3 { return None; }
-        let part = r.grep_candidates(bytes)?;
+        out.push(bytes.to_vec());
+    }
+    Some(out)
+}
+
+/// For a regex pattern, return the trigram candidate set if any can be
+/// extracted. Returns None ⇒ caller should fall back to a full scan.
+///
+/// Algorithm: parse → extract prefix literals via HIR analysis → for
+/// each ≥3-byte literal, intersect its per-trigram posting lists, then
+/// UNION across alternatives (the regex matches if ANY alternative
+/// matches). Russ Cox / livegrep style.
+fn grep_candidates_for_regex(
+    r: &StoreReader,
+    pattern: &str,
+) -> Option<std::collections::HashSet<u32>> {
+    let lits = regex_literals_for_trigram(pattern)?;
+    let mut union: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for lit in lits {
+        let part = r.grep_candidates(&lit)?;
         if part.is_empty() { continue; }
         union.extend(part);
     }
@@ -2162,5 +2175,73 @@ fn short_lang(k: FileKind) -> &'static str {
         Proto => "proto",
         Aidl => "aidl",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Literal pattern → identity extraction.
+    #[test]
+    fn regex_lit_pure_literal() {
+        let lits = regex_literals_for_trigram("ZygoteInit").unwrap();
+        assert_eq!(lits, vec![b"ZygoteInit".to_vec()]);
+    }
+
+    /// `foo|bar` → two alternatives that we union over.
+    #[test]
+    fn regex_lit_alternation() {
+        let mut lits = regex_literals_for_trigram("foobar|bazqux").unwrap();
+        lits.sort();
+        assert_eq!(lits, vec![b"bazqux".to_vec(), b"foobar".to_vec()]);
+    }
+
+    /// Prefix + class — we should at least keep the prefix.
+    #[test]
+    fn regex_lit_prefix_then_class() {
+        // \bTransaction\d+ has prefix literal "Transaction"
+        let lits = regex_literals_for_trigram(r"Transaction\d+").unwrap();
+        // The extractor may emit "Transaction" as a single inexact prefix,
+        // or it may expand into a small set — accept either as long as
+        // every entry STARTS WITH the literal prefix and is ≥3 bytes.
+        assert!(!lits.is_empty(), "got: {:?}", lits);
+        for l in &lits {
+            assert!(l.starts_with(b"Transaction"), "literal {:?} doesn't start with Transaction", l);
+            assert!(l.len() >= 3);
+        }
+    }
+
+    /// Patterns with no extractable literal must bail (return None) so
+    /// the caller knows to fall back rather than over-narrow.
+    #[test]
+    fn regex_lit_bails_on_short_literal() {
+        // `a.*b` extracts "a" (1 byte) — too short to trigram.
+        assert!(regex_literals_for_trigram("a.*b").is_none());
+    }
+
+    #[test]
+    fn regex_lit_bails_on_unbounded() {
+        // `.*` is unbounded — no literals.
+        assert!(regex_literals_for_trigram(".*").is_none());
+        assert!(regex_literals_for_trigram("[a-z]+").is_none());
+    }
+
+    #[test]
+    fn regex_lit_bails_on_invalid() {
+        // Unclosed group: parse fails → None.
+        assert!(regex_literals_for_trigram("(foo").is_none());
+    }
+
+    /// Wide alternation must bail — we'd be UNIONing across too many
+    /// posting lists for the pre-filter to actually narrow.
+    #[test]
+    fn regex_lit_bails_on_wide_alternation() {
+        // Build a pattern with 65 alternatives of 3-byte literals.
+        let alts: Vec<String> = (0..65)
+            .map(|i| format!("a{:02x}", i))  // "a00", "a01", ..., "a40" — all 3 bytes
+            .collect();
+        let pat = alts.join("|");
+        assert!(regex_literals_for_trigram(&pat).is_none(), "should bail at 65 alternatives");
     }
 }

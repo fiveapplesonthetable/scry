@@ -7,6 +7,23 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.17] — 2026-05-16
+
+Real-producer validation for v0.1.16's SCIP importer + producer
+matrix doc.
+
+- Validated the importer end-to-end against `scip-typescript`'s
+  output on a tiny TS fixture (\`Animal\` / \`Dog\` classes): 8
+  unique symbols, 12 occurrences, byte_offset alignment lined
+  up exactly with scry's tree-sitter def site so
+  \`--scip-precise\` correctly resolved a def symbol on real
+  TypeScript SCIP records.
+- New \`docs/SCIP_PRODUCERS.md\` lists every SCIP producer
+  scry's importer supports (TypeScript, JavaScript, Python,
+  Java, Kotlin, Go, Rust, C/C++/ObjC via lsif-clang, Ruby,
+  C#) with the exact CLI to generate the index, plus filter-
+  composition rules and Path B vs Path C tradeoffs.
+
 ## [0.1.16] — 2026-05-16
 
 SCIP importer + `--scip-precise` filter — Path C. Brings symbol-

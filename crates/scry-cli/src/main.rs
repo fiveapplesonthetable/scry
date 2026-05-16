@@ -280,6 +280,33 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
     },
+    /// Replay recent queries from ~/.scry/queries.log. Useful as a
+    /// thin memory primitive for LLM agents that want to know "what
+    /// did I already search for this session" without re-running the
+    /// queries.
+    Recall {
+        /// Cap the number of entries returned. Default: 20.
+        #[arg(long, default_value = "20")]
+        last: usize,
+        /// Only entries whose cmd matches (def, grep, callers, ...).
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Only entries whose query string contains this substring.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Override the log location (default: $SCRY_LOG, then
+        /// $HOME/.scry/queries.log).
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Deduplicate consecutive identical (cmd, query) entries.
+        /// Useful when a session re-runs the same query many times;
+        /// off by default so the count reflects actual activity.
+        #[arg(long)]
+        dedup: bool,
+        /// Machine-readable output: one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
     /// MCP (Model Context Protocol) server. Stdio JSON-RPC 2.0 over
     /// the standard MCP request/response shape; one MCP tool per scry
     /// command (def/ref/callers/prefix/fuzzy/grep/outline/coverage/
@@ -466,6 +493,8 @@ fn main() -> Result<()> {
         ),
         Cmd::Serve { index, listen } => cmd_serve(index, listen),
         Cmd::Mcp { index } => cmd_mcp(index),
+        Cmd::Recall { last, cmd, grep, log, dedup, json } =>
+            cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Mod { name, index, limit, json } => {
             cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
@@ -2753,6 +2782,154 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
     Ok(())
 }
 
+/// One parsed entry from the `~/.scry/queries.log` ops log. The fields
+/// mirror what `log_query_with_files` writes — keep in sync.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct RecallEntry {
+    ts: u64,
+    cmd: String,
+    query: String,
+    hits: u64,
+    shown: u64,
+    files_total: u64,
+    #[serde(default)]
+    candidate_files: Option<u64>,
+    elapsed_ms: u64,
+    index: String,
+}
+
+/// Read and parse an ops log. Returns entries in *file order* (oldest
+/// first); callers reverse + take(last) to get the most-recent window.
+/// Malformed lines are silently skipped so a partial-write at the tail
+/// (the indexer was SIGKILL'd mid-line) doesn't break recall.
+fn parse_recall_log<R: std::io::BufRead>(rd: R) -> Vec<RecallEntry> {
+    let mut out = Vec::new();
+    for line in rd.lines().map_while(|r| r.ok()) {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Ok(e) = serde_json::from_str::<RecallEntry>(line) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// Human-friendly relative-time formatter. Returns strings like
+/// "3m ago" / "1h ago" / "2d ago" / "now". Output is at most a few
+/// characters so it stays terminal-friendly in a column.
+fn format_relative_time(now_ts: u64, then_ts: u64) -> String {
+    if then_ts > now_ts {
+        // Clock-skew or future timestamp; just say "now".
+        return "now".to_string();
+    }
+    let delta = now_ts - then_ts;
+    match delta {
+        0..=4          => "now".to_string(),
+        5..=59         => format!("{}s ago", delta),
+        60..=3599      => format!("{}m ago", delta / 60),
+        3600..=86_399  => format!("{}h ago", delta / 3600),
+        _              => format!("{}d ago", delta / 86_400),
+    }
+}
+
+/// `scry recall` — replay the recent ops log. Filters by --cmd and
+/// --grep; optionally dedupes consecutive (cmd, query) repeats so
+/// "ran the same def 50 times in this session" collapses to one line.
+fn cmd_recall(
+    last: usize,
+    cmd: Option<String>,
+    grep: Option<String>,
+    log: Option<PathBuf>,
+    dedup: bool,
+    json: bool,
+) -> Result<()> {
+    let path = log.or_else(query_log_path).ok_or_else(|| {
+        anyhow::anyhow!("no ops log path (set SCRY_LOG or $HOME, or pass --log)")
+    })?;
+    let f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Empty log is not an error — the agent might just be in
+            // a fresh session. Print an empty result and exit 0.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if !json {
+                    eprintln!("(no ops log at {} — no queries yet)", path.display());
+                }
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("open {}: {e}", path.display()));
+        }
+    };
+    let entries = parse_recall_log(std::io::BufReader::new(f));
+    let total = entries.len();
+
+    // Apply filters (cmd, grep), then dedup, then take the last `last`
+    // entries in *reverse* (newest first).
+    let filtered: Vec<RecallEntry> = entries.into_iter()
+        .filter(|e| cmd.as_deref().map(|c| e.cmd == c).unwrap_or(true))
+        .filter(|e| grep.as_deref().map(|g| e.query.contains(g)).unwrap_or(true))
+        .collect();
+    let mut deduped: Vec<RecallEntry> = if dedup {
+        let mut out: Vec<RecallEntry> = Vec::with_capacity(filtered.len());
+        for e in filtered {
+            match out.last() {
+                Some(prev) if prev.cmd == e.cmd && prev.query == e.query => {
+                    // Same key as the previous entry — overwrite so the
+                    // *latest* timestamp/hits/elapsed wins.
+                    *out.last_mut().unwrap() = e;
+                }
+                _ => out.push(e),
+            }
+        }
+        out
+    } else {
+        filtered
+    };
+    // Newest first.
+    deduped.reverse();
+    deduped.truncate(last);
+
+    let now = now_unix_secs();
+    if json {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        use std::io::Write;
+        for e in &deduped {
+            writeln!(out, "{}", serde_json::to_string(e)?)?;
+        }
+    } else {
+        if deduped.is_empty() {
+            println!("(no matching queries — log has {total} entries total)");
+            return Ok(());
+        }
+        println!("recent queries (last {} of {total} total):", deduped.len());
+        for e in &deduped {
+            let cand = e.candidate_files
+                .map(|c| format!(" ({c} cand)"))
+                .unwrap_or_default();
+            println!(
+                "  {:9}  {:<8}  {:<40}  {} hits in {}ms{}",
+                format_relative_time(now, e.ts),
+                e.cmd,
+                truncate_query_for_display(&e.query, 40),
+                e.hits,
+                e.elapsed_ms,
+                cand,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Truncate a query string for the recall display column. Long regex
+/// or path patterns get a `…` suffix so the layout doesn't break.
+fn truncate_query_for_display(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { return s.to_string(); }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Entry point for the `mcp` subcommand. MCP — Model Context Protocol
 /// — is a stdio JSON-RPC 2.0 protocol used by Claude Desktop, Cursor,
 /// and other agent runtimes to call out to external tools. scry's MCP
@@ -4013,5 +4190,70 @@ mod tests {
         assert!(r.is_some());
         // The bare "name" field always survives.
         assert_eq!(hit["name"], "Foo");
+    }
+
+    // ------------------------------------------------------------------
+    // Recall: ops-log parser + relative-time formatter.
+    // ------------------------------------------------------------------
+
+    /// Parser tolerates a partial-write at the tail (incomplete final
+    /// line from a SIGKILL'd writer) and silently drops it instead of
+    /// erroring out — recall should always return something useful.
+    #[test]
+    fn parse_recall_log_skips_malformed_tail() {
+        let buf = b"{\"ts\":1,\"cmd\":\"def\",\"query\":\"Foo\",\"hits\":1,\"shown\":1,\"files_total\":100,\"candidate_files\":null,\"elapsed_ms\":10,\"index\":\"/i\"}\n{partial-write-no-newline";
+        let entries = parse_recall_log(&buf[..]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cmd, "def");
+        assert_eq!(entries[0].query, "Foo");
+    }
+
+    /// Multi-entry log: all entries parse, order preserved.
+    #[test]
+    fn parse_recall_log_multi_entry() {
+        let buf = b"{\"ts\":1,\"cmd\":\"def\",\"query\":\"Foo\",\"hits\":1,\"shown\":1,\"files_total\":1,\"candidate_files\":null,\"elapsed_ms\":5,\"index\":\"/i\"}\n\
+                    {\"ts\":2,\"cmd\":\"grep\",\"query\":\"bar\",\"hits\":7,\"shown\":7,\"files_total\":1,\"candidate_files\":15,\"elapsed_ms\":42,\"index\":\"/i\"}\n";
+        let entries = parse_recall_log(&buf[..]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ts, 1);
+        assert_eq!(entries[1].cmd, "grep");
+        assert_eq!(entries[1].candidate_files, Some(15));
+    }
+
+    /// candidate_files is optional in the log shape; missing or null
+    /// should both parse cleanly as None.
+    #[test]
+    fn parse_recall_log_optional_candidate_files() {
+        let buf = b"{\"ts\":1,\"cmd\":\"def\",\"query\":\"X\",\"hits\":1,\"shown\":1,\"files_total\":1,\"elapsed_ms\":5,\"index\":\"/i\"}\n";
+        let entries = parse_recall_log(&buf[..]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].candidate_files, None);
+    }
+
+    /// Relative-time covers the boundaries: 0 (now), seconds, minutes,
+    /// hours, days. The clock-skew case (then > now) collapses to
+    /// "now" rather than producing a negative string.
+    #[test]
+    fn format_relative_time_buckets() {
+        let now: u64 = 1_000_000;
+        assert_eq!(format_relative_time(now, now), "now");
+        assert_eq!(format_relative_time(now, now - 2), "now");        // ≤4 s
+        assert_eq!(format_relative_time(now, now - 10), "10s ago");
+        assert_eq!(format_relative_time(now, now - 120), "2m ago");   // 120 s
+        assert_eq!(format_relative_time(now, now - 3600 * 2), "2h ago");
+        assert_eq!(format_relative_time(now, now - 86_400 * 3), "3d ago");
+        // Future timestamp (clock skew) collapses to "now".
+        assert_eq!(format_relative_time(now, now + 1000), "now");
+    }
+
+    /// Display truncation never panics on multi-byte UTF-8 (the unicode
+    /// `…` ellipsis must land on a char boundary).
+    #[test]
+    fn truncate_query_for_display_handles_utf8() {
+        let q = "αβγδεζηθικλμνξοπρστυφχψω"; // 24 chars, 48 bytes
+        let out = truncate_query_for_display(q, 10);
+        assert!(out.ends_with('…'));
+        // 9 chars + the ellipsis = 10 visible.
+        assert_eq!(out.chars().count(), 10);
     }
 }

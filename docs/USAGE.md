@@ -478,6 +478,43 @@ through MCP without extra implementation effort.
 
 ---
 
+## Query memory: `scry recall`
+
+A thin memory primitive over `~/.scry/queries.log`. Useful for
+agents that want to know "what did I already search for this
+session" without re-running every query, and for humans wanting
+to inspect a session's search activity.
+
+```sh
+$ scry recall --last 5
+recent queries (last 5 of 134 total):
+  3m ago     callers   transact                                  820 hits in 120ms
+  5m ago     def       ActivityManagerService                    4 hits in 8ms
+  6m ago     grep      ZygoteInit                                12 hits in 580ms (1416 cand)
+  7m ago     outline   frameworks/base/.../ActivityThread.java   1 hits in 45ms
+  9m ago     ref       Binder                                    87 hits in 30ms
+```
+
+Filters:
+
+```sh
+$ scry recall --cmd def --last 10              # only def queries
+$ scry recall --grep transact                  # only queries matching transact
+$ scry recall --dedup                          # collapse consecutive same-query repeats
+$ scry recall --json | jq -s 'group_by(.cmd) | map({cmd:.[0].cmd, count:length})'
+```
+
+`--log PATH` overrides the default location (`$SCRY_LOG` then
+`$HOME/.scry/queries.log`). Missing logs are not an error — the
+command exits 0 with an empty result so agent loops don't break
+in fresh sessions.
+
+The parser is tolerant: a partial-write at the tail (the writer
+was SIGKILL'd mid-line) is silently skipped, so recall always
+returns the longest valid prefix of the log.
+
+---
+
 ## Index admin
 
 ```sh

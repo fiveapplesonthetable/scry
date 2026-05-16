@@ -6,10 +6,11 @@ members = [
     "crates/scry-lang",
     "crates/scry-store",
     "crates/scry-aosp",
+    "crates/scry-clang",
 ]
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 rust-version = "1.79"
 license = "Apache-2.0"

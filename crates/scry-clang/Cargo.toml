@@ -1,0 +1,24 @@
+[package]
+name = "scry-clang"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+bincode = { workspace = true }
+parking_lot = { workspace = true }
+clang-sys = { version = "1.8", features = ["runtime"] }
+shell-words = "1"
+scry-store = { path = "../scry-store" }
+
+[lints]
+workspace = true

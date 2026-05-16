@@ -544,6 +544,48 @@ enum Cmd {
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
     },
+    /// Generate the clang USR sidecar at `<index>/clang_usrs.bin`
+    /// from a compile_commands.json. Per-TU libclang parse, USR
+    /// interning, system-header filtering. Path B precision.
+    ClangIndex {
+        /// Path to compile_commands.json (Bazel, CMake, Soong, GN,
+        /// or anything Bear-wrapped emits this).
+        #[arg(long, value_name = "PATH")]
+        compile_commands: PathBuf,
+        /// Existing scry index dir; sidecar lands here.
+        #[arg(long, value_name = "DIR")]
+        index: Option<PathBuf>,
+        /// Only index TUs whose source is under this prefix.
+        #[arg(long, value_name = "PATH")]
+        root: Option<PathBuf>,
+        /// Parallel parse workers (0 = num_cpus).
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
+        /// Skip TUs whose source exceeds this size (bytes). 0 = no cap.
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        max_file_bytes: u64,
+    },
+    /// Report stats from the optional clang USR sidecar at
+    /// `<index>/clang_usrs.bin` (produced by `scry clang-index`).
+    /// Useful for verifying that Path B precision is wired up
+    /// before issuing `--clang-usr` queries.
+    ClangStats {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
+    /// Look up the clang USR for a (path, byte_offset) pair against
+    /// the sidecar. Returns the empty string if no record covers
+    /// that exact site.
+    ClangLookup {
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Absolute source path (matches what clang saw).
+        #[arg(long)]
+        path: String,
+        /// Byte offset of the cursor location within the file.
+        #[arg(long)]
+        offset: u32,
+    },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
     /// hundreds of ms). Sequential parallel read of every file in
@@ -887,6 +929,10 @@ fn main() -> Result<()> {
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
+        Cmd::ClangIndex { compile_commands, index, root, workers, max_file_bytes } =>
+            cmd_clang_index(compile_commands, index, root, workers, max_file_bytes),
+        Cmd::ClangStats { index } => cmd_clang_stats(index),
+        Cmd::ClangLookup { index, path, offset } => cmd_clang_lookup(index, &path, offset),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -6187,6 +6233,82 @@ fn cmd_build_modgraph(kind: &str, root: &Path, output: &Path) -> Result<()> {
         kind, g.modules.len(), g.deps.len(), g.files.len(),
         output.display(), json.len(), t.elapsed().as_millis(),
     );
+    Ok(())
+}
+
+/// `scry clang-index --compile-commands … --index DIR` entrypoint —
+/// drives libclang per-TU and writes `clang_usrs.bin` next to the
+/// main scry index.
+fn cmd_clang_index(
+    compile_commands: PathBuf,
+    index: Option<PathBuf>,
+    root: Option<PathBuf>,
+    workers: usize,
+    max_file_bytes: u64,
+) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    let workers = if workers == 0 {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(8)
+    } else {
+        workers
+    };
+    scry_clang::build_clang_usrs(
+        &compile_commands,
+        &dir,
+        root.as_deref(),
+        workers,
+        max_file_bytes,
+    )
+}
+
+/// `scry clang-stats --index DIR` — report sidecar shape so users
+/// can verify Path B is wired before issuing precise queries.
+fn cmd_clang_stats(index: Option<PathBuf>) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    let sidecar_path = scry_store::StorePaths::new(dir.clone()).clang_usrs();
+    match scry_store::clang_usrs::ClangUsrIndex::open(&sidecar_path)? {
+        None => {
+            println!(
+                "no clang_usrs.bin found at {}. Run `scry-clang-index \
+                 --compile-commands … --index {}` to generate it.",
+                sidecar_path.display(),
+                dir.display(),
+            );
+        }
+        Some(idx) => {
+            println!(
+                "clang_usrs.bin: version 1, {} unique USRs, {} records ({} bytes file)",
+                idx.usr_count(),
+                idx.len(),
+                std::fs::metadata(&sidecar_path)
+                    .map(|m| m.len()).unwrap_or(0),
+            );
+            // Sample 3 USRs so the user can sanity-check.
+            for u in idx.sidecar.usr_table.iter().take(3) {
+                println!("  sample: {u}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `scry clang-lookup --index DIR --path X --offset N` — look up a
+/// USR by source location. Returns empty if absent (callable from
+/// scripts; exit 0 either way).
+fn cmd_clang_lookup(index: Option<PathBuf>, path: &str, offset: u32) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    let sidecar_path = scry_store::StorePaths::new(dir).clang_usrs();
+    let idx = scry_store::clang_usrs::ClangUsrIndex::open(&sidecar_path)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "no clang_usrs.bin at {} — run scry-clang-index first",
+            sidecar_path.display(),
+        ))?;
+    if let Some(u) = idx.usr_for(path, offset) {
+        println!("{u}");
+    }
+    // empty stdout = no record covers this site
     Ok(())
 }
 

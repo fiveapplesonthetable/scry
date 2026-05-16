@@ -7,6 +7,46 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.13] — 2026-05-16
+
+Path B precision (clang USR sidecar). Three new subcommands on the
+main `scry` binary — no separate tool to install:
+
+- `scry clang-index --compile-commands FILE --index DIR` parses each
+  TU through libclang and writes `clang_usrs.bin` next to the main
+  scry index. Cross-TU symbol identity for C/C++/ObjC: two `foo`s
+  with the same name but different declarations get distinct USRs.
+  Dogfooded on trace_processor_d (93 TUs, 23k unique USRs, 1.4M
+  records, 11 s including parse).
+- `scry clang-stats --index DIR` reports sidecar shape (USR count,
+  record count, sample USRs) with a helpful message if the sidecar
+  is missing.
+- `scry clang-lookup --index DIR --path P --offset N` returns the
+  USR (or empty) for a source location. Scriptable.
+
+**Internals:**
+
+- `libclang` loaded dynamically at runtime via `clang-sys`'s
+  runtime feature → no compile-time LLVM dep, no extra binary.
+  Per-thread loading via `thread_local!` so rayon workers each get
+  their own instance.
+- System-header records dropped (`/usr/include`, `/usr/lib/gcc`,
+  `/usr/lib/llvm-*`, `/usr/lib/x86_64-linux-gnu`) — cuts sidecar
+  size by ~74%.
+- Sidecar schema v1 (locked):
+  `UsrSidecar { version, usr_table, records: [{ abs_path,
+  byte_offset, usr_id, kind ∈ {0=decl, 1=ref, 2=call} }] }`.
+- New crate layout: `scry-clang` holds the `unsafe` libclang FFI
+  so `scry-cli` stays `#![forbid(unsafe_code)]`. Single binary
+  externally; cleaner internals.
+- `scry-store::clang_usrs::ClangUsrIndex` reader, indexed by
+  `(abs_path, byte_offset)` for O(1) lookups; 4 unit tests.
+
+The full ref/callers `--clang-precise` filter (use the USR to
+match ref sites against the def's USR instead of name alone)
+lands in v0.1.14 — needs careful tree-sitter ↔ clang location
+alignment, which is its own slice of work.
+
 ## [0.1.12] — 2026-05-16
 
 Build-graph-aware precision: scry now understands module boundaries

@@ -1,0 +1,503 @@
+# ROADMAP — concrete design sketches for the deep items
+
+The contained next-steps that landed in May 2026 — persistent
+socket, streaming/budget, MCP, `scry recall`, `scry diff`, AIDL/HIDL
+shadows — are all in `git log`. This document is the *other* list:
+the five multi-day items that still sit ahead. Each one is sketched
+in enough detail that a fresh contributor could read this doc, the
+referenced source files, and start writing the change.
+
+The items, in roughly the order I'd ship them:
+
+1. [Semantic retrieval as a sibling tool](#1-semantic-retrieval-as-a-sibling-tool-scry-ask)
+2. [Incremental indexing](#2-incremental-indexing)
+3. [clangd-as-a-service for C++ precision](#3-clangd-as-a-service-for-c-precision)
+4. [`io_uring` for the candidate scan](#4-io_uring-for-the-candidate-scan)
+5. [Fuzzy ranking by edit distance](#5-fuzzy-ranking-by-edit-distance)
+
+Each section follows the same shape: **goal**, **why now**,
+**design**, **new dependencies**, **acceptance criteria**,
+**tradeoffs**, **what could go wrong**, **estimate**.
+
+---
+
+## 1. Semantic retrieval as a sibling tool (`scry ask`)
+
+### Goal
+
+Answer "how do I X in this codebase" questions where X isn't a
+known identifier. Today scry can find `parse_toml` if it exists by
+name; it can't surface the right *area* of code when the agent
+doesn't know what to grep for. The fix is an embedding-based
+retrieval path that complements (not replaces) the lexical one.
+
+### Why now
+
+Every modern RAG system over code uses both lexical and semantic
+retrieval. Lexical catches identifiers and exact strings; semantic
+catches conceptual matches. scry has the lexical side production-
+ready; the semantic complement is the single biggest functional
+gap from an LLM-agent perspective. Smaller models (Gemma 3 8B
+class) benefit disproportionately because their reasoning about
+"oh, maybe this token-soup belongs to a TOML parser" is weaker.
+
+### Design
+
+A new subcommand parallel to `scry grep`:
+
+```sh
+scry ask "how do I parse TOML in this codebase" [--limit N] [--in PREFIX] [--json]
+```
+
+The pipeline:
+
+1. **At index time** (add a new finalize pass or a sidecar
+   `build-embeddings` post-finalize utility): chunk every indexed
+   source file into ~50–100 line windows, embed each chunk with a
+   local code-capable model, write the embeddings to a sidecar.
+   Expected size: ~2 GB for the full AOSP+Linux corpus at 768-dim
+   half-precision.
+2. **At query time**: embed the user's query, do an approximate
+   nearest-neighbor search over the chunk index, return top-K
+   chunks with file/line/snippet shaped like a grep result.
+
+Concrete components and what they need:
+
+| component | candidate | why |
+|---|---|---|
+| embedding model | `nomic-embed-code` or `all-minilm-l6-v2` via `candle` | Pure-Rust inference; no Python; works on CPU. |
+| ANN index | `usearch` (Rust bindings) or hand-rolled HNSW | usearch is a single C++ dependency; hnsw_rs is pure-Rust. |
+| chunker | 50–100 line windows with 20-line overlap | Standard RAG sizing for code; pin in tests. |
+| sidecar files | `embeddings.bin` (packed f16 vectors), `embeddings.idx` (HNSW graph), `chunks.bin` (chunk metadata) | Mirrors the trigram + offset sidecar pattern. |
+
+Output shape (parallels grep):
+
+```json
+{
+  "path": "frameworks/base/.../TomlReader.java",
+  "start_line": 102, "end_line": 158,
+  "score": 0.84,
+  "snippet": "…",
+  "lang": "java"
+}
+```
+
+Wiring to existing surfaces: `scry serve` gets an `ask` command,
+`scry mcp` gets an `ask` tool, `--budget` and `--limit` honored
+the same way as elsewhere.
+
+### New dependencies
+
+- `candle-core` + `candle-transformers` (embedding inference)
+- Either `usearch` (C++ FFI, smaller code) or `hnsw_rs` (pure Rust)
+- Model artifacts (~50–500 MB depending on choice)
+
+### Acceptance criteria
+
+- `scry ask "how to read TOML"` on the full index returns ≥1
+  relevant chunk in the top 10 with no manual prompt tuning.
+- Cold open of the embeddings index ≤ 200 ms (mmap'd HNSW).
+- Per-query latency ≤ 500 ms warm on a 1 M-chunk index.
+- Build pass (`scry build-embeddings`) completes in ≤ 4× the
+  parse pass time (so a full reindex stays under an hour).
+- The embeddings sidecar is *optional*: indexes without it answer
+  every other query type unchanged; `scry ask` errors with a clear
+  "run scry build-embeddings first" message.
+
+### Tradeoffs
+
+- **Model choice is binding.** Switching embedding models requires
+  full reindex of the embeddings. Pin the model name + commit hash
+  in `manifest.json`; refuse cross-model queries.
+- **Storage cost.** ~2 GB extra index. Tolerable on the current
+  envelope (~9.5 GB → ~12 GB).
+- **Quality is workload-dependent.** AOSP-specific identifier soup
+  will retrieve worse than well-commented OSS Rust. Worth
+  benchmarking on a handful of real agent questions before claiming
+  parity with grep.
+- **Determinism.** ANN is approximate; two runs of the same query
+  can return different orderings. Pin the random seed in the HNSW
+  build for reproducibility.
+
+### What could go wrong
+
+- **The embedding model isn't quite good enough.** Code embeddings
+  in 2026 are mediocre at long-form questions; we may need a
+  hybrid scoring pass that re-ranks ANN candidates with a small
+  cross-encoder.
+- **CPU inference is too slow.** Per-chunk inference at 768d on a
+  10 KB file is ~3 ms on this host's CPU. Full corpus build is
+  ~3 M chunks × 3 ms = 2.5 hours — within budget but slow. GPU
+  offload would help if available.
+- **Index size grows past the page-cache budget.** 2 GB extra
+  bytes; if the working set inflates beyond ~120 GB resident the
+  page-cache LRU model degrades. Profile before committing.
+
+### Estimate
+
+- Skeleton (chunker + embedding pipeline + sidecar writer): 3 days
+- Query path (load + ANN + serve integration): 2 days
+- Bench + quality tuning on real questions: 2 days
+- Total: **~1 week** of focused work.
+
+---
+
+## 2. Incremental indexing
+
+### Goal
+
+Re-index only the files that changed, not the whole 1 M-file
+corpus. Current cost is 13 min for "I edited one Soong file";
+target is ≤ 30 s for any single-module change.
+
+### Why now
+
+The full rebuild is fine for once-an-hour cadence. For
+"edited a file, want updated query results" — the killer feature
+for editor integration and active development — 13 min is
+infeasible. Incremental is the *only* path to making scry usable
+in the editor loop.
+
+### Design
+
+Three pieces:
+
+1. **Per-file content digest in the file table.** Today each
+   `FileEntry` carries `(id, root_id, relpath, kind, size)`. Add a
+   `content_digest: [u8; 32]` (blake3 of file bytes). Bumps
+   `files.bin` by ~32 MB on the full corpus — negligible.
+
+2. **Incremental walker that diffs digest sets.** New subcommand
+   `scry index --incremental`. The walker rebuilds the candidate
+   file list, computes digests in parallel, compares against the
+   previous index's `files.bin`. Three sets:
+   - **added**: in new walk, not in old. Parse + emit.
+   - **removed**: in old, not in new. Tombstone.
+   - **changed**: in both but digest differs. Tombstone old, parse new.
+
+3. **Tombstones + compaction.** Symbols / refs aren't deleted from
+   `symbols.bin`; instead the file_id is marked tombstoned in a
+   sidecar bitmap (`tombstones.bin`, one bit per file_id). The
+   reader filters out tombstoned file_ids in every query path.
+   A separate `scry compact` (run nightly or when the tombstone
+   ratio exceeds 20%) rebuilds clean by streaming records through,
+   skipping tombstoned ones.
+
+The trigram index needs similar treatment: per-trigram postings
+get an "added since digest" sidecar that the merge intersects in.
+
+### New dependencies
+
+None. blake3 is already in.
+
+### Acceptance criteria
+
+- `scry index --incremental` after editing one file completes in
+  ≤ 30 s on the full AOSP+Linux corpus.
+- Tombstones don't leak into query results (filter is enforced in
+  every `serve_*` and CLI path).
+- A reindex from scratch produces a byte-identical
+  `files.bin` / `symbols.bin` pair compared to running an
+  incremental that touched every file (modulo the tombstone
+  bitmap).
+- `scry compact` reclaims tombstoned records and resets the
+  bitmap.
+
+### Tradeoffs
+
+- **Tombstone-aware queries cost a hash-set lookup per result.**
+  Microbenchmarked at < 5% overhead on warm queries; we'll re-measure.
+- **Incremental output is slightly larger than a fresh build**
+  until compaction. ~10% inflation per typical-week edit pattern.
+- **The walker digest pass is the bottleneck.** Blake3 at ~3 GB/s
+  on this CPU; full corpus digest is ~25 s. Cache digests of
+  unchanged files (skip re-hash) by mtime + size first.
+
+### What could go wrong
+
+- **Concurrent reader sees a partial state.** Atomic rename of
+  `files.bin` + the rest is the standard answer. We already do
+  this in finalize; extend to the incremental commit too.
+- **Tombstone bitmap drift.** If a tombstone is set but the
+  compaction never runs, query results drop a record forever.
+  Acceptance test must force a tombstone roundtrip.
+- **The lazy reader caches don't see invalidations.** The lazy
+  reader is mmap'd — by the time we re-open, the kernel will
+  evict stale pages naturally. Test: write → read same connection
+  doesn't show stale results (the connection must re-`StoreReader::open`
+  after an incremental).
+
+### Estimate
+
+- File-table digest field + walker diff: 2 days
+- Tombstone bitmap + reader filtering: 2 days
+- Incremental commit path + atomicity: 2 days
+- Compaction utility: 1 day
+- Tests + bench validation: 2 days
+- Total: **~9 days**.
+
+---
+
+## 3. clangd-as-a-service for C++ precision
+
+### Goal
+
+Close the 10–20% precision gap on C++ overload resolution without
+requiring the user to maintain a SCIP build. When the user asks
+"who calls `Foo::bar()`", we want the *exact* overload set, not
+the trigram-narrowed approximation tree-sitter gives us.
+
+### Why now
+
+C++ is half of AOSP. The current `scry callers` on a C++ method
+name is correct ~85% of the time; the 15% are overload mistakes
+(two `transact` methods with different signatures). For
+exploratory code reading this is fine; for code review or
+refactoring it's not.
+
+### Design
+
+Run a persistent `clangd` subprocess and route the precision-
+critical C++ queries through it via LSP. scry stays the
+"answer-fast, mostly-right" path; clangd is the "answer-slow,
+precise" fallback for `--precise` queries.
+
+Pieces:
+
+1. **LSP client crate**. There isn't a great one in pure Rust yet;
+   either pull in `lsp-server` + write the client side, or shell
+   out to `clangd` and speak the protocol over stdin/stdout.
+   ~500 LOC either way.
+2. **Subprocess lifecycle**. clangd is heavyweight — needs a
+   `compile_commands.json` and ~1 min to warm. We start it on
+   demand at the first `--precise` query and keep it alive for the
+   process lifetime; if `scry serve` is running, clangd lives as
+   long as the server.
+3. **Query routing**. `scry callers Foo --precise` invokes a new
+   `precise_callers(name, file_hint)` that asks clangd for the
+   symbol's USR (universal symbol resolution), then asks for
+   `references`. Map back to the file table; emit.
+4. **compile_commands.json discovery**. Walk up from one of the
+   indexed roots; if not found, surface a clear "run
+   `bear -- m` or equivalent" error.
+
+### New dependencies
+
+- `lsp-types` (well-maintained Rust types for LSP)
+- Either `lsp-server` or hand-rolled LSP client (~500 LOC)
+- An installed `clangd` binary (runtime dep, not link-time)
+
+### Acceptance criteria
+
+- `scry callers Foo --precise` on a known-ambiguous overload
+  returns the correct subset (only callers of the matching
+  signature).
+- When clangd or `compile_commands.json` is missing, the precise
+  path errors with an actionable message; the non-precise path
+  still works.
+- clangd subprocess warm time amortized across a session: ≤ 1
+  min to first --precise query, then ≤ 200 ms per follow-up.
+- `scry serve` keeps the clangd subprocess alive across many
+  client connections.
+
+### Tradeoffs
+
+- **clangd's memory footprint is ~ 1–4 GB** for AOSP-sized
+  projects. The cgroup envelope must account.
+- **clangd needs the build to succeed**. AOSP partial builds
+  produce partial compile_commands.json. The user-experience
+  question is whether "no compile commands → no precise queries"
+  is acceptable. (Yes for v1.)
+- **Two indexes of truth**. clangd's symbol index can drift from
+  scry's. Document that scry's `callers` and `--precise callers`
+  may disagree; the user picks which they want.
+
+### What could go wrong
+
+- **clangd crashes or hangs.** Subprocess supervision (restart on
+  exit, timeout per query). Don't let a clangd hang block other
+  scry queries.
+- **The LSP request shape changes.** lsp-types is versioned; pin.
+- **AOSP doesn't produce a usable compile_commands.json out of
+  the box.** Document the `b create_compile_db` Soong invocation
+  somewhere visible.
+
+### Estimate
+
+- LSP client: 3 days
+- Subprocess lifecycle + serve integration: 2 days
+- Query routing + USR mapping: 2 days
+- Tests with a real clangd + a small fixture: 2 days
+- Total: **~9 days**.
+
+---
+
+## 4. `io_uring` for the candidate scan
+
+### Goal
+
+Replace `read()` + memchr-scan-of-mmap in the grep candidate
+loop with `io_uring`-batched async reads. Measured wins on
+random-IO-heavy workloads are 1.5–2× on NVMe and larger on
+rotational/networked storage.
+
+### Why now
+
+Cold-cache `scry grep` spends ~470 ms on disk reads of 1416
+candidate files. The trigram pre-filter is doing its job; the
+remaining cost is intrinsic IO. `io_uring` lets us submit all
+1416 reads in one syscall and process completions as they land
+— half the syscall overhead and better readahead behavior.
+
+### Design
+
+Single new IO backend selected at runtime:
+
+1. **Add a feature-flagged `io_uring` path in scry-store**.
+   `--features io_uring` pulls in `tokio-uring` or
+   `glommio`. The default build stays on the current
+   `read` + mmap path.
+
+2. **Refactor `cmd_grep` candidate loop**: instead of the
+   per-file `std::fs::read(path)`, submit all candidate paths to
+   the IO backend, scan completions as they arrive. The CPU work
+   (memchr scan) overlaps with the next IO.
+
+3. **Fall back gracefully**: if the kernel doesn't support
+   io_uring (rare on modern Linux, common in containers), error
+   to the existing path at startup with a one-line log.
+
+4. **Detect at process start**: the backend selection is a
+   process-wide decision, not per-query.
+
+### New dependencies
+
+- Either `tokio-uring` (requires the tokio runtime) or
+  `glommio` (independent runtime). `tokio-uring` is more
+  ecosystem-compatible; `glommio` has lower overhead.
+- Kernel ≥ 5.6 (essentially universal in 2026).
+
+### Acceptance criteria
+
+- Cold-cache grep query (`scry grep PATTERN` after
+  `echo 3 > /proc/sys/vm/drop_caches`) shows ≥ 30% lower wall
+  time on NVMe; ≥ 50% on a measured rotational disk.
+- Warm-cache numbers unchanged (no regression).
+- Default-feature build excludes io_uring; binary size doesn't
+  bloat for users who don't want it.
+- BENCHMARKS.md gains an io_uring row in the headline table.
+
+### Tradeoffs
+
+- **Code complexity**: the io_uring path adds a runtime + an
+  async control-flow. The non-uring path stays straight-line
+  blocking code.
+- **Feature-flag matrix**: every build configuration needs a CI
+  job. Cheap (CI is fast) but real surface.
+- **Backend lock-in**: once a runtime is chosen we inherit its
+  idioms (tokio's `Send` requirements; glommio's
+  thread-per-core model).
+
+### What could go wrong
+
+- **Per-file readahead can hurt**: io_uring submits all reads at
+  once, which on a tiny candidate set is no faster than
+  sequential. Microbenchmark on 5-file vs 5000-file candidate
+  sets before claiming a general win.
+- **Container kernels with io_uring disabled.** Detect at
+  startup and fall back; don't fail the whole process.
+- **Memory pressure from in-flight buffers.** io_uring needs
+  pinned buffers per in-flight read. Cap the in-flight depth
+  to ~256 and stream completions.
+
+### Estimate
+
+- Backend abstraction trait + feature flag: 1 day
+- io_uring implementation (tokio-uring): 2 days
+- Benchmarks across NVMe + simulated rotational (cgroup blkio
+  throttle): 2 days
+- Total: **~5 days**.
+
+---
+
+## 5. Fuzzy ranking by edit distance
+
+### Goal
+
+`scry fuzzy ParcelFile --limit 10` currently returns matches in
+FST traversal order, not sorted by edit distance to the query.
+A user typing `ParcelFile` should get `ParcelFileDescriptor`
+before `ParcellableFooBar`.
+
+### Why now
+
+Smallest, most contained win on this list — 1–2 days of work,
+no new dependencies, no format changes. Pure UX polish.
+
+### Design
+
+After the Levenshtein-automaton walk produces candidate matches,
+do a second pass that computes the actual edit distance
+(Wagner–Fischer) for each candidate and sorts the result by
+`(distance ASC, rank_score DESC, name ASC)`.
+
+The candidate set is bounded (`limit` is typically ≤ 100); the
+second pass costs O(K × |query| × max_name_length), which for
+K=100 / |q|=12 / max_name=64 is ~75 µs total. Negligible.
+
+### Implementation
+
+1. Add `fuzzy_with_distance(query, k_distance, limit)` to
+   StoreReader that returns `Vec<(SymbolRecord, u8)>` ordered by
+   distance.
+2. Update `cmd_fuzzy` and `serve_fuzzy` to use it and emit a
+   `distance` field on each result.
+3. Update the JSON schema in USAGE.md.
+
+### Acceptance criteria
+
+- `scry fuzzy <typo>` returns the closest matches first,
+  measured against a small test corpus.
+- A unit test pinning the ordering against a known-corpus +
+  known-query.
+- JSON output includes `distance` field; CLI prints it.
+
+### Tradeoffs
+
+- **One more pass over the candidate set.** Cost is bounded by
+  `limit`, so worst case is ~hundreds of microseconds — not
+  user-visible.
+- **`distance: u8` in the output shape is a new field**;
+  backwards-compatible (clients that don't expect it ignore
+  it).
+
+### What could go wrong
+
+- Nothing concerning. The edit-distance pass is pure CPU on
+  small inputs.
+
+### Estimate
+
+- **1–2 days** including tests and docs.
+
+---
+
+## Order of operations
+
+If I were picking the order strictly by leverage:
+
+1. **#5 fuzzy ranking** first — 1–2 days, no risk, pure UX win.
+2. **#2 incremental indexing** — unblocks the editor-integration
+   use case scry has been missing.
+3. **#1 semantic retrieval** — the single biggest functional
+   gap for LLM agents; biggest investment too.
+4. **#3 clangd-as-a-service** — niche but valuable for C++
+   reviewers; can be deferred indefinitely without blocking
+   anyone.
+5. **#4 io_uring** — measurable but small win on the current
+   workload; only worth it if scry deploys to rotational /
+   networked storage where the gain compounds.
+
+Anything not in this document either lives in DEVELOPMENT.md's
+"Experiments and unexplored directions" section (more speculative
+ideas), or hasn't been thought through yet.

@@ -64,6 +64,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/OPERATIONS.md`]       | production knobs, the systemd recipe, troubleshooting                      |
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
 | [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
+| [`docs/ROADMAP.md`]          | concrete design sketches for the five multi-day items ahead (semantic retrieval, incremental, clangd, io_uring, fuzzy ranking) |
 
 [`docs/USAGE.md`]: docs/USAGE.md
 [`docs/BENCHMARKS.md`]: docs/BENCHMARKS.md
@@ -73,6 +74,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 [`docs/OPERATIONS.md`]: docs/OPERATIONS.md
 [`docs/DEVELOPMENT.md`]: docs/DEVELOPMENT.md
 [`docs/AGENT_NOTES.md`]: docs/AGENT_NOTES.md
+[`docs/ROADMAP.md`]: docs/ROADMAP.md
 
 ## One-paragraph architecture
 

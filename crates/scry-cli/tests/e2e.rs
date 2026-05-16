@@ -310,6 +310,46 @@ fn synthetic_tree_roundtrip() {
     assert!(r2["result"]["files_total"].as_u64().is_some(),
             "stats should report files_total via socket");
 
+    // 7a. Streaming mode: same socket, send a request with stream:true,
+    // expect per-hit lines + a closing {done:true,shown:K} envelope.
+    let mut stream2 = UnixStream::connect(&sock_path).expect("reconnect for stream test");
+    writeln!(stream2, r#"{{"id":42,"cmd":"def","args":{{"name":"Binder","limit":5}},"stream":true}}"#).unwrap();
+    stream2.shutdown(std::net::Shutdown::Write).ok();
+    let mut sbuf = String::new();
+    stream2.read_to_string(&mut sbuf).expect("read stream reply");
+    let slines: Vec<&str> = sbuf.lines().filter(|l| !l.is_empty()).collect();
+    assert!(slines.len() >= 2, "expected ≥1 hit line + 1 done line; got {sbuf:?}");
+    let last: serde_json::Value = serde_json::from_str(slines.last().unwrap())
+        .expect("last stream line is JSON");
+    assert_eq!(last["id"], 42);
+    assert_eq!(last["done"], true, "last line must be the done envelope");
+    let shown = last["shown"].as_u64().expect("done envelope has shown count");
+    // Every non-last line must be a hit envelope for the same id.
+    for hit_line in &slines[..slines.len()-1] {
+        let h: serde_json::Value = serde_json::from_str(hit_line).expect("hit line is JSON");
+        assert_eq!(h["id"], 42);
+        assert!(h["hit"].is_object(), "hit field should hold the symbol object: {h}");
+    }
+    assert_eq!(shown as usize, slines.len() - 1,
+               "shown count should match number of emitted hit lines");
+
+    // 7b. Budget: ask for a Binder lookup with a tiny byte cap;
+    // assert the response carries a "truncated" tag and that snippet
+    // / scope / fqn have been stripped progressively.
+    let mut stream3 = UnixStream::connect(&sock_path).expect("reconnect for budget test");
+    writeln!(stream3, r#"{{"id":7,"cmd":"def","args":{{"name":"Binder","limit":5}},"budget":120}}"#).unwrap();
+    stream3.shutdown(std::net::Shutdown::Write).ok();
+    let mut bbuf = String::new();
+    stream3.read_to_string(&mut bbuf).expect("read budget reply");
+    let bline = bbuf.lines().find(|l| !l.is_empty()).expect("at least one line");
+    let bresp: serde_json::Value = serde_json::from_str(bline).expect("budget reply is JSON");
+    assert_eq!(bresp["id"], 7);
+    assert!(bresp.get("truncated").is_some(),
+            "small budget should produce a truncated tag; got {bresp}");
+    let tag = bresp["truncated"].as_str().unwrap();
+    assert!(tag.contains("snippet") || tag.contains("truncated"),
+            "truncated tag should describe what was dropped; got {tag:?}");
+
     // Cleanup the daemon and the socket file.
     daemon.kill().ok();
     daemon.wait().ok();

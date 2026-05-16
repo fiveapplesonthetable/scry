@@ -382,6 +382,53 @@ is the same as single-client. The socket file is best-effort cleaned up
 on bind (stale sockets from a crashed prior run are replaced); SIGKILL
 will leave the file behind but the next start reclaims it.
 
+### Streaming responses (`"stream": true`)
+
+For large result sets where the caller wants to start reading before
+all hits are computed (or wants to cut off early), set `stream: true`
+on the request. The server emits one JSON line per hit, then a
+closing envelope:
+
+```sh
+$ printf '%s\n' \
+    '{"id":1,"cmd":"def","args":{"name":"Activity","limit":3},"stream":true}' \
+  | scry serve --index /mnt/agent/scry-index
+{"id":1,"hit":{"name":"Activity","kind":"class",...}}
+{"id":1,"hit":{"name":"Activity","kind":"class",...}}
+{"id":1,"hit":{"name":"Activity","kind":"class",...}}
+{"id":1,"done":true,"shown":3}
+```
+
+Streaming is meaningful for the multi-hit commands (def, prefix,
+fuzzy, ref, callers, grep). For scalar-shaped commands (outline,
+coverage, stats), `stream: true` is silently ignored — they always
+return one envelope.
+
+### Budget (`"budget": BYTES`)
+
+When the response would exceed `BYTES` of serialized JSON, fields are
+progressively stripped in a priority order: **snippet → scope → fqn**,
+and finally **the result array is truncated** from the tail. The
+response then carries a `"truncated"` field naming what was dropped:
+
+```sh
+$ printf '%s\n' \
+    '{"id":1,"cmd":"def","args":{"name":"Activity","limit":50},"budget":2000}' \
+  | scry serve --index /mnt/agent/scry-index
+{"id":1,"result":[…40 hits, all without scope or snippet…],"truncated":"snippet+scope"}
+```
+
+The order is "drop the most reconstructible thing first": snippets
+are kilobytes and the agent can re-read the file; scope paths are
+helpful but derivable from path+line; fqn is name+scope; the count
+truncation is last-resort. Set `limit` to cap result *count*; set
+`budget` to cap result *bytes*. Use both together for predictable
+agent token economy.
+
+Streaming + budget compose: in stream mode, budget caps each hit
+individually (no way to retroactively trim already-emitted hits).
+In non-stream mode, budget caps the whole response.
+
 Full per-command argument schema is in `README.md` under the JSON-RPC
 section.
 

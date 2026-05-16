@@ -2750,7 +2750,9 @@ fn cmd_serve(index: Option<PathBuf>, listen: Option<String>) -> Result<()> {
 }
 
 /// Stdin/stdout transport: one-shot agent loops, ad-hoc CLI experiments.
-/// Reads requests one line at a time; writes one response per request.
+/// Reads requests one line at a time; writes responses through the
+/// shared `serve_one_request` writer path (may be one line or many,
+/// depending on whether the request set `stream: true`).
 fn serve_stdio(reader: &StoreReader) -> Result<()> {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
@@ -2764,8 +2766,7 @@ fn serve_stdio(reader: &StoreReader) -> Result<()> {
         };
         let line = line.trim();
         if line.is_empty() { continue; }
-        let resp = serve_one_request(reader, line);
-        writeln!(out, "{}", resp)?;
+        serve_one_request(reader, line, &mut out)?;
         out.flush()?;
     }
     Ok(())
@@ -2857,8 +2858,7 @@ fn serve_connection<R: std::io::Read, W: std::io::Write>(
         };
         let line = line.trim();
         if line.is_empty() { continue; }
-        let resp = serve_one_request(reader, line);
-        writeln!(wr, "{}", resp)?;
+        serve_one_request(reader, line, &mut wr)?;
         wr.flush()?;
     }
     Ok(())
@@ -2875,14 +2875,37 @@ fn reader_clone_for_share(r: &StoreReader) -> Result<StoreReader> {
         .with_context(|| format!("re-open index at {} for listener mode", r.paths.root.display()))
 }
 
-/// Handle a single newline-delimited JSON-RPC request and return the
-/// serialized response (one JSON line, no trailing newline). Shared by
-/// all transports — stdio, unix socket, tcp socket. Pure function of
-/// reader + request string; trivially testable.
-fn serve_one_request(reader: &StoreReader, line: &str) -> String {
+/// Handle a single newline-delimited JSON-RPC request by writing its
+/// response(s) to `wr`. Shared by all transports — stdio, unix socket,
+/// tcp socket, MCP. The shape of what gets written depends on the
+/// request:
+///
+/// - **Default (non-streaming)**: one JSON line of the form
+///   `{"id":N,"result":VALUE}`. If `budget: BYTES` is set on the
+///   request and the serialized response exceeds it, fields are
+///   stripped progressively (snippet → scope → fqn) and finally the
+///   result array is truncated. A `truncated` field is added to
+///   record what was dropped.
+/// - **Streaming (`"stream": true`)**: one JSON line per hit of the
+///   form `{"id":N,"hit":VALUE}`, then a closing
+///   `{"id":N,"done":true,"shown":K}` envelope. The hit shape is the
+///   same as a single element of the non-streaming result array. For
+///   commands whose result is a scalar/object (outline, coverage,
+///   stats), streaming has no effect — they emit one regular response.
+///
+/// Returns IO errors from `wr` so a broken pipe propagates cleanly.
+fn serve_one_request<W: std::io::Write>(
+    reader: &StoreReader,
+    line: &str,
+    wr: &mut W,
+) -> Result<()> {
     let req: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(e) => return serde_json::json!({"error": format!("bad json: {e}")}).to_string(),
+        Err(e) => {
+            let resp = serde_json::json!({"error": format!("bad json: {e}")});
+            writeln!(wr, "{}", resp)?;
+            return Ok(());
+        }
     };
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
@@ -2891,6 +2914,8 @@ fn serve_one_request(reader: &StoreReader, line: &str) -> String {
     let lang = args.get("lang").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
     let in_ = args.get("in").and_then(|v| v.as_str());
+    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let budget = req.get("budget").and_then(|v| v.as_u64()).map(|n| n as usize);
 
     // Per-command primary arg name. Each command also accepts "name"
     // as a fallback so existing callers don't break, but the
@@ -2906,7 +2931,7 @@ fn serve_one_request(reader: &StoreReader, line: &str) -> String {
             .unwrap_or("")
     };
 
-    let result = match cmd {
+    let mut result = match cmd {
         "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, limit),
         "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, limit),
         "fuzzy"   => serve_fuzzy(reader, arg_str("substr"), in_, limit),
@@ -2917,13 +2942,136 @@ fn serve_one_request(reader: &StoreReader, line: &str) -> String {
         "coverage" => serve_coverage(reader, arg_str("path"),
             args.get("by_kind").and_then(|v| v.as_bool()).unwrap_or(false)),
         "stats"   => serve_stats(reader),
-        other     => serde_json::json!({"error": format!("unknown cmd: {other}")}),
+        other     => {
+            let resp = serde_json::json!({
+                "id": id, "error": format!("unknown cmd: {other}"),
+            });
+            writeln!(wr, "{}", resp)?;
+            return Ok(());
+        }
     };
 
-    serde_json::json!({
-        "id": id,
-        "result": result,
-    }).to_string()
+    // Streaming path: only meaningful when the result is an array
+    // (the multi-hit commands: def, prefix, fuzzy, ref, callers, grep).
+    // For scalar/object results (outline, coverage, stats), streaming
+    // degrades to a single regular response.
+    if stream {
+        if let serde_json::Value::Array(hits) = &mut result {
+            let mut shown = 0usize;
+            for hit in hits.drain(..) {
+                let mut hit = hit;
+                if let Some(b) = budget {
+                    // Per-hit budget cap, applied to each hit's serialized
+                    // size independently. We use a smaller per-hit budget
+                    // (budget/shown_limit) to avoid one heavy hit
+                    // monopolizing the bytes.
+                    let per_hit = b.saturating_sub(64).max(128) / limit.max(1);
+                    let _ = apply_budget_to_hit(&mut hit, per_hit);
+                }
+                let env = serde_json::json!({"id": id, "hit": hit});
+                writeln!(wr, "{}", env)?;
+                shown += 1;
+            }
+            let done = serde_json::json!({"id": id, "done": true, "shown": shown});
+            writeln!(wr, "{}", done)?;
+            return Ok(());
+        }
+    }
+
+    // Non-streaming path: optionally apply the budget to the whole
+    // response, then write one line.
+    let truncated = budget
+        .and_then(|b| apply_budget_to_response(&mut result, b));
+    let mut envelope = serde_json::json!({"id": id, "result": result});
+    if let Some(tag) = truncated {
+        envelope.as_object_mut().unwrap()
+            .insert("truncated".to_string(), serde_json::Value::String(tag.to_string()));
+    }
+    writeln!(wr, "{}", envelope)?;
+    Ok(())
+}
+
+/// Strip a single response value's optional fields in priority order
+/// until the serialized size fits within `budget` bytes. Returns the
+/// name of the deepest trim applied (`"snippet"`, `"snippet+scope"`,
+/// `"snippet+scope+fqn"`, `"snippet+scope+fqn+truncated"`) or `None`
+/// if the original already fit.
+///
+/// Trimming order is *information-preserving first*: snippets are the
+/// largest expendable field (kilobytes per hit), then scope_path
+/// (helpful but reconstructible from path + line), then fqn (a
+/// derivative of name + scope), and finally truncation of the result
+/// array as the last resort. The caller is responsible for setting a
+/// sensible `limit`; budget should not be the only cap.
+fn apply_budget_to_response(value: &mut serde_json::Value, budget: usize) -> Option<&'static str> {
+    if serialized_len(value) <= budget { return None; }
+    strip_field_recursive(value, "snippet");
+    if serialized_len(value) <= budget { return Some("snippet"); }
+    strip_field_recursive(value, "scope");
+    if serialized_len(value) <= budget { return Some("snippet+scope"); }
+    strip_field_recursive(value, "fqn");
+    if serialized_len(value) <= budget { return Some("snippet+scope+fqn"); }
+    // Last resort: truncate the array (keeping highest-ranked hits at
+    // the front, since serve_* functions already returned them sorted).
+    truncate_array_to_budget(value, budget);
+    Some("snippet+scope+fqn+truncated")
+}
+
+/// Per-hit budget trim used in streaming mode. Same priority order as
+/// the non-streaming variant but operates on one hit at a time —
+/// streaming has no way to retroactively trim already-emitted hits.
+fn apply_budget_to_hit(hit: &mut serde_json::Value, budget: usize) -> Option<&'static str> {
+    if serialized_len(hit) <= budget { return None; }
+    strip_field_recursive(hit, "snippet");
+    if serialized_len(hit) <= budget { return Some("snippet"); }
+    strip_field_recursive(hit, "scope");
+    if serialized_len(hit) <= budget { return Some("snippet+scope"); }
+    strip_field_recursive(hit, "fqn");
+    Some("snippet+scope+fqn")
+}
+
+/// Serialized length in bytes — used by the budget machinery to decide
+/// when to stop trimming. Cheap: serde_json's writer is fast and we're
+/// only calling this on intermediate sizes, not the response itself.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    serde_json::to_string(value).map(|s| s.len()).unwrap_or(usize::MAX)
+}
+
+/// Remove every occurrence of `field` from any object inside `value`,
+/// walking the tree. Used by the budget code to drop snippets / scope
+/// / fqn fields without disturbing the rest of the response shape.
+fn strip_field_recursive(value: &mut serde_json::Value, field: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove(field);
+            for v in map.values_mut() { strip_field_recursive(v, field); }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() { strip_field_recursive(v, field); }
+        }
+        _ => {}
+    }
+}
+
+/// Walk `value`'s top-level array (or `symbols` array inside an
+/// outline-shaped object) and drop elements from the tail until the
+/// serialized size fits within `budget`. No-op if `value` isn't an
+/// array.
+fn truncate_array_to_budget(value: &mut serde_json::Value, budget: usize) {
+    let arr = match value {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(map) => {
+            // outline returns {symbols: [...]}; reach inside.
+            match map.get_mut("symbols") {
+                Some(serde_json::Value::Array(a)) => a,
+                _ => return,
+            }
+        }
+        _ => return,
+    };
+    while !arr.is_empty() && serialized_len(&serde_json::Value::Array(arr.clone())) > budget {
+        arr.pop();
+    }
 }
 
 /// Does the symbol/ref live under the given subdir prefix?
@@ -3521,5 +3669,116 @@ mod tests {
         let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
         assert_eq!(got, 11, "should pick first same-lang candidate");
         assert_eq!(n, 0, "no narrowing happened");
+    }
+
+    // ------------------------------------------------------------------
+    // Budget machinery for the streaming serve transport (Phase B).
+    // ------------------------------------------------------------------
+
+    /// strip_field_recursive must walk both arrays and nested objects;
+    /// nothing else in the value should change.
+    #[test]
+    fn strip_field_recursive_walks_nested() {
+        let mut v = serde_json::json!({
+            "result": [
+                {"name": "Foo", "snippet": "very long source bytes"},
+                {"name": "Bar", "snippet": "more bytes", "inner": {"snippet": "also here"}},
+            ],
+        });
+        strip_field_recursive(&mut v, "snippet");
+        assert!(!serde_json::to_string(&v).unwrap().contains("snippet"),
+                "snippet should be gone everywhere; got {v}");
+        // Names preserved.
+        assert!(serde_json::to_string(&v).unwrap().contains("Foo"));
+    }
+
+    /// Original-fits-in-budget should be a no-op (return None).
+    #[test]
+    fn budget_noop_when_fits() {
+        let mut v = serde_json::json!([{"name": "Foo"}]);
+        let r = apply_budget_to_response(&mut v, 1000);
+        assert!(r.is_none(), "expected None, got {r:?}");
+    }
+
+    /// Snippet-only trim is enough → returns Some("snippet").
+    #[test]
+    fn budget_drops_snippets_first() {
+        let big_snippet = "x".repeat(500);
+        let mut v = serde_json::json!([
+            {"name": "A", "snippet": big_snippet.clone()},
+            {"name": "B", "snippet": big_snippet},
+        ]);
+        let r = apply_budget_to_response(&mut v, 200);
+        assert_eq!(r, Some("snippet"));
+        assert!(!serde_json::to_string(&v).unwrap().contains("xxxx"),
+                "snippets must be gone");
+        // The names survive.
+        assert!(serde_json::to_string(&v).unwrap().contains("\"A\""));
+        assert!(serde_json::to_string(&v).unwrap().contains("\"B\""));
+    }
+
+    /// Snippet + scope trim required → returns Some("snippet+scope").
+    #[test]
+    fn budget_drops_scope_after_snippet() {
+        let big = "x".repeat(100);
+        let scope = vec!["a", "b", "c", "d", "e", "f"];
+        let mut v = serde_json::json!([
+            {"name": "A", "snippet": big.clone(), "scope": scope},
+            {"name": "B", "snippet": big.clone(), "scope": ["a","b","c","d","e","f"]},
+            {"name": "C", "snippet": big, "scope": ["a","b","c","d","e","f"]},
+        ]);
+        let r = apply_budget_to_response(&mut v, 80);
+        // Either snippet+scope or further; just verify scope is gone.
+        assert!(r.is_some());
+        assert!(!serde_json::to_string(&v).unwrap().contains("scope"),
+                "scope must be gone; got {v}");
+    }
+
+    /// Truncation as last resort: even with snippet+scope+fqn dropped,
+    /// the array is still too big, so we drop elements from the tail.
+    #[test]
+    fn budget_truncates_array_as_last_resort() {
+        // 50 minimal hits at ~30 bytes each → ~1500 bytes serialized.
+        let hits: Vec<serde_json::Value> = (0..50)
+            .map(|i| serde_json::json!({"name": format!("name_{i}_padding_padding")}))
+            .collect();
+        let mut v = serde_json::Value::Array(hits);
+        let r = apply_budget_to_response(&mut v, 200);
+        assert_eq!(r, Some("snippet+scope+fqn+truncated"));
+        let final_len = v.as_array().unwrap().len();
+        assert!(final_len < 50, "expected truncation, got {final_len}/50 still present");
+        assert!(final_len > 0, "shouldn't truncate to empty if budget permits some");
+    }
+
+    /// truncate_array_to_budget should also descend into the
+    /// outline-shape {"symbols": [...]} envelope.
+    #[test]
+    fn truncate_array_descends_into_outline_envelope() {
+        let hits: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"name": format!("sym_{i}")}))
+            .collect();
+        let mut v = serde_json::json!({
+            "path": "/some/file.java",
+            "symbols": hits,
+        });
+        truncate_array_to_budget(&mut v, 100);
+        let n = v["symbols"].as_array().unwrap().len();
+        assert!(n < 20, "expected outline symbols truncated, got {n}/20");
+    }
+
+    /// Hit-level trim is the streaming-mode variant: snippet → scope →
+    /// fqn but no truncation (you can't un-emit lines).
+    #[test]
+    fn hit_budget_strips_in_order() {
+        let mut hit = serde_json::json!({
+            "name": "Foo",
+            "snippet": "x".repeat(300),
+            "scope": ["a","b","c"],
+            "fqn": "com.android.foo.Foo",
+        });
+        let r = apply_budget_to_hit(&mut hit, 50);
+        assert!(r.is_some());
+        // The bare "name" field always survives.
+        assert_eq!(hit["name"], "Foo");
     }
 }

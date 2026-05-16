@@ -331,9 +331,14 @@ by kind:
 
 ---
 
-## JSON-RPC over stdin: `scry serve`
+## JSON-RPC: `scry serve`
 
-Open once per agent session and reuse the warm mmap'd index:
+Two transports — pick by how long the agent or editor lives:
+
+### Stdio (one-shot agent loops, ad-hoc CLI piping)
+
+Open once per agent session and reuse the warm mmap'd index for the
+remaining lifetime of the process:
 
 ```sh
 $ printf '%s\n' \
@@ -349,6 +354,33 @@ $ printf '%s\n' \
 {"id":4,"result":{"path":"…/app_main.cpp","lang":"Cpp","symbols_total":13,...}}
 {"id":5,"result":{"scry_version":"0.0.1","files_total":1009166,...}}
 ```
+
+### Listener (long-running daemon, multiple concurrent clients)
+
+For editor integrations, agents that span many sessions, or any
+workflow that would otherwise pay the ~50 ms cold-open cost on every
+shell-out:
+
+```sh
+# Bind a Unix domain socket (preferred for local clients).
+$ scry serve --index /mnt/agent/scry-index --listen unix:/tmp/scry.sock &
+[scry serve] listening on unix:/tmp/scry.sock
+
+# Connect from any tool that speaks line-delimited JSON over a socket.
+$ printf '{"id":1,"cmd":"def","args":{"name":"Binder","limit":1}}\n' \
+    | socat - UNIX-CONNECT:/tmp/scry.sock
+{"id":1,"result":[{"name":"Binder","kind":"class",...}]}
+
+# Or TCP, for cross-host or container-network setups.
+$ scry serve --index /mnt/agent/scry-index --listen tcp:127.0.0.1:9999 &
+```
+
+Daemon mode accepts many connections concurrently on its own OS
+threads. The `StoreReader` is mmap-backed and immutable, so concurrent
+queries don't serialize on any internal lock — query latency under load
+is the same as single-client. The socket file is best-effort cleaned up
+on bind (stale sockets from a crashed prior run are replaced); SIGKILL
+will leave the file behind but the next start reclaims it.
 
 Full per-command argument schema is in `README.md` under the JSON-RPC
 section.

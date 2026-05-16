@@ -268,6 +268,53 @@ fn synthetic_tree_roundtrip() {
             "build-resolutions should have populated at least one resolved_to, got 0/{} (refs: {:?})",
             lines.len(), lines);
 
+    // 7. Unix-socket serve mode. Spawn the daemon, give it ~100 ms to
+    // bind, connect with a UnixStream, send two requests, read two
+    // responses, assert the shapes. Also exercises the
+    // reader_clone_for_share path (Arc<StoreReader> across threads).
+    use std::os::unix::net::UnixStream;
+    use std::io::Read;
+    let sock_path = base.join("scry-e2e.sock");
+    let _ = std::fs::remove_file(&sock_path); // best-effort stale-cleanup
+    let mut daemon = Command::new(scry_bin())
+        .args(["serve", "--index"])
+        .arg(&idx)
+        .arg("--listen")
+        .arg(format!("unix:{}", sock_path.display()))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn scry serve --listen");
+    // Wait for the bind. The daemon prints a "listening on unix:..."
+    // banner to stderr; poll for the socket file with a tiny budget.
+    let mut bound = false;
+    for _ in 0..50 {
+        if sock_path.exists() { bound = true; break; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(bound, "socket {} never appeared", sock_path.display());
+
+    let mut stream = UnixStream::connect(&sock_path).expect("connect to scry serve socket");
+    writeln!(stream, r#"{{"id":1,"cmd":"def","args":{{"name":"Binder","limit":1}}}}"#).unwrap();
+    writeln!(stream, r#"{{"id":2,"cmd":"stats"}}"#).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).ok(); // signal EOF
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).expect("read socket reply");
+    let lines: Vec<&str> = buf.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 socket responses, got: {buf:?}");
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).expect("socket reply 1 is JSON");
+    assert_eq!(r1["id"], 1, "first reply id must echo request");
+    assert!(!r1["result"].as_array().unwrap().is_empty(),
+            "def Binder via socket should return at least one hit");
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).expect("socket reply 2 is JSON");
+    assert_eq!(r2["id"], 2);
+    assert!(r2["result"]["files_total"].as_u64().is_some(),
+            "stats should report files_total via socket");
+
+    // Cleanup the daemon and the socket file.
+    daemon.kill().ok();
+    daemon.wait().ok();
+    let _ = std::fs::remove_file(&sock_path);
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

@@ -280,12 +280,29 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
     },
-    /// JSON-RPC server reading newline-delimited requests on stdin.
-    /// Each request is {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|stats", "args": {...}}.
-    /// Responses are one JSON object per request.
+    /// JSON-RPC server. Reads newline-delimited requests, writes
+    /// newline-delimited responses. Each request is
+    /// {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|outline|coverage|stats", "args": {...}}.
+    ///
+    /// Transport defaults to stdin/stdout (one-shot agent loops). Pass
+    /// --listen unix:/tmp/scry.sock or --listen tcp:127.0.0.1:9999 to
+    /// run as a persistent daemon that accepts multiple concurrent
+    /// connections from a single warm StoreReader. The daemon mode
+    /// holds the mmap'd index across all connections — per-query cold
+    /// open cost (~50 ms) is paid once, not per process.
     Serve {
         #[arg(long)]
         index: Option<PathBuf>,
+        /// Bind a listener instead of using stdin/stdout. Accepted forms:
+        ///   unix:/path/to/sock     — Unix domain socket (preferred for
+        ///                            local editor / agent integrations)
+        ///   tcp:HOST:PORT          — TCP socket, e.g. tcp:127.0.0.1:9999
+        /// Each accepted connection runs the same JSON-RPC loop as the
+        /// stdin/stdout transport. The shared StoreReader is Sync (mmap'd
+        /// + immutable) so concurrent queries are safe and don't block
+        /// each other.
+        #[arg(long)]
+        listen: Option<String>,
     },
     /// Show Soong modules matching NAME (sugar for `def NAME --kind soong`).
     Mod {
@@ -431,7 +448,7 @@ fn main() -> Result<()> {
             pattern, index, regex, lang, in_, limit, json, workers,
             max_file_bytes, mem_cap,
         ),
-        Cmd::Serve { index } => cmd_serve(index),
+        Cmd::Serve { index, listen } => cmd_serve(index, listen),
         Cmd::Mod { name, index, limit, json } => {
             cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
@@ -2719,9 +2736,23 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
     Ok(())
 }
 
-fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
-    use std::io::{BufRead, Write};
+/// Entry point for the `serve` subcommand. Dispatches to the requested
+/// transport — stdin/stdout (default) or a bound listener (unix / tcp).
+/// The shared `StoreReader` lives for the whole process and is borrowed
+/// by every connection; mmap-backed and immutable, so no synchronization
+/// is needed across concurrent clients.
+fn cmd_serve(index: Option<PathBuf>, listen: Option<String>) -> Result<()> {
     let reader = open_index(index)?;
+    match listen.as_deref() {
+        None => serve_stdio(&reader),
+        Some(spec) => serve_listener(&reader, spec),
+    }
+}
+
+/// Stdin/stdout transport: one-shot agent loops, ad-hoc CLI experiments.
+/// Reads requests one line at a time; writes one response per request.
+fn serve_stdio(reader: &StoreReader) -> Result<()> {
+    use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -2733,59 +2764,166 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
         };
         let line = line.trim();
         if line.is_empty() { continue; }
-        let req: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = serde_json::json!({"error": format!("bad json: {e}")});
-                writeln!(out, "{}", resp)?;
-                out.flush()?;
-                continue;
-            }
-        };
-        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-        let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-        let lang = args.get("lang").and_then(|v| v.as_str());
-        let kind = args.get("kind").and_then(|v| v.as_str());
-        let in_ = args.get("in").and_then(|v| v.as_str());
-
-        // Per-command primary arg name. Each command also accepts "name"
-        // as a fallback so existing callers don't break, but the
-        // semantic field is what the docs and examples use:
-        //   def/ref/callers      → "name"
-        //   prefix               → "prefix"
-        //   fuzzy                → "substr"
-        //   grep                 → "pattern"
-        //   outline              → "path"
-        let arg_str = |primary: &str| -> &str {
-            args.get(primary).and_then(|v| v.as_str())
-                .or_else(|| args.get("name").and_then(|v| v.as_str()))
-                .unwrap_or("")
-        };
-
-        let result = match cmd {
-            "def"     => serve_def(&reader, arg_str("name"), lang, kind, in_, limit),
-            "prefix"  => serve_prefix(&reader, arg_str("prefix"), in_, limit),
-            "fuzzy"   => serve_fuzzy(&reader, arg_str("substr"), in_, limit),
-            "ref"     => serve_ref(&reader, arg_str("name"), lang, kind, in_, limit),
-            "callers" => serve_ref(&reader, arg_str("name"), lang, Some("call"), in_, limit),
-            "grep"    => serve_grep(&reader, arg_str("pattern"), lang, in_, limit),
-            "outline" => serve_outline(&reader, arg_str("path"), limit),
-            "coverage" => serve_coverage(&reader, arg_str("path"),
-                args.get("by_kind").and_then(|v| v.as_bool()).unwrap_or(false)),
-            "stats"   => serve_stats(&reader),
-            other     => serde_json::json!({"error": format!("unknown cmd: {other}")}),
-        };
-
-        let resp = serde_json::json!({
-            "id": id,
-            "result": result,
-        });
+        let resp = serve_one_request(reader, line);
         writeln!(out, "{}", resp)?;
         out.flush()?;
     }
     Ok(())
+}
+
+/// Bound-listener transport: keep the warm StoreReader resident across
+/// many client connections. Spec syntax:
+///   `unix:/path/to/socket`     — Unix domain socket
+///   `tcp:HOST:PORT`            — TCP socket
+///
+/// Each accepted connection runs the same per-line request loop as
+/// stdio mode, on its own OS thread. The `StoreReader` is `Sync` (only
+/// mmaps + immutable Vecs) so concurrent reads need no synchronization.
+///
+/// On Unix-socket mode, the socket file is unlinked before bind (handles
+/// stale sockets from a crashed prior run) and cleaned up on the most
+/// common exit paths. SIGINT/SIGKILL still leave it behind; the next
+/// start will reclaim it.
+fn serve_listener(reader: &StoreReader, spec: &str) -> Result<()> {
+    use std::sync::Arc;
+    use std::thread;
+    let reader = Arc::new(reader_clone_for_share(reader)?);
+    match spec.split_once(':') {
+        Some(("unix", path)) => {
+            use std::os::unix::net::UnixListener;
+            // Best-effort cleanup of a stale socket from a prior crashed
+            // run. If the file isn't actually a socket we'll fail to bind
+            // below with a clear error — safer than silently overwriting.
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path)
+                .with_context(|| format!("bind unix:{path}"))?;
+            eprintln!("[scry serve] listening on unix:{path}");
+            for stream in listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[scry serve] accept: {e}"); continue; }
+                };
+                let r = Arc::clone(&reader);
+                thread::spawn(move || {
+                    if let Err(e) = serve_connection(&r, &stream, &stream) {
+                        eprintln!("[scry serve] connection: {e:#}");
+                    }
+                });
+            }
+            Ok(())
+        }
+        Some(("tcp", addr)) => {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind(addr)
+                .with_context(|| format!("bind tcp:{addr}"))?;
+            eprintln!("[scry serve] listening on tcp:{addr}");
+            for stream in listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[scry serve] accept: {e}"); continue; }
+                };
+                let r = Arc::clone(&reader);
+                thread::spawn(move || {
+                    let read = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("[scry serve] dup: {e}"); return; }
+                    };
+                    if let Err(e) = serve_connection(&r, &read, &stream) {
+                        eprintln!("[scry serve] connection: {e:#}");
+                    }
+                });
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!(
+            "invalid --listen spec '{spec}': expected unix:PATH or tcp:HOST:PORT"
+        ),
+    }
+}
+
+/// One client connection's read/write loop. Lifted from `serve_stdio` so
+/// both transports share the request-handling code path verbatim.
+fn serve_connection<R: std::io::Read, W: std::io::Write>(
+    reader: &StoreReader,
+    rd: R,
+    mut wr: W,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    let buf = BufReader::new(rd);
+    for line in buf.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let resp = serve_one_request(reader, line);
+        writeln!(wr, "{}", resp)?;
+        wr.flush()?;
+    }
+    Ok(())
+}
+
+/// Open the index a *second* time for sharing across listener threads.
+/// `StoreReader` is `Sync`, so in principle we could `Arc<StoreReader>`
+/// the original directly — but `open_index` ergonomically returns
+/// `StoreReader` (not `Arc<StoreReader>`), and we want every code path
+/// that holds a reference to be obvious in its lifetime. Cheap: this is
+/// just re-mmapping the same files (~ms, no IO).
+fn reader_clone_for_share(r: &StoreReader) -> Result<StoreReader> {
+    StoreReader::open(&r.paths.root)
+        .with_context(|| format!("re-open index at {} for listener mode", r.paths.root.display()))
+}
+
+/// Handle a single newline-delimited JSON-RPC request and return the
+/// serialized response (one JSON line, no trailing newline). Shared by
+/// all transports — stdio, unix socket, tcp socket. Pure function of
+/// reader + request string; trivially testable.
+fn serve_one_request(reader: &StoreReader, line: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return serde_json::json!({"error": format!("bad json: {e}")}).to_string(),
+    };
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+    let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let lang = args.get("lang").and_then(|v| v.as_str());
+    let kind = args.get("kind").and_then(|v| v.as_str());
+    let in_ = args.get("in").and_then(|v| v.as_str());
+
+    // Per-command primary arg name. Each command also accepts "name"
+    // as a fallback so existing callers don't break, but the
+    // semantic field is what the docs and examples use:
+    //   def/ref/callers      → "name"
+    //   prefix               → "prefix"
+    //   fuzzy                → "substr"
+    //   grep                 → "pattern"
+    //   outline              → "path"
+    let arg_str = |primary: &str| -> &str {
+        args.get(primary).and_then(|v| v.as_str())
+            .or_else(|| args.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("")
+    };
+
+    let result = match cmd {
+        "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, limit),
+        "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, limit),
+        "fuzzy"   => serve_fuzzy(reader, arg_str("substr"), in_, limit),
+        "ref"     => serve_ref(reader, arg_str("name"), lang, kind, in_, limit),
+        "callers" => serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit),
+        "grep"    => serve_grep(reader, arg_str("pattern"), lang, in_, limit),
+        "outline" => serve_outline(reader, arg_str("path"), limit),
+        "coverage" => serve_coverage(reader, arg_str("path"),
+            args.get("by_kind").and_then(|v| v.as_bool()).unwrap_or(false)),
+        "stats"   => serve_stats(reader),
+        other     => serde_json::json!({"error": format!("unknown cmd: {other}")}),
+    };
+
+    serde_json::json!({
+        "id": id,
+        "result": result,
+    }).to_string()
 }
 
 /// Does the symbol/ref live under the given subdir prefix?

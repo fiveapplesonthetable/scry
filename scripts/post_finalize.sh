@@ -53,25 +53,79 @@ SCRY_INDEX_DIR="$INDEX" /mnt/agent/scry/scripts/bench_grep.sh || true
 echo "step 4 took $(($(date +%s) - t4)) sec"
 
 DURATION=$(($(date +%s) - t1))
-SUMMARY=$($SCRY stats --index "$INDEX" 2>/dev/null | head -10)
+SUMMARY=$($SCRY stats --index "$INDEX" 2>/dev/null | head -20)
+INDEX_LAYOUT=$(ls -la "$INDEX" 2>/dev/null | tail -n +2)
+INDEX_DISK=$(du -sh "$INDEX" 2>/dev/null | awk '{print $1}')
+
+# High-level repo layout — answers "what is scry made of" for someone
+# reading this email cold. Pulled live (not hardcoded) so it stays in
+# sync as the code evolves.
+REPO=/mnt/agent/scry
+CRATES=$(ls -d "$REPO"/crates/*/ 2>/dev/null | awk -F/ '{print "  - " $(NF-1)}')
+DOC_FILES=$(ls "$REPO"/docs/*.md "$REPO"/README.md 2>/dev/null | awk -F/ '{print "  - " $(NF-1) "/" $NF}' | sed "s|/mnt/agent/scry/||")
+LATEST_COMMITS=$(git -C "$REPO" log --oneline -10 2>/dev/null)
+LANG_COUNTS=$($SCRY stats --index "$INDEX" --json 2>/dev/null | head -200 || echo "(stats unavailable)")
+
+# Sample queries to demonstrate the API to whoever reads the email.
+SAMPLES=$(
+  for q in \
+    "def ActivityManagerService" \
+    "callers transact --lang Java --limit 5" \
+    "grep 'ZygoteInit'" \
+    "def libbinder --kind soong" \
+    "def zygote --kind init.svc"; do
+    printf '\n$ scry %s\n' "$q"
+    timeout 5 $SCRY $q --index "$INDEX" 2>&1 | head -5
+  done
+)
 
 msmtp -t <<EMAIL_END
 To: $TO
 From: $FROM
 Subject: [scry] FULL INDEX COMPLETE — post-finalize done in ${DURATION}s
 
-Index has finalized. Post-finalize pipeline ran:
-  1. build-offsets
-  2. build-trigrams
-  3. validate.sh
-  4. bench_grep.sh
+The scry full AOSP + Linux kernel index has finalized. Post-finalize
+pipeline ran:
+  1. build-offsets (lazy/mmap reader sidecars)
+  2. build-trigrams (100× rg grep path)
+  3. validate.sh (def/ref/grep against real AOSP symbols)
+  4. bench_grep.sh (scry vs rg head-to-head)
 
-Index at $INDEX.
+Index at: $INDEX
+Index size on disk: $INDEX_DISK
 
-STATS:
+==================================================================
+PROJECT STRUCTURE
+==================================================================
+Source root: $REPO  (git: github.com/fiveapplesonthetable/scry)
+
+Crates:
+$CRATES
+
+Docs:
+$DOC_FILES
+
+Latest commits:
+$LATEST_COMMITS
+
+==================================================================
+STATS
+==================================================================
 $SUMMARY
 
-Last 120 lines of post-finalize log:
+==================================================================
+INDEX LAYOUT
+==================================================================
+$INDEX_LAYOUT
+
+==================================================================
+SAMPLE QUERIES (live against the just-finalized index)
+==================================================================
+$SAMPLES
+
+==================================================================
+LAST 120 LINES OF POST-FINALIZE LOG
+==================================================================
 $(tail -120 "$LOG")
 EMAIL_END
 echo "=== email sent ==="

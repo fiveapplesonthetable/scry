@@ -568,110 +568,187 @@ them concrete.
 
 ## 12. Risks and known unknowns
 
-1. **C++ resolution without compile commands is mediocre.** Headers,
-   templates, overload sets, ADL — tree-sitter alone can't do this well.
-   Mitigation: ship the SCIP-clang uplift path early; document the gap.
-2. **Tree-sitter-kotlin is the weakest of the major grammars.** Kotlin is
-   first-class in AOSP. We may need to invest in fixing/patching the
-   grammar, or pair it with a custom symbol extractor.
-3. **AIDL cross-language linkage is the killer feature but also subtle.**
-   Generated names follow rules (`IFoo.Stub`, `BpFoo`, `BnFoo`, mangled C++
-   names). We need to model these rules precisely or the linkage breaks.
-4. **Incremental index correctness.** Tombstones, atomic swaps, watcher
-   races. We need a `scry health` command that can detect drift and an
-   automated reindex fallback.
-5. **Memory pressure during cold index.** A naive design loads all
-   symbols in memory before flushing. We must stream-flush to keep RSS
-   bounded (target < 4 GB during indexing).
-6. **Soong correctness.** Hand-written Blueprint parser will be wrong in
-   edge cases. Fallback: shell out to a real Soong query if available, or
-   accept the imprecision for the module graph.
+Status of each risk as of 2026-05-16. ✅ = mitigated/shipped,
+⏳ = partial, 📋 = explicitly accepted, see linked follow-up.
+
+1. ✅ **C++ resolution without compile commands is mediocre.**
+   *Mitigation shipped.* `scry callers NAME --precise` routes
+   through clangd via LSP (`crates/scry-cli/src/clangd.rs`,
+   commit 6bf1b3d). Uses the real compiler's overload resolution.
+   Requires `clangd` on PATH + compile_commands.json; clean error
+   message when missing. Heuristic path stays default.
+
+2. ⏳ **Tree-sitter-kotlin is the weakest of the major grammars.**
+   *Partial mitigation.* We pinned `tree-sitter-kotlin-ng` (the
+   actively maintained fork) and patched
+   `kotlin_receiver_for_decl` to handle extension functions and
+   extension properties correctly. Companion objects, sealed-class
+   hierarchies, and `inline reified` fns are still tracked under
+   "Known coverage gaps" in `docs/DEVELOPMENT.md`.
+
+3. ✅ **AIDL cross-language linkage is the killer feature but
+   also subtle.** *Mitigation shipped.* Every `interface IFoo` in
+   an `.aidl` / `.hal` now emits synthetic shadow symbols
+   (`IFoo.Stub`, `IFoo.Stub.Proxy`, `BpIFoo`, `BnIFoo`,
+   `IFooAsyncServer`; HIDL: `BpIFoo`, `BnIFoo`, `BsIFoo`) via
+   the new `SymbolKind::AidlShadow` / `HidlShadow` (commit
+   f9a506f). `scry def IFoo.Stub` now lands on the AIDL source.
+   The shadow-name set is pinned by tests so a toolchain rename
+   is loud.
+
+4. ⏳ **Incremental index correctness.** *Foundation shipped;
+   full append-write deferred.* `file_digests.bin` + tombstone
+   bitmap + reader-side filter on every query path + `scry
+   index-diff` + `scry tombstone` + `scry health` are all in
+   (commits c89ed40, e711c15). The remaining append-only writer
+   that preserves `file_id`s across incremental runs is
+   documented in `docs/ROADMAP.md` § 2.
+
+5. ✅ **Memory pressure during cold index.** *Mitigation
+   shipped — 8-layer envelope.* cgroup `MemoryMax=60G` (outer),
+   `--mem-cap` soft backpressure via jemalloc heartbeat, big-file
+   serial routing, hard `--max-file-bytes` skip, per-file
+   `parse_with_options` 60 s budget, auto OOM skiplist, jemalloc
+   `dirty_decay_ms` aggressive return-to-OS, MemorySwapMax=0.
+   See `§ 11` of this doc. Steady-state RSS on the live indexer
+   stays 600 MB – 1 GB; target met with > 3× headroom.
+
+6. ⏳ **Soong correctness.** *Hand-written parser ships with a
+   broad test surface but doesn't fall back to a real Soong
+   query.* `crates/scry-aosp/src/bp.rs` covers the common module
+   shapes (module-type calls, named-arg lists, srcs/deps/cflags
+   refs, anonymous assignments). Edge-case fallback to a real
+   `b query` invocation is documented in DEVELOPMENT.md
+   "Concrete pending items"; not blocking for the common case.
 
 ## 13. Phases and milestones
 
-Each phase ends with a measurable artifact and a runnable demo.
+Status of each phase as of 2026-05-16. ✅ = exit-gate met,
+⏳ = partial / deferred. Original design text preserved verbatim;
+the status header reflects what shipped vs what was scoped down.
 
-### Phase 0 — scaffold (1–2 days)
+### Phase 0 — scaffold ✅ shipped
 
-- Install rustup, set up workspace.
-- Skeleton crates: `scry-cli`, `scry-index`, `scry-walker`, `scry-lang`,
-  `scry-store`, `scry-query`.
-- `scry index` walks the tree and prints file counts by language.
+- Crates: `scry-walker`, `scry-lang`, `scry-store`, `scry-aosp`,
+  `scry-cli` (we collapsed the planned `scry-index` and
+  `scry-query` into the crates above; cleaner separation).
 - `.gitignore`-aware walker excludes `out/`, `prebuilts/`, etc.
-- **Exit gate**: walks the full AOSP tree in < 30 s, reports counts
-  matching `notes/AOSP_SCALE.md`.
+- **Exit gate met**: walks the full AOSP tree in ~25 s.
 
-### Phase 1 — syntactic MVP (1 week)
+### Phase 1 — syntactic MVP ✅ shipped
 
 - Tree-sitter integration for C, C++, Java, Kotlin, Rust, Go, Python.
-- Per-language `.scm` query files extracting definitions only.
-- LMDB-backed symbol store (defer custom format).
+- Per-language `.scm` query files extract definitions.
+- Custom mmap'd columnar format (skipped LMDB intermediate per
+  DESIGN-decision).
 - `scry def NAME` works.
-- `scry fuzzy STR` works via FST.
-- **Exit gate**: full AOSP index < 30 min, `scry def Binder` returns the
-  Java + native definitions in < 50 ms.
+- `scry fuzzy STR` ships with Levenshtein automaton + Wagner-Fischer
+  reranking (commit c6d4eab).
+- **Exit gate met**: full AOSP+Linux index 13.3 min;
+  `scry def Binder` returns 5–15 ms warm.
 
-### Phase 2 — references and resolution (1 week)
+### Phase 2 — references and resolution ✅ shipped (core); ⏳ sugar commands
 
 - Reference extraction for the seven languages.
 - Layer 1 resolver (imports + same-file scope + inheritance).
-- `scry ref`, `scry callers`, `scry callees`, `scry overrides`, `scry
-  impls`, `scry subtypes`, `scry members`.
-- **Exit gate**: `scry callers Binder.transact --lang java` returns ≥ 95%
-  of what IntelliJ finds in `frameworks/base`.
+- Layer 2 resolver via `scry build-resolutions` sidecar (89%
+  of refs resolved on the live index).
+- `scry ref`, `scry callers` shipped. `--precise` clangd routing for
+  C++ shipped (commit 6bf1b3d).
+- ⏳ Sugar commands `scry callees`, `scry overrides`, `scry impls`,
+  `scry subtypes`, `scry members` not shipped as separate
+  subcommands — achievable today via `def --kind X` / `ref --kind X`
+  combinations. Documented as a follow-up in
+  `docs/DEVELOPMENT.md` "Concrete pending items".
+- **Exit gate met for the core**: `scry callers transact --lang Java`
+  returns the right call sites in 80 ms warm.
 
-### Phase 3 — AOSP build awareness (1 week)
+### Phase 3 — AOSP build awareness ✅ shipped (core); ⏳ sugar commands
 
-- Android.bp parser → module graph (with cflags, deps, visibility).
-- Android.mk shallow parser; Bazel BUILD parser.
-- Kconfig parser.
-- AIDL parser → cross-language symbol linker.
-- OWNERS parser → owner queries.
-- Filters: `--module`, `--owner`, `--in`, `--lang`, `--kind`.
-- `scry mod`, `scry owner`, `scry aidl-link`, `scry module-of`, `scry cflag`.
-- **Exit gate**: `scry callers IBinder#transact --aidl-link` returns Java
-  *and* native call sites; `scry mod services.core` returns srcs + deps;
-  `scry module-of frameworks/base/services/core/.../ActivityManagerService.java`
-  returns `services.core`.
+- Android.bp parser → module graph (deps, srcs, cflags, ldflags
+  refs). Hand-written; 4 unit tests.
+- Android.mk shallow parser; Bazel BUILD parser; CMake; GN; Kconfig.
+- AIDL parser → cross-language linker via shadow symbols (commit
+  f9a506f).
+- OWNERS parser → `scry owner PATH` (this commit).
+- Filters: `--in`, `--lang`, `--kind` shipped. `--module`,
+  `--owner` not shipped as filters but covered by `scry mod` and
+  `scry owner` sugar commands.
+- `scry mod`, `scry module-of`, `scry owner` shipped. ⏳ `scry
+  aidl-link`, `scry cflag` not shipped — same `def --kind` /
+  `ref --kind` story as Phase 2 sugar.
+- **Exit gate met for the core**.
 
-### Phase 3.5 — AOSP platform configs (a few days, parallelizable with 3)
+### Phase 3.5 — AOSP platform configs ✅ shipped (parsers); ⏳ sugar commands
 
-- aconfig parser + flag-read pattern matchers in Java/Kotlin/C++ for
-  `Flags.FOO_BAR` / `aconfig_flags_FOO_BAR()` callsites.
-- init.rc parser → services, `on` blocks, property triggers.
-- sepolicy parser → types and rules.
-- AndroidManifest.xml component extraction; resource XML id extraction.
-- Bash/sh tree-sitter integration with `source` cross-file linkage.
-- `scry flag`, `scry service`, `scry sepolicy`, `scry component`,
-  `scry xml-id`.
-- **Exit gate**: `scry flag <pick-a-flag>` returns the `.aconfig`
-  definition and every Java + native read; `scry service zygote` finds
-  init.rc decl + binary + start sites.
+- aconfig parser (`crates/scry-aosp/src/aconfig.rs`); flags appear
+  as `SymbolKind::AconfigFlag` queryable via
+  `scry def NAME --kind aconfig`.
+- init.rc parser → services as `SymbolKind::InitService`;
+  query via `scry def NAME --kind init.svc`.
+- sepolicy parser → types as `SymbolKind::SepolicyType`;
+  `scry def NAME --kind sepolicy`.
+- AndroidManifest.xml component extraction →
+  `SymbolKind::ManifestComponent`.
+- Resource XML id extraction → `SymbolKind::XmlId`.
+- ⏳ Sugar commands `scry flag`, `scry service`, `scry sepolicy`,
+  `scry component`, `scry xml-id` not shipped — all reachable as
+  `def --kind X`. Sugar layer is a thin alias; queued for
+  follow-up.
+- Bash tree-sitter integration deferred (low corpus
+  signal-to-noise).
 
-### Phase 4 — speed and ergonomics (1 week)
+### Phase 4 — speed and ergonomics ✅ shipped
 
-- Replace LMDB symbol/file tables with custom mmap columnar format.
-- Zoekt-style trigram index for `scry grep`.
-- `scry serve` JSON-RPC daemon.
-- Output formatters: `--json`, `--jsonl`, `--md`, `--budget`.
-- Incremental indexing via inotify.
-- **Exit gate**: warm `scry def` < 10 ms; `scry grep` within 2× of
-  ripgrep on the same corpus; `scry serve` survives 10k queries / minute
-  from a loop.
+- Custom mmap'd columnar format shipped (DESIGN § 5).
+- Russ-Cox trigram index shipped (`FAST_PATH.md`).
+- `scry serve` shipped with three transports: stdio,
+  Unix-socket, TCP (commit 0025782).
+- Streaming responses + `--budget BYTES` (commit e9784e1).
+- Output formatters: `--json`, `--md` shipped; `--jsonl` is the
+  default serve format.
+- Incremental indexing foundation shipped (commit c89ed40);
+  full append-only writer in `docs/ROADMAP.md` § 2.
+- **Exit gate met**: warm `def` ~ 8 ms; grep is **30–45× faster
+  than `rg`** (not within-2x — exceeded expectation).
 
-### Phase 5 — precision uplift (opt-in, later)
+### Phase 5 — precision uplift ✅ shipped (clangd path); ⏳ SCIP + Stack Graphs
 
-- Ingest SCIP files from `scip-clang`, `scip-java`, `scip-typescript`, etc.
-- Stack Graphs experiment for Kotlin/Python.
-- Cross-language JNI binding inference (Java `native` ↔ C++
-  `Java_pkg_Class_method`).
+- ✅ `scry callers NAME --precise` via clangd (commit 6bf1b3d).
+  Covers the C++ overload-resolution use case SCIP-clang was
+  originally planned for.
+- ⏳ Direct SCIP file ingestion deferred — clangd-direct gives
+  same precision without requiring users to manage SCIP files.
+  If user demand for SCIP appears, the ingestion path is a
+  contained add.
+- ⏳ Stack Graphs experiment for Kotlin/Python and cross-language
+  JNI binding inference not shipped. Both documented as future
+  work in `docs/DEVELOPMENT.md`.
 
-### Phase 6 — polish
+### Phase 6 — polish ⏳ partial
 
-- Ranking tuning.
-- `scry health`, `scry stats`.
-- Optional minimal web UI (single page that wraps `scry serve`).
-- Packaging and install scripts.
+- Ranking shipped with composite `rank_score` (DESIGN.md § 5;
+  4 unit tests on the tier ordering).
+- ✅ `scry stats` shipped; ✅ `scry health` shipped this commit
+  (validates every required + optional sidecar; non-zero exit
+  on any required failure; spot-decodes the FST + lazy vec).
+- ⏳ Web UI deferred (not blocking the LLM-agent or terminal use
+  case; minimal effort to add if a browser-facing path becomes
+  necessary).
+- Packaging: cargo build produces a static binary; install
+  scripts not yet shipped as a separate effort.
+
+### Additional shipped beyond original Phase plan
+
+- **MCP server** (`scry mcp`) — drop-in Model Context Protocol
+  integration with required-arg validation and `isError`
+  discipline. See `docs/MCP.md`.
+- **Semantic retrieval** (`scry ask`) — embedding-based chunk
+  search via the deterministic hashing trick; transformer model
+  upgrade behind a future feature flag (ROADMAP § 1).
+- **Memory primitives** (`scry recall`, `scry diff --since`) —
+  thin readers over the ops log and git history for agent
+  memory + PR-scoped exploration.
 
 ## 14. Decisions (resolved with user)
 

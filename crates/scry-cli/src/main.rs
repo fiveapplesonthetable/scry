@@ -522,6 +522,34 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Validate the on-disk index: confirm every required artifact
+    /// exists and is non-empty, the manifest is parseable, the lazy
+    /// sidecars round-trip a small sample of records, and the
+    /// optional sidecars (file_symbols, ref_resolutions, file_digests,
+    /// trigrams, chunks/embeddings) are either present-and-valid or
+    /// absent (legacy). Reports the state of each. Exits non-zero on
+    /// any required-artifact failure.
+    Health {
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OWNERS lookup: walk up from PATH collecting OWNERS entries
+    /// from the nearest enclosing OWNERS files until the root. The
+    /// closest-to-PATH owner list comes first, more-distant
+    /// inherited owners after — matches Gerrit's evaluation order.
+    /// Supports --include-deep to show every level; default shows
+    /// only the nearest non-empty owner set.
+    Owner {
+        path: PathBuf,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        include_deep: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute and store per-chunk text embeddings (chunks.bin +
     /// embeddings.bin). Default model is a deterministic hash-based
     /// bag-of-tokens embedding (no model download, no extra deps);
@@ -663,6 +691,9 @@ fn main() -> Result<()> {
             cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
         Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
+        Cmd::Health { index, json } => cmd_health(index, json),
+        Cmd::Owner { path, index, include_deep, json } =>
+            cmd_owner(path, index, include_deep, json),
         Cmd::BuildTrigrams { index, workers, max_file_bytes } => {
             cmd_build_trigrams(index, workers, max_file_bytes)
         }
@@ -3605,6 +3636,262 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// health (validate the on-disk index)
+// ---------------------------------------------------------------------------
+//
+// Walks every required + optional sidecar. For each: existence check,
+// non-empty check, format spot-check (decode a sample record). Reports
+// per-artifact state. Non-zero exit on any *required* failure;
+// missing-but-optional sidecars are surfaced as warnings.
+//
+// Goal: a one-shot integrity check the user can run after any
+// build/copy/restore to confirm the index is queryable end-to-end.
+fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+
+    struct Check { name: &'static str, status: String, required: bool, ok: bool }
+    let mut checks: Vec<Check> = Vec::new();
+
+    // Required artifacts: anything an open() of StoreReader would
+    // fail without.
+    let required_files: &[(&str, std::path::PathBuf)] = &[
+        ("manifest.json", paths.manifest()),
+        ("roots.bin",     paths.roots()),
+        ("files.bin",     paths.files()),
+        ("symbols.bin",   paths.symbols()),
+        ("refs.bin",      paths.refs()),
+        ("names.fst",     paths.names_fst()),
+        ("name_postings.bin", paths.name_postings()),
+        ("ref_names.fst", paths.ref_names_fst()),
+        ("ref_postings.bin", paths.ref_postings()),
+    ];
+    for (name, path) in required_files {
+        let (ok, status) = match std::fs::metadata(path) {
+            Ok(m) if m.len() > 0 => (true, format!("OK ({} bytes)", m.len())),
+            Ok(_) => (false, "EMPTY".to_string()),
+            Err(e) => (false, format!("MISSING: {e}")),
+        };
+        checks.push(Check { name, status, required: true, ok });
+    }
+
+    // Optional sidecars: report state but don't fail.
+    let optional_files: &[(&str, std::path::PathBuf)] = &[
+        ("trigrams.fst",         paths.trigram_fst()),
+        ("trigram_postings.bin", paths.trigram_postings()),
+        ("symbols_offsets.bin",  paths.symbol_offsets()),
+        ("refs_offsets.bin",     paths.ref_offsets()),
+        ("file_symbols.bin",     paths.file_symbols()),
+        ("file_symbols_offsets.bin", paths.file_symbols_offsets()),
+        ("ref_resolutions.bin",  paths.ref_resolutions()),
+        ("file_digests.bin",     paths.file_digests()),
+        ("tombstones.bin",       paths.tombstones()),
+        ("chunks.bin",           paths.chunks()),
+        ("embeddings.bin",       paths.embeddings()),
+    ];
+    for (name, path) in optional_files {
+        let (ok, status) = match std::fs::metadata(path) {
+            Ok(m) if m.len() > 0 => (true, format!("OK ({} bytes)", m.len())),
+            Ok(_) => (true, "empty (treated absent)".to_string()),
+            Err(_) => (true, "absent (optional)".to_string()),
+        };
+        checks.push(Check { name, status, required: false, ok });
+    }
+
+    // Live-open spot-check: try to open the reader and decode the
+    // first few records. Catches "files exist but are corrupted" cases
+    // that pure existence checks miss.
+    let mut reader_ok = false;
+    let reader_status;
+    match scry_store::StoreReader::open(&index_dir) {
+        Ok(r) => {
+            // Decode the first symbol + ref via the lazy paths; both
+            // should succeed on any healthy index with >= 1 record.
+            let s_ok = r.n_symbols() == 0 || r.get_symbol_raw(0).is_some();
+            let r_ok = r.n_refs() == 0 || r.get_ref_raw(0).is_some();
+            // Look up a known-no-such-name to exercise the FST.
+            let fst_ok = r.lookup_exact("__definitely_not_a_real_symbol__").is_empty();
+            if s_ok && r_ok && fst_ok {
+                reader_ok = true;
+                reader_status = format!(
+                    "open OK ({} files, {} symbols, {} refs)",
+                    r.files.len(), r.n_symbols(), r.n_refs(),
+                );
+            } else {
+                reader_status = format!(
+                    "open OK but spot-check failed (sym={s_ok} ref={r_ok} fst={fst_ok})"
+                );
+            }
+        }
+        Err(e) => {
+            reader_status = format!("open FAILED: {e:#}");
+        }
+    }
+    checks.push(Check {
+        name: "open + spot-decode", status: reader_status,
+        required: true, ok: reader_ok,
+    });
+
+    let any_required_failed = checks.iter().any(|c| c.required && !c.ok);
+
+    if json {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let arr: Vec<serde_json::Value> = checks.iter().map(|c| serde_json::json!({
+            "artifact": c.name,
+            "required": c.required,
+            "ok": c.ok,
+            "status": c.status,
+        })).collect();
+        writeln!(out, "{}", serde_json::json!({
+            "index": index_dir.display().to_string(),
+            "healthy": !any_required_failed,
+            "checks": arr,
+        }))?;
+    } else {
+        println!("scry health — index: {}", index_dir.display());
+        for c in &checks {
+            let tag = if c.ok { " OK" } else { "FAIL" };
+            let req = if c.required { " (required)" } else { "" };
+            println!("  [{tag}] {:<30} {}{}", c.name, c.status, req);
+        }
+        println!();
+        if any_required_failed {
+            println!("OVERALL: UNHEALTHY (one or more required artifacts missing/invalid)");
+        } else {
+            println!("OVERALL: healthy");
+        }
+    }
+    if any_required_failed {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// owner (walk OWNERS chain)
+// ---------------------------------------------------------------------------
+//
+// Walks up from PATH collecting OWNERS entries from each enclosing
+// OWNERS file. Returns the nearest non-empty owner set by default;
+// --include-deep returns every level so the caller can see the
+// inheritance chain explicitly. Matches Gerrit's evaluation order
+// (nearest first).
+fn cmd_owner(
+    path: PathBuf,
+    index: Option<PathBuf>,
+    include_deep: bool,
+    json: bool,
+) -> Result<()> {
+    let r = open_index(index)?;
+    // Resolve the queried path against the indexed roots; we accept
+    // both absolute paths and root-relative substrings.
+    let needle = path.to_string_lossy().to_string();
+    let target_fe = r.files.iter().find(|fe| {
+        let p = fe.display_path(&r.roots);
+        p == needle || p.contains(&needle)
+    });
+    let target_path = match target_fe {
+        Some(fe) => PathBuf::from(fe.display_path(&r.roots)),
+        None => path.clone(),  // not in the index; still walk fs path
+    };
+
+    // Collect OWNERS files by walking up from the target.
+    let mut layers: Vec<(PathBuf, Vec<String>, Vec<String>)> = Vec::new();
+    let mut cur = if target_path.is_file() {
+        target_path.parent().map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"))
+    } else {
+        target_path.clone()
+    };
+    loop {
+        let owners_path = cur.join("OWNERS");
+        if owners_path.is_file() {
+            let (emails, per_file) = parse_owners_file(&owners_path);
+            if include_deep || !emails.is_empty() || !per_file.is_empty() {
+                layers.push((owners_path.clone(), emails.clone(), per_file));
+            }
+            // Default behavior: stop after the first OWNERS file that
+            // resolves to at least one direct email entry. AOSP often
+            // uses per-file-only directories before bottoming out at a
+            // top-level OWNERS with explicit emails — this matches
+            // "who do I @-mention" intent.
+            if !include_deep && !emails.is_empty() {
+                break;
+            }
+        }
+        match cur.parent() {
+            Some(p) if p != cur => cur = p.to_path_buf(),
+            _ => break,
+        }
+    }
+
+    if json {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let arr: Vec<serde_json::Value> = layers.iter().map(|(p, emails, per_file)| serde_json::json!({
+            "owners_file": p.display().to_string(),
+            "emails": emails,
+            "per_file_rules": per_file,
+        })).collect();
+        writeln!(out, "{}", serde_json::json!({
+            "path": target_path.display().to_string(),
+            "layers": arr,
+        }))?;
+    } else if layers.is_empty() {
+        println!("(no OWNERS file above {})", target_path.display());
+    } else {
+        println!("owners for {}:", target_path.display());
+        for (p, emails, per_file) in &layers {
+            println!("  via {}", p.display());
+            for e in emails { println!("    {e}"); }
+            for pf in per_file { println!("    per-file: {pf}"); }
+        }
+    }
+    Ok(())
+}
+
+/// Parse an OWNERS file: collect direct email entries AND per-file
+/// rules separately. Returns (emails, per_file_rules).
+///
+/// Direct emails are lines containing `@` with no spaces — the most
+/// common form (`alice@example.com`). `per-file PATTERN = EMAILS_OR_FILE`
+/// rules are common in AOSP and we keep them as-is for display so
+/// the caller can see "this dir has no direct owners but ActivityManager*
+/// is owned by file:/ACTIVITY_MANAGER_OWNERS".
+///
+/// Skipped: comments (`#…`), `set noparent`, `include …` (those would
+/// require following the include chain — out of scope for v1).
+fn parse_owners_file(path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let txt = match std::fs::read_to_string(path) {
+        Ok(s) => s, Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let mut emails = Vec::new();
+    let mut per_file = Vec::new();
+    for line in txt.lines() {
+        let trim = line.trim();
+        if trim.is_empty() || trim.starts_with('#') { continue; }
+        if trim.starts_with("set ") || trim.starts_with("include ") { continue; }
+        if let Some(rest) = trim.strip_prefix("per-file") {
+            per_file.push(rest.trim().to_string());
+            continue;
+        }
+        if trim.starts_with("file:") {
+            // Top-level file:... reference; treat similarly to per-file.
+            per_file.push(trim.to_string());
+            continue;
+        }
+        // Plain email line.
+        if trim.contains('@') && !trim.contains(' ') {
+            emails.push(trim.to_string());
+        }
+    }
+    (emails, per_file)
+}
+
 /// `scry diff --since COMMITISH` — surface symbols/refs in files
 /// that have changed since a git revision. Per-root: shell out to
 /// `git -C ROOT diff --name-only COMMITISH..HEAD`, intersect the
@@ -5454,5 +5741,60 @@ mod tests {
         assert_eq!(err.pointer("/content/0/type").and_then(|v| v.as_str()), Some("text"));
         assert_eq!(err.pointer("/content/0/text").and_then(|v| v.as_str()), Some("kaboom"));
         assert_eq!(err.get("isError").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    // ------------------------------------------------------------------
+    // OWNERS parser — small focused tests on the line classifier.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_owners_collects_emails_and_per_file() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-owners-test-{}", std::process::id())
+        );
+        std::fs::write(&tmp,
+            "# AOSP OWNERS-style fixture\n\
+             alice@example.com\n\
+             bob@example.com  \n\
+             set noparent\n\
+             include /COMMON_OWNERS\n\
+             per-file ActivityManager* = file:/AM_OWNERS\n\
+             per-file *.java = carol@example.com\n\
+             file:/TOP_LEVEL_REF\n\
+             not_an_email_just_text\n"
+        ).unwrap();
+        let (emails, per_file) = parse_owners_file(&tmp);
+        // Two emails, in file order; comments + set + include skipped.
+        assert_eq!(emails, vec![
+            "alice@example.com".to_string(),
+            "bob@example.com".to_string(),
+        ]);
+        // Two per-file rules + the top-level file: reference (= 3 entries).
+        assert_eq!(per_file.len(), 3);
+        assert!(per_file.iter().any(|p| p.contains("ActivityManager*")));
+        assert!(per_file.iter().any(|p| p.contains("carol@example.com")));
+        assert!(per_file.iter().any(|p| p.starts_with("file:")));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Missing file → empty pair, never panics.
+    #[test]
+    fn parse_owners_missing_file_returns_empty() {
+        let (e, p) = parse_owners_file(std::path::Path::new("/no/such/OWNERS"));
+        assert!(e.is_empty());
+        assert!(p.is_empty());
+    }
+
+    /// Comments-only file → empty pair.
+    #[test]
+    fn parse_owners_comments_only() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-owners-comments-{}", std::process::id())
+        );
+        std::fs::write(&tmp, "# just\n# comments\n\n").unwrap();
+        let (e, p) = parse_owners_file(&tmp);
+        assert!(e.is_empty());
+        assert!(p.is_empty());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

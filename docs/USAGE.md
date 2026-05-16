@@ -510,6 +510,13 @@ section.
 Drop-in MCP server for Claude Desktop, Cursor, and other MCP-aware
 agent runtimes. No custom shell-out wrapper required.
 
+Full wire-shape reference, error semantics, and per-client
+configuration recipes (Claude Desktop, Cursor, Continue, custom
+LangGraph) live in [`docs/MCP.md`]. The summary below is the
+quickstart.
+
+[`docs/MCP.md`]: MCP.md
+
 ```sh
 $ printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

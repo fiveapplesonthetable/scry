@@ -503,6 +503,28 @@ fn synthetic_tree_roundtrip() {
     assert_eq!(r["error"]["code"].as_i64(), Some(-32601),
                "unknown method must return JSON-RPC -32601; got {r}");
 
+    // 8b. `scry health` against the synthetic index must report
+    // OVERALL: healthy and exit 0. JSON form is parsed and pinned.
+    let out = Command::new(scry_bin())
+        .args(["health", "--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("scry health");
+    assert!(out.status.success(),
+            "scry health failed: {}", String::from_utf8_lossy(&out.stderr));
+    let line = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().find(|l| !l.is_empty()).expect("health prints JSON");
+    let v: serde_json::Value = serde_json::from_str(line).expect("health is JSON");
+    assert_eq!(v["healthy"].as_bool(), Some(true),
+               "synthetic index must be healthy: {v}");
+    let checks = v["checks"].as_array().expect("checks array");
+    // Every required artifact must report ok=true.
+    for c in checks {
+        if c["required"].as_bool() == Some(true) {
+            assert_eq!(c["ok"].as_bool(), Some(true),
+                       "required check {} failed: {c}", c["artifact"]);
+        }
+    }
+
     // 9. scry diff --since: turn the synthetic root into a git repo
     // with two commits, then assert `scry diff --since HEAD~1` finds
     // the file we modified between commits. Skips silently if `git`

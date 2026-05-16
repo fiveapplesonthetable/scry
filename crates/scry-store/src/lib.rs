@@ -238,6 +238,48 @@ pub struct SymbolRecord {
 }
 
 impl SymbolRecord {
+    /// Composite ranking score (higher = better) used to sort hits so the
+    /// most useful definition lands first. Heuristic, not a model:
+    ///
+    /// - Type definitions (class / interface / struct / etc.) outrank
+    ///   functions outrank fields/vars outrank "other".
+    /// - api-txt symbols (Android API surface signatures) are demoted —
+    ///   they're declarations of every public API, useful but noisy when
+    ///   you're looking for the actual implementation.
+    /// - Build-system definitions (Soong modules, init services, sepolicy
+    ///   types) keep their original boost since they ARE the canonical
+    ///   definition for those domains.
+    /// - Top-level (no scope_path) wins over deeply nested. Catches the
+    ///   common case where you want the outer Activity class, not an
+    ///   inner Activity helper class.
+    ///
+    /// Caller usually does: sort_by_key(|s| std::cmp::Reverse(s.rank_score()))
+    pub fn rank_score(&self) -> i64 {
+        let kind = match self.kind {
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait
+            | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Union => 100,
+            SymbolKind::Method | SymbolKind::Function | SymbolKind::Constructor => 90,
+            SymbolKind::AidlInterface | SymbolKind::AidlMethod | SymbolKind::AidlParcelable => 85,
+            SymbolKind::ProtoMessage | SymbolKind::ProtoService | SymbolKind::ProtoEnum => 85,
+            SymbolKind::SoongModule => 80,
+            SymbolKind::InitService | SymbolKind::SepolicyType => 75,
+            SymbolKind::Module | SymbolKind::Namespace | SymbolKind::Package => 70,
+            SymbolKind::AconfigFlag | SymbolKind::ManifestComponent => 65,
+            SymbolKind::Field | SymbolKind::Variable | SymbolKind::Constant => 50,
+            SymbolKind::EnumVariant | SymbolKind::Type => 50,
+            SymbolKind::Macro | SymbolKind::Annotation | SymbolKind::Decorator => 40,
+            SymbolKind::Parameter => 20,
+            SymbolKind::XmlId | SymbolKind::OwnersEmail | SymbolKind::Other => 10,
+        };
+        let lang_penalty = if matches!(self.lang, scry_walker::FileKind::ApiTxt) {
+            // api-txt declarations are useful for "is this in the SDK"
+            // but should never crowd out real source definitions.
+            40
+        } else { 0 };
+        let scope_penalty = (self.scope_path.len() as i64).min(10) * 3;
+        kind - lang_penalty - scope_penalty
+    }
+
     /// Cheap, deterministic estimate of how much RAM this record occupies
     /// when held in a `Vec<SymbolRecord>`. Used by the streaming indexer to
     /// decide when to flush a chunk to disk WITHOUT polling /proc/self/status
@@ -1866,5 +1908,65 @@ mod tests {
         data.truncate(data.len() - 8); // chop the last two indices
         let got = read_file_symbols_entry(&data, &offs, 0);
         assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    fn mk_symbol(name: &str, kind: SymbolKind, lang: FileKind, scope: Vec<&str>) -> SymbolRecord {
+        SymbolRecord {
+            id: 1, name: name.into(), fqn: None, kind,
+            file_id: 0, byte_start: 0, byte_end: 1, line: 1, col: 1,
+            scope_path: scope.into_iter().map(String::from).collect(),
+            lang,
+        }
+    }
+
+    /// A real class definition outranks an api-txt class declaration of
+    /// the same name. This is the canonical regression `def Activity`
+    /// returning Activity.java first instead of *current.txt.
+    #[test]
+    fn rank_real_class_beats_api_txt() {
+        let real = mk_symbol("Activity", SymbolKind::Class, FileKind::Java, vec!["Activity"]);
+        let apitxt = mk_symbol("Activity", SymbolKind::Class, FileKind::ApiTxt, vec!["android.app"]);
+        assert!(real.rank_score() > apitxt.rank_score(),
+                "real {} should beat api-txt {}", real.rank_score(), apitxt.rank_score());
+    }
+
+    /// Top-level types outrank deeply-nested ones with the same name.
+    /// Matches the intuition that `def Foo` should surface the outer
+    /// Foo class first, not an inner helper class.
+    #[test]
+    fn rank_shallow_scope_beats_deep() {
+        let shallow = mk_symbol("Foo", SymbolKind::Class, FileKind::Java, vec![]);
+        let deep = mk_symbol("Foo", SymbolKind::Class, FileKind::Java,
+                              vec!["pkg", "Outer", "Middle", "Inner"]);
+        assert!(shallow.rank_score() > deep.rank_score());
+    }
+
+    /// Types outrank functions outrank fields — pinning the kind tier
+    /// ordering so a refactor of the match arms can't silently swap them.
+    #[test]
+    fn rank_kind_ordering() {
+        let class = mk_symbol("X", SymbolKind::Class, FileKind::Java, vec![]);
+        let function = mk_symbol("X", SymbolKind::Function, FileKind::Java, vec![]);
+        let field = mk_symbol("X", SymbolKind::Field, FileKind::Java, vec![]);
+        let param = mk_symbol("X", SymbolKind::Parameter, FileKind::Java, vec![]);
+        assert!(class.rank_score() > function.rank_score());
+        assert!(function.rank_score() > field.rank_score());
+        assert!(field.rank_score() > param.rank_score());
+    }
+
+    /// AOSP-specific kinds keep their boost — SoongModule and AidlInterface
+    /// ARE the canonical definition in their domain, so a generic Class
+    /// of the same name shouldn't crowd them out when an agent is
+    /// explicitly looking for a build module or AIDL interface.
+    #[test]
+    fn rank_aosp_kinds_keep_boost() {
+        let aidl = mk_symbol("IFoo", SymbolKind::AidlInterface, FileKind::Aidl, vec![]);
+        let soong = mk_symbol("libfoo", SymbolKind::SoongModule, FileKind::Soong, vec![]);
+        let init = mk_symbol("zygote", SymbolKind::InitService, FileKind::InitRc, vec![]);
+        // All should outrank a plain Field/Parameter
+        let field = mk_symbol("X", SymbolKind::Field, FileKind::Java, vec![]);
+        assert!(aidl.rank_score() > field.rank_score());
+        assert!(soong.rank_score() > field.rank_score());
+        assert!(init.rank_score() > field.rank_score());
     }
 }

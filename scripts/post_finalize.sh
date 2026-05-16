@@ -34,6 +34,11 @@ t1=$(date +%s)
 $SCRY build-offsets --index "$INDEX"
 echo "step 1 took $(($(date +%s) - t1)) sec"
 
+echo "=== step 1b: build-file-symbols (outline fast path) ==="
+t1b=$(date +%s)
+$SCRY build-file-symbols --index "$INDEX"
+echo "step 1b took $(($(date +%s) - t1b)) sec"
+
 echo "=== step 2: build-trigrams ==="
 t2=$(date +%s)
 $SCRY build-trigrams --index "$INDEX" --workers 16

@@ -1205,6 +1205,7 @@ fn cmd_def(
             None => false,
         });
     }
+    rank_symbols(&mut filtered, &r);
     if md {
         print_results_md(&r, &filtered, limit, budget);
     } else {
@@ -1215,15 +1216,20 @@ fn cmd_def(
 
 fn cmd_prefix(prefix: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
     let r = open_index(index)?;
-    let results = r.lookup_prefix(&prefix, limit);
-    print_results(&r, &results, limit, json);
+    // Over-fetch then rank; the FST gives unordered hits and the limit
+    // should land on the BEST matches, not just the first ones the FST
+    // happens to encounter.
+    let mut results = r.lookup_prefix(&prefix, limit.saturating_mul(8).max(limit));
+    rank_symbols(&mut results, &r);
+    print_results(&r, &results[..limit.min(results.len())], limit, json);
     Ok(())
 }
 
 fn cmd_fuzzy(substr: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
     let r = open_index(index)?;
-    let results = r.lookup_substring(&substr, limit);
-    print_results(&r, &results, limit, json);
+    let mut results = r.lookup_substring(&substr, limit.saturating_mul(8).max(limit));
+    rank_symbols(&mut results, &r);
+    print_results(&r, &results[..limit.min(results.len())], limit, json);
     Ok(())
 }
 
@@ -1417,6 +1423,53 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
         }
     }
     Ok(())
+}
+
+/// Sort symbol hits by descending desirability. Composes the kind/lang/
+/// scope heuristic from SymbolRecord::rank_score with a path-shape signal
+/// the store can't see (path depth, presence of `test/` segments — a test
+/// fixture is rarely the canonical hit).
+///
+/// Stable: ties resolve by (path, line, col) so the output is reproducible
+/// across runs of the same query.
+fn rank_symbols(syms: &mut [SymbolRecord], r: &StoreReader) {
+    syms.sort_by(|a, b| {
+        let pa = r.files.get(a.file_id as usize).map(|f| f.display_path(&r.roots)).unwrap_or_default();
+        let pb = r.files.get(b.file_id as usize).map(|f| f.display_path(&r.roots)).unwrap_or_default();
+        let sa = symbol_total_score(a, &pa);
+        let sb = symbol_total_score(b, &pb);
+        // descending score; tie-break ascending (path, line, col) for
+        // deterministic output.
+        sb.cmp(&sa).then_with(|| (&pa, a.line, a.col).cmp(&(&pb, b.line, b.col)))
+    });
+}
+
+/// Combine SymbolRecord::rank_score with path-shape signals only the CLI
+/// (which holds the StoreReader) can compute. Negative adjustments for
+/// fixtures/tests/sample paths; small positive for the shortest paths
+/// (closest to repo root = usually canonical).
+fn symbol_total_score(s: &SymbolRecord, path: &str) -> i64 {
+    let mut score = s.rank_score();
+    // Path-shape penalties: test fixtures, sample code, generated code
+    // are usually NOT what an agent asking "where is X defined?" wants.
+    let path_lower = path.to_ascii_lowercase();
+    if path_lower.contains("/test/") || path_lower.contains("/tests/")
+        || path_lower.contains("/testing/") {
+        score -= 25;
+    }
+    if path_lower.contains("/sample") || path_lower.contains("/example") {
+        score -= 15;
+    }
+    if path_lower.contains("/generated/") || path_lower.contains("/gen/")
+        || path_lower.contains(".pb.") || path_lower.contains("_pb2.") {
+        score -= 20;
+    }
+    // Mild shorter-is-better signal: a path with fewer segments is closer
+    // to a repo root and tends to be the canonical home. Capped so it
+    // can't dominate the kind/lang signal.
+    let depth = path.bytes().filter(|b| *b == b'/').count();
+    score -= ((depth as i64) - 6).max(0).min(8);
+    score
 }
 
 fn filter_results(
@@ -2244,41 +2297,43 @@ fn serve_def(
     limit: usize,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
-    let mut out = Vec::new();
-    let syms = r.lookup_exact(name);
-    for s in syms.into_iter() {
-        if out.len() >= limit { break; }
-        if let Some(l) = lang {
-            if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) { continue; }
-        }
-        if let Some(k) = kind {
-            if !s.kind.short().eq_ignore_ascii_case(k) { continue; }
-        }
-        if !file_in_prefix(r, s.file_id, prefix) { continue; }
-        out.push(symbol_to_json(r, &s));
-    }
+    let mut filtered: Vec<SymbolRecord> = r.lookup_exact(name).into_iter()
+        .filter(|s| {
+            if let Some(l) = lang {
+                if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) { return false; }
+            }
+            if let Some(k) = kind {
+                if !s.kind.short().eq_ignore_ascii_case(k) { return false; }
+            }
+            file_in_prefix(r, s.file_id, prefix)
+        })
+        .collect();
+    rank_symbols(&mut filtered, r);
+    let out: Vec<_> = filtered.iter().take(limit).map(|s| symbol_to_json(r, s)).collect();
     serde_json::Value::Array(out)
 }
 
 fn serve_prefix(r: &StoreReader, prefix: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
     let in_prefix = in_.unwrap_or("");
-    // Over-fetch from the FST then filter by subdir; pad up to limit but
-    // cap the work at 8× to bound latency on broad prefixes.
-    let cap = if in_prefix.is_empty() { limit } else { limit.saturating_mul(8).max(limit) };
-    let v: Vec<_> = r.lookup_prefix(prefix, cap).into_iter()
+    // Over-fetch then rank+filter — the limit should land on the BEST
+    // matches, not just the first ones the FST happens to return.
+    let cap = limit.saturating_mul(8).max(limit);
+    let mut filtered: Vec<SymbolRecord> = r.lookup_prefix(prefix, cap).into_iter()
         .filter(|s| file_in_prefix(r, s.file_id, in_prefix))
-        .take(limit)
-        .map(|s| symbol_to_json(r, &s)).collect();
+        .collect();
+    rank_symbols(&mut filtered, r);
+    let v: Vec<_> = filtered.iter().take(limit).map(|s| symbol_to_json(r, s)).collect();
     serde_json::Value::Array(v)
 }
 
 fn serve_fuzzy(r: &StoreReader, substr: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
     let in_prefix = in_.unwrap_or("");
-    let cap = if in_prefix.is_empty() { limit } else { limit.saturating_mul(8).max(limit) };
-    let v: Vec<_> = r.lookup_substring(substr, cap).into_iter()
+    let cap = limit.saturating_mul(8).max(limit);
+    let mut filtered: Vec<SymbolRecord> = r.lookup_substring(substr, cap).into_iter()
         .filter(|s| file_in_prefix(r, s.file_id, in_prefix))
-        .take(limit)
-        .map(|s| symbol_to_json(r, &s)).collect();
+        .collect();
+    rank_symbols(&mut filtered, r);
+    let v: Vec<_> = filtered.iter().take(limit).map(|s| symbol_to_json(r, s)).collect();
     serde_json::Value::Array(v)
 }
 

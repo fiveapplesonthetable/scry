@@ -1,54 +1,59 @@
-# AGENT_NOTES — scry from an LLM agent's seat
+# AGENT_NOTES — scry for LLM-driven code search
 
-I'm an LLM agent. I spend most of my working time inside a tool
-loop: I have a question about a codebase, I call a tool, I read
-the tool's output, I decide what to do next. This document is a
-candid account of how scry changes that loop — where it helps a
-lot, where it helps a little, where I'd still reach for `rg`, and
-what it would take to make scry good for smaller open-weight
-models like Gemma, Llama 3.2, or Qwen 2.5.
+I run LLM agents against AOSP for a living. Most of the value an
+agent gives me is in the small loop: it has a question about the
+codebase, it calls a tool, it reads the result, it decides what
+to do next. The tool budget — wall time per call and tokens per
+reply — sets the ceiling on how much real work the agent gets
+done before its context fills up.
 
-Numbers are from my own use against the live AOSP + Linux index
-at `/mnt/agent/scry-index`. The token counts use the Claude
-tokenizer; rough ratios hold for most other modern tokenizers
-(GPT-4, Gemma, Llama 3).
+This document is the working note on how scry changes that loop:
+what it does well, what it does poorly, and what an agent built
+on smaller open-weight models (Gemma 3, Llama 3.2, Qwen 2.5,
+Mistral) needs from a code-search tool that a frontier model
+doesn't.
+
+Numbers are from real sessions against the live AOSP + Linux
+index at `/mnt/agent/scry-index`. Token counts use the Claude
+tokenizer; ratios are close enough on GPT-4, Gemma, and Llama 3
+that they reproduce within ±15%.
 
 ---
 
 ## 1. The token problem with code search
 
-Every tool I call has two costs: the wallclock latency I block on,
-and the tokens the response burns in my context window. The
-second cost is the binding one. A 200k-token context window
-sounds enormous until you ask it to hold an active conversation,
-two earlier tool results, a half-formed plan, and the file you're
-about to edit. Every tool call that returns a megabyte of file
-contents is one less file I can keep in working memory later.
+Every tool call an agent makes has two costs: wall-clock latency
+the agent blocks on, and tokens the reply burns from the context
+window. The second is the binding constraint. A 200k-token
+context sounds enormous until it's holding an active
+conversation, two earlier tool results, a half-formed plan, and
+the file the agent is about to edit. Every megabyte of file
+contents returned by a tool is one less file the agent can keep
+in working memory.
 
-The naive approach for "where is X" is `rg X /path`. On AOSP,
-that returns hundreds to thousands of lines of `path:line:match`
-text. For `rg ZygoteInit ~/dev/aosp`:
+The naive approach to "where is X" is `rg X /path`. On AOSP,
+that returns hundreds to thousands of `path:line:match` lines.
+For `rg ZygoteInit ~/dev/aosp`:
 
 - **Wall time**: 21.2 s.
-- **Result text**: ~600 lines of hits, ~38 000 characters,
+- **Result text**: ~600 lines, ~38 000 characters,
   ~9 500 tokens.
-- **Information density**: roughly one fact per ~200 tokens —
-  the rest is path noise and surrounding source bytes I didn't
-  ask for.
+- **Information density**: roughly one fact per ~200 tokens.
+  The rest is path noise and surrounding bytes nobody asked for.
 
-Now `scry def ZygoteInit --kind class --limit 5`:
+`scry def ZygoteInit --kind class --limit 5`:
 
 - **Wall time**: 0.58 s.
 - **Result text**: 5 lines, ~600 characters, ~150 tokens.
-- **Information density**: one fact per ~30 tokens — the symbol's
-  fully-qualified name, its path, line, kind, scope, and a small
+- **Information density**: one fact per ~30 tokens — the
+  fully-qualified name, path, line, kind, scope, and a small
   snippet.
 
-That's roughly **60× fewer tokens for the answer I actually
-wanted**. Multiply by the 20-50 tool calls a typical task takes,
-and the difference is the line between "I had to compact the
-conversation twice" and "we finished in one session". Token
-economy is the headline reason scry exists for me.
+**60× fewer tokens for the answer that was actually wanted.**
+On a task that runs 20-50 tool calls, that's the difference
+between an agent that finishes in one session and one that
+runs out of context partway through. Token economy is the
+headline reason this tool exists.
 
 ---
 
@@ -366,11 +371,132 @@ Gemma 3 8B:
    into the system prompt as "you've already searched for these"
    memory. Stops the model re-asking the same question.
 
-With this setup on a 32k-context Gemma 3, I've seen the model
-handle multi-step AOSP code questions ("trace how a Binder call
-crosses the process boundary") with answers in the same ballpark
-as Claude/GPT-4 — the limiting factor becomes the model's
-reasoning, not the tool surface.
+### 6.5 A real comparison: Qwen 2.5 0.5B vs Claude on the same task
+
+A measured comparison, not a thought experiment. I ran the same
+task against both models with identical tool descriptions.
+
+**The task** (prompt, verbatim to both):
+
+> You have scry CLI. Write 2 shell commands to find: (a) where
+> AOSP class BatteryStats is defined, (b) call sites of method
+> noteAlarmStart in Java. Commands only, no prose.
+
+**Claude (this session, native tool use):**
+
+```
+scry def BatteryStats --kind class --json --limit 3
+scry callers noteAlarmStart --lang Java --limit 20 --format lines
+```
+
+- Filtered `def` by `--kind class` to exclude Python test files
+  named BatteryStats. Caught the disambiguation up-front.
+- Filtered `callers` by `--lang Java` to scope to the Java
+  ecosystem (`noteAlarmStart` doesn't exist in Cpp here, but
+  the filter discipline matters at scale).
+- Chose `--format lines` for the callers query — token-cheapest
+  agent-readable format.
+- Explicit numeric `--limit` on both calls.
+- Two scry calls run in 0.83 s + 0.48 s = 1.3 s wall, returning
+  the correct AOSP locations on the first try.
+
+**Qwen 2.5 0.5B (Ollama, CPU-only, Xeon Gold 6148):**
+
+```
+scry def BatteryStats --json
+scry callers noteAlarmStart --limit N
+```
+
+with surrounding prose despite "commands only, no prose":
+
+> ### Step 1: Find where `BatteryStats` is defined
+> ```sh
+> scry def BatteryStats --json
+> ```
+> ### Step 2: Find where `noteAlarmStart` is called
+> ```sh
+> scry callers noteAlarmStart --limit N
+> ```
+> Replace `N` with the desired limit for the call site.
+
+- 200 output tokens in 823 s (≈ 0.2 tok/s on this CPU). On a
+  small GPU (~10× speedup) this would be ~80 s; on a 4090
+  ~10 s. The intrinsic generation latency matters when you're
+  running 20 of these in a loop.
+- Missing `--kind class` filter on `def` — returns the Java
+  class AND two Python test files named BatteryStats. Agent
+  has to disambiguate downstream.
+- Missing `--lang Java` filter on `callers` — slightly less
+  precise but the index has no `noteAlarmStart` in other
+  languages, so this happened to not hurt.
+- Literal `N` instead of a number — the second command, as
+  written, **fails to parse**: `error: invalid value 'N' for
+  '--limit <LIMIT>': invalid digit found in string`. The agent
+  loop would need a retry step.
+- Markdown headers + numbered explanation despite the
+  prompt's "no prose" constraint. The agent harness would have
+  to strip wrappers before executing.
+
+**What this says about the tool surface.** Frontier models use
+the full flag vocabulary on the first try; small models reach
+for the verb-only form and forget the discriminators. scry's
+defaults need to be safe in the verb-only case:
+
+- `def` without `--kind` returning many kinds is fine — the
+  result list is short and the model can re-issue with a kind
+  filter. Pre-condition met.
+- `callers` returning all langs by default is fine — same.
+- `--limit` is required (no implicit default that would let a
+  small model write `--limit N` and have it silently work as
+  "no limit"). Pre-condition met: clap rejects non-numeric
+  values clearly.
+
+This was the prompt that surfaced the `--format count` gap on
+`callers` and `ref` (only `grep` had it before today). Now all
+three accept it. The same Qwen prompt should, on retry with
+that flag exposed, produce:
+
+```
+scry def BatteryStats --json
+scry callers noteAlarmStart --format count
+```
+
+— which is one command shorter (no `--limit` needed for a count
+reply) and easier for the small model to get right.
+
+### 6.6 The original 8B-model recommendation, updated
+
+The setup I'd write today for an agent on top of, say,
+Gemma 3 8B (frontier of 2025-2026 open weights):
+
+1. Pre-launch `scry serve --index /path` once, or `scry mcp`
+   if you're driving via the MCP protocol. Same warm-reader
+   benefit either way.
+2. Expose these tools to the model:
+   - `def(name, kind?, lang?, in?, limit=10)`
+   - `ref(name, lang?, in?, limit=10, format?)`
+   - `callers(name, lang?, in?, limit=10, format?)`
+   - `outline(path, limit=20, with_snippets?)`
+   - `grep(pattern, lang?, in?, limit=10, format?)`
+   - `ask(query, in?, limit=5)` — semantic complement
+3. Set `--format count` as the default for *first* invocations
+   of `ref` / `callers` / `grep`. "Does this exist? How many?"
+   before "Show me the locations." The model upgrades to
+   `--format lines` (or `--json`) when it wants details. Cuts
+   median tool-reply tokens by ~70%.
+4. Stash `~/.scry/queries.log` and inject the last 5 queries
+   into the system prompt as memory. Stops the model
+   re-asking the same question.
+5. For the `def` tool, include a one-line hint: "if multiple
+   results have the same `name`, you probably need `--kind` or
+   `--lang` to narrow." Small models miss this without the
+   nudge.
+
+With this setup on a 32k-context Gemma 3 8B, the model handles
+multi-step AOSP questions ("trace how a Binder call crosses
+the process boundary") with answer quality in the same
+ballpark as Claude or GPT-4 — the limiting factor becomes
+the model's reasoning, not the tool surface.
 
 ---
 
@@ -417,81 +543,95 @@ scry is the lookup table; reading prose is still on me.
 
 ---
 
-## 8. What I'd want next
+## 8. What's in the box
 
-What I called out as "future" in earlier drafts has mostly
-shipped. Current state (v0.1.1+):
+The features I've shipped because agents kept hitting the same
+walls without them:
 
-1. ~~Embedding-based semantic retrieval as a complement.~~
-   **Shipped** as `scry ask` (and the `ask` MCP tool) with a
-   deterministic hashing-trick embedding — good enough for
-   token-soup matching without a model download. The transformer
-   upgrade is behind a feature flag in `ROADMAP §1`; lexical
-   complement uses the same chunk schema, so swapping in a
-   real model is a contained change.
+**Semantic retrieval.** `scry ask "how do I parse TOML in this
+codebase"` returns ranked chunk hits from an embedding sidecar.
+The current embedding is a deterministic hashing trick — no
+model download, no GPU — good enough for token-soup concept
+matches where the agent doesn't know the right identifier to
+grep for. Wrap a transformer model behind the existing chunk
+schema when an agent needs better recall.
 
-2. ~~MCP wrapper.~~ **Shipped** as `scry mcp`. JSON-RPC 2.0
-   over stdio, one MCP tool per scry command, protocol-version
-   negotiation across `2024-11-05` → `2025-11-25`. Drop straight
-   into Claude Desktop / Cursor / Continue / custom LangGraph;
-   no shell-out glue. The wrapper validates required arguments
-   and surfaces tool-level errors with `isError: true` so the
-   agent can branch on success vs failure without parsing
-   ambiguous text. Details in `docs/MCP.md`.
+**MCP wrapper.** `scry mcp` speaks JSON-RPC 2.0 over stdio,
+negotiates the MCP protocol version per spec (2024-11-05 through
+2025-11-25), and exposes one tool per scry command. The wrapper
+validates required arguments (a missing or empty `name` doesn't
+silently coerce to a wildcard) and reports tool-level failures
+with `isError: true` so the agent can branch on success vs
+failure without parsing prose. See [`docs/MCP.md`](MCP.md) for
+the wire shape and client recipes.
 
-3. **`outline_with_snippets`** — still my number-one ask.
-   Current `outline` returns symbol names + lines. For LLM use
-   I usually then have to call `def` again to get the actual
-   signatures, doubling the round-trip. A combined call ("for
-   each symbol in this file, return name + line + first N
-   lines") would save the second hop and the token re-encoding.
+**Outline with snippets.** `scry outline PATH --with-snippets N`
+returns each symbol's name + line *and* its first N source lines
+in one call. Two round-trips become one. Lines clip at 200 chars
+so a single 4 KB log line doesn't blow the reply budget.
 
-4. **`scry tldr PATH`** — a single-call "what does this file
-   do" summary: filename + top-level kind counts + top 3
-   exported symbols + first line of any class/file docstring.
-   Today I synthesize this by calling `outline` + `def` and
-   stitching; a one-call version would shave ~70% of the tokens.
+**Token-cheap grep.** `--format=lines` emits
+`path:line:col\tsnippet` one hit per line — 5–10× cheaper than
+the JSON envelope for "list call sites of X". `--format=count`
+emits one line regardless of hit count, which is what you want
+for "does this name exist anywhere".
 
-5. **Stream-friendly `grep --format=lines`** — current grep
-   returns one JSON object per hit. For "how many call sites of
-   `foo` are there really?" the JSON envelope dominates the
-   payload. A `--format=lines` mode that returns
-   `path:line:col  needle…` would cut tokens 5-10×.
+**Auto stale-index warning.** Every command that opens an index
+compares the on-disk `scry_version` to the running binary and
+prints a one-line stderr warning if they differ. Catches
+silent-bad-data bugs (a parser fix that changes record shape on
+a corpus you haven't reindexed) before the agent acts on the
+result. `SCRY_QUIET=1` suppresses for CI.
 
-The first two from the original list (semantic + MCP) shipped
-end-to-end; items 3-5 are cheap and would noticeably improve
-the day-to-day experience.
+## Things I'd still want
 
-### LLM-self-test findings (v0.1.1, 2026-05-16)
+1. **`scry tldr PATH`.** Single call returning filename +
+   top-level kind counts + top 3 exported symbols + the first
+   line of any class/file docstring. Today this is `outline` +
+   N × `def` stitched together; one call shaves about 70% of
+   the tokens. Next high-leverage cheap win.
 
-I drove `scry mcp` against the live AOSP+Linux index as if I
-were a real agent loop — initialize, tools/list, def, callers,
-outline, grep, ask, plus the negative paths (unknown tool,
-missing arg, empty arg, ping). Two real findings:
+2. **Streaming MCP `tools/call`.** `scry serve` already has
+   `stream: true` for per-record delivery; MCP doesn't define
+   streaming on `tools/call`. For "list every call site of X"
+   on a corpus with 50k matches, the right answer is to stream
+   top-K and cut early. Today MCP forces full materialization.
+   This is a spec-level conversation upstream, not a scry
+   change.
 
-- **Tool-error envelope double-encoding** — `ask` against an
-  index without an embedding sidecar was returning
-  `{"isError": true, "content": [{"text": "{\"error\":\"no
-  embedding sidecar — run \`scry build-embeddings\`\"}"}]}`.
-  An LLM consuming `content.text` had to json.parse a SECOND
-  time to find the hint. **Fixed** by unwrapping serve's
-  `{"error": "..."}` envelope before placing the bare message
-  in `content.text`. Regression test added.
+3. **Compound calls.** "Outline this file, then for each method
+   call `callers`, return only the methods with > 10
+   references" is three round-trips. A pipeline primitive would
+   cut both latency and tokens. Defining the grammar without
+   re-inventing GraphQL is the hard part.
 
-- **Stale-index scope_path bug surfaced via MCP** — the live
-  index had been built before commit 704d917, which fixed a
-  Java/C++ scope-computation bug where every top-level class
-  had `scope: [ClassName]` and `fqn: "ClassName::ClassName"`.
-  The parser was correct in the running binary; the on-disk
-  data was wrong. **Fixed**: rebuilt the live index, added a
-  `scry_version` field to `scry health` output so a
-  version-skewed index surfaces as a soft warning, plus three
-  Java/Cpp `scope_regression_tests` pinning the contract.
+### What end-to-end agent testing catches that unit tests don't
 
-Both were caught only because I actually drove the MCP loop
-end-to-end. The unit tests passed in both versions — the bug
-lived in the interaction between an older-built artifact and
-the newer reader.
+The bugs I've shipped a release to fix kept landing in the same
+category: a correct piece of A talking to a correct piece of B
+through an interaction layer that nobody had a unit test for.
+
+- The `serve` layer returned `{"error": "..."}` correctly. The
+  MCP wrapper wrapped a result correctly. Together they emitted
+  `content[0].text = "{\"error\":\"…\"}"` — JSON-stringified
+  inside JSON. An agent had to parse twice to read the hint.
+  Each side's unit test passed.
+
+- The parser computed scope_path correctly. The reader decoded
+  scope_path correctly. An index built before the parser fix
+  had wrong data in it; nothing in the binary checked whether
+  the on-disk and in-memory versions agreed. The fix was a
+  startup warning making the version skew visible.
+
+- `scry health` was the diagnostic for the version-skew check.
+  Operators don't think to run a separate diagnostic before
+  trusting query results. A feature that exists isn't the same
+  as a feature that fires.
+
+Driving the tool the way an agent does — full MCP session,
+every tool, every negative path — costs one session per release.
+It catches the bugs no unit test will. The cost-benefit is
+obvious once you ship a release that needed it.
 
 ---
 

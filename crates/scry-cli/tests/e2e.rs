@@ -503,7 +503,7 @@ fn synthetic_tree_roundtrip() {
     assert_eq!(r["error"]["code"].as_i64(), Some(-32601),
                "unknown method must return JSON-RPC -32601; got {r}");
 
-    // 8c. scry index --incremental round-trip. Reindex from the
+    // 8b. scry index --incremental round-trip. Reindex from the
     // current state, build digests, modify one file + add a new
     // one, incremental-rebuild, assert: unchanged file's symbols
     // survive; changed file's new symbol is queryable; new file's
@@ -569,7 +569,7 @@ fn synthetic_tree_roundtrip() {
     assert!(!arr.is_empty(),
             "Bravo (unchanged, replayed) must survive incremental: {bravo}");
 
-    // 8c-bis. Incremental with file DELETION. Drop Charlie.java +
+    // 8c. Incremental with file DELETION. Drop Charlie.java +
     // delete Alpha.java entirely; rebuild incremental; assert the
     // diff line reports `1 removed` and the dropped symbols are no
     // longer queryable. This is the path the previous test did not
@@ -599,7 +599,7 @@ fn synthetic_tree_roundtrip() {
     assert!(!query_def(&inc_idx, "Bravo").as_array().unwrap().is_empty(),
             "Bravo should survive deletion of Alpha");
 
-    // 8c-ter. Stable file_id invariant: re-running the SAME
+    // 8d. Stable file_id invariant: re-running the SAME
     // incremental against an unchanged tree must be a no-op
     // ("no changes — index already current"). This proves the digest
     // round-trip is deterministic; a stable-order bug would flip a
@@ -613,7 +613,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stderr.contains("no changes"),
             "second no-change incremental should be a no-op: {stderr}");
 
-    // 8d. `scry index-diff` with a file removal. The diff path is
+    // 8e. `scry index-diff` with a file removal. The diff path is
     // separate from the incremental builder; it must independently
     // report removed=1 when a file vanishes. Sequence:
     //   1. Add Delta.java to disk.
@@ -646,7 +646,7 @@ fn synthetic_tree_roundtrip() {
     assert!(combined.contains("removed:   1") || combined.contains("removed: 1"),
             "index-diff must report removed=1 when a file vanishes: {combined}");
 
-    // 8e. Short-pattern grep (< 3 bytes). The trigram fast-path
+    // 8f. Short-pattern grep (< 3 bytes). The trigram fast-path
     // requires ≥ 3 bytes; with a 2-byte pattern the engine must
     // degrade to the full scan rather than silently returning zero.
     // Build trigrams on the incremental index first.
@@ -664,7 +664,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.contains("package"),
             "short-pattern grep must match `package`: {stdout}");
 
-    // 8f. Regex grep path (separate code path from literal mmap+memchr).
+    // 8g. Regex grep path (separate code path from literal mmap+memchr).
     let out = Command::new(scry_bin())
         .args(["grep", "--regex", "Bravo|Charlie", "--index"]).arg(&inc_idx)
         .args(["--limit", "10"])
@@ -675,7 +675,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.contains("Bravo") || stdout.contains("Charlie"),
             "regex alternation grep must find at least one: {stdout}");
 
-    // 8g. Smoke-test the other CLI commands the agent audit flagged
+    // 8h. Smoke-test the other CLI commands the agent audit flagged
     // as untested. Each one is a separate process invocation against
     // the synthetic index; we assert exit=0 + a basic shape check.
     let assert_smoke = |args: &[&str], must_contain: &str, label: &str| {
@@ -695,7 +695,7 @@ fn synthetic_tree_roundtrip() {
     assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
 
-    // 8h. `scry grep --format=lines` — rg-shaped one-per-line. Output
+    // 8i. `scry grep --format=lines` — rg-shaped one-per-line. Output
     // must contain "path:line:col" but NOT the JSON envelope.
     let out = Command::new(scry_bin())
         .args(["grep", "package", "--format", "lines",
@@ -710,7 +710,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.lines().any(|l| l.contains(".java:") && l.contains('\t')),
             "grep --format=lines must emit path:line:col\\tsnippet; got:\n{stdout}");
 
-    // 8i. `scry grep --format=count` — just the totals.
+    // 8j. `scry grep --format=count` — just the totals.
     let out = Command::new(scry_bin())
         .args(["grep", "package", "--format", "count",
                "--index"]).arg(&inc_idx)
@@ -720,7 +720,35 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.contains("hits across") && stdout.contains("files"),
             "grep --format=count must report totals; got:\n{stdout}");
 
-    // 8j. `scry grep --format=invalid` — must reject cleanly, not
+    // 8j-bis. callers / ref --format=count — cheapest "how many?"
+    // reply. Mutually exclusive with --json. Closes the consistency
+    // gap surfaced by the Qwen small-model comparison.
+    let out = Command::new(scry_bin())
+        .args(["callers", "transact", "--format", "count",
+               "--index"]).arg(&inc_idx)
+        .output().expect("callers --format count");
+    assert!(out.status.success(),
+            "callers --format count failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(" callers"),
+            "callers --format count must say `N callers`; got: {stdout}");
+    let out = Command::new(scry_bin())
+        .args(["ref", "transact", "--format", "count",
+               "--index"]).arg(&inc_idx)
+        .output().expect("ref --format count");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(" ref"),
+            "ref --format count must say `N ref`; got: {stdout}");
+    // Mutual-exclusion with --json.
+    let out = Command::new(scry_bin())
+        .args(["callers", "transact", "--format", "count", "--json",
+               "--index"]).arg(&inc_idx)
+        .output().expect("callers --format + --json");
+    assert!(!out.status.success(),
+            "callers with both --format and --json must error");
+
+    // 8k. `scry grep --format=invalid` — must reject cleanly, not
     // silently fall through.
     let out = Command::new(scry_bin())
         .args(["grep", "package", "--format", "wat",
@@ -732,7 +760,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stderr.contains("format must be one of"),
             "rejection message must list valid formats; got:\n{stderr}");
 
-    // 8k. `scry grep --json --format=lines` — mutually exclusive.
+    // 8l. `scry grep --json --format=lines` — mutually exclusive.
     let out = Command::new(scry_bin())
         .args(["grep", "package", "--json", "--format", "lines",
                "--index"]).arg(&inc_idx)
@@ -740,7 +768,7 @@ fn synthetic_tree_roundtrip() {
     assert!(!out.status.success(),
             "grep with both --json and --format must error");
 
-    // 8l. `scry outline --with-snippets=3` — JSON shape must include
+    // 8m. `scry outline --with-snippets=3` — JSON shape must include
     // a `snippet` field on each symbol; snippet contains the actual
     // source line.
     let out = Command::new(scry_bin())
@@ -773,7 +801,7 @@ fn synthetic_tree_roundtrip() {
     assert!(out.status.success(),
             "compact failed: {}", String::from_utf8_lossy(&out.stderr));
 
-    // 8b. `scry health` against the synthetic index must report
+    // 8n. `scry health` against the synthetic index must report
     // OVERALL: healthy and exit 0. JSON form is parsed and pinned.
     let out = Command::new(scry_bin())
         .args(["health", "--index"]).arg(&idx)

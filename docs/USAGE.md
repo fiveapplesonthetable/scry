@@ -163,6 +163,23 @@ different `def:` id, the C++ Binder. Pass `--json` to get the raw
 ctor, type-use, field-access, import, inherit). `callers` is the
 common-case shorthand for `ref --kind call`.
 
+### `--format count`
+
+For "how many callers does X have?" the JSON envelope and the
+per-hit rows are both wasted bytes. `--format count` emits one
+short line:
+
+```sh
+$ scry callers transact --lang Java --format count
+1524 callers
+
+$ scry ref BatteryStats --format count
+85 ref
+```
+
+Mutually exclusive with `--json`. Useful as a cheap probe
+before deciding whether to spend tokens on the full list.
+
 ---
 
 ## Path-prefix completion: `scry prefix`

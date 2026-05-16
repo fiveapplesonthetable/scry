@@ -167,6 +167,11 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Compact output. `count` emits just `N refs` — cheapest
+        /// possible "how many references does X have?" reply.
+        /// Mutually exclusive with --json.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -195,6 +200,11 @@ enum Cmd {
         /// compile_commands.json are missing.
         #[arg(long)]
         precise: bool,
+        /// Compact output. `count` emits just `N callers` — cheapest
+        /// possible "how many callers does X have?" reply. Mutually
+        /// exclusive with --json.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
     },
     /// Look up exact symbol definitions by name. LSP analogue:
     /// textDocument/definition; ctags/gtags analogue: tag lookup.
@@ -701,16 +711,15 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, distance, limit, json } => {
             cmd_fuzzy(substr, index, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json } => {
-            cmd_ref(name, index, lang, kind, in_, limit, json)
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format } => {
+            cmd_ref(name, index, lang, kind, in_, limit, json, format)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, format } => {
             if precise {
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
             // Fall through to the heuristic path.
-            let _ = (); // explicit no-op for the fallback marker.
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json)
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format)
         }
         Cmd::Stats { index } => cmd_stats(index),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -1714,7 +1723,16 @@ fn cmd_ref(
     in_: Option<String>,
     limit: usize,
     json: bool,
+    format: Option<String>,
 ) -> Result<()> {
+    if json && format.is_some() {
+        anyhow::bail!("--json and --format are mutually exclusive");
+    }
+    if let Some(f) = format.as_deref() {
+        if f != "count" {
+            anyhow::bail!("--format must be 'count' (got '{f}')");
+        }
+    }
     let t = Instant::now();
     let r = open_index(index)?;
     let results = r.lookup_refs_exact(&name);
@@ -1742,8 +1760,15 @@ fn cmd_ref(
             true
         })
         .collect();
-    print_refs(&r, &filtered, limit, json);
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
+    // --format count: just the totals, no per-hit rows. Pays off for
+    // "how many callers does X have?" agent queries — one short line
+    // regardless of how many hits the index actually holds.
+    if format.as_deref() == Some("count") {
+        println!("{} {label}", filtered.len());
+    } else {
+        print_refs(&r, &filtered, limit, json);
+    }
     log_query(&r, label, &name, filtered.len(), filtered.len().min(limit), t);
     Ok(())
 }

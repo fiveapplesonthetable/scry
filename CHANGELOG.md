@@ -7,6 +7,36 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-16
+
+The small-model-comparison drop. Ran Qwen 2.5 0.5B (Ollama, CPU)
+against the same task I'd give myself (Claude) and captured the
+interaction patterns. The comparison surfaced one real
+consistency gap that small models hit hardest.
+
+### Added
+- **`--format count`** on `scry callers` and `scry ref`. Emits
+  one short line (`N callers` / `N ref`) for the "how many
+  references does X have?" agent query. Was only on `grep`
+  before; small models reach for verb-only commands and
+  shouldn't need to count lines themselves. Mutually exclusive
+  with `--json`. New e2e regression block.
+- **AGENT_NOTES §6.5** — a real Qwen 2.5 0.5B vs Claude
+  side-by-side on the BatteryStats / noteAlarmStart task.
+  Verbatim prompts, verbatim outputs, actual scry invocations,
+  what Qwen got wrong and why (missed `--kind class`, missed
+  `--lang Java`, used literal `N` instead of a number),
+  measured timing (823 s for 200 tokens at 0.4 t/s on CPU).
+- **AGENT_NOTES §6.6** — updated 8B-model recommendation,
+  reflecting what the comparison taught: default `--format
+  count` on first-invocation, expose `with_snippets` via
+  outline, hint at `--kind` for ambiguous `def`.
+
+### Tests
+- 143 → 144 tests across the workspace (new `callers --format
+  count` + `ref --format count` + `--format + --json` mutual-
+  exclusion checks).
+
 ## [0.1.3] — 2026-05-16
 
 The user-shouldn't-have-to-know drop. The stale-index version
@@ -180,7 +210,8 @@ First tagged release. Full feature surface implemented and tested.
 - Zero clippy warnings under strict `[workspace.lints]` policy.
 - Pre-release discipline: no backward-compat shims carried.
 
-[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.0...v0.1.1

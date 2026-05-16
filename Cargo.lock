@@ -508,7 +508,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scry-aosp"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "quick-xml",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "scry-cli"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "bincode",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "scry-lang"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "scry-store",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "scry-store"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "bincode",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "scry-walker"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "ignore",

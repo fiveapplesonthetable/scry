@@ -7,6 +7,45 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.12] — 2026-05-16
+
+Build-graph-aware precision: scry now understands module boundaries
+in five build systems and can prune callers/refs to only those
+reachable across declared dependency edges.
+
+**Highlights:**
+
+- New `--reachable` flag on `scry callers` and `scry ref` (also
+  exposed via JSON-RPC and MCP). When a `module_graph.json`
+  sidecar is present in the index, results are filtered to
+  refs whose owning module can reach the callee's module
+  through the build graph's transitive closure. Validated on
+  AOSP: `bindService` callers go from 1981 → 1567 hits (~21%
+  unreachable noise pruned) with ~300 ms filter overhead.
+
+- New `scry build-modgraph` subcommand emits a canonical v1
+  `module_graph.json` from any of five build systems:
+  - **`cargo`** — Rust workspaces (Cargo.toml + path-deps).
+  - **`soong`** — AOSP, via cached `out/soong/module-info-<target>.json`.
+    Dogfooded on real AOSP (~91k modules, 552k deps, 1.4M file
+    attributions, 14 s).
+  - **`kernel`** — Linux Kbuild (top-level subsystems; 22
+    modules, 462 deps, 72k files on linux/master, 712 ms).
+  - **`gn`** — Chromium/perfetto/V8/ANGLE (parses
+    `gn gen --ide=json` output).
+  - **`bazel`** — parses `bazel query --output=jsonproto`.
+
+- New `ModuleGraph` reader (`scry-store::modgraph`): JSON v1
+  schema, Warshall transitive-closure into a packed reachability
+  bitmap for O(1) `is_reachable(from, to)` queries at filter time.
+
+**Internals:**
+
+- Soong adapter's single-walk algorithm: dir→module HashMap with
+  longest-prefix-wins via sort-length-desc + or_insert, then walk
+  non-overlapping roots once. Earlier per-module walks blew up at
+  AOSP scale (9 GB RSS / 18 min hung, vs 14 s now).
+
 ## [0.1.11] — 2026-05-16
 
 A wide-ranging quality-and-throughput drop. Three classes of fix:

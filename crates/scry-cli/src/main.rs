@@ -264,6 +264,22 @@ enum Cmd {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Build (or rebuild) the trigram index for an existing index dir.
+    /// Use this when the original `scry index` run didn't pass
+    /// --build-trigrams. Walks every file in the index's files.bin,
+    /// extracts trigrams, writes trigrams.fst + trigram_postings.bin
+    /// alongside the existing index — no re-parsing needed.
+    BuildTrigrams {
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Worker count for parallel trigram extraction.
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Skip files larger than N bytes (default 5 MiB). Same default
+        /// as scry index — keeps data-blob outliers from polluting.
+        #[arg(long, default_value_t = 5 * 1024 * 1024)]
+        max_file_bytes: u64,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -348,6 +364,9 @@ fn main() -> Result<()> {
             cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
         Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
+        Cmd::BuildTrigrams { index, workers, max_file_bytes } => {
+            cmd_build_trigrams(index, workers, max_file_bytes)
+        }
     }
 }
 
@@ -1574,6 +1593,135 @@ struct Hit {
     line: u32,
     col: u32,
     snippet: String,
+}
+
+// ---------------------------------------------------------------------------
+// build-trigrams (standalone — add trigram index to an existing index)
+// ---------------------------------------------------------------------------
+
+fn cmd_build_trigrams(
+    index: Option<PathBuf>,
+    workers: Option<usize>,
+    max_file_bytes: u64,
+) -> Result<()> {
+    if let Some(n) = workers {
+        if n > 0 {
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+            eprintln!("[trigrams] rayon pool: {} workers", n);
+        }
+    }
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    eprintln!("[trigrams] target index: {}", index_dir.display());
+    let r = StoreReader::open(&index_dir)
+        .with_context(|| format!("open {}", index_dir.display()))?;
+    eprintln!("[trigrams] {} files in index", r.files.len());
+
+    // Per-batch sink + chunk staging dir. We piggyback on the index's
+    // <index>.trigrams_tmp/ to keep artifacts off the live index dir until
+    // we atomically rename them in.
+    let tmp = index_dir.with_extension("trigrams_tmp");
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)
+            .with_context(|| format!("clean stale {}", tmp.display()))?;
+    }
+    std::fs::create_dir_all(&tmp)?;
+
+    let batch_size: usize = 5000;
+    let n_files = r.files.len();
+    let total_batches = (n_files + batch_size - 1) / batch_size.max(1);
+    let mut chunk_count: u32 = 0;
+    let t_total = Instant::now();
+    let total_failed = std::sync::atomic::AtomicU64::new(0);
+    let total_skipped = std::sync::atomic::AtomicU64::new(0);
+    let total_trigram_pushes = std::sync::atomic::AtomicU64::new(0);
+
+    let mut start = 0usize;
+    let mut batch_no = 0usize;
+    while start < n_files {
+        let end = (start + batch_size).min(n_files);
+        batch_no += 1;
+        let slice = &r.files[start..end];
+        let sink: parking_lot::Mutex<Vec<(scry_store::trigram::Trigram, u32)>> =
+            parking_lot::Mutex::new(Vec::with_capacity(slice.len() * 4096));
+        let t_batch = Instant::now();
+        slice.par_iter().for_each(|fe| {
+            if fe.size > max_file_bytes {
+                total_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            let path = fe.display_path(&r.roots);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => { total_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
+            };
+            let trigrams = scry_store::trigram::extract_sorted(&bytes);
+            if trigrams.is_empty() { return; }
+            let mut s = sink.lock();
+            s.reserve(trigrams.len());
+            for t in &trigrams { s.push((*t, fe.id)); }
+            total_trigram_pushes.fetch_add(trigrams.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        });
+        // Flush this batch's tuples to a sorted chunk file (same format the
+        // writer's flush_trigrams_chunk uses, so kway_merge can consume them).
+        let mut buf = sink.into_inner();
+        buf.sort_unstable();
+        let chunk_path = tmp.join(format!("trigrams.chunk.{:06}.bin", chunk_count));
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&chunk_path)?);
+        use std::io::Write as _;
+        for (t, f) in &buf {
+            w.write_all(t)?;
+            w.write_all(&f.to_le_bytes())?;
+        }
+        w.flush()?;
+        let chunk_bytes = std::fs::metadata(&chunk_path).map(|m| m.len()).unwrap_or(0);
+        chunk_count += 1;
+        eprintln!(
+            "[trigrams] batch {}/{}  {} files / {} tuples / chunk {} ({}) / {} ms",
+            batch_no, total_batches, slice.len(), buf.len(),
+            chunk_count - 1, human_bytes(chunk_bytes),
+            t_batch.elapsed().as_millis(),
+        );
+        start = end;
+    }
+
+    eprintln!(
+        "[trigrams] all batches done in {} ms. failed reads: {}, skipped (>max-file-bytes): {}, total tuples: {}",
+        t_total.elapsed().as_millis(),
+        total_failed.load(std::sync::atomic::Ordering::Relaxed),
+        total_skipped.load(std::sync::atomic::Ordering::Relaxed),
+        total_trigram_pushes.load(std::sync::atomic::Ordering::Relaxed),
+    );
+
+    // K-way merge into the final trigrams.fst + trigram_postings.bin
+    // (in the tmp dir, then atomically rename into the index).
+    let t_merge = Instant::now();
+    let chunk_paths: Vec<PathBuf> = (0..chunk_count)
+        .map(|n| tmp.join(format!("trigrams.chunk.{:06}.bin", n)))
+        .collect();
+    let staged_fst = tmp.join("trigrams.fst");
+    let staged_postings = tmp.join("trigram_postings.bin");
+    scry_store::kway_merge_trigrams_to_fst_public(&chunk_paths, &staged_fst, &staged_postings)?;
+    eprintln!("[trigrams] k-way merge done in {} ms", t_merge.elapsed().as_millis());
+
+    // Move staged files into the index dir, replacing any existing.
+    let target_fst = index_dir.join("trigrams.fst");
+    let target_postings = index_dir.join("trigram_postings.bin");
+    if target_fst.exists() { std::fs::remove_file(&target_fst).ok(); }
+    if target_postings.exists() { std::fs::remove_file(&target_postings).ok(); }
+    std::fs::rename(&staged_fst, &target_fst)?;
+    std::fs::rename(&staged_postings, &target_postings)?;
+    // Drop chunk files
+    for p in &chunk_paths { let _ = std::fs::remove_file(p); }
+    std::fs::remove_dir_all(&tmp).ok();
+
+    let fst_sz = std::fs::metadata(&target_fst).map(|m| m.len()).unwrap_or(0);
+    let post_sz = std::fs::metadata(&target_postings).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "[trigrams] DONE.  trigrams.fst: {}, trigram_postings.bin: {}, total {} (in {} ms)",
+        human_bytes(fst_sz), human_bytes(post_sz), human_bytes(fst_sz + post_sz),
+        t_total.elapsed().as_millis(),
+    );
+    Ok(())
 }
 
 fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {

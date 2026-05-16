@@ -962,6 +962,18 @@ impl PartialOrd for TrigramHeapItem {
 /// Delta+varint is the same compression Code Search / livegrep use; gives
 /// ~3-5× shrink vs. raw u32 for typical posting lists in source-code
 /// corpora where file_ids are densely packed.
+/// Public wrapper so the standalone `scry build-trigrams` utility can drive
+/// the same k-way merge as the regular finalize_streaming path. Same input
+/// format (sorted (trigram, file_id) chunk files), same output (trigrams.fst
+/// + trigram_postings.bin with delta+varint posting lists).
+pub fn kway_merge_trigrams_to_fst_public(
+    chunk_paths: &[PathBuf],
+    fst_path: &Path,
+    postings_path: &Path,
+) -> Result<()> {
+    kway_merge_trigrams_to_fst(chunk_paths, fst_path, postings_path)
+}
+
 fn kway_merge_trigrams_to_fst(
     chunk_paths: &[PathBuf],
     fst_path: &Path,

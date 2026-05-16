@@ -278,6 +278,8 @@ impl StorePaths {
     pub fn ref_postings(&self) -> PathBuf { self.root.join("ref_postings.bin") }
     pub fn trigram_fst(&self) -> PathBuf { self.root.join("trigrams.fst") }
     pub fn trigram_postings(&self) -> PathBuf { self.root.join("trigram_postings.bin") }
+    pub fn symbol_offsets(&self) -> PathBuf { self.root.join("symbols_offsets.bin") }
+    pub fn ref_offsets(&self) -> PathBuf { self.root.join("refs_offsets.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,23 +581,33 @@ impl StoreWriter {
         write_bincode(&tmp_paths.roots(), &self.roots)?;
         write_bincode(&tmp_paths.files(), &self.files)?;
 
-        // -- symbols.bin: concatenate chunks into a single bincode Vec<SymbolRecord> --
+        // -- symbols.bin + symbols_offsets.bin --
+        //    Concatenate chunks into a single bincode Vec<SymbolRecord>, and
+        //    in parallel write a u64-LE byte-offset per record into the
+        //    sidecar offsets file. The lazy/mmap reader can then look up
+        //    record N via offsets[N] -> seek into symbols.bin -> decode one.
         let total_syms: u64 = self.symbol_chunk_lens.iter().sum();
         {
-            let mut w = BufWriter::new(File::create(tmp_paths.symbols())?);
+            let mut w = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.symbols())?);
+            let mut ow = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.symbol_offsets())?);
             // bincode 1.3 with default config encodes Vec<T> as u64-LE length
             // followed by each element. We stamp the length, then stream each
             // chunk's records back out one by one without rebuilding a Vec.
             w.write_all(&total_syms.to_le_bytes())?;
+            let mut byte_pos: u64 = 8; // past the length prefix
             for n in 0..self.symbol_chunk_count {
                 let p = Self::chunk_path(&tmp, "symbols", n);
                 let chunk: Vec<SymbolRecord> = read_bincode(&p)?;
                 for s in &chunk {
-                    bincode::serialize_into(&mut w, s)
-                        .with_context(|| "stream symbol")?;
+                    ow.write_all(&byte_pos.to_le_bytes())?;
+                    let bytes = bincode::serialize(s)
+                        .with_context(|| "serialize symbol")?;
+                    w.write_all(&bytes)?;
+                    byte_pos += bytes.len() as u64;
                 }
             }
             w.flush()?;
+            ow.flush()?;
         }
 
         // -- names.fst + name_postings.bin (k-way merge over per-chunk sorted
@@ -611,20 +623,26 @@ impl StoreWriter {
             )?;
         }
 
-        // -- refs.bin + ref_names.fst + ref_postings.bin --
+        // -- refs.bin + refs_offsets.bin + ref_names.fst + ref_postings.bin --
         let total_refs: u64 = self.ref_chunk_lens.iter().sum();
         {
-            let mut w = BufWriter::new(File::create(tmp_paths.refs())?);
+            let mut w = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.refs())?);
+            let mut ow = BufWriter::with_capacity(1 << 20, File::create(tmp_paths.ref_offsets())?);
             w.write_all(&total_refs.to_le_bytes())?;
+            let mut byte_pos: u64 = 8;
             for n in 0..self.ref_chunk_count {
                 let p = Self::chunk_path(&tmp, "refs", n);
                 let chunk: Vec<RefRecord> = read_bincode(&p)?;
                 for r in &chunk {
-                    bincode::serialize_into(&mut w, r)
-                        .with_context(|| "stream ref")?;
+                    ow.write_all(&byte_pos.to_le_bytes())?;
+                    let bytes = bincode::serialize(r)
+                        .with_context(|| "serialize ref")?;
+                    w.write_all(&bytes)?;
+                    byte_pos += bytes.len() as u64;
                 }
             }
             w.flush()?;
+            ow.flush()?;
         }
         {
             let chunk_paths: Vec<PathBuf> = (0..self.ref_chunk_count)

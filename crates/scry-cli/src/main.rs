@@ -280,6 +280,16 @@ enum Cmd {
         #[arg(long, default_value_t = 5 * 1024 * 1024)]
         max_file_bytes: u64,
     },
+    /// Build the offsets sidecar files for an existing index. This is what
+    /// enables the lazy/mmap StoreReader path: cold query latency drops
+    /// from "deserialize 10 GB bincode Vec" to "mmap + single-record decode"
+    /// (~10 ms vs several seconds). Walks the existing symbols.bin /
+    /// refs.bin, recording each record's byte offset into the corresponding
+    /// _offsets.bin sidecar. No re-indexing required.
+    BuildOffsets {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -367,6 +377,7 @@ fn main() -> Result<()> {
         Cmd::BuildTrigrams { index, workers, max_file_bytes } => {
             cmd_build_trigrams(index, workers, max_file_bytes)
         }
+        Cmd::BuildOffsets { index } => cmd_build_offsets(index),
     }
 }
 
@@ -1593,6 +1604,67 @@ struct Hit {
     line: u32,
     col: u32,
     snippet: String,
+}
+
+// ---------------------------------------------------------------------------
+// build-offsets (standalone — add offsets sidecars for lazy reader)
+// ---------------------------------------------------------------------------
+
+fn cmd_build_offsets(index: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufReader, BufWriter, Read, Write};
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    eprintln!("[offsets] target index: {}", index_dir.display());
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+    let t_total = Instant::now();
+
+    // Generic walker: stream-decode each bincode Vec<T>, recording the
+    // byte position of each record into a u64-LE sidecar.
+    fn build_one<T: for<'de> serde::Deserialize<'de> + serde::Serialize>(
+        data_path: &Path, offsets_path: &Path, label: &str,
+    ) -> Result<u64> {
+        if !data_path.exists() {
+            eprintln!("[offsets] {} missing — skipping", data_path.display());
+            return Ok(0);
+        }
+        let f = std::fs::File::open(data_path)
+            .with_context(|| format!("open {}", data_path.display()))?;
+        let mut reader = BufReader::with_capacity(8 << 20, f);
+        let mut len_buf = [0u8; 8];
+        reader.read_exact(&mut len_buf)?;
+        let total = u64::from_le_bytes(len_buf);
+        let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(offsets_path)?);
+        let mut byte_pos: u64 = 8;
+        let t = Instant::now();
+        for i in 0..total {
+            ow.write_all(&byte_pos.to_le_bytes())?;
+            let r: T = bincode::deserialize_from(&mut reader)
+                .with_context(|| format!("decode {label} record {i}"))?;
+            let sz = bincode::serialized_size(&r)
+                .with_context(|| format!("size {label} record {i}"))?;
+            byte_pos += sz;
+            if i % 1_000_000 == 0 && i > 0 {
+                eprintln!("[offsets] {label}: {i}/{total} records ({} ms)", t.elapsed().as_millis());
+            }
+        }
+        ow.flush()?;
+        eprintln!("[offsets] {label}: {total} records → {} in {} ms",
+            human_bytes(std::fs::metadata(offsets_path).map(|m| m.len()).unwrap_or(0)),
+            t.elapsed().as_millis(),
+        );
+        Ok(total)
+    }
+
+    let n_syms = build_one::<scry_store::SymbolRecord>(
+        &paths.symbols(), &paths.symbol_offsets(), "symbols"
+    )?;
+    let n_refs = build_one::<scry_store::RefRecord>(
+        &paths.refs(), &paths.ref_offsets(), "refs"
+    )?;
+    eprintln!(
+        "[offsets] DONE.  {} symbols + {} refs offsets written in {} ms",
+        n_syms, n_refs, t_total.elapsed().as_millis(),
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

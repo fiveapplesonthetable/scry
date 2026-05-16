@@ -110,6 +110,55 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    /// Stable string name used in JSON output and `--lang` filter
+    /// matching. NEVER use `format!("{:?}", k)` for these — Debug is
+    /// allowed to change between versions, but as_str is a wire
+    /// contract.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileKind::C => "C",
+            FileKind::Cpp => "Cpp",
+            FileKind::Header => "Header",
+            FileKind::HeaderCpp => "HeaderCpp",
+            FileKind::Java => "Java",
+            FileKind::Kotlin => "Kotlin",
+            FileKind::Rust => "Rust",
+            FileKind::Go => "Go",
+            FileKind::Python => "Python",
+            FileKind::Bash => "Bash",
+            FileKind::Proto => "Proto",
+            FileKind::Aidl => "Aidl",
+            FileKind::Hidl => "Hidl",
+            FileKind::Assembly => "Assembly",
+            FileKind::Soong => "Soong",
+            FileKind::AndroidMk => "AndroidMk",
+            FileKind::Bazel => "Bazel",
+            FileKind::Bzl => "Bzl",
+            FileKind::CMake => "CMake",
+            FileKind::Gn => "Gn",
+            FileKind::Kconfig => "Kconfig",
+            FileKind::Makefile => "Makefile",
+            FileKind::Gradle => "Gradle",
+            FileKind::FlagsFile => "FlagsFile",
+            FileKind::Jarjar => "Jarjar",
+            FileKind::Toml => "Toml",
+            FileKind::Aconfig => "Aconfig",
+            FileKind::InitRc => "InitRc",
+            FileKind::Sepolicy => "Sepolicy",
+            FileKind::SepolicyOther => "SepolicyOther",
+            FileKind::Manifest => "Manifest",
+            FileKind::ApiTxt => "ApiTxt",
+            FileKind::XmlOther => "XmlOther",
+            FileKind::Json => "Json",
+            FileKind::Properties => "Properties",
+            FileKind::Cfg => "Cfg",
+            FileKind::Yaml => "Yaml",
+            FileKind::Owners => "Owners",
+            FileKind::Markdown => "Markdown",
+            FileKind::License => "License",
+        }
+    }
+
     /// Classify by filename + extension. Returns None for unrecognized files.
     pub fn classify(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;

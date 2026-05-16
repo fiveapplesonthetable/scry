@@ -1275,7 +1275,7 @@ fn cmd_ref(
                 }
             }
             if let Some(l) = &lang {
-                if !format!("{:?}", rr.lang).eq_ignore_ascii_case(l) {
+                if !rr.lang.as_str().eq_ignore_ascii_case(l) {
                     return false;
                 }
             }
@@ -1310,17 +1310,9 @@ fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
     let mut by_lang: std::collections::HashMap<FileKind, u64> = std::collections::HashMap::new();
     let mut by_kind: std::collections::HashMap<SymbolKind, u64> =
         std::collections::HashMap::new();
-    // In lazy mode `r.symbols` is empty; iterate via lazy_symbols if available.
-    if let Some(lz) = r.lazy_symbols.as_ref() {
-        for s in lz.iter() {
-            *by_lang.entry(s.lang).or_default() += 1;
-            *by_kind.entry(s.kind).or_default() += 1;
-        }
-    } else {
-        for s in &r.symbols {
-            *by_lang.entry(s.lang).or_default() += 1;
-            *by_kind.entry(s.kind).or_default() += 1;
-        }
+    for s in r.iter_symbols() {
+        *by_lang.entry(s.lang).or_default() += 1;
+        *by_kind.entry(s.kind).or_default() += 1;
     }
     println!("\nby language:");
     let mut lv: Vec<_> = by_lang.into_iter().collect();
@@ -1400,19 +1392,7 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
             }
             v
         }
-        None => {
-            let mut v: Vec<SymbolRecord> = Vec::new();
-            if let Some(lz) = r.lazy_symbols.as_ref() {
-                for s in lz.iter() {
-                    if s.file_id == file_id { v.push(s); }
-                }
-            } else {
-                for s in &r.symbols {
-                    if s.file_id == file_id { v.push(s.clone()); }
-                }
-            }
-            v
-        }
+        None => r.iter_symbols().filter(|s| s.file_id == file_id).collect(),
     };
     // Stable: sort by (line, col, name).
     found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
@@ -1422,7 +1402,7 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
         let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(&r, s)).collect();
         let out = serde_json::json!({
             "path": display,
-            "lang": format!("{:?}", fe.kind),
+            "lang": fe.kind.as_str(),
             "symbols_total": found.len(),
             "symbols_shown": take,
             "symbols": arr,
@@ -1499,7 +1479,7 @@ fn filter_results(
     syms.into_iter()
         .filter(|s| {
             if let Some(l) = lang {
-                if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) {
+                if !s.lang.as_str().eq_ignore_ascii_case(l) {
                     return false;
                 }
             }
@@ -1533,7 +1513,7 @@ fn print_results_md(
         } else {
             format!("**scope**: `{}`  ", s.scope_path.join("::"))
         };
-        let lang_label = format!("{:?}", s.lang);
+        let lang_label = s.lang.as_str();
         let section = format!(
             "### `{}`  ({} · {})\n\
              **location**: `{}:{}:{}`  \n\
@@ -1588,7 +1568,7 @@ fn print_results(reader: &StoreReader, syms: &[SymbolRecord], limit: usize, json
                 "name": s.name,
                 "fqn": s.fqn,
                 "kind": s.kind.short(),
-                "lang": format!("{:?}", s.lang),
+                "lang": s.lang.as_str(),
                 "path": path,
                 "line": s.line,
                 "col": s.col,
@@ -1630,7 +1610,7 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
             let obj = serde_json::json!({
                 "name": r.name,
                 "ref_kind": r.kind.short(),
-                "lang": format!("{:?}", r.lang),
+                "lang": r.lang.as_str(),
                 "path": path,
                 "line": r.line,
                 "col": r.col,
@@ -1762,7 +1742,7 @@ fn cmd_grep(
                 }
             }
             if let Some(ref l) = lang_lower {
-                if !format!("{:?}", fe.kind).eq_ignore_ascii_case(l) {
+                if !fe.kind.as_str().eq_ignore_ascii_case(l) {
                     return false;
                 }
             }
@@ -1938,24 +1918,14 @@ fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
     let t = Instant::now();
     let mut by_file: Vec<Vec<u32>> = vec![Vec::new(); n_files];
     let mut sym_idx: u32 = 0;
-    if let Some(lz) = r.lazy_symbols.as_ref() {
-        for s in lz.iter() {
-            let fid = s.file_id as usize;
-            if fid < by_file.len() {
-                by_file[fid].push(sym_idx);
-            }
-            sym_idx += 1;
-            if sym_idx % 1_000_000 == 0 {
-                eprintln!("[fsyms] grouped {} M symbols ({} ms)", sym_idx / 1_000_000, t.elapsed().as_millis());
-            }
+    for s in r.iter_symbols() {
+        let fid = s.file_id as usize;
+        if fid < by_file.len() {
+            by_file[fid].push(sym_idx);
         }
-    } else {
-        for s in &r.symbols {
-            let fid = s.file_id as usize;
-            if fid < by_file.len() {
-                by_file[fid].push(sym_idx);
-            }
-            sym_idx += 1;
+        sym_idx += 1;
+        if sym_idx % 1_000_000 == 0 {
+            eprintln!("[fsyms] grouped {} M symbols ({} ms)", sym_idx / 1_000_000, t.elapsed().as_millis());
         }
     }
     eprintln!("[fsyms] grouping done in {} ms; writing sidecars", t.elapsed().as_millis());
@@ -2034,11 +2004,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
             pkg: None, // filled in pass1b for Java type-defs
         });
     };
-    if let Some(lz) = r.lazy_symbols.as_ref() {
-        for s in lz.iter() { pass1(s); }
-    } else {
-        for s in &r.symbols { pass1(s.clone()); }
-    }
+    for s in r.iter_symbols() { pass1(s); }
     // Pass1b: stamp pkg on Java type-defs (Class/Interface/Enum) — small
     // overhead, lets the resolver short-circuit by-package lookups
     // without re-resolving file_id → pkg on every ref.
@@ -2067,11 +2033,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         };
         per_file_imports.entry(rr.file_id).or_default().push((simple, pkg));
     };
-    if let Some(lz) = r.lazy_refs.as_ref() {
-        for i in 0..lz.len() { if let Some(rr) = lz.get(i) { process_import(&rr); } }
-    } else {
-        for rr in &r.refs { process_import(rr); }
-    }
+    for rr in r.iter_refs() { process_import(&rr); }
     eprintln!("[res] pass 2 (per-file imports: {} files) in {} ms",
               per_file_imports.len(), t2.elapsed().as_millis());
 
@@ -2088,11 +2050,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         ow.write_all(&chosen_id.to_le_bytes())?;
         Ok(())
     };
-    if let Some(lz) = r.lazy_refs.as_ref() {
-        for i in 0..lz.len() { if let Some(rr) = lz.get(i) { resolve_ref(&rr)?; } }
-    } else {
-        for rr in &r.refs { resolve_ref(rr)?; }
-    }
+    for rr in r.iter_refs() { resolve_ref(&rr)?; }
     ow.flush()?;
     drop(ow);
     std::fs::rename(&tmp, paths.ref_resolutions())?;
@@ -2544,7 +2502,7 @@ fn serve_def(
     let mut filtered: Vec<SymbolRecord> = r.lookup_exact(name).into_iter()
         .filter(|s| {
             if let Some(l) = lang {
-                if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) { return false; }
+                if !s.lang.as_str().eq_ignore_ascii_case(l) { return false; }
             }
             if let Some(k) = kind {
                 if !s.kind.short().eq_ignore_ascii_case(k) { return false; }
@@ -2594,7 +2552,7 @@ fn serve_ref(
     for rr in r.lookup_refs_exact(name).into_iter() {
         if out.len() >= limit { break; }
         if let Some(l) = lang {
-            if !format!("{:?}", rr.lang).eq_ignore_ascii_case(l) { continue; }
+            if !rr.lang.as_str().eq_ignore_ascii_case(l) { continue; }
         }
         if let Some(k) = kind {
             if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
@@ -2633,7 +2591,7 @@ fn serve_grep(
             if !tg.contains(&fe.id) { continue; }
         }
         if let Some(l) = lang {
-            if !format!("{:?}", fe.kind).eq_ignore_ascii_case(l) { continue; }
+            if !fe.kind.as_str().eq_ignore_ascii_case(l) { continue; }
         }
         if !prefix.is_empty() {
             // Substring match — same semantics as file_in_prefix and
@@ -2660,7 +2618,7 @@ fn serve_grep(
                 "line": line,
                 "col": col,
                 "snippet": snippet,
-                "lang": format!("{:?}", fe.kind),
+                "lang": fe.kind.as_str(),
             }));
             per_file += 1;
             if out.len() >= limit || per_file >= 16 { break; }
@@ -2699,26 +2657,14 @@ fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value
             }
             v
         }
-        None => {
-            let mut v: Vec<SymbolRecord> = Vec::new();
-            if let Some(lz) = r.lazy_symbols.as_ref() {
-                for s in lz.iter() {
-                    if s.file_id == file_id { v.push(s); }
-                }
-            } else {
-                for s in &r.symbols {
-                    if s.file_id == file_id { v.push(s.clone()); }
-                }
-            }
-            v
-        }
+        None => r.iter_symbols().filter(|s| s.file_id == file_id).collect(),
     };
     found.sort_by(|a, b| (a.line, a.col, &a.name).cmp(&(b.line, b.col, &b.name)));
     let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
     let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(r, s)).collect();
     serde_json::json!({
         "path": fe.display_path(&r.roots),
-        "lang": format!("{:?}", fe.kind),
+        "lang": fe.kind.as_str(),
         "symbols_total": found.len(),
         "symbols_shown": take,
         "symbols": arr,
@@ -2748,7 +2694,7 @@ fn symbol_to_json(r: &StoreReader, s: &SymbolRecord) -> serde_json::Value {
         "name": s.name,
         "fqn": s.fqn,
         "kind": s.kind.short(),
-        "lang": format!("{:?}", s.lang),
+        "lang": s.lang.as_str(),
         "path": path,
         "line": s.line,
         "col": s.col,
@@ -2762,7 +2708,7 @@ fn ref_to_json(r: &StoreReader, rr: &RefRecord) -> serde_json::Value {
     serde_json::json!({
         "name": rr.name,
         "ref_kind": rr.kind.short(),
-        "lang": format!("{:?}", rr.lang),
+        "lang": rr.lang.as_str(),
         "path": path,
         "line": rr.line,
         "col": rr.col,

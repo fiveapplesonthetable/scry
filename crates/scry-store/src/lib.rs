@@ -1470,6 +1470,31 @@ impl StoreReader {
     pub fn n_symbols(&self) -> usize {
         self.lazy_symbols.as_ref().map(|l| l.len()).unwrap_or(self.symbols.len())
     }
+
+    /// Iterate every symbol record, transparently using the lazy mmap
+    /// path when available. Single source of truth — previously the
+    /// `if let Some(lz) = ..lazy_symbols.as_ref() { ... } else { ... }`
+    /// dance was open-coded in 9 call sites across CLI + serve, easy
+    /// to forget when adding a new query type.
+    pub fn iter_symbols(&self) -> Box<dyn Iterator<Item = SymbolRecord> + '_> {
+        if let Some(lz) = self.lazy_symbols.as_ref() {
+            Box::new(lz.iter())
+        } else {
+            Box::new(self.symbols.iter().cloned())
+        }
+    }
+
+    /// Iterate every ref record, transparently using the lazy mmap
+    /// path. Same de-duplication motive as iter_symbols. Note this
+    /// does NOT apply the resolution sidecar — callers that want
+    /// resolved_to overrides should go through get_ref(idx).
+    pub fn iter_refs(&self) -> Box<dyn Iterator<Item = RefRecord> + '_> {
+        if let Some(lz) = self.lazy_refs.as_ref() {
+            Box::new(lz.iter())
+        } else {
+            Box::new(self.refs.iter().cloned())
+        }
+    }
     /// Total number of ref records, regardless of lazy/eager backing.
     pub fn n_refs(&self) -> usize {
         self.lazy_refs.as_ref().map(|l| l.len()).unwrap_or(self.refs.len())

@@ -374,6 +374,10 @@ impl StorePaths {
     /// file's entry begins in file_symbols.bin. Allows random access
     /// without scanning the whole packed file.
     pub fn file_symbols_offsets(&self) -> PathBuf { self.root.join("file_symbols_offsets.bin") }
+    /// Per-ref resolution overrides: packed u64-LE per ref_idx; 0 = unresolved,
+    /// other values are the resolved definition's id (matches SymbolRecord.id).
+    /// Produced by `scry build-resolutions`; reader honors it on get_ref().
+    pub fn ref_resolutions(&self) -> PathBuf { self.root.join("ref_resolutions.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1319,10 @@ pub struct StoreReader {
     /// to the linear scan path then. Retrofit via build-file-symbols.
     pub file_symbols_mmap: Option<memmap2::Mmap>,
     pub file_symbols_offsets_mmap: Option<memmap2::Mmap>,
+    /// Per-ref resolved-def-id overrides. Indexed by ref_idx; 0 ⇒
+    /// unresolved (use the RefRecord's own resolved_to, which may also
+    /// be None). Built post-finalize via `scry build-resolutions`.
+    pub ref_resolutions_mmap: Option<memmap2::Mmap>,
 }
 
 impl StoreReader {
@@ -1387,13 +1395,32 @@ impl StoreReader {
             }
             _ => (None, None),
         };
+        // Per-ref resolution overrides (Layer 2 sidecar). Optional.
+        let ref_resolutions_mmap = match File::open(paths.ref_resolutions()) {
+            Ok(f) => Some(unsafe { memmap2::Mmap::map(&f)? }),
+            Err(_) => None,
+        };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
             trigram_fst, trigram_postings_mmap,
             lazy_symbols, lazy_refs,
             file_symbols_mmap, file_symbols_offsets_mmap,
+            ref_resolutions_mmap,
         })
+    }
+
+    /// Apply the resolution sidecar override to a RefRecord, if present.
+    /// 0 in the sidecar = "no override; keep the record's own resolved_to".
+    pub fn apply_resolution_override(&self, ref_idx: u32, r: &mut RefRecord) {
+        let m = match self.ref_resolutions_mmap.as_ref() { Some(m) => m, None => return };
+        let o = (ref_idx as usize) * 8;
+        if o + 8 > m.len() { return; }
+        let id = match m[o..o + 8].try_into() {
+            Ok(b) => u64::from_le_bytes(b),
+            Err(_) => return,
+        };
+        if id != 0 { r.resolved_to = Some(id); }
     }
 
     /// O(1) lookup of all symbol indices defined in the given file.
@@ -1424,11 +1451,13 @@ impl StoreReader {
         }
     }
     pub fn get_ref(&self, idx: u32) -> Option<RefRecord> {
-        if let Some(l) = self.lazy_refs.as_ref() {
-            l.get(idx as usize)
+        let mut rec = if let Some(l) = self.lazy_refs.as_ref() {
+            l.get(idx as usize)?
         } else {
-            self.refs.get(idx as usize).cloned()
-        }
+            self.refs.get(idx as usize).cloned()?
+        };
+        self.apply_resolution_override(idx, &mut rec);
+        Some(rec)
     }
 
     /// Trigram pre-filter for literal grep. Returns Some(set of candidate

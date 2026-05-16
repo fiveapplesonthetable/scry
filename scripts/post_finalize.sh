@@ -44,6 +44,11 @@ t2=$(date +%s)
 $SCRY build-trigrams --index "$INDEX" --workers 16
 echo "step 2 took $(($(date +%s) - t2)) sec"
 
+echo "=== step 2b: build-resolutions (Layer 2 ref→def overrides) ==="
+t2b=$(date +%s)
+$SCRY build-resolutions --index "$INDEX"
+echo "step 2b took $(($(date +%s) - t2b)) sec"
+
 echo "=== final index layout ==="
 ls -la "$INDEX"
 

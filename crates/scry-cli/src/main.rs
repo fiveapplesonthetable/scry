@@ -314,6 +314,16 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Layer 2 ref-to-def resolution: per-ref override sidecar produced
+    /// by walking the index ONCE post-finalize. For each unresolved or
+    /// ambiguous ref, narrow candidates using language-specific context
+    /// (Java today: same package + explicit imports; same fallback to
+    /// name-match for everything else). Writes ref_resolutions.bin;
+    /// the reader honors it automatically on get_ref.
+    BuildResolutions {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -404,6 +414,7 @@ fn main() -> Result<()> {
         }
         Cmd::BuildOffsets { index } => cmd_build_offsets(index),
         Cmd::BuildFileSymbols { index } => cmd_build_file_symbols(index),
+        Cmd::BuildResolutions { index } => cmd_build_resolutions(index),
     }
 }
 
@@ -1610,6 +1621,7 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
                 "line": r.line,
                 "col": r.col,
                 "scope": r.scope_path,
+                "resolved_to": r.resolved_to,
             });
             println!("{}", obj);
         }
@@ -1623,13 +1635,17 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
         } else {
             format!("  [{}]", r.scope_path.join("::"))
         };
+        let resolved = r.resolved_to
+            .map(|id| format!("  → def:{:x}", id))
+            .unwrap_or_default();
         println!(
-            "{}:{}:{}  ({} {}){}  {}",
+            "{}:{}:{}  ({} {}){}  {}{}",
             path, r.line, r.col,
             r.kind.short(),
             short_lang(r.lang),
             scope,
             r.name,
+            resolved,
         );
     }
     eprintln!("\n{} refs (showing {})", refs.len(), refs.len().min(limit));
@@ -1952,6 +1968,206 @@ fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
         human_bytes(std::fs::metadata(paths.file_symbols_offsets()).map(|m| m.len()).unwrap_or(0)),
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// build-resolutions (Layer 2 ref→def resolution sidecar)
+// ---------------------------------------------------------------------------
+
+/// One-shot pass over the finalized index producing a u64-LE per-ref
+/// override (`ref_resolutions.bin`). Algorithm:
+///   1. Walk symbols once → name → Vec<(sym_idx, sym_id, file_id, lang)>
+///      and per_file_pkg (Java only) from kind=Package symbols.
+///   2. Walk refs once → for each ref, narrow candidates with the
+///      file's package + imports, fall back to plain name match, write
+///      the chosen def's u64 id to the sidecar (or 0 if unresolved).
+fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
+    use std::collections::HashMap;
+    use std::io::{BufWriter, Write};
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    eprintln!("[res] target index: {}", index_dir.display());
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+    let r = scry_store::StoreReader::open(&index_dir)?;
+    let n_refs = r.n_refs();
+    let n_syms = r.n_symbols();
+    if n_refs == 0 {
+        eprintln!("[res] no refs to resolve — skipping");
+        return Ok(());
+    }
+    eprintln!("[res] {} symbols, {} refs", n_syms, n_refs);
+
+    // --- Pass 1: build the symbol index. ---
+    let t1 = Instant::now();
+    let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+    // Per-file Java package (extracted via SymbolKind::Package). Computed
+    // in the same pass to avoid double-iterating the symbol vec.
+    let mut per_file_pkg: HashMap<u32, String> = HashMap::new();
+    let mut pass1 = |s: scry_store::SymbolRecord| {
+        if matches!(s.kind, scry_store::SymbolKind::Package)
+            && matches!(s.lang, scry_walker::FileKind::Java) {
+            per_file_pkg.insert(s.file_id, s.name.clone());
+        }
+        by_name.entry(s.name.clone()).or_default().push(ResolveDef {
+            id: s.id, file_id: s.file_id, lang: s.lang,
+            pkg: None, // filled in pass1b for Java type-defs
+        });
+    };
+    if let Some(lz) = r.lazy_symbols.as_ref() {
+        for s in lz.iter() { pass1(s); }
+    } else {
+        for s in &r.symbols { pass1(s.clone()); }
+    }
+    // Pass1b: stamp pkg on Java type-defs (Class/Interface/Enum) — small
+    // overhead, lets the resolver short-circuit by-package lookups
+    // without re-resolving file_id → pkg on every ref.
+    for entries in by_name.values_mut() {
+        for e in entries.iter_mut() {
+            if matches!(e.lang, scry_walker::FileKind::Java) {
+                if let Some(pkg) = per_file_pkg.get(&e.file_id) {
+                    e.pkg = Some(pkg.clone());
+                }
+            }
+        }
+    }
+    eprintln!("[res] pass 1 (by-name + per-file-pkg) in {} ms", t1.elapsed().as_millis());
+
+    // --- Pass 2: per-file import lists (Java). ---
+    let t2 = Instant::now();
+    let mut per_file_imports: HashMap<u32, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut process_import = |rr: &scry_store::RefRecord| {
+        if !matches!(rr.kind, scry_store::RefKind::Import) { return; }
+        if !matches!(rr.lang, scry_walker::FileKind::Java) { return; }
+        // For Java, the importer emits the import ref with name = the full
+        // qualified path. Split into pkg + simple name.
+        let (pkg, simple) = match rr.name.rsplit_once('.') {
+            Some((p, s)) => (Some(p.to_string()), s.to_string()),
+            None => (None, rr.name.clone()),
+        };
+        per_file_imports.entry(rr.file_id).or_default().push((simple, pkg));
+    };
+    if let Some(lz) = r.lazy_refs.as_ref() {
+        for i in 0..lz.len() { if let Some(rr) = lz.get(i) { process_import(&rr); } }
+    } else {
+        for rr in &r.refs { process_import(rr); }
+    }
+    eprintln!("[res] pass 2 (per-file imports: {} files) in {} ms",
+              per_file_imports.len(), t2.elapsed().as_millis());
+
+    // --- Pass 3: resolve every ref, write sidecar. ---
+    let t3 = Instant::now();
+    let tmp = paths.ref_resolutions().with_extension("bin.tmp");
+    let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
+    let mut resolved_count: u64 = 0;
+    let mut narrowed_count: u64 = 0;
+    let mut resolve_ref = |rr: &scry_store::RefRecord| -> Result<()> {
+        let chosen_id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
+                                     &mut narrowed_count);
+        if chosen_id != 0 { resolved_count += 1; }
+        ow.write_all(&chosen_id.to_le_bytes())?;
+        Ok(())
+    };
+    if let Some(lz) = r.lazy_refs.as_ref() {
+        for i in 0..lz.len() { if let Some(rr) = lz.get(i) { resolve_ref(&rr)?; } }
+    } else {
+        for rr in &r.refs { resolve_ref(rr)?; }
+    }
+    ow.flush()?;
+    drop(ow);
+    std::fs::rename(&tmp, paths.ref_resolutions())?;
+    eprintln!("[res] pass 3 (resolve {} refs, {} resolved, {} narrowed via Java context) in {} ms",
+              n_refs, resolved_count, narrowed_count, t3.elapsed().as_millis());
+    eprintln!("[res] DONE. {} bytes written → {}",
+        std::fs::metadata(paths.ref_resolutions()).map(|m| m.len()).unwrap_or(0),
+        paths.ref_resolutions().display());
+    Ok(())
+}
+
+/// Pick the best def for one ref. Returns the def's u64 id or 0 = unresolved.
+/// Updates `narrowed_count` when Java-aware narrowing makes the choice (vs
+/// plain name-match fallback).
+fn resolve_one(
+    rr: &scry_store::RefRecord,
+    by_name: &std::collections::HashMap<String, Vec<ResolveDef>>,
+    per_file_pkg: &std::collections::HashMap<u32, String>,
+    per_file_imports: &std::collections::HashMap<u32, Vec<(String, Option<String>)>>,
+    narrowed: &mut u64,
+) -> u64 {
+    let cands = match by_name.get(&rr.name) {
+        Some(c) if !c.is_empty() => c,
+        _ => return 0,
+    };
+    // Single candidate: trivially resolve.
+    if cands.len() == 1 { return cands[0].id; }
+
+    // Same-lang preference (mirrors the old Layer 1 behavior).
+    let same_lang: Vec<&ResolveDef> = cands.iter().filter(|c| c.lang == rr.lang).collect();
+    let pool: &[&ResolveDef] = if !same_lang.is_empty() { &same_lang[..] } else {
+        // Fall back to all candidates if no same-lang match (rare).
+        // Need to convert &[ResolveDef] to &[&ResolveDef] for the type.
+        // Simpler: pick first cand and return.
+        return cands[0].id;
+    };
+    if pool.len() == 1 { return pool[0].id; }
+
+    // Java-aware narrowing: prefer (same package) > (imported) > (java.lang) > anything.
+    if matches!(rr.lang, scry_walker::FileKind::Java) {
+        let my_pkg = per_file_pkg.get(&rr.file_id);
+        let imports = per_file_imports.get(&rr.file_id);
+
+        // 1. Same-package match.
+        if let Some(pkg) = my_pkg {
+            for c in pool {
+                if c.pkg.as_deref() == Some(pkg.as_str()) {
+                    *narrowed += 1;
+                    return c.id;
+                }
+            }
+        }
+        // 2. Explicit import match: `import x.y.Bar;` → resolve `Bar` only
+        //    if c's package == "x.y".
+        if let Some(imps) = imports {
+            for (simple, pkg) in imps {
+                if simple == &rr.name {
+                    if let Some(p) = pkg {
+                        for c in pool {
+                            if c.pkg.as_deref() == Some(p.as_str()) {
+                                *narrowed += 1;
+                                return c.id;
+                            }
+                        }
+                    }
+                }
+                if simple == "*" {
+                    if let Some(p) = pkg {
+                        for c in pool {
+                            if c.pkg.as_deref() == Some(p.as_str()) {
+                                *narrowed += 1;
+                                return c.id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 3. java.lang fallback.
+        for c in pool {
+            if c.pkg.as_deref() == Some("java.lang") {
+                *narrowed += 1;
+                return c.id;
+            }
+        }
+    }
+
+    // 4. Layer 1 fallback: pick first same-lang candidate.
+    pool[0].id
+}
+
+#[derive(Clone)]
+struct ResolveDef {
+    id: u64,
+    #[allow(dead_code)] file_id: u32,
+    lang: scry_walker::FileKind,
+    pkg: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2523,6 +2739,10 @@ fn ref_to_json(r: &StoreReader, rr: &RefRecord) -> serde_json::Value {
         "line": rr.line,
         "col": rr.col,
         "scope": rr.scope_path,
+        // resolved_to is the Layer 2 sidecar override (or Layer 1
+        // in-memory name match); 0 / null means we don't know the
+        // exact definition this ref points to.
+        "resolved_to": rr.resolved_to,
     })
 }
 

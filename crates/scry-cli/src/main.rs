@@ -193,6 +193,13 @@ enum Cmd {
         /// emits a one-line stderr note and returns unfiltered.
         #[arg(long)]
         reachable: bool,
+        /// Filter refs by clang USR identity: keep only refs whose
+        /// (file, byte_start) maps to the same USR as the def site.
+        /// Drops name-collision noise for C/C++/ObjC. Requires
+        /// `scry clang-index --compile-commands ... --index DIR` to
+        /// have been run first. No-op without the sidecar.
+        #[arg(long)]
+        clang_precise: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -229,6 +236,10 @@ enum Cmd {
         /// clangd path if both are passed.
         #[arg(long)]
         reachable: bool,
+        /// Filter callers by clang USR identity (see `scry ref
+        /// --clang-precise`). Requires `clang_usrs.bin` sidecar.
+        #[arg(long)]
+        clang_precise: bool,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -899,10 +910,10 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, distance, limit, json } => {
             cmd_fuzzy(substr, index, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable } => {
-            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable)
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable, clang_precise } => {
+            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, reachable, format } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, reachable, clang_precise, format } => {
             if precise {
                 // clangd path returns precise callers; reachable filter
                 // is composed on top there too (TODO: thread through —
@@ -911,7 +922,7 @@ fn main() -> Result<()> {
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
             // Fall through to the heuristic path with reachable filter.
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable)
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -2177,6 +2188,7 @@ fn cmd_ref(
     json: bool,
     format: Option<String>,
     reachable: bool,
+    clang_precise: bool,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2257,6 +2269,71 @@ fn cmd_ref(
                         "[scry] --reachable: {} → {} refs after module-graph \
                          reachability filter ({} callee modules)",
                         before, kept.len(), callee_modules.len(),
+                    );
+                    kept
+                }
+            }
+        }
+    } else {
+        filtered
+    };
+    // --clang-precise: drop refs whose (path, byte_start) doesn't
+    // map to the same USR as any def of the name. Requires the
+    // clang_usrs.bin sidecar produced by `scry clang-index`.
+    let filtered = if clang_precise {
+        let sidecar_path = r.paths.clang_usrs();
+        match scry_store::clang_usrs::ClangUsrIndex::open(&sidecar_path)? {
+            None => {
+                eprintln!(
+                    "[scry] --clang-precise: this index has no clang_usrs.bin \
+                     sidecar; run `scry clang-index --compile-commands FILE \
+                     --index DIR` first. Returning unfiltered.",
+                );
+                filtered
+            }
+            Some(cusr) => {
+                // Collect USR(s) for any def of `name`.
+                // Use a ±64-byte window for both def and ref lookups
+                // — clang's cursor location can sit at the keyword
+                // (struct/class/typedef) while scry's byte_start sits
+                // at the identifier. 64 covers all real-world widths
+                // without false positives across distinct decls.
+                const WINDOW: u32 = 64;
+                let defs = r.lookup_exact(&name);
+                let def_usrs: std::collections::HashSet<String> = defs
+                    .iter()
+                    .filter_map(|s| {
+                        let p = r.files.get(s.file_id as usize)?
+                            .display_path(&r.roots);
+                        cusr.usr_for_window(&p, s.byte_start, WINDOW)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                if def_usrs.is_empty() {
+                    eprintln!(
+                        "[scry] --clang-precise: no clang USR found for any def of \
+                         {name:?} (def site outside the indexed compile_commands?). \
+                         Returning unfiltered.",
+                    );
+                    filtered
+                } else {
+                    let before = filtered.len();
+                    let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
+                        let p = match r.files.get(rr.file_id as usize) {
+                            Some(fe) => fe.display_path(&r.roots),
+                            None => return true, // can't disprove → keep
+                        };
+                        match cusr.usr_for_window(&p, rr.byte_start, WINDOW) {
+                            Some(u) => def_usrs.contains(u),
+                            // No clang record for this site → keep
+                            // (it's a non-C/C++ file or an uncovered TU).
+                            None => true,
+                        }
+                    }).collect();
+                    eprintln!(
+                        "[scry] --clang-precise: {} → {} refs after USR identity \
+                         filter ({} def USRs)",
+                        before, kept.len(), def_usrs.len(),
                     );
                     kept
                 }
@@ -5921,6 +5998,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar."},
+                "clang_precise": {"type": "boolean", "default": false,
+                    "description": "Filter refs by clang USR identity (C/C++/ObjC name-collision pruning). No-op without the clang_usrs.bin sidecar (`scry clang-index ...`)."},
             })),
         ),
         tool(
@@ -5939,6 +6018,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present."},
+                "clang_precise": {"type": "boolean", "default": false,
+                    "description": "Same as on `ref` — clang USR identity filter; no-op without clang_usrs.bin."},
             })),
         ),
         tool(
@@ -6648,12 +6729,16 @@ fn serve_one_request<W: std::io::Write>(
         "ref"     => {
             let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable)
+            let clang_precise = args.get("clang_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise)
         }
         "callers" => {
             let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable)
+            let clang_precise = args.get("clang_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise)
         }
         "grep"    => {
             let ci = args.get("case_insensitive")
@@ -6888,6 +6973,7 @@ fn serve_ref(
     in_: Option<&str>,
     limit: usize,
     reachable: bool,
+    clang_precise: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     // Precompute the callee module set ONCE if --reachable + sidecar.
@@ -6904,6 +6990,20 @@ fn serve_ref(
     } else {
         None
     };
+    // Open the clang USR sidecar once (lazy: only if --clang-precise).
+    // Same alignment-window as the CLI path.
+    const CLANG_WINDOW: u32 = 64;
+    let cusr: Option<scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
+        scry_store::clang_usrs::ClangUsrIndex::open(&r.paths.clang_usrs()).ok().flatten()
+    } else {
+        None
+    };
+    let def_usrs: Option<std::collections::HashSet<String>> = cusr.as_ref().map(|c| {
+        r.lookup_exact(name).iter().filter_map(|s| {
+            let p = r.files.get(s.file_id as usize)?.display_path(&r.roots);
+            c.usr_for_window(&p, s.byte_start, CLANG_WINDOW).map(str::to_string)
+        }).collect()
+    });
     let mut out = Vec::new();
     for rr in r.lookup_refs_exact(name).into_iter() {
         if out.len() >= limit { break; }
@@ -6924,6 +7024,18 @@ fn serve_ref(
                     }
                 }
                 // Unattributed caller: pass through (same as CLI).
+            }
+        }
+        // Clang USR identity filter (Path B). Sites without a clang
+        // record pass through (non-C/C++ or uncovered TU).
+        if let (Some(c), Some(usrs)) = (cusr.as_ref(), def_usrs.as_ref()) {
+            if !usrs.is_empty() {
+                if let Some(fe) = r.files.get(rr.file_id as usize) {
+                    let p = fe.display_path(&r.roots);
+                    if let Some(u) = c.usr_for_window(&p, rr.byte_start, CLANG_WINDOW) {
+                        if !usrs.contains(u) { continue; }
+                    }
+                }
             }
         }
         out.push(ref_to_json(r, &rr));

@@ -40,6 +40,11 @@ pub struct ClangUsrIndex {
     /// same (path, offset) appears with multiple kinds (rare; e.g.
     /// definition-as-reference), the first record wins.
     by_loc: HashMap<(String, u32), u32>,
+    /// abs_path → sorted Vec<(byte_offset, usr_id)>. Used by
+    /// `usr_for_window` for fuzzy lookups when scry's byte_start
+    /// doesn't exactly match clang's cursor offset (e.g. scry's
+    /// struct identifier vs clang's struct keyword position).
+    by_path: HashMap<String, Vec<(u32, u32)>>,
 }
 
 impl ClangUsrIndex {
@@ -62,12 +67,22 @@ impl ClangUsrIndex {
         }
         let mut by_loc: HashMap<(String, u32), u32> =
             HashMap::with_capacity(sidecar.records.len());
+        let mut by_path: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
         for r in &sidecar.records {
             by_loc
                 .entry((r.abs_path.clone(), r.byte_offset))
                 .or_insert(r.usr_id);
+            by_path
+                .entry(r.abs_path.clone())
+                .or_default()
+                .push((r.byte_offset, r.usr_id));
         }
-        Ok(Some(Self { sidecar, by_loc }))
+        // Sort each per-path list by offset so usr_for_window can
+        // binary-search.
+        for v in by_path.values_mut() {
+            v.sort_by_key(|x| x.0);
+        }
+        Ok(Some(Self { sidecar, by_loc, by_path }))
     }
 
     /// Look up the USR for a (path, offset) pair. Returns None if no
@@ -76,6 +91,35 @@ impl ClangUsrIndex {
         self.by_loc
             .get(&(abs_path.to_string(), byte_offset))
             .and_then(|&id| self.sidecar.usr_table.get(id as usize).map(String::as_str))
+    }
+
+    /// Look up the USR for a site within ±`window` bytes of
+    /// `byte_offset`. Use this when the query and clang's cursor
+    /// disagree on whether to point at the keyword vs identifier
+    /// (e.g. tree-sitter struct decl byte_start = identifier, clang
+    /// CXCursor_StructDecl = keyword). Returns the USR of the
+    /// CLOSEST record within the window, or None if none.
+    pub fn usr_for_window(
+        &self,
+        abs_path: &str,
+        byte_offset: u32,
+        window: u32,
+    ) -> Option<&str> {
+        let entries = self.by_path.get(abs_path)?;
+        let lo = byte_offset.saturating_sub(window);
+        let hi = byte_offset.saturating_add(window);
+        let start = entries.partition_point(|(o, _)| *o < lo);
+        let mut best: Option<(u32, u32)> = None;
+        for (o, id) in entries.iter().skip(start) {
+            if *o > hi { break; }
+            let d = o.abs_diff(byte_offset);
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, *id));
+            }
+        }
+        best.and_then(|(_, id)| {
+            self.sidecar.usr_table.get(id as usize).map(String::as_str)
+        })
     }
 
     pub fn len(&self) -> usize { self.sidecar.records.len() }
@@ -126,6 +170,34 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&nope);
         assert!(ClangUsrIndex::open(&nope).unwrap().is_none());
+    }
+
+    #[test]
+    fn window_lookup_finds_closest_within_range() {
+        let tmp = std::env::temp_dir().join(format!("scry-cusr-win-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let s = UsrSidecar {
+            version: 1,
+            usr_table: vec!["c:@S@A".into(), "c:@S@B".into(), "c:@S@C".into()],
+            records: vec![
+                UsrRecord { abs_path: "/x/a.cc".into(), byte_offset: 100, usr_id: 0, kind: 0 },
+                UsrRecord { abs_path: "/x/a.cc".into(), byte_offset: 110, usr_id: 1, kind: 0 },
+                UsrRecord { abs_path: "/x/a.cc".into(), byte_offset: 500, usr_id: 2, kind: 0 },
+            ],
+        };
+        std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
+        let idx = ClangUsrIndex::open(&tmp).unwrap().unwrap();
+        // Exact hits still work via window.
+        assert_eq!(idx.usr_for_window("/x/a.cc", 100, 64), Some("c:@S@A"));
+        // Within window: 105 is closer to 100 than 110.
+        assert_eq!(idx.usr_for_window("/x/a.cc", 105, 64), Some("c:@S@A"));
+        // 107 is closer to 110 than 100 (dist 3 vs 7).
+        assert_eq!(idx.usr_for_window("/x/a.cc", 107, 64), Some("c:@S@B"));
+        // Outside window from 500: nothing.
+        assert_eq!(idx.usr_for_window("/x/a.cc", 200, 64), None);
+        // Unknown path → None.
+        assert_eq!(idx.usr_for_window("/x/none.cc", 100, 64), None);
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

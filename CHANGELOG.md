@@ -7,6 +7,44 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-05-16
+
+`--clang-precise` ref/callers filter — Path B's payoff. Uses the
+clang USR sidecar to drop name-collision noise for C/C++/ObjC: a
+ref is kept only if its `(file, byte_offset)` site maps to the same
+USR as the def. Wired into both the CLI and the JSON-RPC + MCP
+surfaces, with the same alignment-window the daemon uses internally.
+
+**What this fixes:**
+
+- Multiple decls of `Hash` / `Init` / similar common identifiers
+  across vendored deps no longer pollute `scry ref Hash`. The filter
+  keeps only the ref sites whose clang USR matches a def's USR.
+- Sites without a clang record (non-C/C++ files, or TUs the user
+  didn't pass to `scry clang-index`) pass through unchanged — the
+  filter only *removes* incorrect hits, never blocks lookups.
+
+**Wiring:**
+
+- CLI: `scry ref NAME --clang-precise`, `scry callers NAME --clang-precise`.
+- JSON-RPC: `{cmd: "ref", "args": {"clang_precise": true, ...}}`.
+- MCP: tools `ref` and `callers` advertise `clang_precise: boolean`.
+- All three compose with `--reachable` (build-graph reachability +
+  USR identity, applied in sequence).
+
+**Internals:**
+
+- New `ClangUsrIndex::usr_for_window(path, offset, window)` —
+  binary-searches the per-path sorted offset list and returns the
+  USR of the closest record within `±window` bytes. Defaults to a
+  64-byte window in both CLI and daemon paths because clang's
+  cursor location for struct/class/typedef decls sits at the
+  *keyword* while tree-sitter's `byte_start` sits at the
+  *identifier*. 64 covers all real-world widths without colliding
+  across distinct decls.
+- 5th unit test in `scry-store::clang_usrs` covers
+  `usr_for_window` (exact + window + miss + cross-path).
+
 ## [0.1.13] — 2026-05-16
 
 Path B precision (clang USR sidecar). Three new subcommands on the

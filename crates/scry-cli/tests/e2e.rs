@@ -675,6 +675,41 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.contains("Bravo") || stdout.contains("Charlie"),
             "regex alternation grep must find at least one: {stdout}");
 
+    // 8g'. Case-insensitive literal grep: lowercased needle must find
+    // the mixed-case symbol (e.g. `bravo` finds `Bravo`). Trigram
+    // pre-filter expands per-trigram case variants, then the inner
+    // regex matcher confirms with case_insensitive(true).
+    let out = Command::new(scry_bin())
+        .args(["grep", "-i", "bravo", "--index"]).arg(&inc_idx)
+        .args(["--limit", "10"])
+        .output().expect("ci literal grep");
+    assert!(out.status.success(),
+            "case-insensitive grep must not error: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Bravo"),
+            "ci literal grep must find mixed-case `Bravo`: {stdout}");
+    // And the case-sensitive default still does NOT match the lowercased query.
+    let out = Command::new(scry_bin())
+        .args(["grep", "bravo", "--index"]).arg(&inc_idx)
+        .args(["--limit", "10"])
+        .output().expect("cs literal grep");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("Bravo"),
+            "case-SENSITIVE grep MUST NOT find `Bravo` for lowercased query — that would prove the trigram pre-filter is leaking results: {stdout}");
+
+    // 8g''. Case-insensitive regex grep: explicit --regex + -i combine
+    // (RegexBuilder::case_insensitive(true) on the user-supplied pattern).
+    let out = Command::new(scry_bin())
+        .args(["grep", "--regex", "-i", "br.vo", "--index"]).arg(&inc_idx)
+        .args(["--limit", "10"])
+        .output().expect("ci regex grep");
+    assert!(out.status.success(),
+            "regex + -i grep must not error: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Bravo"),
+            "regex+i grep must find mixed-case `Bravo`: {stdout}");
+
     // 8h. Smoke-test the other CLI commands the agent audit flagged
     // as untested. Each one is a separate process invocation against
     // the synthetic index; we assert exit=0 + a basic shape check.
@@ -694,6 +729,48 @@ fn synthetic_tree_roundtrip() {
     assert_smoke(&["fuzzy", "Bravo", "--json"],    "Bravo",   "cmd_fuzzy");
     assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
+
+    // 8h-fail. Locks the `[fail] PATH kind=… size=… reason=…` log line
+    // the operator-facing parse-failure feature introduced in v0.1.11.
+    // Build a fixture with one unreadable file (chmod 000) alongside a
+    // good one, run `scry index`, scan stderr for the `[fail]` row and
+    // the path of the locked file. Then chmod back so the dir is
+    // deletable.
+    {
+        let fail_src = std::env::temp_dir().join(format!(
+            "scry-fail-fixture-{}", std::process::id()
+        ));
+        let fail_idx = std::env::temp_dir().join(format!(
+            "scry-fail-idx-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&fail_src).unwrap();
+        std::fs::write(fail_src.join("good.rs"), "fn ok() {}\n").unwrap();
+        let locked = fail_src.join("locked.java");
+        std::fs::write(&locked, "public class Locked {}\n").unwrap();
+        let mut perm = std::fs::metadata(&locked).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(0o000);
+        std::fs::set_permissions(&locked, perm).unwrap();
+        let out = Command::new(scry_bin())
+            .args(["index"]).arg(&fail_src)
+            .arg("-o").arg(&fail_idx)
+            .args(["--workers", "1"])
+            .output().expect("index with unreadable file");
+        // chmod back FIRST so cleanup always succeeds, even if asserts blow up
+        let mut perm = std::fs::metadata(&locked).unwrap().permissions();
+        perm.set_mode(0o644);
+        std::fs::set_permissions(&locked, perm).unwrap();
+        assert!(out.status.success(),
+                "index over fixture with unreadable file should still succeed; got: {}",
+                String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("[fail] ") && stderr.contains("locked.java"),
+                "[fail] log must name the unreadable path; stderr:\n{stderr}");
+        assert!(stderr.contains("kind=Java") && stderr.contains("reason="),
+                "[fail] log must carry kind=… reason=… for operator triage:\n{stderr}");
+        std::fs::remove_dir_all(&fail_src).ok();
+        std::fs::remove_dir_all(&fail_idx).ok();
+    }
 
     // 8h-bis-coverage. Pin the coverage --json envelope shape so that an
     // agent (or downstream consumer) can rely on field names. Adding new
@@ -1212,12 +1289,25 @@ fn tcp_serve_roundtrip() {
     writer.write_all(
         b"{\"id\":2,\"cmd\":\"stats\",\"args\":{}}\n"
     ).unwrap();
+    // grep with case_insensitive=true: source has `Hello` (capitalized),
+    // request `hello` lowercase — must come back with a hit. Without
+    // case_insensitive, this would return an empty array.
+    writer.write_all(
+        b"{\"id\":3,\"cmd\":\"grep\",\"args\":{\"pattern\":\"hello\",\"case_insensitive\":true}}\n"
+    ).unwrap();
+    writer.write_all(
+        b"{\"id\":4,\"cmd\":\"grep\",\"args\":{\"pattern\":\"hello\"}}\n"
+    ).unwrap();
     writer.flush().unwrap();
     let mut buf = String::new();
     let mut reader = BufReader::new(stream);
     reader.read_line(&mut buf).expect("read response 1");
     let mut buf2 = String::new();
     reader.read_line(&mut buf2).expect("read response 2");
+    let mut buf3 = String::new();
+    reader.read_line(&mut buf3).expect("read response 3");
+    let mut buf4 = String::new();
+    reader.read_line(&mut buf4).expect("read response 4");
 
     // Tear down the listener.
     child.kill().ok();
@@ -1232,6 +1322,22 @@ fn tcp_serve_roundtrip() {
     let r2: serde_json::Value = serde_json::from_str(buf2.trim())
         .expect("response 2 is JSON");
     assert_eq!(r2["id"].as_u64(), Some(2));
+    // grep CI: hits must include the `Hello` line.
+    let r3: serde_json::Value = serde_json::from_str(buf3.trim())
+        .expect("response 3 is JSON");
+    assert_eq!(r3["id"].as_u64(), Some(3));
+    let hits = r3["result"].as_array().expect("grep CI returns array");
+    assert!(!hits.is_empty(),
+            "grep with case_insensitive=true must find `Hello` for `hello`: {r3}");
+    assert!(hits.iter().any(|h| h["snippet"].as_str().unwrap_or("").contains("Hello")),
+            "CI grep snippets must contain `Hello`: {r3}");
+    // grep CS control: must return empty array (no `hello` lowercase in fixture).
+    let r4: serde_json::Value = serde_json::from_str(buf4.trim())
+        .expect("response 4 is JSON");
+    assert_eq!(r4["id"].as_u64(), Some(4));
+    let hits = r4["result"].as_array().expect("grep CS returns array");
+    assert!(hits.is_empty(),
+            "grep WITHOUT case_insensitive MUST NOT find `Hello` for `hello` (proves CI flag is the only thing flipping the behavior): {r4}");
 
     // Tee unread bytes into the void so the reader drops cleanly.
     let mut sink = Vec::new();

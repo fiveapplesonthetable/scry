@@ -90,10 +90,14 @@ enum Cmd {
         /// allocate GB-scale memory on pathological inputs; running such
         /// files concurrently can OOM the host between memory-stats polls.
         /// Serializing them bounds peak RAM to one big parse at a time.
-        /// Default 64 KiB — keeps the parallel hot path on small files
-        /// while ensuring no Vec-init-list explosion goes parallel.
-        #[arg(long, default_value_t = 64 * 1024)]
-        big_file_bytes: u64,
+        /// Unset (the default) auto-scales: when `--mem-cap N` is set,
+        /// target ~N × 16 KiB capped at 4 MiB (so a 100 GiB cap gets a
+        /// 1.6 MiB threshold — more files run parallel, peak transient
+        /// stays well under cap even under adversarial allocation
+        /// ratios); otherwise 64 KiB (the conservative default that
+        /// catches Vec-init-list-explosion regressions).
+        #[arg(long)]
+        big_file_bytes: Option<u64>,
         /// Soft memory ceiling in GiB. When jemalloc-reported allocated
         /// memory climbs above 80% of this value, parser workers WAIT
         /// (don't pick up new files) until the heap drains via batch
@@ -107,17 +111,25 @@ enum Cmd {
         /// Hard upper bound on files per batch. With --flush-bytes set this
         /// is just a sanity cap; the actual batch size adapts to hit the byte
         /// target. With --flush-bytes 0 this is the only knob (file-count
-        /// flushing, with proxy-for-memory semantics).
-        #[arg(long, default_value_t = 50_000)]
-        flush_every: usize,
+        /// flushing, with proxy-for-memory semantics). Unset (the default)
+        /// auto-scales: with `--mem-cap N` we raise the cap proportional to
+        /// the cap so the bytes-target flush_bytes can actually be reached
+        /// — otherwise the file-count cap fires first and the bytes target
+        /// is dead weight (e.g. 50k × 8 KB ≈ 400 MB while flush_bytes=25 GiB).
+        /// Formula: N × 50000 files per GiB of mem_cap, capped at 5 M files.
+        /// Without `--mem-cap`, defaults to 50 000.
+        #[arg(long)]
+        flush_every: Option<usize>,
         /// Target in-RAM record bytes per batch (MiB). The batch size adapts
         /// every iteration from a rolling avg of bytes/file so accumulated
         /// records stay close to this target. Bounded above by --flush-every.
-        /// 0 = disabled (fall back to file-count). Default 1024 MiB — bounds
-        /// steady-state record RAM to ~1 GiB on top of transient parse
-        /// allocation. Tune down on memory-constrained hosts.
-        #[arg(long, default_value_t = 1024)]
-        flush_bytes: u32,
+        /// 0 = disabled (fall back to file-count). Unset (the default)
+        /// auto-scales: when `--mem-cap` is set, target ≈ 25 % of cap so
+        /// finalize merges fewer chunks on big-memory hosts; otherwise
+        /// 1024 MiB. Tune down on memory-constrained hosts; tune up
+        /// when you have headroom you want spent on bigger batches.
+        #[arg(long)]
+        flush_bytes: Option<u32>,
         /// Resume from a previous run's checkpoint. If `<index>.tmp/`
         /// contains `batch.NNNNNN.done` markers, skip those batches' files
         /// and continue from the next one. Pairs with systemd
@@ -340,6 +352,11 @@ enum Cmd {
         index: Option<PathBuf>,
         #[arg(long)]
         regex: bool,
+        /// Case-insensitive match. Works for literal and regex patterns;
+        /// the trigram pre-filter expands each query trigram across its
+        /// ASCII case variants so this stays fast on big indexes.
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
         #[arg(long)]
         lang: Option<String>,
         #[arg(long, value_name = "PREFIX")]
@@ -484,6 +501,17 @@ enum Cmd {
         /// 32-64. Ignored in stdin/stdout mode.
         #[arg(long, default_value_t = 0)]
         max_conns: u32,
+    },
+    /// Prewarm the OS page cache with every sidecar in the index, so
+    /// subsequent queries land warm (sub-10 ms) instead of cold (50–
+    /// hundreds of ms). Sequential parallel read of every file in
+    /// the index dir; uses available RAM as page cache. `scry serve`
+    /// and `scry mcp` auto-run this on startup; use the standalone
+    /// command after a fresh boot before issuing queries, or before
+    /// a perf bench so you're measuring warm latency.
+    Warm {
+        #[arg(long)]
+        index: Option<PathBuf>,
     },
     /// Which Soong module declares PATH as one of its sources?
     /// Looks up the file's basename across Soong Import refs.
@@ -719,6 +747,27 @@ fn human_bytes(b: u64) -> String {
     format!("{:.1} {}", x, U[i])
 }
 
+/// Format a duration in seconds as a short human label suitable for
+/// inline progress output: `45s`, `12m30s`, `2h05m`. Caps at hours;
+/// indexing jobs that legitimately take days are out of scope.
+fn format_eta(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return String::from("—");
+    }
+    let total = secs.round() as u64;
+    if total < 60 {
+        return format!("{}s", total);
+    }
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m{s:02}s")
+    }
+}
+
 fn main() -> Result<()> {
     // CLI tools must die quietly when their stdout pipe closes
     // (e.g. `scry grep PATTERN | head`); the helper lives in
@@ -736,10 +785,24 @@ fn main() -> Result<()> {
                 cmd_index_incremental(roots, out, profile, workers,
                                       max_file_bytes, build_trigrams)
             } else {
+                // Auto-scale flush_every with mem_cap so the bytes-target
+                // flush_bytes is actually reachable. Without this the
+                // file-count cap (default 50_000) fires first and we
+                // never approach the bytes target.
+                let flush_every: usize = match flush_every {
+                    Some(v) => v,
+                    None => {
+                        if mem_cap > 0 {
+                            ((mem_cap as usize).saturating_mul(50_000)).min(5_000_000)
+                        } else {
+                            50_000
+                        }
+                    }
+                };
                 cmd_index(
                     roots, profile, out, count_only, limit, no_refs, workers,
-                    max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes,
-                    resume, build_trigrams,
+                    max_file_bytes, mem_cap, flush_every, flush_bytes,
+                    big_file_bytes, resume, build_trigrams,
                 )
             }
         }
@@ -768,14 +831,15 @@ fn main() -> Result<()> {
             cmd_outline(path, index, json, limit, with_snippets),
         Cmd::Tldr { path, index, json } => cmd_tldr(path, index, json),
         Cmd::Grep {
-            pattern, index, regex, lang, in_, limit, json, workers,
+            pattern, index, regex, ignore_case, lang, in_, limit, json, workers,
             max_file_bytes, mem_cap, format, explain,
         } => cmd_grep(
-            pattern, index, regex, lang, in_, limit, json, workers,
+            pattern, index, regex, ignore_case, lang, in_, limit, json, workers,
             max_file_bytes, mem_cap, format, explain,
         ),
         Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
         Cmd::Mcp { index } => cmd_mcp(index),
+        Cmd::Warm { index } => cmd_warm(index),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -841,13 +905,50 @@ fn cmd_index(
     no_refs: bool,
     workers: Option<usize>,
     max_file_bytes: u64,
-    big_file_bytes: u64,
     mem_cap: u32,
     flush_every: usize,
-    flush_bytes: u32,
+    flush_bytes: Option<u32>,
+    big_file_bytes: Option<u64>,
     resume: bool,
     build_trigrams: bool,
 ) -> Result<()> {
+    // Auto-scale `flush_bytes` if the user didn't set it. On big-memory
+    // hosts (e.g. --mem-cap 100), the static 1024 MiB default leaves
+    // tens of GiB of RAM unused while writing more chunks than needed,
+    // which lengthens finalize. Target ~25 % of the cap so workers can
+    // still run, mmap'd source files still page in, and there's
+    // headroom for transient tree-sitter allocations.
+    let flush_bytes: u32 = match flush_bytes {
+        Some(v) => v,
+        None => {
+            if mem_cap > 0 {
+                let auto_mib = (mem_cap as u64).saturating_mul(1024) / 4;
+                // Sanity cap at u32::MAX MiB (4 TiB target; absurdly high).
+                auto_mib.min(u32::MAX as u64) as u32
+            } else {
+                1024
+            }
+        }
+    };
+    // Auto-scale `big_file_bytes` similarly. The serial-bucket threshold
+    // exists to bound peak transient parse RAM across N workers. With a
+    // generous --mem-cap we can afford to keep more files on the parallel
+    // path. Scale: N × 16 KiB, capped at 4 MiB. A 100 GiB cap → 1.6 MiB
+    // threshold, which is large enough to keep most legitimate AOSP
+    // source on the parallel hot path (typical Java/C++ files are
+    // 50 KB–1 MB) while still serializing the multi-MB generated test
+    // fixtures that historically OOM'd the host.
+    let big_file_bytes: u64 = match big_file_bytes {
+        Some(v) => v,
+        None => {
+            if mem_cap > 0 {
+                let scaled = (mem_cap as u64).saturating_mul(16 * 1024);
+                scaled.min(4 * 1024 * 1024)
+            } else {
+                64 * 1024
+            }
+        }
+    };
     if let Some(n) = workers {
         if n > 0 {
             if let Err(e) = rayon::ThreadPoolBuilder::new()
@@ -1075,6 +1176,7 @@ fn cmd_index(
             }
             if !oom_skiplist.is_empty() {
                 eprintln!("[resume] OOM skiplist loaded: {} file(s)", oom_skiplist.len());
+                probe_oom_skiplist(&mut oom_skiplist, &skiplist_path);
             }
         }
     }
@@ -1115,13 +1217,17 @@ fn cmd_index(
                         writer.tmp_dir.as_ref().unwrap().display(),
                     );
                 }
-                // File-count drift between runs is the common case in AOSP
-                // (background processes touch the tree). A small drift means
-                // some files were inserted into the sorted walk, which COULD
-                // shift file_ids and misalign chunks. We warn loudly and let
-                // the operator decide — bailing on every drift makes the
-                // resume loop unusable in production.
+                // File-count drift between runs means the deterministic
+                // walk order produced a different number of files for a
+                // root, which silently shifts file_ids — any chunk record
+                // referencing file_id N past the insertion point would
+                // resolve to a different file than the one that was parsed
+                // when the chunk was written. The resulting index would be
+                // CORRUPT in a non-obvious way (lookups returning wrong
+                // paths). We refuse to resume rather than warn-and-hope.
                 let mut any_path_changed = false;
+                let mut any_drift = false;
+                let mut drift_details: Vec<String> = Vec::new();
                 for (i, rj) in want.iter().enumerate() {
                     let want_path = rj.get("path").and_then(|x| x.as_str()).unwrap_or("");
                     let want_n = rj.get("n_files").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -1136,18 +1242,27 @@ fn cmd_index(
                     }
                     let drift = (cur.files.len() as i64) - (want_n as i64);
                     if drift != 0 {
-                        eprintln!(
-                            "[resume] WARN: root[{}] file count drift {:+} ({} now vs {} in progress) \
-                             — file_ids past the insertion point may be misaligned; \
-                             chunks may contain stale references.",
+                        any_drift = true;
+                        drift_details.push(format!(
+                            "root[{}] {:+} files ({} now vs {} in progress)",
                             i, drift, cur.files.len(), want_n,
-                        );
+                        ));
                     }
                 }
                 if any_path_changed {
                     anyhow::bail!(
                         "resume: root path(s) changed — cannot continue. \
                          Remove {} and re-index without --resume.",
+                        writer.tmp_dir.as_ref().unwrap().display(),
+                    );
+                }
+                if any_drift {
+                    anyhow::bail!(
+                        "resume: file-count drift detected — refusing to continue \
+                         because file_ids past the insertion point would shift \
+                         and silently corrupt the index. Details:\n  {}\n\
+                         Remove {} and re-index without --resume.",
+                        drift_details.join("\n  "),
                         writer.tmp_dir.as_ref().unwrap().display(),
                     );
                 }
@@ -1194,6 +1309,13 @@ fn cmd_index(
         }
     }
 
+    // Anchor for whole-job progress. Used by the per-1000-file progress
+    // line below so users see "N of TOTAL_FILES_TOTAL files (P%)" with a
+    // throughput in files/sec — not just a per-batch counter that hides
+    // how close indexing is to done on a 1 M-file corpus.
+    let job_start = Instant::now();
+    let mut files_done_at_root_start: u64 = 0;
+
     // ----- per-root batched parse -----
     for pr in &prepared {
         let root_id = pr.root_id;
@@ -1237,6 +1359,13 @@ fn cmd_index(
             let symbols_total = Arc::new(AtomicU64::new(0));
             let refs_total = Arc::new(AtomicU64::new(0));
             let est_bytes = Arc::new(AtomicU64::new(0));
+            // Monotonic high-water mark over emitted progress milestones,
+            // measured in units of progress_step. Workers race past
+            // boundaries in parallel; without this they'd each see
+            // `p % step == 0` for the same milestone and print duplicates
+            // (observed in smoke test: "1000/51682" twice). fetch_max
+            // ensures exactly one thread crosses any given milestone.
+            let progress_milestone = Arc::new(AtomicU64::new(0));
 
             let syms_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.symbols));
             let refs_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.refs));
@@ -1252,35 +1381,75 @@ fn cmd_index(
             let outlier_ms: u128 = 250;
             let outlier_records: usize = 5_000;
 
-            // SIZE-ROUTED SCHEDULING: pre-split this batch into "small"
-            // (parallel-safe) and "big" (must serialize) buckets BEFORE
-            // opening any files — we already know rf.size from the walker.
-            // Big-bucket files run one-at-a-time so a single pathological
-            // tree-sitter parse can't compound across workers.
-            let (small_items, big_items): (Vec<_>, Vec<_>) = batch_files_slice
+            // Unified scheduling: every file goes through the parallel
+            // pool. The historical "big" bucket was serialized to bound
+            // peak transient RAM, but that cost 75+ seconds on a single
+            // 27 MB generated CPP file while all 64 workers sat idle.
+            // The user's explicit guidance is to USE the --mem-cap /
+            // --workers budget and rely on the existing backpressure
+            // stack: `await_memory_headroom` parks workers when
+            // jemalloc-reported allocation exceeds 85 % of `--mem-cap`,
+            // and if we still OOM the cgroup hard-kills and `--resume`
+            // recovers from the last batch flush.
+            //
+            // Sort hint: smallest-first. Counter-intuitive but right —
+            // largest-first would dispatch the multi-MB generated CPP
+            // monsters to workers immediately, leaving 60 workers idle
+            // waiting for the slowest 4 to finish 60–70 s parses.
+            // Smallest-first keeps all workers saturated through the
+            // bulk of the batch and only blocks on the giant tail in
+            // the final seconds. Total wall-clock is dominated by the
+            // slowest file regardless, but workers stay productive
+            // until then instead of starving from the start.
+            let mut all_items: Vec<_> = batch_files_slice
                 .iter()
                 .zip(batch_entries_slice.iter())
-                .partition(|(rf, _)| rf.size <= big_file_bytes);
-            if !big_items.is_empty() {
+                .collect();
+            all_items.sort_by_key(|(rf, _)| rf.size);
+            let n_big = all_items.iter().filter(|(rf, _)| rf.size > big_file_bytes).count();
+            if n_big > 0 {
                 eprintln!(
-                    "[route] batch {}: {} small (parallel), {} big (serial, > {})",
-                    batch_no, small_items.len(), big_items.len(),
-                    human_bytes(big_file_bytes),
+                    "[route] batch {}: {} files ({} larger than {} processed parallel under mem-budget)",
+                    batch_no, all_items.len(), n_big, human_bytes(big_file_bytes),
                 );
             }
 
-            // Helper closure — inlined parse + sink push + diagnostics.
-            // Called from both the parallel small pass and the serial big pass.
-            // Big-bucket files get their path recorded to a tmp sidecar
-            // BEFORE parse; if the cgroup OOM-kills us mid-parse, the next
-            // --resume run reads this and adds the file to oom_skiplist
-            // (self-healing — pathological files exclude themselves after
-            // one OOM, instead of looping forever on the same batch). When
-            // workers=1 (the safest defensive config), small-bucket files
-            // also mark_attempted since there's no concurrent write contention.
+            // Per-worker accumulator. The parallel small-file pass uses
+            // rayon's fold/reduce so each worker thread builds up its own
+            // (syms, refs, trigrams) vecs across files in its work
+            // share, and we only touch the global sinks O(workers) times
+            // per batch instead of O(files). This removes the per-file
+            // mutex-contention bottleneck that capped CPU at ~1700% on a
+            // 64-worker pool. The serial big-file pass writes through
+            // its own local accumulator and merges in once at the end.
+            #[derive(Default)]
+            struct LocalAccum {
+                syms: Vec<SymbolRecord>,
+                refs: Vec<RefRecord>,
+                trigrams: Vec<(scry_store::trigram::Trigram, u32)>,
+            }
+            impl LocalAccum {
+                fn merge(&mut self, other: LocalAccum) {
+                    self.syms.extend(other.syms);
+                    self.refs.extend(other.refs);
+                    self.trigrams.extend(other.trigrams);
+                }
+            }
+
+            // Helper closure — inlined parse + LOCAL accumulator push +
+            // diagnostics. Called from both the parallel small pass and
+            // the serial big pass. Big-bucket files get their path
+            // recorded to a tmp sidecar BEFORE parse; if the cgroup
+            // OOM-kills us mid-parse, the next --resume run reads this
+            // and adds the file to oom_skiplist (self-healing —
+            // pathological files exclude themselves after one OOM,
+            // instead of looping forever on the same batch). When
+            // workers=1 (the safest defensive config), small-bucket
+            // files also mark_attempted since there's no concurrent
+            // write contention.
             let last_attempted_path = writer.tmp_dir.as_ref()
                 .map(|t| t.join("last_attempted.txt"));
-            let process_one = |rf: &RawFile, fe: &FileEntry, mark_attempted: bool| {
+            let process_one = |rf: &RawFile, fe: &FileEntry, mark_attempted: bool, acc: &mut LocalAccum| {
                 await_memory_headroom();
                 let t_file = Instant::now();
                 let attempted = if mark_attempted { last_attempted_path.as_deref() } else { None };
@@ -1292,9 +1461,8 @@ fn cmd_index(
                 match result {
                     Ok(Ok((s, r, tgs))) => {
                         if !tgs.is_empty() {
-                            let mut sink = trigrams_sink.lock();
-                            sink.reserve(tgs.len());
-                            for t in tgs { sink.push((t, fe.id)); }
+                            acc.trigrams.reserve(tgs.len());
+                            for t in tgs { acc.trigrams.push((t, fe.id)); }
                         }
                         let total_recs = s.len() + r.len();
                         if elapsed_file_ms > outlier_ms || total_recs > outlier_records {
@@ -1313,53 +1481,124 @@ fn cmd_index(
                         for x in &s { batch_inc += x.estimated_bytes() as u64; }
                         for x in &r { batch_inc += x.estimated_bytes() as u64; }
                         est_bytes.fetch_add(batch_inc, Ordering::Relaxed);
-                        if !s.is_empty() { syms_sink.lock().extend(s); }
-                        if !r.is_empty() { refs_sink.lock().extend(r); }
+                        if !s.is_empty() { acc.syms.extend(s); }
+                        if !r.is_empty() { acc.refs.extend(r); }
                         let p = parsed.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-                        if p % progress_step == 0 {
+                        let m = p / progress_step;
+                        let prev = progress_milestone.fetch_max(m, Ordering::Relaxed);
+                        if m > prev && p > 0 {
+                            // Whole-job progress: files done across all
+                            // roots / total walked. files/sec is over the
+                            // full job (not just this batch) so it stays
+                            // a useful ETA signal across batch boundaries.
+                            let job_done = files_done_at_root_start + p;
+                            let job_total = total_files_total.max(job_done);
+                            let pct = if job_total > 0 {
+                                (job_done as f64 / job_total as f64) * 100.0
+                            } else { 100.0 };
+                            let secs = job_start.elapsed().as_secs_f64().max(0.001);
+                            let fps = job_done as f64 / secs;
+                            let eta = if fps > 0.0 && job_total > job_done {
+                                let remaining = (job_total - job_done) as f64 / fps;
+                                format_eta(remaining)
+                            } else { String::from("—") };
                             eprintln!(
-                                "[batch{}] {} files done, {} syms, {} refs, ~{} in-RAM",
-                                batch_no, p,
+                                "[progress] {}/{} files ({:.1}%) · {:.0} f/s · ETA {} · batch {} · {} syms · {} refs",
+                                job_done, job_total, pct, fps, eta,
+                                batch_no,
                                 symbols_total.load(Ordering::Relaxed),
                                 refs_total.load(Ordering::Relaxed),
-                                human_bytes(est_bytes.load(Ordering::Relaxed)),
                             );
                         }
                     }
-                    _ => { failed.fetch_add(1, Ordering::Relaxed); }
+                    Ok(Err(e)) => {
+                        // Parser-level error (tree-sitter returned no tree,
+                        // I/O failure reading the file, format registry
+                        // refused the kind, etc.). Logged at one line per
+                        // file so operators can `grep ^\[fail\]` the build
+                        // log and triage what didn't parse. The counter
+                        // still increments so the final DONE line reports
+                        // it under `files_failed`.
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[fail] {} kind={:?} size={} reason={}",
+                            rf.path.display(), rf.kind,
+                            human_bytes(rf.size), e,
+                        );
+                    }
+                    Err(panic_payload) => {
+                        // catch_unwind caught a panic inside tree-sitter or
+                        // one of the extractors. The payload is usually
+                        // String / &str; format defensively in case it
+                        // isn't, so we always print something useful.
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        let msg: String = if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                            (*s).to_string()
+                        } else {
+                            String::from("<panic payload not a string>")
+                        };
+                        eprintln!(
+                            "[fail-panic] {} kind={:?} size={} panic={}",
+                            rf.path.display(), rf.kind,
+                            human_bytes(rf.size), msg,
+                        );
+                    }
                 }
             };
 
-            // 1. Parallel pass over small files (the bulk of the corpus).
-            // At workers=1 there's no concurrent write race on last_attempted,
-            // so small files mark too — needed to identify single-worker OOMs.
-            let small_marks_attempted = rayon::current_num_threads() == 1;
-            small_items.par_iter().for_each(|(rf, fe)| process_one(rf, fe, small_marks_attempted));
-
-            // 2. Serial pass over big files — guarantees ONE big tree-sitter
-            //    parse in flight at a time. Peak transient RAM ≈ one big
-            //    file's pathological allocation (bounded to a few GB) rather
-            //    than N × that. This is the actual fix for the 100ms-burst
-            //    OOM that polling-backpressure can't catch.
-            for (rf, fe) in &big_items {
-                process_one(rf, fe, true);
-            }
-            // Clear the last-attempted marker after the batch's big files
-            // finished — only an UNCLEARED marker on resume means OOM.
+            // Unified parallel pass: every file (small or big) goes
+            // through fold + reduce per-worker accumulation. With the
+            // largest-first sort above, the work-stealing queue picks
+            // up the most expensive parses first; smaller files fill
+            // in around them. Marks-attempted is OFF unless workers=1
+            // (with N parallel writers to last_attempted.txt the file
+            // is racy and recovers the wrong path on OOM); we rely on
+            // cgroup + --resume + skiplist-probe instead.
+            let marks_attempted = rayon::current_num_threads() == 1;
+            let batch_accum: LocalAccum = all_items.par_iter()
+                .fold(
+                    LocalAccum::default,
+                    |mut acc, (rf, fe)| {
+                        process_one(rf, fe, marks_attempted, &mut acc);
+                        acc
+                    },
+                )
+                .reduce(
+                    LocalAccum::default,
+                    |mut a, b| { a.merge(b); a },
+                );
+            // Clear the last-attempted marker after the batch finished
+            // — only an UNCLEARED marker on resume means OOM during
+            // workers=1 mode.
             if let Some(p) = last_attempted_path.as_ref() {
                 let _ = std::fs::remove_file(p);
             }
 
-            writer.symbols = syms_sink.into_inner();
-            writer.refs = refs_sink.into_inner();
-            // Drain the trigram sink into the writer's pending buffer.
-            if build_trigrams {
-                let sink = trigrams_sink.into_inner();
-                if !sink.is_empty() {
-                    if let Some(buf) = writer.trigrams.as_mut() {
-                        buf.reserve(sink.len());
-                        buf.extend(sink);
-                    }
+            // Merge the batch accumulator back into the writer. Three
+            // appends total per batch regardless of file count or
+            // worker count — this is the contention fix landed earlier.
+            // (syms_sink / refs_sink / trigrams_sink are now unused
+            // for the parse pass; we keep them only as the pre-existing
+            // storage that writer.symbols / writer.refs were
+            // temporarily taken from at the top of the batch.)
+            let mut combined_syms = syms_sink.into_inner();
+            let mut combined_refs = refs_sink.into_inner();
+            let mut combined_trigrams = trigrams_sink.into_inner();
+            combined_syms.reserve(batch_accum.syms.len());
+            combined_syms.extend(batch_accum.syms);
+            combined_refs.reserve(batch_accum.refs.len());
+            combined_refs.extend(batch_accum.refs);
+            combined_trigrams.reserve(batch_accum.trigrams.len());
+            combined_trigrams.extend(batch_accum.trigrams);
+            writer.symbols = combined_syms;
+            writer.refs = combined_refs;
+            // Drain the trigram accumulator into the writer's pending buffer.
+            if build_trigrams && !combined_trigrams.is_empty() {
+                if let Some(buf) = writer.trigrams.as_mut() {
+                    buf.reserve(combined_trigrams.len());
+                    buf.extend(combined_trigrams);
                 }
             }
 
@@ -1409,6 +1648,12 @@ fn cmd_index(
                 human_bytes(bytes_n), batch_start.elapsed().as_millis(),
                 avg_bytes_per_file as u64,
             );
+            // Roll the whole-job counter forward by THIS batch's contribution
+            // (parsed + failed = every attempted file). Done after the batch
+            // log so the next batch's [progress] line reflects post-batch
+            // state — important when a batch lands hundreds of files past
+            // the last 1000-step boundary.
+            files_done_at_root_start += parsed_n + failed_n;
 
             // Soft cap warning if a single batch already exceeded it.
             if mem_cap_bytes > 0 && bytes_n > soft_cap {
@@ -1466,6 +1711,70 @@ fn cmd_index(
     );
     heartbeat_stop.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Re-test each entry in the OOM skiplist with the current binary and the
+/// current per-parse timeout. Drop entries that now parse cleanly (or that
+/// no longer exist / no longer classify as source). Self-heals stale
+/// entries from older binaries that didn't have the parse timeout.
+///
+/// Safe to call unconditionally: the per-parse timeout caps any retry at
+/// ~5 s, so even an entry that truly hangs the parser can't reblock the
+/// indexer. If the retry succeeds, the file goes back into the rotation;
+/// if it times out again, the entry stays in the skiplist for the run.
+fn probe_oom_skiplist(
+    skiplist: &mut std::collections::HashSet<String>,
+    skiplist_path: &Path,
+) {
+    if skiplist.is_empty() { return; }
+    let probe_start = Instant::now();
+    let mut to_drop: Vec<String> = Vec::new();
+    for path_str in skiplist.iter() {
+        let p = Path::new(path_str);
+        if !p.exists() {
+            to_drop.push(path_str.clone());
+            continue;
+        }
+        let kind = match FileKind::classify(p) {
+            Some(k) => k,
+            None => {
+                // File still exists but no longer classifies as a source
+                // we care about — irrelevant going forward.
+                to_drop.push(path_str.clone());
+                continue;
+            }
+        };
+        let md = match std::fs::metadata(p) { Ok(m) => m, _ => continue };
+        // Skip the probe for very large files — they'd time out anyway and
+        // probing isn't free. The walker's per-file size cap is what bounds
+        // these at index time.
+        if md.len() > 10 * 1024 * 1024 { continue; }
+        let bytes = match std::fs::read(p) { Ok(b) => b, _ => continue };
+        if scry_lang::extract(kind, &bytes).is_ok() {
+            to_drop.push(path_str.clone());
+        }
+    }
+    let drop_count = to_drop.len();
+    for p in &to_drop { skiplist.remove(p); }
+    if drop_count > 0 {
+        let new_contents = if skiplist.is_empty() {
+            String::new()
+        } else {
+            let mut v: Vec<&String> = skiplist.iter().collect();
+            v.sort();
+            v.into_iter().cloned().collect::<Vec<_>>().join("\n") + "\n"
+        };
+        let _ = std::fs::write(skiplist_path, new_contents);
+        eprintln!(
+            "[resume] OOM skiplist probe: dropped {} stale entry/entries ({} ms; {} remain)",
+            drop_count, probe_start.elapsed().as_millis(), skiplist.len(),
+        );
+    } else {
+        eprintln!(
+            "[resume] OOM skiplist probe: all {} entries still problematic ({} ms)",
+            skiplist.len(), probe_start.elapsed().as_millis(),
+        );
+    }
 }
 
 /// Write `progress.json` via tmp-then-rename so the file either reflects the
@@ -2731,6 +3040,7 @@ fn cmd_grep(
     pattern: String,
     index: Option<PathBuf>,
     is_regex: bool,
+    ignore_case: bool,
     lang: Option<String>,
     in_: Option<String>,
     limit: usize,
@@ -2831,8 +3141,19 @@ fn cmd_grep(
         }
     }
     let r = open_index(index)?;
+    // `re` is set when either --regex is on, OR --ignore-case is on for a
+    // literal pattern (we route literal-CI through regex::bytes with
+    // case_insensitive(true) so the inner matcher Just Works).
     let re = if is_regex {
-        Some(regex::bytes::Regex::new(&pattern).context("invalid regex")?)
+        Some(regex::bytes::RegexBuilder::new(&pattern)
+            .case_insensitive(ignore_case)
+            .build()
+            .context("invalid regex")?)
+    } else if ignore_case {
+        Some(regex::bytes::RegexBuilder::new(&regex::escape(&pattern))
+            .case_insensitive(true)
+            .build()
+            .expect("escaped literal must compile"))
     } else {
         None
     };
@@ -2844,12 +3165,19 @@ fn cmd_grep(
     // trigram index to get the set of files that COULD contain the needle.
     // This is the 100× rg path: instead of scanning every file matching
     // lang/prefix, we open only the files containing the pattern's trigrams.
-    // Regex queries skip this (a regex could match anything).
+    // Regex queries skip this (a regex could match anything). In CI mode
+    // we expand each trigram across its ASCII case variants and union
+    // their postings (≤ 8× per trigram, then intersect across positions).
     let trigram_candidates: Option<std::collections::HashSet<u32>> = if !is_regex {
         let t_tg = Instant::now();
-        let cs = r.grep_candidates(pattern.as_bytes());
+        let cs = if ignore_case {
+            r.grep_candidates_ci(pattern.as_bytes())
+        } else {
+            r.grep_candidates(pattern.as_bytes())
+        };
         if let Some(ref c) = cs {
-            eprintln!("[grep] trigram pre-filter: {} candidate files in {} ms",
+            eprintln!("[grep] trigram pre-filter{}: {} candidate files in {} ms",
+                if ignore_case { " (CI)" } else { "" },
                 c.len(), t_tg.elapsed().as_millis());
         }
         cs
@@ -3020,7 +3348,12 @@ fn cmd_grep(
             eprintln!("\n{} hits across {} files", hits.len(), total_files);
         }
     }
-    let label = if is_regex { "grep-regex" } else { "grep" };
+    let label = match (is_regex, ignore_case) {
+        (true,  true)  => "grep-regex-i",
+        (true,  false) => "grep-regex",
+        (false, true)  => "grep-i",
+        (false, false) => "grep",
+    };
     log_query_with_files(&r, label, &pattern, hits.len(), hits.len(), t, Some(total_files));
     Ok(())
 }
@@ -5264,7 +5597,11 @@ fn truncate_query_for_display(s: &str, max: usize) -> String {
 /// Notifications (no `id`) are consumed silently as the spec requires.
 fn cmd_mcp(index: Option<PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
+    let resolved = index.clone().unwrap_or_else(default_index_dir);
     let reader = open_index(index)?;
+    // Auto-warm: same rationale as cmd_serve — the first agent /
+    // Claude tool call shouldn't pay cold-mmap latency.
+    let _ = warm_index_dir(&resolved);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -5475,7 +5812,10 @@ fn mcp_tools_list_result() -> serde_json::Value {
         tool(
             "grep",
             "Content search across indexed source. Literal pattern \
-             unless `regex: true`. For 'is X mentioned at all?' \
+             unless `regex: true`. Set `case_insensitive: true` for \
+             case-folded match (e.g. 'bindservice' finds 'bindService') \
+             — trigram pre-filter expands across case variants so this \
+             stays fast on big indexes. For 'is X mentioned at all?' \
              prefer `format: 'count'`; for 'list all hits' use \
              `format: 'lines'` (rg-shape, much cheaper in tokens \
              than the default JSON envelope).",
@@ -5483,6 +5823,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "pattern": {"type": "string"},
                 "regex":   {"type": "boolean", "default": false,
                     "description": "Treat pattern as a regex. Default is literal substring."},
+                "case_insensitive": {"type": "boolean", "default": false,
+                    "description": "Match case-insensitively. Works for literal and regex patterns. Trigram pre-filter expands each query trigram across ASCII case variants so this stays fast."},
                 "lang":    lang_prop,
                 "in":      in_prop,
                 "limit":   limit_prop,
@@ -5695,11 +6037,79 @@ fn mcp_validate_required_args(tool: &str, args: &serde_json::Value) -> Option<St
 /// by every connection; mmap-backed and immutable, so no synchronization
 /// is needed across concurrent clients.
 fn cmd_serve(index: Option<PathBuf>, listen: Option<String>, max_conns: u32) -> Result<()> {
+    let resolved = index.clone().unwrap_or_else(default_index_dir);
     let reader = open_index(index)?;
+    // Daemon auto-warm: prefault every sidecar into the OS page cache
+    // BEFORE accepting connections. Without this the first agent to
+    // query pays cold-mmap latency (tens to hundreds of ms per file
+    // depending on which sidecar gets touched first). The warm pass
+    // runs once per daemon process and is a fixed cost; per-request
+    // latency stays sub-10 ms warm for the daemon's lifetime.
+    let _ = warm_index_dir(&resolved);
     match listen.as_deref() {
         None => serve_stdio(&reader),
         Some(spec) => serve_listener(&reader, spec, max_conns),
     }
+}
+
+/// Run the warm pass and print a one-line summary. Standalone
+/// `scry warm --index DIR` entrypoint; the daemon paths call
+/// `warm_index_dir` directly without the summary print.
+fn cmd_warm(index: Option<PathBuf>) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    if !dir.is_dir() {
+        anyhow::bail!("not an index directory: {}", dir.display());
+    }
+    let t = Instant::now();
+    let stats = warm_index_dir(&dir)?;
+    eprintln!(
+        "[warm] {} files, {} read in {} ms — page cache primed",
+        stats.files, human_bytes(stats.bytes), t.elapsed().as_millis(),
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct WarmStats { files: u64, bytes: u64 }
+
+/// Prefault every regular file in the index directory into the OS
+/// page cache. Parallel one-file-per-rayon-task; each file gets a
+/// posix_fadvise(WILLNEED) hint followed by a sequential read pass
+/// (the actual fault-in — fadvise alone is just a kernel scheduler
+/// hint and doesn't guarantee residency). Errors are swallowed
+/// (warming is best-effort; a partial warmup is still useful).
+fn warm_index_dir(dir: &Path) -> Result<WarmStats> {
+    use rayon::prelude::*;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => return Ok(WarmStats::default()),
+    };
+    let bytes = AtomicU64::new(0);
+    entries.par_iter().for_each(|p| {
+        scry_store::prefault_path(p);
+        if let Ok(mut f) = std::fs::File::open(p) {
+            let mut buf = vec![0u8; 1 << 20];
+            let mut n: u64 = 0;
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(k) => n += k as u64,
+                    Err(_) => break,
+                }
+            }
+            bytes.fetch_add(n, Ordering::Relaxed);
+        }
+    });
+    Ok(WarmStats {
+        files: entries.len() as u64,
+        bytes: bytes.load(Ordering::Relaxed),
+    })
 }
 
 /// Stdin/stdout transport: one-shot agent loops, ad-hoc CLI experiments.
@@ -5977,7 +6387,12 @@ fn serve_one_request<W: std::io::Write>(
         }
         "ref"     => serve_ref(reader, arg_str("name"), lang, kind, in_, limit),
         "callers" => serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit),
-        "grep"    => serve_grep(reader, arg_str("pattern"), lang, in_, limit),
+        "grep"    => {
+            let ci = args.get("case_insensitive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            serve_grep(reader, arg_str("pattern"), lang, in_, limit, ci)
+        }
         "outline" => serve_outline(reader, arg_str("path"), limit),
         "tldr"    => serve_tldr(reader, arg_str("path")),
         "coverage" => serve_coverage(reader, arg_str("path"),
@@ -6230,13 +6645,32 @@ fn serve_grep(
     lang: Option<&str>,
     in_: Option<&str>,
     limit: usize,
+    case_insensitive: bool,
 ) -> serde_json::Value {
     if pattern.is_empty() {
         return serde_json::json!({"error": "empty pattern"});
     }
     let prefix = in_.unwrap_or("");
     let needle = pattern.as_bytes();
-    let candidates: Option<std::collections::HashSet<u32>> = r.grep_candidates(needle);
+    let candidates: Option<std::collections::HashSet<u32>> = if case_insensitive {
+        r.grep_candidates_ci(needle)
+    } else {
+        r.grep_candidates(needle)
+    };
+    // CI matches are compiled once as `regex::bytes` with case_insensitive(true);
+    // the literal pattern is escaped first so meta-characters stay literal.
+    let ci_re: Option<regex::bytes::Regex> = if case_insensitive {
+        match regex::bytes::RegexBuilder::new(&regex::escape(pattern))
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(re) => Some(re),
+            // Escaped-literal compiles deterministically, but guard anyway.
+            Err(e) => return serde_json::json!({"error": format!("regex build: {e}")}),
+        }
+    } else {
+        None
+    };
     let mut out: Vec<serde_json::Value> = Vec::new();
     // Soft cap on files scanned even when trigram returns many — keeps a
     // bad query (e.g. "the") from blocking the serve loop for seconds.
@@ -6264,24 +6698,39 @@ fn serve_grep(
             Ok(b) => b,
             Err(_) => continue,
         };
-        // memmem search through the file; cap matches per-file to avoid
-        // pathological hits (e.g. every line) eating the limit.
-        let mut start_at = 0usize;
         let mut per_file = 0usize;
-        while let Some(off) = memchr::memmem::find(&bytes[start_at..], needle) {
-            let abs = start_at + off;
-            let (line, col, snippet) = locate_match(&bytes, abs, abs + needle.len());
-            out.push(serde_json::json!({
-                "path": path,
-                "line": line,
-                "col": col,
-                "snippet": snippet,
-                "lang": fe.kind.as_str(),
-            }));
-            per_file += 1;
-            if out.len() >= limit || per_file >= 16 { break; }
-            start_at = abs + needle.len().max(1);
-            if start_at >= bytes.len() { break; }
+        if let Some(re) = &ci_re {
+            for m in re.find_iter(&bytes) {
+                let (line, col, snippet) = locate_match(&bytes, m.start(), m.end());
+                out.push(serde_json::json!({
+                    "path": path,
+                    "line": line,
+                    "col": col,
+                    "snippet": snippet,
+                    "lang": fe.kind.as_str(),
+                }));
+                per_file += 1;
+                if out.len() >= limit || per_file >= 16 { break; }
+            }
+        } else {
+            // memmem search through the file; cap matches per-file to avoid
+            // pathological hits (e.g. every line) eating the limit.
+            let mut start_at = 0usize;
+            while let Some(off) = memchr::memmem::find(&bytes[start_at..], needle) {
+                let abs = start_at + off;
+                let (line, col, snippet) = locate_match(&bytes, abs, abs + needle.len());
+                out.push(serde_json::json!({
+                    "path": path,
+                    "line": line,
+                    "col": col,
+                    "snippet": snippet,
+                    "lang": fe.kind.as_str(),
+                }));
+                per_file += 1;
+                if out.len() >= limit || per_file >= 16 { break; }
+                start_at = abs + needle.len().max(1);
+                if start_at >= bytes.len() { break; }
+            }
         }
     }
     serde_json::Value::Array(out)
@@ -6581,6 +7030,23 @@ fn short_lang(k: FileKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `format_eta` contract used by the `[progress]` line. Crosses the
+    /// 60s and 1h boundaries cleanly; bad inputs (NaN, negative) render
+    /// as `—` so the progress line stays readable instead of printing
+    /// `NaN` or a negative duration.
+    #[test]
+    fn format_eta_renders_short_medium_long() {
+        assert_eq!(format_eta(0.0), "0s");
+        assert_eq!(format_eta(45.0), "45s");
+        assert_eq!(format_eta(59.4), "59s");
+        assert_eq!(format_eta(60.0), "1m00s");
+        assert_eq!(format_eta(750.0), "12m30s");
+        assert_eq!(format_eta(3600.0), "1h00m");
+        assert_eq!(format_eta(7530.0), "2h05m");
+        assert_eq!(format_eta(f64::NAN), "—");
+        assert_eq!(format_eta(-5.0), "—");
+    }
 
     /// Rotation: writing a 200-byte file with cap=100 → rename to
     /// {path}.1 on the next rotate_log_if_oversized call; the

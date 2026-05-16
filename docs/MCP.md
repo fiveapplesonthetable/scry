@@ -59,7 +59,7 @@ Any other method gets a JSON-RPC `-32601` (method not found) error.
 | `callers`  | `name`        | `lang`, `in`, `limit`                  | references with `kind=call`            |
 | `prefix`   | `prefix`      | `in`, `limit`                          | symbols whose name starts with PREFIX  |
 | `fuzzy`    | `substr`      | `in`, `distance`, `limit`              | edit-distance-ranked symbol matches    |
-| `grep`     | `pattern`     | `lang`, `in`, `limit`                  | content matches (literal pattern)      |
+| `grep`     | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `limit`, `format` | content matches (literal substring; `regex: true` for regex; `case_insensitive: true` for case-folded match) |
 | `outline`  | `path`        | `limit`                                | every symbol in the file, by line      |
 | `coverage` | `path`        | `by_kind`                              | per-language file/byte/symbol counts   |
 | `stats`    | —             | —                                      | index metadata                         |

@@ -290,6 +290,7 @@ $ scry grep '\bZygoteInit\b' --regex --limit 2
 | short | long                  | what                                         |
 |------:|-----------------------|----------------------------------------------|
 |       | `--regex`             | Treat PATTERN as a regex (else literal)      |
+| `-i`  | `--ignore-case`       | Case-insensitive match (literal or regex). Trigram pre-filter expands across ASCII case variants so it stays fast. |
 | `-t`  | `--lang LANG`         | Filter by language                           |
 |       | `--in SUBSTR`         | Restrict to files whose path contains SUBSTR |
 |       | `--limit N`           | Cap hits (default 100)                       |
@@ -299,6 +300,24 @@ $ scry grep '\bZygoteInit\b' --regex --limit 2
 |       | `--json`              | NDJSON (one object per hit)                  |
 |       | `--format lines`      | `path:line:col\tsnippet`, one hit per line   |
 |       | `--format count`      | Just `N hits across M files` — no per-hit rows |
+
+### Case-insensitive grep (`-i` / `--ignore-case`)
+
+`bindservice` should find `bindService`. Pass `-i`:
+
+```sh
+$ scry grep -i bindservice --limit 3
+.../IServiceManager.java:42:23:    public IBinder bindService(...) {
+[grep] trigram pre-filter (CI): 2913 candidate files in 18 ms
+```
+
+How it stays fast: for each 3-byte trigram of the query, the
+pre-filter unions the posting lists of every ASCII case variant
+(≤ 8 per trigram), then intersects across positions. The inner
+matcher is `regex::bytes` compiled with `case_insensitive(true)`
+from a regex-escaped form of the literal — so meta-characters in
+the pattern stay literal. Same shape works with `--regex -i` for
+case-folded regex.
 
 ### Compact output (`--format`)
 
@@ -904,6 +923,26 @@ sub-second for small change sets.
 # with the right knobs + cgroup-protected systemd unit).
 $ scry index ~/dev/aosp /mnt/agent/dev/linux -o /mnt/agent/scry-index \
     --workers 16 --mem-cap 40 --resume --build-trigrams
+[walk]  /home/zim/dev/aosp (profile: Aosp)
+[walk]  978214 files / 73.4 GB / 8412 ms
+[walk]  /mnt/agent/dev/linux (profile: Linux)
+[walk]  30947 files / 1.2 GB / 412 ms
+[progress] 1000/1009161 files (0.1%) · 12834 f/s · ETA 1m18s · batch 1 · 421 syms · 1252 refs
+[progress] 2000/1009161 files (0.2%) · 9128 f/s · ETA 1m50s · batch 1 · 8211 syms · 24930 refs
+...
+[progress] 1009000/1009161 files (100.0%) · 6478 f/s · ETA 0s · batch 87 · 25081244 syms · 63163521 refs
+[parse] batch 87/87  11631 files / 33112 syms / 71202 refs / ~38 MB in-RAM / 8814 ms (avg 6914 B/file)
+[write] 25082959 symbols, 63166322 refs across 1009161 files / 2 roots, finalizing -> /mnt/agent/scry-index
+[write] finalized in 13298 ms
+DONE: 1009161 files, 25082959 symbols, 63166322 refs, total 5510277 ms (183.1 files/s)
+```
+
+The `[progress]` line fires every 1000 files. `f/s` is rolling
+over the full job (not per-batch) so it stays a stable ETA
+signal; `ETA` formats as `45s`, `12m30s`, or `2h05m`. Each
+milestone prints exactly once (atomic `fetch_max` over
+`p / step`) so the output is clean even with N×64 parallel
+workers.
 
 # Post-finalize sidecar utilities — retrofit a finalized index
 # without re-parsing. Each is atomic (tmp + rename).

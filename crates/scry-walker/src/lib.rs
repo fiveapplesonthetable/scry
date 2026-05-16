@@ -317,6 +317,7 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
     let files: Arc<Mutex<Vec<RawFile>>> = Arc::new(Mutex::new(Vec::with_capacity(1_000_000)));
     let unknown = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
+    let skipped_binary = Arc::new(AtomicU64::new(0));
 
     let mut builder = WalkBuilder::new(&root);
     builder
@@ -342,10 +343,12 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
     let files_c = files.clone();
     let unknown_c = unknown.clone();
     let bytes_c = bytes.clone();
+    let skipped_binary_c = skipped_binary.clone();
     builder.build_parallel().run(|| {
         let files = files_c.clone();
         let unknown = unknown_c.clone();
         let bytes = bytes_c.clone();
+        let skipped_binary = skipped_binary_c.clone();
         let root_for_strip = root_for_strip.clone();
         Box::new(move |dent| {
             if let Ok(e) = dent {
@@ -356,6 +359,21 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
                     bytes.fetch_add(size, Ordering::Relaxed);
                     match FileKind::classify(p) {
                         Some(kind) => {
+                            // Sniff content for files that classify as a text
+                            // source format but might actually be a binary blob
+                            // wearing the extension (e.g. capture_stream.ts
+                            // is a 73 MB MPEG-TS broadcast stream, not
+                            // TypeScript). Only sniff once size > 1 KB —
+                            // smaller files are rarely binary mis-labels and
+                            // the I/O cost dominates on tiny files.
+                            if size > 1024 && looks_binary(p) {
+                                skipped_binary.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "[skip-binary] {} kind={:?} size={} bytes — first 512 bytes are non-text",
+                                    p.display(), kind, size,
+                                );
+                                return WalkState::Continue;
+                            }
                             let rel = p.strip_prefix(&root_for_strip)
                                 .unwrap_or(p)
                                 .to_path_buf();
@@ -378,6 +396,10 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
     });
     let elapsed_ms = start.elapsed().as_millis();
     let files = std::mem::take(&mut *files.lock());
+    let n_skipped_binary = skipped_binary.load(Ordering::Relaxed);
+    if n_skipped_binary > 0 {
+        eprintln!("[walk]  {} files skipped as binary (mislabeled extension)", n_skipped_binary);
+    }
     Ok(CollectedFiles {
         root,
         profile,
@@ -386,6 +408,44 @@ pub fn collect_files(root: &Path, profile: Profile) -> Result<CollectedFiles> {
         unknown_files: unknown.load(Ordering::Relaxed),
         elapsed_ms,
     })
+}
+
+/// Peek the first 512 bytes of a file to decide if it's plausibly a text
+/// source despite its extension. Returns true if the prefix looks binary
+/// (a NUL byte, or more than 10 % of bytes outside printable-ASCII /
+/// common-whitespace / UTF-8-continuation ranges). False on empty files,
+/// open errors, or anything that decodes as plausible text — the caller
+/// then proceeds to classify and parse as normal.
+fn looks_binary(path: &Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 512];
+    let n = match f.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => return false,
+    };
+    let chunk = &buf[..n];
+    let mut suspicious = 0usize;
+    for &b in chunk {
+        match b {
+            // A NUL byte in the first 512 of a "source" file is decisive.
+            0x00 => return true,
+            // Common ASCII whitespace.
+            0x09 | 0x0a | 0x0d => {}
+            // Printable ASCII.
+            0x20..=0x7e => {}
+            // High bytes — could be UTF-8 multibyte continuation; harmless.
+            0x80..=0xff => {}
+            _ => suspicious += 1,
+        }
+    }
+    // >10 % control bytes in the prefix → binary. capture_stream.ts (MPEG-TS)
+    // hits this; legitimate UTF-8 sources don't because their high bytes are
+    // counted as text via the 0x80..=0xff arm above.
+    suspicious * 10 > chunk.len()
 }
 
 /// Walk one source root with the given profile. Parallelized via the `ignore`

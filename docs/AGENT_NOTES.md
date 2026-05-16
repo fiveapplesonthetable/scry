@@ -386,7 +386,7 @@ For an agent on top of an open-weights ≥3B-class model (Gemma 3
    - `callers(name, lang?, in?, limit=10, format?)` — call sites
    - `outline(path, limit=20, with_snippets?)` — file's symbols
    - `tldr(path)` — one-call file summary; cheapest "what is this?"
-   - `grep(pattern, lang?, in?, limit=10, format?)` — content
+   - `grep(pattern, lang?, in?, limit=10, format?, regex?, case_insensitive?)` — content (set `case_insensitive: true` when you're guessing at casing — `bindservice` will find `bindService`)
    - `ask(query, in?, limit=5)` — semantic complement
 3. Encourage `format: 'count'` as the *first* invocation of
    `ref` / `callers` / `grep`. "Does this exist? How many?"
@@ -511,6 +511,72 @@ scry returns facts, not explanations. If I want to understand
 no amount of `scry def` and `scry callers` will give me that —
 the answer lives in commit messages, design docs, blog posts.
 scry is the lookup table; reading prose is still on me.
+
+### Build-boundary precision (the Kythe gap)
+
+This is the one that bites hardest on AOSP, and the one I should
+be most honest about. scry's resolution model is **name-based
+with light per-language narrowing** — closer to "ctags with a
+real symbol table" than to Kythe. Concretely:
+
+- **Refs are keyed by `(spelled-name, file)`, not `(USR, file, variant)`.**
+  A C++ `foo()` defined in two distinct overloads collapses to
+  one entry in the index. tree-sitter parses without a
+  preprocessor; `-D` defines, `#ifdef` branches, and template
+  instantiations are invisible.
+- **The same `.cpp` compiled into multiple Soong module variants
+  becomes one set of refs**, not one per variant. Different
+  architectures, SDK versions, system/vendor/product partitions,
+  APEX containers — scry sees them as one file.
+- **There is no Soong link-graph reachability filter.** A "caller
+  of `IActivityManager.startActivity`" returned by `scry callers`
+  is any file that spells `startActivity(` and is name-resolvable
+  to that target by scry's Layer-2 narrowing (Java imports +
+  same-package, Kotlin equivalent, JNI shadow). It is *not*
+  filtered by whether the caller's module transitively depends
+  on the definition's module per Soong.
+- **Generated code under `out/` is not indexed** — AIDL, HIDL,
+  protobuf, and Rust bindgen outputs live there. Callers
+  into generated symbols won't resolve unless you re-index
+  including `out/`.
+
+scry's Layer-2 sidecar does narrow some real ambiguity:
+same-name Java methods in different packages get disambiguated
+by the calling file's import list and package. Kotlin / C++ /
+JNI have their own narrow paths. That's enough to be useful at
+the editor scale; it is *not* enough to be "right" at the AOSP
+build-graph scale.
+
+**When this matters in practice**: agents that need to enumerate
+"every real call site of `bindService` that ships on the
+`generic_arm64-userdebug` build" will get false positives from
+scry — references in vendor code that doesn't link against
+`libframework`, references behind `#ifdef`'d branches that the
+build doesn't take, references in modules with no visibility
+into the definition's APEX. scry returns all the name matches;
+filtering to "real-given-build" needs build-graph data scry
+doesn't have today.
+
+**The correct tool for that today is Kythe.** cs.android.com is
+Kythe-powered; its precise xrefs are built from per-TU
+extraction (full compiler flags captured) joined to the build
+graph at index time. Kythe is in maintenance mode but
+functional and open source.
+
+**The pragmatic do-it-yourself path** (Path B) is to run the
+Soong `compile_commands.json` through a per-TU clang indexer to
+get USR-keyed references with variant hashes, then join to the
+module graph from `m json-module-graph`. That's roughly the
+shape Kythe takes, minus the language-agnostic graph schema.
+This is queued as **`scry index --build soong`** for v0.1.12.
+Until that lands, the right answer to "is this caller real on
+the build I ship?" is: ask cs.android.com, or use scry's name
+match as a starting set and verify with a real build.
+
+What scry does have that Kythe doesn't: 13-min index for
+1 M files on a 72-core host, <100 ms cold queries, no
+indexer-as-builder cost. The point is that the trade is
+explicit — speed and footprint for precision.
 
 ---
 

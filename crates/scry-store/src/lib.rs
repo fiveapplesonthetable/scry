@@ -525,6 +525,16 @@ impl StorePaths {
     pub fn ref_postings(&self) -> PathBuf { self.root.join("ref_postings.bin") }
     pub fn trigram_fst(&self) -> PathBuf { self.root.join("trigrams.fst") }
     pub fn trigram_postings(&self) -> PathBuf { self.root.join("trigram_postings.bin") }
+    /// Trigram → list-of-unique-name-ordinals. Powers `lookup_substring`
+    /// (fuzzy / substring search over symbol names) without walking
+    /// the whole names FST.
+    pub fn name_trigram_fst(&self) -> PathBuf { self.root.join("name_trigrams.fst") }
+    pub fn name_trigram_postings(&self) -> PathBuf { self.root.join("name_trigram_postings.bin") }
+    /// The unique-name corpus, in lexicographic order — same order as
+    /// the keys in names.fst. Random-access by ordinal via the
+    /// sibling offsets file.
+    pub fn unique_names(&self) -> PathBuf { self.root.join("unique_names.bin") }
+    pub fn unique_name_offsets(&self) -> PathBuf { self.root.join("unique_name_offsets.bin") }
     pub fn symbol_offsets(&self) -> PathBuf { self.root.join("symbols_offsets.bin") }
     pub fn ref_offsets(&self) -> PathBuf { self.root.join("refs_offsets.bin") }
     /// file_id → list of symbol indices. Packed: per file_id (in order),
@@ -979,6 +989,20 @@ impl StoreWriter {
             )?;
         }
 
+        // -- unique_names + name_trigrams (always built).
+        //    Walk names.fst in lex order (== the unique-name ordinal),
+        //    write each name's bytes to unique_names.bin and a sentinel
+        //    offset table; for every name extract trigrams and append
+        //    (trigram, ordinal) tuples to an in-RAM bucket map, then
+        //    serialize that to the FST + varint-delta posting blob.
+        build_name_trigram_sidecar(
+            &tmp_paths.names_fst(),
+            &tmp_paths.unique_names(),
+            &tmp_paths.unique_name_offsets(),
+            &tmp_paths.name_trigram_fst(),
+            &tmp_paths.name_trigram_postings(),
+        )?;
+
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             scry_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1346,6 +1370,115 @@ fn kway_merge_trigrams_to_fst(
     Ok(())
 }
 
+/// Build the unique-names blob + name-trigram inverted index.
+///
+/// Walks `names_fst` in lexicographic order — each key is the i-th
+/// unique symbol name. Writes:
+///   * `unique_names_path`:        flat blob of concatenated name bytes.
+///   * `unique_name_offsets_path`: u32-LE count, then (count + 1)
+///     u64-LE byte positions. The sentinel last entry equals the
+///     blob's total byte length so callers don't special-case the
+///     last name.
+///   * `name_trigram_fst_path`:    FST mapping 3-byte trigram → u64
+///     byte offset into the posting blob.
+///   * `name_trigram_postings_path`: per-trigram posting list of
+///     sorted unique-name ordinals, in the same wire format as
+///     trigram_postings.bin (u32-LE count + varint deltas).
+///
+/// Names shorter than 3 bytes contribute no trigrams (they are still
+/// listed in unique_names so callers can fall back to a prefix scan).
+fn build_name_trigram_sidecar(
+    names_fst_path: &Path,
+    unique_names_path: &Path,
+    unique_name_offsets_path: &Path,
+    name_trigram_fst_path: &Path,
+    name_trigram_postings_path: &Path,
+) -> Result<()> {
+    use fst::Streamer;
+    use std::collections::BTreeMap;
+
+    // Inverted index built in memory. BTreeMap so the FST builder
+    // can consume entries in ascending key order without a sort pass.
+    let mut buckets: BTreeMap<[u8; 3], Vec<u32>> = BTreeMap::new();
+
+    let mut names_out = BufWriter::with_capacity(1 << 20, File::create(unique_names_path)?);
+    let mut offsets_out = BufWriter::with_capacity(1 << 16, File::create(unique_name_offsets_path)?);
+
+    // Header for the offsets file. We patch the real count in after
+    // the walk; reserve 4 bytes here.
+    offsets_out.write_all(&0u32.to_le_bytes())?;
+
+    let fst = fst::Map::new(safe_mmap(names_fst_path)?)?;
+    let mut stream = fst.stream();
+    let mut count: u32 = 0;
+    let mut byte_pos: u64 = 0;
+
+    while let Some((key, _off)) = stream.next() {
+        offsets_out.write_all(&byte_pos.to_le_bytes())?;
+        names_out.write_all(key)?;
+        byte_pos += key.len() as u64;
+
+        if key.len() >= 3 {
+            for w in key.windows(3) {
+                let mut t = [0u8; 3];
+                t.copy_from_slice(w);
+                buckets.entry(t).or_default().push(count);
+            }
+        }
+        count = count.checked_add(1)
+            .ok_or_else(|| anyhow!("more than 2^32 unique symbol names"))?;
+    }
+    // Sentinel last offset so callers can compute every name's length
+    // as offsets[i+1] - offsets[i] without bounds checks.
+    offsets_out.write_all(&byte_pos.to_le_bytes())?;
+    names_out.flush()?;
+    offsets_out.flush()?;
+    drop(names_out);
+
+    // Backpatch the count in the offsets file's 4-byte header.
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(unique_name_offsets_path)?;
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(0))?;
+        f.write_all(&count.to_le_bytes())?;
+        f.flush()?;
+    }
+
+    // Write trigram postings + FST. Same wire format as
+    // trigram_postings.bin: u32-LE count followed by varint deltas.
+    let mut postings = BufWriter::with_capacity(1 << 20, File::create(name_trigram_postings_path)?);
+    let fst_file = BufWriter::with_capacity(1 << 20, File::create(name_trigram_fst_path)?);
+    let mut fst_builder = fst::MapBuilder::new(fst_file)?;
+    let mut pos: u64 = 0;
+
+    fn write_varint(w: &mut BufWriter<File>, mut v: u32) -> std::io::Result<u64> {
+        let mut n: u64 = 0;
+        while v >= 0x80 { w.write_all(&[(v as u8 & 0x7f) | 0x80])?; v >>= 7; n += 1; }
+        w.write_all(&[v as u8])?;
+        Ok(n + 1)
+    }
+
+    for (trigram, mut ords) in buckets {
+        ords.sort_unstable();
+        ords.dedup();
+        let offset = pos;
+        postings.write_all(&(ords.len() as u32).to_le_bytes())?;
+        pos += 4;
+        let mut prev: u32 = 0;
+        for o in &ords {
+            let delta = o.wrapping_sub(prev);
+            pos += write_varint(&mut postings, delta)?;
+            prev = *o;
+        }
+        fst_builder.insert(trigram, offset)
+            .with_context(|| format!("name-trigram fst insert {:?}", trigram))?;
+    }
+    if pos == 0 { postings.write_all(&[0u8])?; }
+    postings.flush()?;
+    fst_builder.finish()?;
+    Ok(())
+}
+
 fn kway_merge_names_to_fst(
     chunk_paths: &[PathBuf],
     fst_path: &Path,
@@ -1489,6 +1622,16 @@ pub struct StoreReader {
     /// the full-scan path. None for old indexes — they still work.
     pub trigram_fst: Option<fst::Map<memmap2::Mmap>>,
     pub trigram_postings_mmap: Option<memmap2::Mmap>,
+    /// Name-trigram index — trigram → list-of-unique-name-ordinals,
+    /// plus a flat blob of the unique name bytes with sentinel offsets
+    /// for random access by ordinal. Powers `lookup_substring` and
+    /// `lookup_fuzzy_ranked`. Built unconditionally at finalize since
+    /// substring search has no other path; absence here means an old
+    /// index that should be rebuilt.
+    pub name_trigram_fst: Option<fst::Map<memmap2::Mmap>>,
+    pub name_trigram_postings_mmap: Option<memmap2::Mmap>,
+    pub unique_names_mmap: Option<memmap2::Mmap>,
+    pub unique_name_offsets_mmap: Option<memmap2::Mmap>,
     /// Lazy/mmap-backed record stores. When Some, the public lookup APIs
     /// decode on-demand instead of relying on the eager `symbols`/`refs`
     /// Vecs. Present iff the index has _offsets.bin sidecars (new indexes,
@@ -1580,6 +1723,25 @@ impl StoreReader {
         } else {
             (None, None)
         };
+        // Name-trigram + unique-name sidecars (added 0.1.11). Always
+        // written by the current writer; absence here means an old
+        // index. lookup_substring will print a one-line "rebuild me"
+        // message in that case rather than fall back to the slow walk.
+        let (name_trigram_fst, name_trigram_postings_mmap,
+             unique_names_mmap, unique_name_offsets_mmap) =
+            if paths.name_trigram_fst().exists()
+                && paths.name_trigram_postings().exists()
+                && paths.unique_names().exists()
+                && paths.unique_name_offsets().exists()
+            {
+                let f = fst::Map::new(safe_mmap(&paths.name_trigram_fst())?)?;
+                let p = safe_mmap(&paths.name_trigram_postings())?;
+                let n = safe_mmap(&paths.unique_names())?;
+                let o = safe_mmap(&paths.unique_name_offsets())?;
+                (Some(f), Some(p), Some(n), Some(o))
+            } else {
+                (None, None, None, None)
+            };
         // file_symbols sidecar — produced by `scry build-file-symbols`
         // (or written inline by `index` when --build-file-symbols is
         // set). Optional everywhere (linear scan still works), so just
@@ -1629,6 +1791,8 @@ impl StoreReader {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
             trigram_fst, trigram_postings_mmap,
+            name_trigram_fst, name_trigram_postings_mmap,
+            unique_names_mmap, unique_name_offsets_mmap,
             lazy_symbols, lazy_refs,
             file_symbols_mmap, file_symbols_offsets_mmap,
             ref_resolutions_mmap,
@@ -1856,6 +2020,44 @@ impl StoreReader {
         Some(result)
     }
 
+    /// Case-insensitive variant of [`Self::grep_candidates`]. For each
+    /// 3-byte trigram of `needle`, unions the posting lists of every
+    /// ASCII case variant of that trigram (≤ 8 per trigram), then
+    /// intersects across positions. Correctness: a file containing the
+    /// needle in *some* case must contain each trigram in *some* case,
+    /// so the result is a superset of the actual-match set — the
+    /// caller still re-scans candidate files with a CI matcher to
+    /// confirm. Returns None on the same paths as `grep_candidates`.
+    pub fn grep_candidates_ci(&self, needle: &[u8]) -> Option<std::collections::HashSet<u32>> {
+        let fst = self.trigram_fst.as_ref()?;
+        let postings = self.trigram_postings_mmap.as_ref()?;
+        let qts = trigram::trigrams_of_query(needle);
+        if qts.is_empty() { return None; }
+        let mut lists: Vec<std::collections::HashSet<u32>> = Vec::with_capacity(qts.len());
+        for t in &qts {
+            let mut acc: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for v in trigram_case_variants(t) {
+                if let Some(off) = fst.get(v.as_slice()) {
+                    acc.extend(read_trigram_posting(postings, off));
+                }
+            }
+            if acc.is_empty() {
+                return Some(std::collections::HashSet::new());
+            }
+            lists.push(acc);
+        }
+        lists.sort_by_key(std::collections::HashSet::len);
+        let mut result = lists.swap_remove(0);
+        for s in lists {
+            result.retain(|f| s.contains(f));
+            if result.is_empty() { break; }
+        }
+        if self.tombstones_mmap.is_some() {
+            result.retain(|f| !self.is_tombstoned(*f));
+        }
+        Some(result)
+    }
+
     /// Diagnostic version of [`Self::grep_candidates`] that returns the
     /// per-trigram posting sizes alongside the final candidate count.
     /// Powers `scry grep --explain` — agents and humans can see *why*
@@ -1947,24 +2149,169 @@ impl StoreReader {
         out
     }
 
+    /// Substring lookup over the symbol-name FST, narrowed by the
+    /// name-trigram sidecar (built at finalize time). Per query:
+    ///
+    ///   1. Extract trigrams from `substr`. For queries < 3 bytes,
+    ///      bail to a bounded prefix-range scan (no useful trigrams).
+    ///   2. For each trigram, decode its posting list — the set of
+    ///      unique-name ordinals whose name contains that trigram.
+    ///   3. Intersect smallest-first (Russ Cox candidate-set pattern).
+    ///   4. For each surviving ordinal, random-access the name bytes
+    ///      from the `unique_names.bin` mmap, memchr-verify, and on
+    ///      match decode the name's posting (symbol_idx list).
+    ///
+    /// Worst-case work is proportional to the rarest trigram's posting
+    /// size — typically a few hundred names even on a corpus of
+    /// millions. The historical full FST walk (every key, ~3 s on
+    /// AOSP+Linux) is gone.
+    /// Three search modes layered, cheapest-first; each subsequent
+    /// mode only runs if the earlier ones haven't already filled
+    /// `limit`:
+    ///
+    ///   1. Case-SENSITIVE substring via trigram intersection (the
+    ///      fast path; what the user gets for "Activity").
+    ///   2. Case-INSENSITIVE substring via the same trigram path
+    ///      with lowercased query (catches "binderservice"
+    ///      → "BinderService").
+    ///   3. Subsequence (fzf-style) match against the unique-name
+    ///      blob (catches "Bndservce" → "bindService" — chars in
+    ///      order with arbitrary gaps).
+    ///
+    /// All three return SymbolRecords; the caller (`lookup_fuzzy_ranked`)
+    /// scores them with `fuzzy_sort_score` so substring matches
+    /// outrank subsequence matches and exact case-sensitive matches
+    /// outrank case-folded ones.
     pub fn lookup_substring(&self, substr: &str, limit: usize) -> Vec<SymbolRecord> {
-        use fst::Streamer;
-        let mut out: Vec<SymbolRecord> = Vec::new();
         let needle = substr.as_bytes();
-        let mut stream = self.fst.stream();
-        while let Some((key, off)) = stream.next() {
-            if memchr::memmem::find(key, needle).is_some() {
-                for i in self.read_posting(off) {
-                    if let Some(s) = self.get_symbol(i) {
-                        out.push(s);
-                        if out.len() >= limit {
-                            return out;
-                        }
-                    }
+        if needle.len() < 3 {
+            return self.lookup_prefix(substr, limit);
+        }
+        let (fst, postings, names_blob, names_offsets) = match (
+            self.name_trigram_fst.as_ref(),
+            self.name_trigram_postings_mmap.as_ref(),
+            self.unique_names_mmap.as_ref(),
+            self.unique_name_offsets_mmap.as_ref(),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => {
+                eprintln!(
+                    "[scry] fuzzy/substring lookup needs the name-trigram \
+                     sidecar (added in 0.1.11). Rebuild this index with \
+                     the current `scry` binary."
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut out: Vec<SymbolRecord> = Vec::new();
+        let mut seen_ords: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        // ---- 1. case-sensitive substring (the fast path) ----
+        self.trigram_substring_into(needle, /*case_insens=*/ false,
+                                     fst, postings, names_blob, names_offsets,
+                                     &mut out, &mut seen_ords, limit);
+
+        // ---- 2. case-insensitive substring ----
+        if out.len() < limit && needle.iter().any(u8::is_ascii_uppercase) {
+            let lc: Vec<u8> = needle.iter().map(u8::to_ascii_lowercase).collect();
+            self.trigram_substring_into(&lc, /*case_insens=*/ true,
+                                         fst, postings, names_blob, names_offsets,
+                                         &mut out, &mut seen_ords, limit);
+        }
+
+        // ---- 3. fzf-style subsequence fallback ----
+        if out.len() < limit {
+            self.subsequence_match_into(needle, names_blob, names_offsets,
+                                         &mut out, &mut seen_ords, limit);
+        }
+
+        out
+    }
+
+    /// Substring helper used by case-sensitive AND case-insensitive
+    /// branches above. When `case_insens` is true we lowercase the
+    /// candidate name's bytes inline before the memchr probe.
+    #[allow(clippy::too_many_arguments)]
+    fn trigram_substring_into(
+        &self,
+        needle: &[u8],
+        case_insens: bool,
+        fst: &fst::Map<memmap2::Mmap>,
+        postings: &memmap2::Mmap,
+        names_blob: &memmap2::Mmap,
+        names_offsets: &memmap2::Mmap,
+        out: &mut Vec<SymbolRecord>,
+        seen: &mut std::collections::HashSet<u32>,
+        limit: usize,
+    ) {
+        let qts = trigram::trigrams_of_query(needle);
+        if qts.is_empty() { return; }
+        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(qts.len());
+        for t in &qts {
+            let off = match fst.get(t.as_slice()) { Some(v) => v, None => return };
+            lists.push(read_name_trigram_posting(postings, off));
+        }
+        lists.sort_by_key(Vec::len);
+        let mut ords = lists.remove(0);
+        for other in &lists {
+            ords.retain(|x| other.binary_search(x).is_ok());
+            if ords.is_empty() { return; }
+        }
+        for ord in &ords {
+            if seen.contains(ord) { continue; }
+            let bytes = read_unique_name(names_blob, names_offsets, *ord);
+            let hit = if case_insens {
+                memchr_substring_ci(bytes, needle)
+            } else {
+                memchr::memmem::find(bytes, needle).is_some()
+            };
+            if !hit { continue; }
+            seen.insert(*ord);
+            let off = match self.fst.get(bytes) { Some(v) => v, None => continue };
+            for i in self.read_posting(off) {
+                if let Some(s) = self.get_symbol(i) {
+                    out.push(s);
+                    if out.len() >= limit { return; }
                 }
             }
         }
-        out
+    }
+
+    /// fzf-style subsequence match: every byte of `needle` appears in
+    /// the candidate name in order (case-insensitive), with arbitrary
+    /// gaps. Walks the unique-name blob linearly — bounded work
+    /// because the names blob is much smaller than the symbols table
+    /// (avg ~10 bytes per name × ~5 M unique names = ~50 MB on the
+    /// AOSP+Linux corpus; ~30 ms to scan).
+    fn subsequence_match_into(
+        &self,
+        needle: &[u8],
+        names_blob: &memmap2::Mmap,
+        names_offsets: &memmap2::Mmap,
+        out: &mut Vec<SymbolRecord>,
+        seen: &mut std::collections::HashSet<u32>,
+        limit: usize,
+    ) {
+        // Lowercased query for the case-insensitive walk.
+        let q: Vec<u8> = needle.iter().map(u8::to_ascii_lowercase).collect();
+        if q.is_empty() { return; }
+        // Count of names = first u32-LE of the offsets file.
+        let off = &names_offsets[..];
+        let count = u32::from_le_bytes(off[..4].try_into().unwrap());
+        for ord in 0..count {
+            if seen.contains(&ord) { continue; }
+            let bytes = read_unique_name(names_blob, names_offsets, ord);
+            if !is_subsequence_ci(&q, bytes) { continue; }
+            seen.insert(ord);
+            let off = match self.fst.get(bytes) { Some(v) => v, None => continue };
+            for i in self.read_posting(off) {
+                if let Some(s) = self.get_symbol(i) {
+                    out.push(s);
+                    if out.len() >= limit { return; }
+                }
+            }
+        }
     }
 
     /// Typo-tolerant fuzzy lookup with an explicit edit-distance ranking.
@@ -2063,6 +2410,114 @@ impl StoreReader {
     fn read_posting(&self, off: u64) -> Vec<u32> {
         read_posting(&self.postings_mmap, off)
     }
+}
+
+/// Case-insensitive substring probe. Equivalent to
+/// `bytes.to_ascii_lowercase().windows(needle.len()).any(|w| w == needle_lc)`
+/// but allocation-free.
+/// Enumerate the ASCII case variants of a 3-byte trigram. Each
+/// alphabetic byte expands to {lower, upper}; non-alphabetic bytes
+/// pass through unchanged. Returns 1..=8 variants (cap is 2^3).
+/// Used by [`StoreReader::grep_candidates_ci`] to expand a single
+/// query trigram into "all on-disk trigrams that look the same
+/// case-folded".
+fn trigram_case_variants(t: &trigram::Trigram) -> Vec<[u8; 3]> {
+    let bytes = *t;
+    let mut letter_positions: Vec<usize> = Vec::with_capacity(3);
+    for (i, b) in bytes.iter().enumerate() {
+        if b.is_ascii_alphabetic() {
+            letter_positions.push(i);
+        }
+    }
+    let n = letter_positions.len();
+    if n == 0 {
+        return vec![bytes];
+    }
+    let mut out: Vec<[u8; 3]> = Vec::with_capacity(1usize << n);
+    for mask in 0u32..(1u32 << n) {
+        let mut v = bytes;
+        for (bit, &idx) in letter_positions.iter().enumerate() {
+            v[idx] = if (mask >> bit) & 1 == 1 {
+                v[idx].to_ascii_uppercase()
+            } else {
+                v[idx].to_ascii_lowercase()
+            };
+        }
+        out.push(v);
+    }
+    out
+}
+
+fn memchr_substring_ci(haystack: &[u8], needle_lc: &[u8]) -> bool {
+    if needle_lc.is_empty() { return true; }
+    if haystack.len() < needle_lc.len() { return false; }
+    for start in 0..=(haystack.len() - needle_lc.len()) {
+        let mut ok = true;
+        for i in 0..needle_lc.len() {
+            if haystack[start + i].to_ascii_lowercase() != needle_lc[i] {
+                ok = false;
+                break;
+            }
+        }
+        if ok { return true; }
+    }
+    false
+}
+
+/// Subsequence test: does every byte of `q` (already lowercased)
+/// appear in `name` in order, case-insensitive? The standard fzf
+/// fuzzy-match primitive.
+fn is_subsequence_ci(q: &[u8], name: &[u8]) -> bool {
+    let mut qi = 0;
+    for &b in name {
+        if qi >= q.len() { break; }
+        if b.to_ascii_lowercase() == q[qi] { qi += 1; }
+    }
+    qi == q.len()
+}
+
+/// Decode a name-trigram posting list (sorted u32 ordinals) at byte
+/// OFFSET in `mmap`. Wire format is identical to the file-trigram
+/// posting: u32-LE count, then `count` varint deltas. Returns a Vec
+/// (not a HashSet) so the caller can `binary_search` for intersection.
+fn read_name_trigram_posting(mmap: &memmap2::Mmap, off: u64) -> Vec<u32> {
+    let buf = &mmap[..];
+    let start = off as usize;
+    let count = match read_u32_le(buf, start) { Some(n) => n as usize, None => return Vec::new() };
+    let mut out = Vec::with_capacity(count);
+    let mut p = start + 4;
+    let mut prev: u32 = 0;
+    for _ in 0..count {
+        let mut delta: u32 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            if p >= buf.len() { return out; }
+            let b = buf[p];
+            p += 1;
+            delta |= ((b & 0x7f) as u32) << shift;
+            if b & 0x80 == 0 { break; }
+            shift += 7;
+            if shift >= 32 { return out; }
+        }
+        let v = prev.wrapping_add(delta);
+        out.push(v);
+        prev = v;
+    }
+    out
+}
+
+/// Look up unique-name ORDINAL's bytes from the (data, offsets) pair.
+/// Offsets file layout: u32-LE count, then `count + 1` u64-LE byte
+/// positions (offsets[i] = start of name i, offsets[count] = end of
+/// the data blob — sentinel so we can compute every name's length
+/// without bounds-checking the next entry).
+fn read_unique_name<'a>(data: &'a memmap2::Mmap, offsets: &memmap2::Mmap, ord: u32) -> &'a [u8] {
+    let i = ord as usize;
+    let off = &offsets[..];
+    let base = 4;  // skip the u32-LE count
+    let start = u64::from_le_bytes(off[base + i * 8 .. base + i * 8 + 8].try_into().unwrap()) as usize;
+    let end   = u64::from_le_bytes(off[base + (i + 1) * 8 .. base + (i + 1) * 8 + 8].try_into().unwrap()) as usize;
+    &data[start..end]
 }
 
 /// Internal ranking score for fuzzy match candidates. Lower wins.
@@ -2286,6 +2741,51 @@ fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 mod tests {
     use super::*;
     use scry_walker::FileKind;
+
+    #[test]
+    fn ci_substring_finds_case_folded_match() {
+        assert!(memchr_substring_ci(b"BindService", b"bindservice"));
+        assert!(memchr_substring_ci(b"BindService", b"bindservice"[..6].as_ref()));
+        assert!(memchr_substring_ci(b"prefixBindServiceSuffix", b"bindservice"));
+        assert!(!memchr_substring_ci(b"BindService", b"bindx"));
+        // Edge: needle longer than haystack — must say no, not crash.
+        assert!(!memchr_substring_ci(b"abc", b"abcdef"));
+        // Edge: empty needle trivially matches.
+        assert!(memchr_substring_ci(b"abc", b""));
+    }
+
+    #[test]
+    fn trigram_case_variants_expands_letters_only() {
+        // All letters → 2^3 = 8 variants.
+        let v = trigram_case_variants(b"abc");
+        assert_eq!(v.len(), 8);
+        assert!(v.iter().any(|x| x == b"abc"));
+        assert!(v.iter().any(|x| x == b"ABC"));
+        assert!(v.iter().any(|x| x == b"AbC"));
+        // Mixed with a non-letter byte: 2^2 = 4 variants, '_' fixed.
+        let v = trigram_case_variants(b"a_b");
+        assert_eq!(v.len(), 4);
+        assert!(v.iter().any(|x| x == b"a_b"));
+        assert!(v.iter().any(|x| x == b"A_B"));
+        // No letters: single passthrough variant.
+        let v = trigram_case_variants(b"123");
+        assert_eq!(v.len(), 1);
+        assert_eq!(&v[0], b"123");
+    }
+
+    #[test]
+    fn subsequence_ci_matches_fzf_style_typos() {
+        // "Bndservce" → "bindService": B/b, n, d, s/S, e, r, v, c, e
+        assert!(is_subsequence_ci(b"bndservce", b"bindService"));
+        // "bndsvc" → still all chars in order
+        assert!(is_subsequence_ci(b"bndsvc", b"bindService"));
+        // Out-of-order doesn't match
+        assert!(!is_subsequence_ci(b"ecivres", b"bindService"));
+        // Missing char doesn't match
+        assert!(!is_subsequence_ci(b"bindservicex", b"bindService"));
+        // Empty query trivially matches
+        assert!(is_subsequence_ci(b"", b"anything"));
+    }
 
     /// Build a LazyVec-compatible pair on disk: data file holds an 8-byte
     /// u64-LE length prefix followed by each record bincode-serialized

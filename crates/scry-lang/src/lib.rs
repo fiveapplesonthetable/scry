@@ -61,11 +61,19 @@ fn current_file_name() -> String {
 /// SCRY_PARSE_TIMEOUT_MS at process start; 0 = unlimited. Read once and
 /// cached so the per-parse setup is a single load.
 ///
-/// Why this exists: tree-sitter grammars can transiently allocate gigabytes
-/// on adversarial inputs (e.g. the ctags Kotlin parser test fixtures). A
-/// timeout lets us cap that — when it fires, parse() returns None and we
-/// record a parse failure for that file instead of OOM-killing the whole
-/// indexer.
+/// Default is **60_000 ms per query** (symbols and refs are two queries,
+/// so a file gets up to 2 min of total parse budget). Rationale:
+/// 99 %+ of legitimate AOSP+Linux files parse under 1 s; the slowest
+/// honest outliers we've seen are 8–10 MB Cython-generated C++ around
+/// 9 s. Pathological inputs (the ctags Kotlin fixtures, the 6.7 MB
+/// generated `old.html` under `NeuralNetworks/.../systrace_parser/test/`)
+/// ran indefinitely before this default — 60 s is plenty to terminate
+/// them. Set `SCRY_PARSE_TIMEOUT_MS=0` to disable, or a lower value to
+/// tighten.
+///
+/// When the budget fires, `parse_with_options` returns None via the
+/// progress callback; we log `[ts-TIMEOUT]` and treat the file as parsed-
+/// but-empty rather than OOM-killing the worker.
 fn parse_timeout_micros() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
@@ -73,7 +81,7 @@ fn parse_timeout_micros() -> u64 {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(|ms| ms.saturating_mul(1000))
-            .unwrap_or(0)
+            .unwrap_or(60_000_000)
     })
 }
 

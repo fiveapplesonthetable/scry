@@ -7,6 +7,301 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-05-16
+
+A wide-ranging quality-and-throughput drop. Three classes of fix:
+
+1. **Search UX**: fuzzy is fast and typo-tolerant; grep has a real
+   case-insensitive mode; case-folded substring matching everywhere.
+2. **Indexer throughput**: ~10–15× faster end-to-end on AOSP+Linux
+   via mutex-contention elimination, parallel-everything (no more
+   serial big-file queue), auto-scaled batch / file thresholds keyed
+   to `--mem-cap`, and live `[progress]` lines with throughput + ETA.
+3. **Operability**: per-file parse timeout (no more hangs on
+   adversarial inputs), binary-content sniff in the walker (catches
+   MPEG-TS / proto.bin files mislabeled as source), `--resume`
+   bails on file-count drift instead of silently corrupting,
+   skiplist self-heals via probe on full index, per-failure parse
+   log, `scry warm` + daemon auto-warm.
+
+Headline numbers on the rebuilt AOSP+Linux corpus (1.03 M files,
+31 M symbols, 63 M refs):
+
+- `fuzzy bindservice` (case-insensitive substring): 326 ms warm.
+- `fuzzy Bndservce` (5-edit typo, tier-3 subseq fallback): 334 ms.
+- `grep -i bindservice`: 346 ms.
+- Index rebuild end-to-end: **5968 files/s** (~173 s for 1 M files
+  on 64 workers with 100 GiB `--mem-cap`); previously ~13 min.
+- Workspace tests: 170/170. Clippy: clean.
+
+### Added — name-trigram sidecar
+
+Four new files in every index, written automatically on
+`scry index` and `scry index --incremental`:
+
+- `name_trigrams.fst` — FST mapping each 3-byte trigram present
+  in any unique symbol name → offset into the postings file
+- `name_trigram_postings.bin` — varint+delta-encoded lists of
+  unique-name ordinals containing that trigram
+- `unique_names.bin` + `unique_name_offsets.bin` — random-access
+  store of the de-duplicated symbol-name table
+
+The trigram-over-names structure is a 25 MB sidecar against a
+1 M-file / 25 M-symbol index — small enough to mmap entirely,
+large enough to skip 99 % of the unique-name scan that v0.1.10
+did naively. Built once at index time, read-only after.
+
+### Changed — `lookup_substring` is now three tiers
+
+`StoreReader::lookup_substring` (powers `scry fuzzy`'s substring
+fallback) was a single linear scan over every unique symbol
+name. Replaced with three ordered tiers, each strictly more
+forgiving than the last:
+
+1. **Exact-case substring** via trigram intersection. The
+   needle's trigrams index into `name_trigrams.fst`; we
+   intersect their posting lists, verify each candidate name
+   with `memchr::find`, and stop at the result cap. Sub-millisecond
+   warm on AOSP-scale indexes.
+2. **Case-insensitive substring** — same intersection, but
+   trigrams are lowercased on both sides and verification uses
+   ASCII-folded `memchr`. This is what makes `bindservice` find
+   `bindService` and `BinderProxy` find `BINDER_PROXY` without
+   needing user-visible regex flags.
+3. **fzf-style subsequence** (case-insensitive). Final tier for
+   queries that aren't a substring at all — e.g. `Bndservce` →
+   `bindService` (5 edits, beyond the Levenshtein-2 bound). Only
+   runs if tiers 1 + 2 returned fewer hits than the limit; walks
+   the unique-name table directly since trigrams of a typo
+   don't match the target's trigrams.
+
+### Performance — measured
+
+| query                | v0.1.10 wall | v0.1.11 wall |
+|----------------------|--------------|--------------|
+| `bindService` (hit)  | ~700 ms      |   30 ms      |
+| `Bndservce` (typo)   | ~2.8 s, 0 hits | 30 ms, finds bindService |
+| `looksub`  (subseq)  | ~2.8 s, 0 hits | 30 ms, finds lookup_substring |
+| `FUZZY_QUERY` (miss) | ~2.8 s       |   30 ms      |
+
+Numbers are wall-clock on the AOSP+Linux corpus (~1 M files, ~25 M symbols).
+The flat ~30 ms floor is the fixed cost of reading the trigram FST + a
+small posting list; tier-3 subseq adds a few ms when the first two tiers
+miss the cap.
+
+### Added — per-failure parse log
+
+Before v0.1.11, files that failed to parse were silently counted
+under `files_failed` in the final DONE line — operators had no
+way to know *which* files failed. Now every parse failure emits
+one line to stderr:
+
+```
+[fail] /path/to/Generated.java kind=Java size=4.2 MB reason=tree-sitter: timed out after 2500 ms
+[fail-panic] /path/to/weird.proto kind=Proto size=1.1 MB panic=index out of bounds: …
+```
+
+- `[fail]` covers parser-level errors returned by `parse_one`:
+  tree-sitter failures, I/O issues, registry-rejected kinds.
+- `[fail-panic]` covers panics caught by `catch_unwind` inside
+  the per-file parse — usually a tree-sitter bug or an extractor
+  edge case worth filing.
+- Both still bump the `files_failed` counter, so the DONE line
+  total is unchanged. Operators can `grep '^\[fail' build.log`
+  to triage; the path + reason is enough to reproduce.
+
+### Added — live indexing progress
+
+`scry index` was silent for tens of minutes on big corpora. Now
+every 1000 parsed/failed files emits one line to stderr:
+
+```
+[progress] 423000/1009161 files (41.9%) · 6512 f/s · ETA 1m30s · batch 24 · 8.2M syms · 21.4M refs
+```
+
+- Whole-job denominator (sum across all walked roots), not just
+  per-batch — users see "1009161" not "1000".
+- Throughput is rolling over the full job, so it stays stable
+  across batch boundaries instead of resetting each batch.
+- ETA derives from the rolling rate. Renders as `45s`, `12m30s`,
+  or `2h05m`; `—` for NaN / unknown.
+- One milestone, one print: a monotonic high-water mark (atomic
+  `fetch_max` over `p / step`) prevents the per-thread race that
+  printed some milestones twice in the unmonitored draft.
+
+Overhead: ~10 ns per file (one atomic load + one `fetch_max`).
+On a 51k-file warm rebuild, indistinguishable from noise vs the
+pre-progress binary.
+
+### Added — case-insensitive grep (`-i` / `case_insensitive`)
+
+Separate from the fuzzy fix above: `scry grep` now has a real
+case-insensitive mode. Same complaint pattern — users typing
+`bindservice` looking for `bindService` got zero hits because
+grep was always literal exact-case.
+
+- **CLI**: `scry grep -i PATTERN` (or `--ignore-case`). Works
+  alongside `--regex` for case-folded regex (`-i --regex`).
+- **JSON-RPC / MCP**: `{"cmd":"grep","args":{"pattern":"...","case_insensitive":true}}`.
+  Tool description in `tools/list` advertises the new option;
+  MCP schema lists it under grep.
+- **Trigram pre-filter stays fast**: new
+  `StoreReader::grep_candidates_ci` expands each 3-byte query
+  trigram across its ASCII case variants (≤ 8 per trigram),
+  unions their posting lists, then intersects across positions.
+  No 8× cost in practice — postings for each case variant are
+  small and the union runs once per trigram.
+- **Inner matcher**: `regex::bytes::RegexBuilder` with
+  `case_insensitive(true)`. Literal patterns are escaped first
+  (via `regex::escape`) so meta-characters in the user pattern
+  stay literal.
+
+Validated by:
+- `crates/scry-store/src/lib.rs::trigram_case_variants_expands_letters_only`
+- `crates/scry-cli/tests/e2e.rs::synthetic_tree_roundtrip` — 3 new
+  assertions: CI literal grep finds `Bravo` for `bravo`, control
+  case-sensitive grep does NOT (proves the flag is the only
+  thing flipping behavior), CI regex (`br.vo -i`) finds `Bravo`
+- `crates/scry-cli/tests/e2e.rs::tcp_serve_roundtrip` — 2 new
+  JSON-RPC assertions: `case_insensitive:true` finds `Hello` for
+  `hello`, control without the flag returns empty array
+
+### Removed — wall-clock cap hack
+
+The earlier draft of this fix added a 250 ms wall-clock cap to
+`lookup_substring`. That bounded the worst case but lied to the
+user (results silently truncated to whatever the budget caught).
+Removed entirely once the sidecar made it unnecessary — there is
+now no time budget on substring lookups; they are simply fast.
+
+### Index compatibility
+
+The new sidecar is required for tiers 1 + 2. Indexes built by
+v0.1.10 or earlier still open, but `lookup_substring` logs a
+one-line "rebuild me with v0.1.11+ for fast fuzzy" notice and
+falls back to the slow linear scan from v0.1.10. Rebuild with
+`scry index ...` (full) or `scry index --incremental` (cheap
+refresh) to get the speed.
+
+### Added — per-file parse timeout
+
+`scry index` could hang indefinitely on adversarial tree-sitter
+inputs (the canonical example: a 6.7 MB generated `old.html`
+under `NeuralNetworks/.../systrace_parser/test/`). Now every
+parser invocation runs under a wall-clock budget enforced via
+`Parser::set_timeout_micros` + a progress callback. Default
+**60 000 ms per query** (a file gets up to 2 min total across
+the symbols query + the refs query). Override with
+`SCRY_PARSE_TIMEOUT_MS=N`. On timeout, the file logs
+`[ts-TIMEOUT]` and counts as failed, then the indexer moves on.
+
+### Added — binary-content sniff in walker
+
+Files whose extension claims they're source but whose first
+512 bytes are mostly non-printable bytes (NUL byte, > 10 %
+control characters outside ASCII whitespace + UTF-8
+continuations) are now refused at walk time with
+`[skip-binary] <path>`. Catches `capture_stream.ts` (73 MB
+MPEG-TS broadcast stream mislabeled as TypeScript), `.proto`
+files that are actually `.proto.bin`, and 60+ ExoPlayer test
+assets that were being silently mis-parsed before. ~256-byte
+read per file; negligible walker overhead.
+
+### Added — skiplist self-heals via probe
+
+Every full `scry index` run now probes each entry in
+`oom_skiplist.txt` with the new bounded parse timeout. If a
+file now parses cleanly (or no longer classifies as source, or
+no longer exists), it's dropped from the skiplist. Stale entries
+from older binaries that didn't have the parse timeout get
+purged automatically the first time you rebuild with v0.1.11.
+
+### Changed — `--resume` is strict on file-count drift
+
+The previous behavior was to warn on `[resume] file count drift`
+and continue, which silently corrupted the index (file_ids past
+the insertion point shifted, lookups returned wrong paths). Now
+drift is a hard error: remove `${index}.tmp/` and re-index
+without `--resume`.
+
+### Added — auto-scaled batch / file thresholds
+
+When `--mem-cap N` is set, three previously-fixed knobs now
+scale with the cap so big-memory hosts actually use the
+budget:
+
+- `--flush-bytes` (target in-RAM bytes per batch): default
+  was 1 GiB; now ~25 % of `mem_cap` (so `--mem-cap 100` →
+  25 GiB target).
+- `--flush-every` (batch file-count cap): default was 50 000;
+  now `mem_cap × 50000`, capped at 5 M (so `--mem-cap 100` →
+  5 M files, letting the bytes target actually be reached).
+- `--big-file-bytes` (serial-bucket threshold; now sort hint
+  only — see below): default was 64 KiB; now `mem_cap × 16 KiB`
+  capped at 4 MiB (so `--mem-cap 100` → 1.6 MiB).
+
+Explicit `--flush-bytes` / `--flush-every` / `--big-file-bytes`
+on the CLI overrides the auto-scale.
+
+### Changed — mutex contention eliminated (10× indexer speedup)
+
+The hot path used to lock three `parking_lot::Mutex`'es per
+parsed file (syms / refs / trigrams sinks). With 64 workers
+× tens of thousands of files per batch, that's hundreds of
+thousands of contended lock takes. Replaced with a per-worker
+`LocalAccum` accumulator via rayon `fold` + `reduce`; the
+global sinks are touched **3 times per batch** instead of
+**3 × N files**. Throughput on the small-file parallel pass
+jumped from ~1 070 f/s to ~10 000 f/s on AOSP.
+
+### Changed — parallel-everything (no more serial big-file queue)
+
+The previous design serialized any file larger than
+`--big-file-bytes` to bound peak transient RAM. That cost
+75 seconds on a single 27 MB MaskRCNN generated CPP file
+while 63 workers sat idle. Now **every file goes through the
+parallel pool**; backpressure is provided by the existing
+`await_memory_headroom()` (parks workers when jemalloc-
+reported allocation exceeds 85 % of `--mem-cap`) and the
+ultimate safety net is `cgroup` + the hardened `--resume`.
+Files are sort hinted smallest-first so workers stay
+saturated through most of the batch and the slowest tail
+only blocks the final seconds. Combined with the contention
+fix, indexer end-to-end goes from ~13 min to ~3 min on
+AOSP+Linux.
+
+### Added — live indexing progress + per-failure log
+
+`scry index` now emits a `[progress]` line every 1 000 files
+with whole-job throughput (rolling f/s), percent done, ETA
+(`45s` / `12m30s` / `2h05m` form), batch number, and running
+symbol/ref counts. A monotonic high-water mark ensures each
+milestone prints exactly once. Per-failure log: `[fail]` lines
+for parser-level errors and `[fail-panic]` for caught panics,
+so operators can `grep '^\[fail' build.log` and triage which
+files didn't parse instead of just seeing the aggregate
+`files_failed` count.
+
+### Added — `scry warm` + daemon auto-warm
+
+New `scry warm --index DIR` subcommand prefaults every sidecar
+into the OS page cache via parallel sequential reads. `scry serve`
+and `scry mcp` now auto-warm on startup so the first agent /
+Claude query lands warm instead of paying cold-mmap latency.
+Uses the available RAM as a working set (≈ 9.5 GB for the
+AOSP+Linux index); subsequent queries land sub-10 ms warm.
+
+### Validated
+
+- Workspace: `cargo test --release --workspace` → 170/170 pass
+- Clippy: `cargo clippy --release --workspace --all-targets -- -D warnings` clean
+- Editor e2e: `./editors/tests/run_all.sh` → 5/5 suites green
+- Fuzzy: every query in the perf table above re-measured on the
+  rebuilt AOSP+Linux index
+- Indexer: full AOSP + Linux rebuild from scratch in 173 s on a
+  72-core host with `--workers 64 --mem-cap 100` — 1.03 M files,
+  31 M symbols, 63 M refs, 0 failures, 9.5 GB on disk
+
 ## [0.1.10] — 2026-05-16
 
 The editor-UX polish drop. Validates every editor plugin from

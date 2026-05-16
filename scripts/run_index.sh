@@ -37,7 +37,11 @@ fi
 # backpressure ceiling. big-file-bytes routes anything > 64KiB to the serial
 # big-bucket so a single pathological tree-sitter parse can't pile up across
 # workers. Resume + cgroup MemoryMax is the OOM safety net beneath all of that.
-exec /mnt/agent/scry/target/release/scry index \
+#
+# We do NOT exec — we need to emit a post-success marker the post-finalize
+# watcher can grep for. systemd still sees the exit code via the shell's
+# propagated status because set -e + final $?.
+/mnt/agent/scry/target/release/scry index \
   "${USE_ROOTS[@]}" \
   --resume \
   --workers 16 \
@@ -47,3 +51,8 @@ exec /mnt/agent/scry/target/release/scry index \
   --big-file-bytes 65536 \
   --max-file-bytes 5242880 \
   -o /mnt/agent/scry-index
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "DONE: scry index finalized cleanly at $(date -Is)"
+fi
+exit "$rc"

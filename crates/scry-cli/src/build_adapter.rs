@@ -56,13 +56,10 @@ pub fn build_modgraph(kind: &str, root: &Path) -> Result<OutGraphV1> {
         "cargo" => cargo::build(root),
         "soong" => soong::build(root),
         "kernel" => kernel::build(root),
-        "gn" => anyhow::bail!(
-            "--build gn: not yet implemented (queued v0.1.12 follow-up). \
-             For now, hand-write module_graph.json from `gn gen --ide=json` \
-             output."
-        ),
+        "gn" => gn::build(root),
+        "bazel" => bazel::build(root),
         other => anyhow::bail!(
-            "unknown --build kind '{}'; expected one of: cargo, soong (skeleton), kernel (pending), gn (pending)",
+            "unknown --build kind '{}'; expected one of: cargo, soong, kernel, gn, bazel",
             other,
         ),
     }
@@ -424,85 +421,123 @@ mod kernel {
 }
 
 // ---------------------------------------------------------------------
-// soong (skeleton — schema based on educated guess from Soong source
-// at build/soong/cmd/soong_build and the Blueprint module model;
-// validate against real `m json-module-graph` output before relying)
+// soong (validated against real AOSP cached output)
+//
+// Reads `out/soong/module-info-<lunch_target>.json` which Soong emits
+// as part of every build. Schema discovered empirically against real
+// AOSP output: an array of single-key objects mapping module name to
+// {path, class, shared_libs, static_libs, dependencies, ...}. This is
+// the same data `module-graph.json` would contain, but cached after
+// every build instead of needing an explicit `m json-module-graph`.
+//
+// File attribution: each module's `path` field names its source dir.
+// For file → module mapping, we use longest-prefix-match against the
+// path list. A file in `frameworks/av/camera/ndk/foo.cpp` belongs to
+// the module whose `path` matches that prefix most specifically.
+//
+// Dep edges: union of `shared_libs`, `static_libs`, `dependencies`.
+// External deps (dep name not in our module table) are silently
+// dropped; intra-graph deps form the reachability bitmap.
 // ---------------------------------------------------------------------
 
 mod soong {
     use super::*;
 
-    /// Soong's module-graph.json is documented in the source as one
-    /// JSON object per Blueprint module, with these fields. We
-    /// deserialize the SUBSET we need; unknown fields are ignored.
-    #[derive(Debug, Deserialize)]
-    #[allow(dead_code)]
-    struct RawModule {
-        #[serde(rename = "Name")]
-        name: String,
-        #[serde(rename = "Type", default)]
-        ty: String,
-        /// Module's source files (relative to the AOSP root). May be
-        /// empty for synthetic / aggregator modules.
-        #[serde(rename = "Srcs", default)]
-        srcs: Vec<String>,
-        /// Direct deps, each carrying the depended-on module's name.
-        /// In real Soong output this includes variant info; we strip
-        /// to bare names for the v1 schema.
-        #[serde(rename = "Deps", default)]
-        deps: Vec<RawDep>,
-        /// Partition the module ships in. Soong source uses fields
-        /// like SystemExtSpecific / VendorSpecific etc.; for now we
-        /// look at a single "Partition" shortcut field if present.
-        #[serde(rename = "Partition", default)]
-        partition: Option<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[allow(dead_code)]
-    struct RawDep {
-        #[serde(rename = "Name")]
-        name: String,
+    /// One entry in module-info-*.json. The outer file is an array of
+    /// these single-key objects; we re-shape into Vec<(name, info)>.
+    #[derive(Debug, Deserialize, Default)]
+    struct ModInfo {
+        #[serde(default)]
+        path: Vec<String>,
+        #[serde(default)]
+        class: Vec<String>,
+        #[serde(default)]
+        shared_libs: Vec<String>,
+        #[serde(default)]
+        static_libs: Vec<String>,
+        #[serde(default)]
+        dependencies: Vec<String>,
     }
 
     pub fn build(root: &Path) -> Result<OutGraphV1> {
-        // Where Soong drops the file (per build/soong/ui/build/config.go).
-        let p = root.join("out/soong/module-graph.json");
-        if !p.exists() {
+        // Find a cached module-info JSON. Soong writes one per lunch
+        // target as `out/soong/module-info-<target>.json`.
+        let soong_out = root.join("out/soong");
+        if !soong_out.is_dir() {
             anyhow::bail!(
-                "{}: not found. Generate it from your AOSP tree with:\n  \
-                 source build/envsetup.sh && lunch <target> && m json-module-graph\n\
-                 then re-run this command.",
-                p.display(),
+                "{}: no out/soong directory found — has Soong ever run \
+                 in this tree? Try `source build/envsetup.sh && lunch \
+                 <target> && m nothing` first.",
+                root.display(),
             );
         }
-        let raw = std::fs::read_to_string(&p)
-            .with_context(|| format!("read {}", p.display()))?;
-        // Soong emits an array at the top level. If the actual format
-        // is wrapped in an object, parse will fail with a clear error
-        // pointing the user to file an issue or use --raw (future flag).
-        let raws: Vec<RawModule> = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", p.display()))?;
-
-        let mut by_name: HashMap<String, u32> = HashMap::new();
-        for (i, m) in raws.iter().enumerate() {
-            by_name.insert(m.name.clone(), i as u32);
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&soong_out) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                if let Some(n) = name.to_str() {
+                    if n.starts_with("module-info-") && n.ends_with(".json") {
+                        candidates.push(entry.path());
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            anyhow::bail!(
+                "{}: no module-info-<target>.json found. Run `m nothing` \
+                 (or any soong-only build) to generate one.",
+                soong_out.display(),
+            );
+        }
+        // Pick the most recently modified — usually the lunch target
+        // the user most recently built. If they have multiple targets
+        // and want a specific one, they can rename / symlink as needed.
+        candidates.sort_by_key(|p| {
+            std::fs::metadata(p).and_then(|m| m.modified()).ok()
+        });
+        let chosen = candidates.last().unwrap().clone();
+        eprintln!("[soong] reading module-info from {}", chosen.display());
+        let raw = std::fs::read_to_string(&chosen)
+            .with_context(|| format!("read {}", chosen.display()))?;
+        // Schema: an array of {NAME: {fields}} objects. Re-shape into
+        // a flat Vec<(String, ModInfo)>.
+        let parsed: Vec<HashMap<String, ModInfo>> = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", chosen.display()))?;
+        let mut mods: Vec<(String, ModInfo)> = Vec::with_capacity(parsed.len());
+        for entry in parsed {
+            for (k, v) in entry {
+                mods.push((k, v));
+            }
         }
 
-        let modules: Vec<OutModule> = raws.iter().enumerate()
-            .map(|(i, m)| OutModule {
-                id: i as u32,
-                name: m.name.clone(),
-                partition: m.partition.clone(),
-            })
-            .collect();
+        // Build module table. Dedup by name (some modules appear in
+        // multiple variants; we keep the first and ignore the rest
+        // for the v1 schema since variant differentiation needs the
+        // clang USR pass).
+        let mut by_name: HashMap<String, u32> = HashMap::new();
+        let mut modules: Vec<OutModule> = Vec::new();
+        let mut compact_mods: Vec<(String, ModInfo)> = Vec::new();
+        for (name, info) in mods {
+            if by_name.contains_key(&name) { continue; }
+            let id = modules.len() as u32;
+            let partition = info.class.first().cloned();
+            by_name.insert(name.clone(), id);
+            modules.push(OutModule { id, name: name.clone(), partition });
+            compact_mods.push((name, info));
+        }
 
+        // Dep edges: union of shared_libs + static_libs + dependencies.
+        // Drop deps whose target isn't in our module table (external,
+        // synthetic, or variant-tagged with a suffix we don't decode).
         let mut deps: Vec<[u32; 2]> = Vec::new();
         let mut dedup: HashSet<(u32, u32)> = HashSet::new();
-        for (i, m) in raws.iter().enumerate() {
+        for (i, (_, info)) in compact_mods.iter().enumerate() {
             let from = i as u32;
-            for d in &m.deps {
-                if let Some(&to) = by_name.get(&d.name) {
+            for dep_name in info.shared_libs.iter()
+                .chain(info.static_libs.iter())
+                .chain(info.dependencies.iter())
+            {
+                if let Some(&to) = by_name.get(dep_name) {
                     if from != to && dedup.insert((from, to)) {
                         deps.push([from, to]);
                     }
@@ -510,22 +545,111 @@ mod soong {
             }
         }
 
-        let mut files: Vec<OutFile> = Vec::new();
-        for (i, m) in raws.iter().enumerate() {
-            let module_id = i as u32;
-            for s in &m.srcs {
-                // Soong's source paths are relative to the AOSP root.
-                // The scry indexer canonicalizes to absolute paths,
-                // so resolve here for the file→module attribution
-                // path key.
-                let abs = root.join(s);
-                if let Some(s) = abs.to_str() {
-                    files.push(OutFile { path: s.to_string(), module_id });
+        // File attribution via longest-prefix match. Build a sorted
+        // list of (path, module_id) sorted by path-length descending
+        // so longest prefixes are checked first. Then walk the tree
+        // assigning each file to the most specific match.
+        //
+        // To avoid walking the whole AOSP tree from scratch (we'd
+        // duplicate scry's indexer work), we instead enumerate the
+        // module paths themselves and emit attribution entries for
+        // every source-ish file under each. The scry reader's path
+        // → file_id map handles the resolution.
+        let mut path_to_id: Vec<(String, u32)> = Vec::new();
+        for (i, (_, info)) in compact_mods.iter().enumerate() {
+            for p in &info.path {
+                if !p.is_empty() {
+                    path_to_id.push((p.clone(), i as u32));
                 }
             }
         }
+        // Sort by length descending so longest-prefix is found first.
+        path_to_id.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
+
+        let mut files: Vec<OutFile> = Vec::new();
+        let mut seen_files: HashSet<String> = HashSet::new();
+        for (rel_path, module_id) in &path_to_id {
+            let abs_dir = root.join(rel_path);
+            if !abs_dir.is_dir() { continue; }
+            walk_soong_sources(&abs_dir, *module_id, &mut files, &mut seen_files);
+        }
 
         Ok(OutGraphV1 { version: 1, modules, deps, files })
+    }
+
+    /// Walk a Soong module's source dir, attributing source files.
+    /// Dedups: if a file was already attributed to a more-specific
+    /// module path (we sort longest-first), it stays with that one.
+    fn walk_soong_sources(
+        dir: &Path, module_id: u32,
+        out: &mut Vec<OutFile>, seen: &mut HashSet<String>,
+    ) {
+        let rd = match std::fs::read_dir(dir) { Ok(rd) => rd, _ => return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name();
+            if let Some(n) = name.to_str() {
+                if n.starts_with('.') { continue; }
+            }
+            if p.is_dir() {
+                walk_soong_sources(&p, module_id, out, seen);
+            } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if matches!(ext,
+                    "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" |
+                    "java" | "kt" | "rs" | "aidl" | "proto" | "hal"
+                ) {
+                    if let Some(s) = p.to_str() {
+                        if seen.insert(s.to_string()) {
+                            out.push(OutFile { path: s.to_string(), module_id });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_module_info_array_shape() {
+            let tmp = std::env::temp_dir().join(format!(
+                "scry-soong-fake-{}", std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(tmp.join("out/soong")).unwrap();
+            std::fs::create_dir_all(tmp.join("frameworks/foo")).unwrap();
+            std::fs::create_dir_all(tmp.join("frameworks/bar")).unwrap();
+            std::fs::write(tmp.join("frameworks/foo/a.cpp"), "//\n").unwrap();
+            std::fs::write(tmp.join("frameworks/bar/b.cpp"), "//\n").unwrap();
+            std::fs::write(tmp.join("out/soong/module-info-tinytest.json"), r#"[
+                {"foo": {
+                    "path": ["frameworks/foo"],
+                    "class": ["SHARED_LIBRARIES"],
+                    "shared_libs": ["bar"],
+                    "static_libs": [],
+                    "dependencies": ["bar"]
+                }},
+                {"bar": {
+                    "path": ["frameworks/bar"],
+                    "class": ["STATIC_LIBRARIES"],
+                    "shared_libs": [],
+                    "static_libs": [],
+                    "dependencies": []
+                }}
+            ]"#).unwrap();
+            let g = build(&tmp).unwrap();
+            assert_eq!(g.modules.len(), 2);
+            let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
+            assert!(names.contains(&"foo"));
+            assert!(names.contains(&"bar"));
+            // foo → bar (via shared_libs OR dependencies; dedup'd to one edge).
+            assert_eq!(g.deps.len(), 1, "deps: {:?}", g.deps);
+            // 2 source files attributed.
+            assert_eq!(g.files.len(), 2);
+            std::fs::remove_dir_all(&tmp).ok();
+        }
     }
 }
 
@@ -646,5 +770,328 @@ version = "0.1.0"
         assert_eq!(v.modules.len(), 2);
         assert_eq!(v.deps.len(), 1);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+// ---------------------------------------------------------------------
+// gn (Chromium / perfetto / V8 / ANGLE …)
+//
+// Reads the `project.json` that `gn gen --ide=json out/` produces.
+// Schema (well documented at gn.googlesource.com/gn):
+//   { "targets": { "//foo:bar": { "type": "...", "deps": [...],
+//                                  "sources": [...] }, ... } }
+// Targets named `//foo:bar` map to module name `foo:bar`. Deps are
+// other `//…` labels — intra-graph deps form our edges; external
+// labels are silently dropped (they don't appear in our module
+// table).
+// ---------------------------------------------------------------------
+
+mod gn {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct GnProject {
+        targets: HashMap<String, GnTarget>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    struct GnTarget {
+        #[serde(rename = "type", default)]
+        ty: Option<String>,
+        #[serde(default)]
+        deps: Vec<String>,
+        #[serde(default)]
+        sources: Vec<String>,
+    }
+
+    pub fn build(root: &Path) -> Result<OutGraphV1> {
+        // GN writes project.json to whichever out dir was used at
+        // `gn gen --ide=json`. Try a handful of common names; the
+        // user can also point us at a specific one via a symlink.
+        let candidates = [
+            "out/Default/project.json",
+            "out/Release/project.json",
+            "out/Debug/project.json",
+            "out/project.json",
+            "project.json",
+        ];
+        let mut chosen: Option<PathBuf> = None;
+        for c in &candidates {
+            let p = root.join(c);
+            if p.is_file() { chosen = Some(p); break; }
+        }
+        let p = chosen.ok_or_else(|| anyhow::anyhow!(
+            "no GN project.json found under {}; ran `gn gen --ide=json out/Default` yet?",
+            root.display(),
+        ))?;
+        let raw = std::fs::read_to_string(&p)
+            .with_context(|| format!("read {}", p.display()))?;
+        let parsed: GnProject = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", p.display()))?;
+
+        // Normalize target label "//path/to:target" → "path/to:target".
+        fn norm_label(s: &str) -> String {
+            s.strip_prefix("//").unwrap_or(s).to_string()
+        }
+
+        let mut by_label: HashMap<String, u32> = HashMap::new();
+        let mut modules: Vec<OutModule> = Vec::new();
+        let mut compact: Vec<(String, GnTarget)> = Vec::new();
+        for (label, tgt) in parsed.targets {
+            let n = norm_label(&label);
+            if by_label.contains_key(&n) { continue; }
+            let id = modules.len() as u32;
+            let partition = tgt.ty.clone();
+            by_label.insert(n.clone(), id);
+            modules.push(OutModule { id, name: n.clone(), partition });
+            compact.push((n, tgt));
+        }
+
+        let mut deps: Vec<[u32; 2]> = Vec::new();
+        let mut dedup: HashSet<(u32, u32)> = HashSet::new();
+        for (i, (_, tgt)) in compact.iter().enumerate() {
+            let from = i as u32;
+            for dep in &tgt.deps {
+                let dep_n = norm_label(dep);
+                if let Some(&to) = by_label.get(&dep_n) {
+                    if from != to && dedup.insert((from, to)) {
+                        deps.push([from, to]);
+                    }
+                }
+            }
+        }
+
+        // Files: sources entries are usually `//path/to/foo.cc` —
+        // resolve against the root.
+        let mut files: Vec<OutFile> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (i, (_, tgt)) in compact.iter().enumerate() {
+            for src in &tgt.sources {
+                let rel = src.strip_prefix("//").unwrap_or(src);
+                let abs = root.join(rel);
+                if let Some(s) = abs.to_str() {
+                    if seen.insert(s.to_string()) {
+                        files.push(OutFile { path: s.to_string(), module_id: i as u32 });
+                    }
+                }
+            }
+        }
+
+        Ok(OutGraphV1 { version: 1, modules, deps, files })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_gn_project_json() {
+            let tmp = std::env::temp_dir().join(format!(
+                "scry-gn-fake-{}", std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(tmp.join("out/Default")).unwrap();
+            std::fs::create_dir_all(tmp.join("src/foo")).unwrap();
+            std::fs::create_dir_all(tmp.join("src/bar")).unwrap();
+            std::fs::write(tmp.join("src/foo/a.cc"), "//\n").unwrap();
+            std::fs::write(tmp.join("src/bar/b.cc"), "//\n").unwrap();
+            std::fs::write(tmp.join("out/Default/project.json"), r#"{
+                "targets": {
+                    "//src/foo:foo": {
+                        "type": "static_library",
+                        "deps": ["//src/bar:bar"],
+                        "sources": ["//src/foo/a.cc"]
+                    },
+                    "//src/bar:bar": {
+                        "type": "static_library",
+                        "deps": [],
+                        "sources": ["//src/bar/b.cc"]
+                    }
+                }
+            }"#).unwrap();
+            let g = build(&tmp).unwrap();
+            assert_eq!(g.modules.len(), 2);
+            assert_eq!(g.deps.len(), 1);
+            assert_eq!(g.files.len(), 2);
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// bazel
+//
+// Reads the output of `bazel query --output=jsonproto 'kind(rule, //...)'`
+// (or its streamed cousin). Schema follows build.proto's Target type:
+//
+//   [ {"type": "RULE",
+//      "rule": { "name": "//foo:bar",
+//                "rule_class": "cc_library",
+//                "attribute": [
+//                  {"name": "deps", "string_list_value": ["//baz:lib", …]},
+//                  {"name": "srcs", "string_list_value": ["//foo/a.cc", …]}
+//                ] } },
+//      ...
+//   ]
+//
+// Or it may be wrapped in `{"results": [...]}`. We try both shapes.
+// User runs `bazel query ... > bazel-query.json` and points us at it,
+// OR we look for `<root>/bazel-query.json` automatically.
+// ---------------------------------------------------------------------
+
+mod bazel {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct TargetWrap {
+        #[serde(rename = "type", default)]
+        ty: Option<String>,
+        #[serde(default)]
+        rule: Option<RawRule>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RawRule {
+        name: String,
+        #[serde(rename = "ruleClass", default)]
+        rule_class: Option<String>,
+        #[serde(default)]
+        attribute: Vec<RawAttr>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RawAttr {
+        name: String,
+        #[serde(default, rename = "stringListValue")]
+        string_list_value: Vec<String>,
+    }
+
+    /// Top-level shape: either an array, or `{ "results": [...] }`.
+    /// We hand-disambiguate by trying both.
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum BazelOutput {
+        Wrapped { results: Vec<TargetWrap> },
+        Flat(Vec<TargetWrap>),
+    }
+
+    pub fn build(root: &Path) -> Result<OutGraphV1> {
+        let candidates = ["bazel-query.json", "bazel-targets.json"];
+        let mut chosen: Option<PathBuf> = None;
+        for c in &candidates {
+            let p = root.join(c);
+            if p.is_file() { chosen = Some(p); break; }
+        }
+        let p = chosen.ok_or_else(|| anyhow::anyhow!(
+            "no bazel-query.json found under {}; run:\n  \
+             bazel query 'kind(rule, //...)' --output=jsonproto > {}/bazel-query.json\n\
+             and try again.",
+            root.display(), root.display(),
+        ))?;
+        let raw = std::fs::read_to_string(&p)
+            .with_context(|| format!("read {}", p.display()))?;
+        let parsed: BazelOutput = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", p.display()))?;
+        let targets = match parsed {
+            BazelOutput::Wrapped { results } => results,
+            BazelOutput::Flat(v) => v,
+        };
+
+        // Normalize bazel label `//path/to:target` → `path/to:target`.
+        fn norm_label(s: &str) -> String {
+            s.strip_prefix("//").unwrap_or(s).to_string()
+        }
+
+        let mut by_label: HashMap<String, u32> = HashMap::new();
+        let mut modules: Vec<OutModule> = Vec::new();
+        let mut compact: Vec<(String, RawRule)> = Vec::new();
+        for tw in targets {
+            if tw.ty.as_deref() != Some("RULE") { continue; }
+            let rule = match tw.rule { Some(r) => r, None => continue };
+            let n = norm_label(&rule.name);
+            if by_label.contains_key(&n) { continue; }
+            let id = modules.len() as u32;
+            let partition = rule.rule_class.clone();
+            by_label.insert(n.clone(), id);
+            modules.push(OutModule { id, name: n.clone(), partition });
+            compact.push((n, rule));
+        }
+
+        let mut deps: Vec<[u32; 2]> = Vec::new();
+        let mut dedup: HashSet<(u32, u32)> = HashSet::new();
+        let mut files: Vec<OutFile> = Vec::new();
+        let mut seen_files: HashSet<String> = HashSet::new();
+        for (i, (_, rule)) in compact.iter().enumerate() {
+            let from = i as u32;
+            for attr in &rule.attribute {
+                match attr.name.as_str() {
+                    "deps" => {
+                        for d in &attr.string_list_value {
+                            let dn = norm_label(d);
+                            if let Some(&to) = by_label.get(&dn) {
+                                if from != to && dedup.insert((from, to)) {
+                                    deps.push([from, to]);
+                                }
+                            }
+                        }
+                    }
+                    "srcs" => {
+                        for s in &attr.string_list_value {
+                            let rel = s.strip_prefix("//")
+                                .map(|s| s.replace(':', "/"))
+                                .unwrap_or_else(|| s.clone());
+                            let abs = root.join(&rel);
+                            if let Some(s) = abs.to_str() {
+                                if seen_files.insert(s.to_string()) {
+                                    files.push(OutFile { path: s.to_string(), module_id: from });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(OutGraphV1 { version: 1, modules, deps, files })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_bazel_jsonproto_shape() {
+            let tmp = std::env::temp_dir().join(format!(
+                "scry-bazel-fake-{}", std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(tmp.join("src/foo")).unwrap();
+            std::fs::create_dir_all(tmp.join("src/bar")).unwrap();
+            std::fs::write(tmp.join("src/foo/a.cc"), "//\n").unwrap();
+            std::fs::write(tmp.join("src/bar/b.cc"), "//\n").unwrap();
+            std::fs::write(tmp.join("bazel-query.json"), r#"[
+                {"type": "RULE", "rule": {
+                    "name": "//src/foo:foo",
+                    "ruleClass": "cc_library",
+                    "attribute": [
+                        {"name": "deps", "stringListValue": ["//src/bar:bar"]},
+                        {"name": "srcs", "stringListValue": ["//src/foo:a.cc"]}
+                    ]
+                }},
+                {"type": "RULE", "rule": {
+                    "name": "//src/bar:bar",
+                    "ruleClass": "cc_library",
+                    "attribute": [
+                        {"name": "srcs", "stringListValue": ["//src/bar:b.cc"]}
+                    ]
+                }}
+            ]"#).unwrap();
+            let g = build(&tmp).unwrap();
+            assert_eq!(g.modules.len(), 2);
+            assert_eq!(g.deps.len(), 1, "deps: {:?}", g.deps);
+            assert_eq!(g.files.len(), 2);
+            std::fs::remove_dir_all(&tmp).ok();
+        }
     }
 }

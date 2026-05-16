@@ -28,7 +28,16 @@ PASS=0
 FAIL=0
 FAILED_SUITES=""
 
-for suite in emacs vim vscode; do
+# Two flavors per editor: batch (driver-level shape assertions) and
+# tty (real interactive editor in an isolated tmux pane). vscode
+# stays node-only since we don't have a Code binary in this env.
+SUITES="emacs vim vscode emacs_tty vim_tty"
+[ -x "$(command -v tmux)" ] || {
+    echo "[run_all] tmux not installed; skipping the TTY suites."
+    SUITES="emacs vim vscode"
+}
+
+for suite in $SUITES; do
     echo
     echo "================================================================"
     echo " editor e2e: $suite"

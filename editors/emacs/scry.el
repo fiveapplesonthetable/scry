@@ -367,7 +367,42 @@ and language."
                                     :test #'equal)))
                   (when row
                     (cons (alist-get 'path row)
-                          (alist-get 'line row))))))))))
+                          (alist-get 'line row)))))
+              ;; corfu + company both recognize :company-doc-buffer for
+              ;; popup-side documentation. We render the symbol's full
+              ;; FQN, kind, lang, and path in a small read-only buffer
+              ;; users can then jump out to via `M-.` (which works
+              ;; because xref shares the same scry backend).
+              :company-doc-buffer
+              (lambda (name)
+                (let* ((row (cl-find name (funcall rows-for
+                                                   (buffer-substring-no-properties
+                                                    beg end))
+                                     :key (lambda (r) (alist-get 'name r))
+                                     :test #'equal))
+                       (buf (get-buffer-create " *scry-doc*")))
+                  (when row
+                    (with-current-buffer buf
+                      (let ((inhibit-read-only t))
+                        (erase-buffer)
+                        (insert (format "%s\n%s · %s"
+                                        (or (alist-get 'fqn row)
+                                            (alist-get 'name row))
+                                        (or (alist-get 'kind row) "?")
+                                        (or (alist-get 'lang row) "?")))
+                        (when (alist-get 'scope row)
+                          (insert (format " · %s"
+                                          (mapconcat #'identity
+                                                     (alist-get 'scope row)
+                                                     "::"))))
+                        (insert (format "\n%s:%s"
+                                        (or (alist-get 'path row) "?")
+                                        (or (alist-get 'line row) "?")))
+                        (special-mode))
+                      buf))))
+              ;; Single-candidate selection trigger for corfu/company.
+              ;; Always allow the popup to surface — the user picks.
+              :company-prefix-length t)))))
 
 ;;; ----------------------------------------------------------------
 ;;; Interactive commands

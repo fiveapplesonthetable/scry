@@ -81,6 +81,46 @@ language-specific completers (lsp-mode, eglot, dabbrev, ...) keep
 working alongside scry; scry just adds candidates from across the
 whole index.
 
+### Popup frontends (recommended)
+
+Vanilla CAPF pops `*Completions*` in a window split — usable but
+plain. Install one of these for an inline popup with kind icons,
+filename annotations, and snippet docs:
+
+| frontend                                                | works in GUI Emacs | works in `emacs -nw` | scry hooks used |
+|---------------------------------------------------------|:------------------:|:--------------------:|-----------------|
+| [`corfu`](https://github.com/minad/corfu)               | yes                | no (needs `corfu-terminal`) | `:annotation-function`, `:company-kind`, `:company-doc-buffer` |
+| `corfu` + [`corfu-terminal`](https://codeberg.org/akib/emacs-corfu-terminal) | yes                | **yes**              | same             |
+| [`company`](https://github.com/company-mode/company-mode) | yes                | yes (native)         | `:company-kind`, `:company-location`, `:company-doc-buffer` |
+
+Minimal corfu setup that gives you the popup everywhere (GUI + TTY):
+
+```elisp
+(use-package corfu
+  :init (global-corfu-mode 1)
+  :custom (corfu-auto t) (corfu-auto-prefix 2) (corfu-auto-delay 0.05))
+
+;; Inline popup inside `emacs -nw`:
+(use-package corfu-terminal
+  :unless (display-graphic-p)
+  :after corfu
+  :config (corfu-terminal-mode 1))
+```
+
+scry.el's CAPF already exports every property corfu / company
+recognize (kind icons, annotation chips with `[kind lang] file`,
+a doc buffer with the symbol's FQN + scope + location). Both
+frontends pick this up automatically — no per-package config.
+
+For company users:
+
+```elisp
+(use-package company
+  :init (global-company-mode 1)
+  :custom (company-minimum-prefix-length 2)
+          (company-idle-delay 0.05))
+```
+
 Configuration
 -------------
 

@@ -7,6 +7,67 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-05-16
+
+The editor-UX polish drop. Validates every editor plugin from
+v0.1.9 inside a real, interactive editor session — not just at
+the API level — and adds the popup-frontend integration
+(`corfu`, `company`, `corfu-terminal`) that the user-facing
+autocomplete UX wants.
+
+### Added — interactive TTY e2e suites
+
+- **`editors/tests/e2e_emacs_tty.sh`** — drives real `emacs -nw`
+  in an isolated tmux server. Six assertions covering modeline
+  lighter, scry-stats, scry-def (jumps to a Rust source line),
+  scry-callers (xref buffer fills), scry-prefix (autocomplete
+  candidate visible), scry-restart confirmation. Auto-loads
+  `corfu` from the user's `~/.emacs.d/straight/build/corfu` if
+  present, falls back to vanilla `*Completions*` otherwise.
+- **`editors/tests/e2e_vim_tty.sh`** — same shape for `vim`:
+  ScryStats, ScryDef, ScryCallers, ScryPrefix, omnifunc
+  candidate count.
+- **Isolation**: both TTY suites use `tmux -L scry-e2e-$$` to
+  create a per-script tmux SERVER (separate socket from
+  `tmux/default`), so they CANNOT touch the user's existing
+  tmux sessions. Cleanup uses `kill-session` only, never
+  `kill-server`. A defensive check refuses to run if the socket
+  name doesn't carry the PID.
+- **`run_all.sh`** auto-picks up both TTY suites when `tmux`
+  is installed; falls back to batch-only otherwise.
+
+### Improved — Emacs popup integration
+
+- `scry-completion-at-point` now also exports
+  `:company-doc-buffer`, which both `corfu` and `company` use
+  to render a small doc panel beside the popup. Contents are
+  the symbol's FQN, kind, lang, scope chain, and path:line —
+  enough that the user can branch between two same-named
+  candidates without leaving the popup.
+- Emacs README gets a "Popup frontends (recommended)" section
+  with the `corfu` + `corfu-terminal` recipe for in-buffer
+  popups under `emacs -nw`, plus the `company` alternative.
+  Every CAPF property scry exports is enumerated against the
+  three frontends so users can see exactly what they'll get.
+
+### Validated
+
+`./editors/tests/run_all.sh` on this host:
+
+```
+editor e2e: emacs       8 ok
+editor e2e: vim         8 ok
+editor e2e: vscode      7 ok
+editor e2e: emacs_tty   6 ok   (real `emacs -nw` in tmux)
+editor e2e: vim_tty     5 ok   (real `vim` in tmux)
+                       --
+                       36 assertions across 5 suites — all green
+```
+
+Zero binary changes (scry-cli, scry-store, scry-lang, scry-aosp,
+scry-walker bytes are identical to v0.1.9). Pure editor + test
+work.
+
 ## [0.1.9] — 2026-05-16
 
 The editor-bindings drop. scry now ships first-class plugins for

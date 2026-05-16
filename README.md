@@ -99,13 +99,20 @@ warm mmap'd index.
 ```sh
 $ printf '%s\n' \
     '{"id":1,"cmd":"def","args":{"name":"Binder","limit":3}}' \
-    '{"id":2,"cmd":"callers","args":{"name":"transact","limit":3}}' \
+    '{"id":2,"cmd":"callers","args":{"name":"transact","in":"frameworks/base/","limit":3}}' \
+    '{"id":3,"cmd":"grep","args":{"name":"ZygoteInit","limit":5}}' \
   | scry serve --index /mnt/agent/scry-index
 {"id":1,"result":[{"name":"Binder","kind":"class","lang":"Java","path":"…","line":85,...}]}
 {"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","path":"…","line":1234,...}]}
+{"id":3,"result":[{"path":"…","line":42,"col":7,"snippet":"…ZygoteInit…"}]}
 ```
 
-Supported commands: `def`, `ref`, `callers`, `prefix`, `fuzzy`, `stats`.
+Supported commands: `def`, `ref`, `callers`, `prefix`, `fuzzy`, `grep`, `stats`.
+All search commands accept an optional `"in"` arg (root-relative subdir
+prefix) to narrow the search — same semantics as the CLI's `--in`.
+`grep` is literal-only (regex queries belong on the CLI where rayon
+parallelism is available); it shares the same trigram pre-filter for
+sub-ms matches on selective patterns.
 
 ## Architecture (one paragraph)
 

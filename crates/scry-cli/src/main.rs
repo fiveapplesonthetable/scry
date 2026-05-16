@@ -1886,13 +1886,15 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let lang = args.get("lang").and_then(|v| v.as_str());
         let kind = args.get("kind").and_then(|v| v.as_str());
+        let in_ = args.get("in").and_then(|v| v.as_str());
 
         let result = match cmd {
-            "def" => serve_def(&reader, name, lang, kind, limit),
-            "prefix" => serve_prefix(&reader, name, limit),
-            "fuzzy" => serve_fuzzy(&reader, name, limit),
-            "ref" => serve_ref(&reader, name, lang, kind, limit),
-            "callers" => serve_ref(&reader, name, lang, Some("call"), limit),
+            "def" => serve_def(&reader, name, lang, kind, in_, limit),
+            "prefix" => serve_prefix(&reader, name, in_, limit),
+            "fuzzy" => serve_fuzzy(&reader, name, in_, limit),
+            "ref" => serve_ref(&reader, name, lang, kind, in_, limit),
+            "callers" => serve_ref(&reader, name, lang, Some("call"), in_, limit),
+            "grep" => serve_grep(&reader, name, lang, in_, limit),
             "stats" => serve_stats(&reader),
             other => serde_json::json!({"error": format!("unknown cmd: {other}")}),
         };
@@ -1907,35 +1909,60 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Does the symbol/ref live under the given subdir prefix? Matched against
+/// the displayed path (root-relative), so callers pass repo-root-relative
+/// prefixes like "frameworks/base/services/".
+fn file_in_prefix(r: &StoreReader, file_id: u32, prefix: &str) -> bool {
+    if prefix.is_empty() { return true; }
+    match r.files.get(file_id as usize) {
+        Some(fe) => fe.display_path(&r.roots).starts_with(prefix),
+        None => false,
+    }
+}
+
 fn serve_def(
     r: &StoreReader,
     name: &str,
     lang: Option<&str>,
     kind: Option<&str>,
+    in_: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
+    let prefix = in_.unwrap_or("");
     let mut out = Vec::new();
     let syms = r.lookup_exact(name);
-    for s in syms.into_iter().take(limit) {
+    for s in syms.into_iter() {
+        if out.len() >= limit { break; }
         if let Some(l) = lang {
             if !format!("{:?}", s.lang).eq_ignore_ascii_case(l) { continue; }
         }
         if let Some(k) = kind {
             if !s.kind.short().eq_ignore_ascii_case(k) { continue; }
         }
+        if !file_in_prefix(r, s.file_id, prefix) { continue; }
         out.push(symbol_to_json(r, &s));
     }
     serde_json::Value::Array(out)
 }
 
-fn serve_prefix(r: &StoreReader, prefix: &str, limit: usize) -> serde_json::Value {
-    let v: Vec<_> = r.lookup_prefix(prefix, limit).into_iter()
+fn serve_prefix(r: &StoreReader, prefix: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
+    let in_prefix = in_.unwrap_or("");
+    // Over-fetch from the FST then filter by subdir; pad up to limit but
+    // cap the work at 8× to bound latency on broad prefixes.
+    let cap = if in_prefix.is_empty() { limit } else { limit.saturating_mul(8).max(limit) };
+    let v: Vec<_> = r.lookup_prefix(prefix, cap).into_iter()
+        .filter(|s| file_in_prefix(r, s.file_id, in_prefix))
+        .take(limit)
         .map(|s| symbol_to_json(r, &s)).collect();
     serde_json::Value::Array(v)
 }
 
-fn serve_fuzzy(r: &StoreReader, substr: &str, limit: usize) -> serde_json::Value {
-    let v: Vec<_> = r.lookup_substring(substr, limit).into_iter()
+fn serve_fuzzy(r: &StoreReader, substr: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
+    let in_prefix = in_.unwrap_or("");
+    let cap = if in_prefix.is_empty() { limit } else { limit.saturating_mul(8).max(limit) };
+    let v: Vec<_> = r.lookup_substring(substr, cap).into_iter()
+        .filter(|s| file_in_prefix(r, s.file_id, in_prefix))
+        .take(limit)
         .map(|s| symbol_to_json(r, &s)).collect();
     serde_json::Value::Array(v)
 }
@@ -1945,17 +1972,84 @@ fn serve_ref(
     name: &str,
     lang: Option<&str>,
     kind: Option<&str>,
+    in_: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
+    let prefix = in_.unwrap_or("");
     let mut out = Vec::new();
-    for rr in r.lookup_refs_exact(name).into_iter().take(limit) {
+    for rr in r.lookup_refs_exact(name).into_iter() {
+        if out.len() >= limit { break; }
         if let Some(l) = lang {
             if !format!("{:?}", rr.lang).eq_ignore_ascii_case(l) { continue; }
         }
         if let Some(k) = kind {
             if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
         }
+        if !file_in_prefix(r, rr.file_id, prefix) { continue; }
         out.push(ref_to_json(r, &rr));
+    }
+    serde_json::Value::Array(out)
+}
+
+/// Literal-only grep over the warm reader. Uses the trigram pre-filter
+/// when present, then scans candidate files in-process. Single-threaded
+/// (one RPC at a time); for ad-hoc parallel batch grep, use the CLI.
+fn serve_grep(
+    r: &StoreReader,
+    pattern: &str,
+    lang: Option<&str>,
+    in_: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
+    if pattern.is_empty() {
+        return serde_json::json!({"error": "empty pattern"});
+    }
+    let prefix = in_.unwrap_or("");
+    let needle = pattern.as_bytes();
+    let candidates: Option<std::collections::HashSet<u32>> = r.grep_candidates(needle);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    // Soft cap on files scanned even when trigram returns many — keeps a
+    // bad query (e.g. "the") from blocking the serve loop for seconds.
+    const MAX_FILES_SCANNED: usize = 5000;
+    let mut scanned = 0usize;
+    for fe in r.files.iter() {
+        if out.len() >= limit { break; }
+        if scanned >= MAX_FILES_SCANNED { break; }
+        if let Some(ref tg) = candidates {
+            if !tg.contains(&fe.id) { continue; }
+        }
+        if let Some(l) = lang {
+            if !format!("{:?}", fe.kind).eq_ignore_ascii_case(l) { continue; }
+        }
+        if !prefix.is_empty() {
+            let p = fe.display_path(&r.roots);
+            if !p.starts_with(prefix) { continue; }
+        }
+        scanned += 1;
+        let path = fe.display_path(&r.roots);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // memmem search through the file; cap matches per-file to avoid
+        // pathological hits (e.g. every line) eating the limit.
+        let mut start_at = 0usize;
+        let mut per_file = 0usize;
+        while let Some(off) = memchr::memmem::find(&bytes[start_at..], needle) {
+            let abs = start_at + off;
+            let (line, col, snippet) = locate_match(&bytes, abs, abs + needle.len());
+            out.push(serde_json::json!({
+                "path": path,
+                "line": line,
+                "col": col,
+                "snippet": snippet,
+                "lang": format!("{:?}", fe.kind),
+            }));
+            per_file += 1;
+            if out.len() >= limit || per_file >= 16 { break; }
+            start_at = abs + needle.len().max(1);
+            if start_at >= bytes.len() { break; }
+        }
     }
     serde_json::Value::Array(out)
 }

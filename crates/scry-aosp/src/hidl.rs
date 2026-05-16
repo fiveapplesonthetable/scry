@@ -131,6 +131,11 @@ impl<'a> P<'a> {
                             n.clone(), SymbolKind::AidlInterface,
                             nl, nc, nb, nb + n.len() as u32, scope.clone(),
                         ));
+                        // HIDL toolchain emits its own family of bindings:
+                        // Bp{I}, Bn{I}, Bs{I} (passthrough wrapper).
+                        // Shadow them as `HidlShadow` so `scry def BpIFoo`
+                        // lands on the .hal source.
+                        emit_hidl_shadows(&n, &scope, nl, nc, nb, syms);
                         // Optional `extends Base`
                         self.ws();
                         if self.peek_word("extends") {
@@ -320,6 +325,44 @@ impl<'a> P<'a> {
     }
 }
 
+/// Emit synthetic shadow symbols for the C++ bindings the HIDL
+/// toolchain generates from `interface IFoo`. All shadows live at
+/// the .hal source location and carry `SymbolKind::HidlShadow`, so
+/// `scry def BpIFoo` finds the HIDL declaration even though `BpIFoo`
+/// only exists as generated C++.
+///
+/// HIDL prefix scheme (fixed by the toolchain):
+///   Bp{I}  — proxy   (client-side)
+///   Bn{I}  — native  (server-side stub)
+///   Bs{I}  — passthrough wrapper (same-process / direct call)
+pub(crate) fn emit_hidl_shadows(
+    iface: &str,
+    pkg_scope: &[String],
+    line: u32,
+    col: u32,
+    byte: u32,
+    syms: &mut Vec<RawSymbol>,
+) {
+    for name in hidl_shadow_names(iface) {
+        syms.push(make_symbol(
+            name.clone(),
+            SymbolKind::HidlShadow,
+            line, col, byte, byte + name.len() as u32,
+            pkg_scope.to_vec(),
+        ));
+    }
+}
+
+/// The fixed set of HIDL shadow names for an interface, in stable
+/// order. Pinned by a test so a toolchain rename is loud.
+pub(crate) fn hidl_shadow_names(iface: &str) -> Vec<String> {
+    vec![
+        format!("Bp{iface}"),
+        format!("Bn{iface}"),
+        format!("Bs{iface}"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +388,40 @@ mod tests {
         assert!(names.contains(&"Bar"));
         let rnames: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
         assert!(rnames.iter().any(|n| n.contains("IBase")));
+    }
+
+    /// HIDL shadow names are fixed by the toolchain: Bp / Bn / Bs.
+    /// Pin the set so a toolchain rename or a refactor of our shadow
+    /// scheme can't silently break the cross-language pivot.
+    #[test]
+    fn hidl_shadow_names_pinned() {
+        assert_eq!(hidl_shadow_names("IFoo"), vec!["BpIFoo", "BnIFoo", "BsIFoo"]);
+    }
+
+    /// End-to-end: parse a small HIDL file, assert the shadows landed
+    /// with `SymbolKind::HidlShadow` at the same location as the
+    /// interface declaration.
+    #[test]
+    fn interface_emits_hidl_shadows() {
+        let src = br#"
+            package android.hardware.foo@1.0;
+            interface IFoo {
+                doSomething(int32_t x);
+            }
+        "#;
+        let (syms, _) = parse(src);
+        let iface = syms.iter().find(|s| s.name == "IFoo" && s.kind == SymbolKind::AidlInterface)
+            .expect("IFoo interface symbol must exist");
+        let shadows: Vec<&RawSymbol> = syms.iter()
+            .filter(|s| s.kind == SymbolKind::HidlShadow).collect();
+        assert_eq!(shadows.len(), 3, "expected exactly 3 HIDL shadows, got {}", shadows.len());
+        for s in &shadows {
+            assert_eq!(s.line, iface.line, "shadow {} not at iface line", s.name);
+        }
+        let names: std::collections::HashSet<&str> = shadows.iter()
+            .map(|s| s.name.as_str()).collect();
+        for must_have in &["BpIFoo", "BnIFoo", "BsIFoo"] {
+            assert!(names.contains(must_have), "missing {must_have} in {names:?}");
+        }
     }
 }

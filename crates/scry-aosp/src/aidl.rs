@@ -145,6 +145,17 @@ impl<'a> P<'a> {
                             n.clone(), SymbolKind::AidlInterface,
                             nline, ncol, nbyte, nbyte + n.len() as u32, scope.clone(),
                         ));
+                        // Cross-language shadow symbols. AIDL `interface
+                        // IFoo` produces a fixed family of generated
+                        // bindings (`IFoo.Stub`, `IFoo.Stub.Proxy` in
+                        // Java; `BpIFoo` / `BnIFoo` in C++; `IFoo` in
+                        // Rust). Emitting them as symbols at the .aidl
+                        // location means `scry def IFoo.Stub` lands on
+                        // the right file instead of returning nothing.
+                        // The lang of these shadow records is left as
+                        // the source kind (Aidl); callers identify them
+                        // by SymbolKind::AidlShadow.
+                        emit_aidl_shadows(&n, &scope, nline, ncol, nbyte, syms);
                         self.parse_interface_body(&n, &scope, syms);
                     } else {
                         self.skip_to_close_brace();
@@ -280,6 +291,62 @@ impl<'a> P<'a> {
     }
 }
 
+/// Emit synthetic shadow symbols for the cross-language bindings the
+/// AIDL toolchain generates from `interface IFoo`. All shadows live at
+/// the AIDL source location (line/col/byte offset of the interface
+/// name) and carry `SymbolKind::AidlShadow`, so a `scry def IFoo.Stub`
+/// query lands on the .aidl file even though `IFoo.Stub` only exists
+/// as generated Java code.
+///
+/// The set of shadows is fixed by the AIDL toolchain conventions:
+///
+///   Java:  IFoo.Stub        — abstract Binder server stub
+///          IFoo.Stub.Proxy  — generated client proxy
+///   C++:   BpIFoo           — proxy ("Bp" = Binder Proxy)
+///          BnIFoo           — server stub ("Bn" = Binder Native)
+///   Rust:  IFoo             — same name as the AIDL interface
+///          IFooAsyncServer  — the async-server variant emitted since
+///                             AIDL Rust async support landed
+///
+/// Six shadows per interface; cheap to store and gives us the cross-
+/// language pivot scry's design lives on. The names are pinned in the
+/// `aidl_shadow_names` test so a future drift in the toolchain (e.g.
+/// "BpIFoo" → "Bp_IFoo") is loud at test time.
+pub(crate) fn emit_aidl_shadows(
+    iface: &str,
+    pkg_scope: &[String],
+    line: u32,
+    col: u32,
+    byte: u32,
+    syms: &mut Vec<RawSymbol>,
+) {
+    for name in aidl_shadow_names(iface) {
+        syms.push(make_symbol(
+            name.clone(),
+            SymbolKind::AidlShadow,
+            line, col, byte, byte + name.len() as u32,
+            pkg_scope.to_vec(),
+        ));
+    }
+}
+
+/// The fixed set of generated-binding names for an AIDL interface,
+/// in a stable order. Extracted into a free function so tests can
+/// pin the exact list without exercising the parser.
+pub(crate) fn aidl_shadow_names(iface: &str) -> Vec<String> {
+    vec![
+        format!("{iface}.Stub"),
+        format!("{iface}.Stub.Proxy"),
+        format!("Bp{iface}"),
+        format!("Bn{iface}"),
+        // Rust binding has the same bare name as the AIDL interface;
+        // we still emit it as a shadow so `scry def IFoo --kind aidl.shadow`
+        // also lists the Rust target side-by-side.
+        iface.to_string(),
+        format!("{iface}AsyncServer"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +375,53 @@ mod tests {
         "#;
         let (syms, _refs) = parse(src);
         assert!(syms.iter().any(|s| s.name == "Parcel"));
+    }
+
+    /// Shadow-name set is fixed by the AIDL toolchain; pin every name
+    /// so a future drift in the toolchain (or in our shadow scheme) is
+    /// loud at test time. The names listed here are the same ones
+    /// `scry def IFoo.Stub` and friends will match against.
+    #[test]
+    fn aidl_shadow_names_complete() {
+        let names = aidl_shadow_names("IBinder");
+        assert_eq!(names, vec![
+            "IBinder.Stub",
+            "IBinder.Stub.Proxy",
+            "BpIBinder",
+            "BnIBinder",
+            "IBinder",
+            "IBinderAsyncServer",
+        ]);
+    }
+
+    /// End-to-end: parse a small AIDL file and assert that the shadow
+    /// symbols got emitted at the same line/col as the interface
+    /// declaration, with `SymbolKind::AidlShadow` so callers can filter.
+    #[test]
+    fn interface_emits_shadow_symbols() {
+        let src = br#"
+            package android.os;
+            interface IBinder {
+                void transact(in int code, in Parcel data);
+            }
+        "#;
+        let (syms, _) = parse(src);
+        let iface = syms.iter().find(|s| s.name == "IBinder" && s.kind == SymbolKind::AidlInterface)
+            .expect("IBinder interface symbol must exist");
+        let shadows: Vec<&RawSymbol> = syms.iter()
+            .filter(|s| s.kind == SymbolKind::AidlShadow).collect();
+        assert_eq!(shadows.len(), 6, "expected exactly 6 shadow symbols, got {}", shadows.len());
+        // All shadows share the interface's location (we emit them at
+        // the same line/col so navigation lands the user on the AIDL).
+        for s in &shadows {
+            assert_eq!(s.line, iface.line);
+            assert_eq!(s.col, iface.col);
+        }
+        // The fixed set must be present.
+        let names: std::collections::HashSet<&str> = shadows.iter()
+            .map(|s| s.name.as_str()).collect();
+        for must_have in &["IBinder.Stub", "IBinder.Stub.Proxy", "BpIBinder", "BnIBinder"] {
+            assert!(names.contains(must_have), "missing shadow {must_have} in {names:?}");
+        }
     }
 }

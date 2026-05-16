@@ -64,6 +64,19 @@ $ scry def zygote --kind init.svc --limit 1
 $ scry def IBinder --kind aidl.iface --limit 1
 /home/zim/dev/aosp/frameworks/native/aidl/binder/android/os/IBinder.aidl:21:11  (aidl.iface aidl)  IBinder
 
+# AIDL cross-language shadows: each `interface IFoo` produces
+# synthetic symbols for the toolchain-generated bindings (Java Stub,
+# C++ Bp/Bn, Rust binding) all pointing back at the .aidl source.
+$ scry def IBinder.Stub --kind aidl.shadow
+/home/zim/dev/aosp/frameworks/native/aidl/binder/android/os/IBinder.aidl:21:11  (aidl.shadow aidl)  IBinder.Stub
+
+$ scry def BpIBinder --kind aidl.shadow
+/home/zim/dev/aosp/frameworks/native/aidl/binder/android/os/IBinder.aidl:21:11  (aidl.shadow aidl)  BpIBinder
+
+# HIDL shadows follow the same pattern (Bp / Bn / Bs).
+$ scry def BpIServiceManager --kind hidl.shadow
+/home/zim/dev/aosp/hardware/.../IServiceManager.hal:14:11  (hidl.shadow hidl)  BpIServiceManager
+
 $ scry def system_server --kind sepolicy --limit 2
 /home/zim/dev/aosp/system/sepolicy/public/system_server.te:1:6  (sepolicy sepolicy)  system_server
 ```

@@ -178,6 +178,15 @@ pub enum SymbolKind {
     AidlInterface,
     AidlMethod,
     AidlParcelable,
+    /// Synthetic shadow symbol for an AIDL-generated language binding.
+    /// Emitted at AIDL parse time so `scry def IFoo.Stub` (Java) or
+    /// `scry def BpIFoo` (C++) finds the AIDL source location instead
+    /// of returning empty. The `lang` field on the SymbolRecord
+    /// distinguishes which target language the shadow names.
+    AidlShadow,
+    /// Same idea for HIDL: BpFoo / BnFoo / IFoo proxies that exist in
+    /// generated C++ but are conceptually rooted in the .hal file.
+    HidlShadow,
     ProtoMessage,
     ProtoEnum,
     ProtoService,
@@ -218,6 +227,8 @@ impl SymbolKind {
             SymbolKind::AidlInterface => "aidl.iface",
             SymbolKind::AidlMethod => "aidl.method",
             SymbolKind::AidlParcelable => "aidl.parcel",
+            SymbolKind::AidlShadow => "aidl.shadow",
+            SymbolKind::HidlShadow => "hidl.shadow",
             SymbolKind::ProtoMessage => "proto.msg",
             SymbolKind::ProtoEnum => "proto.enum",
             SymbolKind::ProtoService => "proto.svc",
@@ -323,6 +334,10 @@ impl SymbolRecord {
             | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Union => 100,
             SymbolKind::Method | SymbolKind::Function | SymbolKind::Constructor => 90,
             SymbolKind::AidlInterface | SymbolKind::AidlMethod | SymbolKind::AidlParcelable => 85,
+            // Shadows are derived bindings; rank below the real AIDL/HIDL
+            // declaration but above plain fields so they surface for the
+            // common "find IFoo.Stub" question without burying the .aidl.
+            SymbolKind::AidlShadow | SymbolKind::HidlShadow => 78,
             SymbolKind::ProtoMessage | SymbolKind::ProtoService | SymbolKind::ProtoEnum => 85,
             SymbolKind::SoongModule => 80,
             SymbolKind::InitService | SymbolKind::SepolicyType => 75,

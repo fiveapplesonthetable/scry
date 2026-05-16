@@ -46,13 +46,16 @@ cargo build --release              # ~20 s cold, ~10 s incremental
 # Query.
 ./target/release/scry def ActivityManagerService --kind class
 ./target/release/scry callers transact --lang Java --limit 20
-./target/release/scry ref liblog --lang Soong              # who depends on liblog?
-./target/release/scry def libbinder --kind soong           # Soong module info
-./target/release/scry def zygote --kind init.svc           # init.rc service
-./target/release/scry def IBinder --kind aidl.iface        # AIDL interface
+./target/release/scry ref liblog --lang Soong                            # who depends on liblog?
+./target/release/scry def libbinder --kind soong                         # Soong module info
+./target/release/scry def zygote --kind init.svc                         # init.rc service
+./target/release/scry def IBinder --kind aidl.iface                      # AIDL interface
+./target/release/scry def Activity --in frameworks/base/services/        # subdir-scoped
+./target/release/scry callers transact --in art/                         # subdir-scoped
 ./target/release/scry prefix Activity --limit 20
 ./target/release/scry fuzzy ParcelFile --limit 10
 ./target/release/scry grep "TODO\(.*\): " --regex --lang Java
+./target/release/scry grep "ZygoteInit"                                  # trigram-accelerated literal
 ./target/release/scry stats
 ```
 
@@ -67,13 +70,25 @@ cargo build --release              # ~20 s cold, ~10 s incremental
 --max-file-bytes N      hard refuse-to-open ceiling (default 100 MiB)
 --no-refs               skip ref extraction (smaller index, no xrefs)
 --resume                pick up from progress.json checkpoint
+--build-trigrams        build trigram index (100× faster grep on literals)
 --profile aosp/linux    select walker skiplist
 
 # env var (read once at startup):
 SCRY_PARSE_TIMEOUT_MS   per-file tree-sitter parse budget (default 0 = unlimited)
 ```
 
-See `docs/OPERATIONS.md` for what each does and when to tune it.
+## Standalone post-index utilities (no re-parsing required)
+
+```sh
+scry build-trigrams --index /path  # add trigram index (100× grep)
+scry build-offsets  --index /path  # add lazy-reader sidecars (30× cold open)
+```
+
+Useful for retrofitting old indexes or indexes built without
+`--build-trigrams`. Both are atomic — safe to run on a live-serving index.
+
+See `docs/OPERATIONS.md` for what each does and when to tune it; see
+`docs/FAST_PATH.md` for the design behind trigram + lazy reader.
 
 ## LLM/agent integration
 

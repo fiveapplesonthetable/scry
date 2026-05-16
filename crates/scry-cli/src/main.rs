@@ -560,24 +560,41 @@ fn cmd_index(
                         writer.tmp_dir.as_ref().unwrap().display(),
                     );
                 }
+                // File-count drift between runs is the common case in AOSP
+                // (background processes touch the tree). A small drift means
+                // some files were inserted into the sorted walk, which COULD
+                // shift file_ids and misalign chunks. We warn loudly and let
+                // the operator decide — bailing on every drift makes the
+                // resume loop unusable in production.
+                let mut any_path_changed = false;
                 for (i, rj) in want.iter().enumerate() {
                     let want_path = rj.get("path").and_then(|x| x.as_str()).unwrap_or("");
                     let want_n = rj.get("n_files").and_then(|x| x.as_u64()).unwrap_or(0);
                     let cur = &prepared[i];
                     let cur_path = cur.root_path.display().to_string();
                     if cur_path != want_path {
-                        anyhow::bail!(
-                            "resume: root[{}] path mismatch (now {} vs progress {}); \
-                             re-index without --resume", i, cur_path, want_path,
+                        any_path_changed = true;
+                        eprintln!(
+                            "[resume] WARN: root[{}] path mismatch (now {} vs progress {})",
+                            i, cur_path, want_path,
                         );
                     }
-                    if cur.files.len() as u64 != want_n {
-                        anyhow::bail!(
-                            "resume: root[{}] file count changed ({} now vs {} in progress); \
-                             source tree shifted — re-index without --resume",
-                            i, cur.files.len(), want_n,
+                    let drift = (cur.files.len() as i64) - (want_n as i64);
+                    if drift != 0 {
+                        eprintln!(
+                            "[resume] WARN: root[{}] file count drift {:+} ({} now vs {} in progress) \
+                             — file_ids past the insertion point may be misaligned; \
+                             chunks may contain stale references.",
+                            i, drift, cur.files.len(), want_n,
                         );
                     }
+                }
+                if any_path_changed {
+                    anyhow::bail!(
+                        "resume: root path(s) changed — cannot continue. \
+                         Remove {} and re-index without --resume.",
+                        writer.tmp_dir.as_ref().unwrap().display(),
+                    );
                 }
                 // Discard any orphan chunks past what progress.json knows about.
                 let tmp = writer.tmp_dir.as_ref().unwrap().clone();
@@ -901,7 +918,12 @@ fn parse_one(
     }
     let bytes = std::fs::read(&rf.path)
         .with_context(|| format!("read {}", rf.path.display()))?;
-    let (raw_syms, raw_refs) = registry.parse(rf.kind, &bytes);
+    // Stamp the filename on the worker thread so tree-sitter timeout /
+    // abort logs can name the offending file. Cleared after the call.
+    let (raw_syms, raw_refs) = scry_lang::with_current_file(
+        rf.path.display().to_string(),
+        || registry.parse(rf.kind, &bytes),
+    );
     let mut syms = Vec::with_capacity(raw_syms.len());
     let relpath = fe.relpath.clone();
     for r in raw_syms {

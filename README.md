@@ -2,15 +2,18 @@
 
 Semantic code search and cross-reference engine for AOSP and the Linux kernel.
 
-**Status:** Phases 0–4 implemented. Live on `/mnt/agent/scry-index` against
-`~/dev/aosp` + `/mnt/agent/dev/linux`. Full design in `docs/DESIGN.md`.
+**Status:** Phases 0–4 implemented + resumable production indexing. Live
+on `/mnt/agent/scry-index` against `~/dev/aosp` + `/mnt/agent/dev/linux`.
+Full design in `docs/DESIGN.md`; production knob + systemd recipe in
+`docs/OPERATIONS.md`.
 
 ## What it is
 
 A single static Rust binary, ripgrep-fast, build-aware code intelligence
-tool that indexes a full AOSP checkout (~118 GB / ~830k files) plus a
-Linux kernel tree (37 GB / ~76k files) — combined **~906k files / ~155 GB
-of source** — and answers semantic and substring queries at interactive
+tool that indexes a full AOSP checkout (~350 GB / ~925k files) plus a
+Linux kernel tree (~37 GB / ~85k files) — combined **~1.01M files / ~70 GB
+of indexed source** (the rest is binaries / build outputs the walker
+filters out) — and answers semantic and substring queries at interactive
 latency on a warm mmap index.
 
 Coverage spans source languages (C, C++, Java, Kotlin, Rust, Go, Python,
@@ -29,12 +32,16 @@ cd /mnt/agent/scry
 . ./env.sh                         # CARGO_HOME / RUSTUP_HOME / PATH
 cargo build --release              # ~20 s cold, ~10 s incremental
 
-# Build the index against AOSP + Linux (default roots if present).
+# One-shot indexing against the AOSP + Linux default roots.
 ./target/release/scry index
 
 # Or pass explicit roots:
 ./target/release/scry index ~/dev/aosp /mnt/agent/dev/linux \
     -o /mnt/agent/scry-index
+
+# Production-grade: systemd-managed loop with cgroup memory cap +
+# auto-resume after OOM-kills. See docs/OPERATIONS.md for the recipe.
+./scripts/run_index.sh
 
 # Query.
 ./target/release/scry def ActivityManagerService --kind class
@@ -48,6 +55,25 @@ cargo build --release              # ~20 s cold, ~10 s incremental
 ./target/release/scry grep "TODO\(.*\): " --regex --lang Java
 ./target/release/scry stats
 ```
+
+## Operator knobs (all CLI flags, nothing hardcoded)
+
+```
+--workers N             rayon pool size (default: all cores)
+--flush-bytes N         MiB of records per batch; adaptive batch size (default 1024)
+--flush-every N         hard file cap per batch (default 50000)
+--mem-cap N             soft jemalloc backpressure ceiling, GiB
+--big-file-bytes N      files > N route SERIAL (default 64 KiB)
+--max-file-bytes N      hard refuse-to-open ceiling (default 100 MiB)
+--no-refs               skip ref extraction (smaller index, no xrefs)
+--resume                pick up from progress.json checkpoint
+--profile aosp/linux    select walker skiplist
+
+# env var (read once at startup):
+SCRY_PARSE_TIMEOUT_MS   per-file tree-sitter parse budget (default 0 = unlimited)
+```
+
+See `docs/OPERATIONS.md` for what each does and when to tune it.
 
 ## LLM/agent integration
 

@@ -32,6 +32,27 @@ pub struct RawRef {
 
 thread_local! {
     static PARSER: RefCell<Parser> = RefCell::new(Parser::new());
+    /// Filename of the file currently being parsed on this worker thread.
+    /// Set by `with_current_file` (called from the indexing pipeline) so
+    /// extract_with / extract_refs_with can emit USEFUL diagnostic logs
+    /// when tree-sitter aborts a parse — "tree-sitter timed out" with no
+    /// path is useless for investigation, which is the whole point of
+    /// surfacing it.
+    static CURRENT_FILE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Scope a string as the "current file" while `f` runs on this thread.
+/// Used so the tree-sitter parse layer can name the file in failure logs
+/// without changing the FormatParser trait signature.
+pub fn with_current_file<R>(name: String, f: impl FnOnce() -> R) -> R {
+    CURRENT_FILE.with(|c| *c.borrow_mut() = Some(name));
+    let r = f();
+    CURRENT_FILE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+fn current_file_name() -> String {
+    CURRENT_FILE.with(|c| c.borrow().clone()).unwrap_or_else(|| "<unknown>".into())
 }
 
 /// Per-file tree-sitter parse timeout (microseconds). Set via env var
@@ -100,9 +121,25 @@ fn extract_refs_with(
         parser.set_language(lang.language)?;
         let t = parse_timeout_micros();
         if t > 0 { parser.set_timeout_micros(t); }
+        let t_parse = std::time::Instant::now();
         let tree = match parser.parse(source, None) {
             Some(t) => t,
-            None => return Ok(Vec::new()),
+            None => {
+                // Loud, file-named log so the operator can investigate the
+                // specific input that defeated tree-sitter. We don't silently
+                // skip; we record + report.
+                let elapsed_ms = t_parse.elapsed().as_millis();
+                let reason = if t > 0 && (elapsed_ms as u128) >= ((t as u128) / 1000).saturating_sub(50) {
+                    "TIMEOUT"
+                } else {
+                    "ABORT"
+                };
+                eprintln!(
+                    "[ts-{}] {} ({} bytes) — tree-sitter parse returned None after {} ms (refs query)",
+                    reason, current_file_name(), source.len(), elapsed_ms,
+                );
+                return Ok(Vec::new());
+            },
         };
         let mut out: Vec<RawRef> = Vec::new();
         let mut cursor = QueryCursor::new();
@@ -154,9 +191,22 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
         parser.set_language(spec.language)?;
         let t = parse_timeout_micros();
         if t > 0 { parser.set_timeout_micros(t); }
+        let t_parse = std::time::Instant::now();
         let tree = match parser.parse(source, None) {
             Some(t) => t,
-            None => return Ok(Vec::new()),
+            None => {
+                let elapsed_ms = t_parse.elapsed().as_millis();
+                let reason = if t > 0 && (elapsed_ms as u128) >= ((t as u128) / 1000).saturating_sub(50) {
+                    "TIMEOUT"
+                } else {
+                    "ABORT"
+                };
+                eprintln!(
+                    "[ts-{}] {} ({} bytes) — tree-sitter parse returned None after {} ms (symbols query)",
+                    reason, current_file_name(), source.len(), elapsed_ms,
+                );
+                return Ok(Vec::new());
+            },
         };
         let mut out: Vec<RawSymbol> = Vec::new();
         let mut cursor = QueryCursor::new();

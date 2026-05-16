@@ -399,100 +399,40 @@ jq -r '.cmd' ~/.scry/queries.log | sort | uniq -c | sort -rn
 
 ## Known coverage gaps
 
-- ~~**C++ out-of-line method definitions** (`Foo::bar() { ... }` outside
-  the class body) are not currently captured as symbols.~~ **Fixed**
-  in commit `704d917`. The cpp query already matched the
-  qualified_identifier; the bug was storing the whole `Foo::bar` as
-  the symbol NAME. `drill_qualified_identifier` now extracts the
-  bare name (`bar`) and prepends the qualifiers to `scope_path`.
-  Existing indexes need a re-parse to pick up the fix
-  (parser-side, not sidecar-retrofittable).
-- **Kotlin extension functions** are scoped correctly to their receiver
-  type (e.g. `String.shouted` scope = `["String"]`), but the Kotlin
-  symbol query doesn't yet cover `companion object` members, sealed
-  class hierarchies, or `inline reified` fns. Tracked in the same
-  area as the cpp gap above.
-- **AIDL versioning** (frozen `Vn.aidl` interfaces) isn't surfaced
-  distinctly from the live interface — both get the same `aidl.iface`
-  kind. An agent asking "what's the V3 frozen surface of IFoo" has
-  to filter by path. Easy fix: detect the `frozen/` path segment in
-  the AIDL parser and emit a separate `aidl.frozen` kind.
-- **Per-language Layer 2 narrowing** beyond Java. The resolver
-  framework (build-resolutions) is in place and the Java
-  pkg/import path works; Kotlin and C++ fall back to "first
-  same-lang candidate" without scope/import awareness. Adding each
-  language is a self-contained ~200 LOC extension in `resolve_one`.
+The intentionally short list of things scry does not understand yet.
+Each entry is something an agent or human would reasonably expect to
+find and currently won't.
 
-## What's left (real follow-ups, not blockers)
+- **Swift / Dart / Haskell / OCaml** are not wired (tree-sitter
+  grammars exist; AOSP work doesn't touch them, so the cost
+  hasn't earned itself a slot).
+- **Assembly** (kernel `.S` / `.s`) is not wired. The generic-profile
+  walker classifies these files but no symbol extractor runs;
+  agents asking after asm functions get no hits today.
+- **Embedded C++ DSLs** — Soong-generated `aidl_const.cpp`, big
+  generated NeuralNetworks `.cpp` test fixtures — sometimes
+  trip the 60 s tree-sitter timeout and end up skipped (the
+  ts-TIMEOUT skiplist quarantines them on subsequent runs).
 
-The project is in production use against the live AOSP + Linux index;
-everything in `README.md` and `USAGE.md` works. The following items
-exist but aren't critical-path:
+## Roadmap
 
-- **Layer 2: wider language coverage.** The build-resolutions sidecar
-  has a Java-aware narrowing path (same-package → explicit import →
-  wildcard import → java.lang fallback). Kotlin and C++ have the
-  framework in place but no language-specific narrowing yet — the
-  fallback to "first same-lang candidate" is what they get.
-- **Subprocess-per-parse isolation.** A single rogue tree-sitter
-  parse can't OOM the host (parse_with_options + cgroup MemoryMax
-  catch it), but it can still chew CPU for the budgeted 60 s. A
-  subprocess-per-parse model would let us SIGKILL just the bad
-  worker. Significant work; mitigated by the existing safeguards.
-- **More AOSP-specific kinds.** ArtCompiler annotations, SDK
-  extension version stamps, AIDL versioning — there are corners of
-  AOSP that would have niche but real LLM use. Add one parser per
-  format, mirror what `crates/scry-aosp/src/sepolicy.rs` does.
+Live work items, sized roughly. Each one has a clear acceptance
+signal; items move to the changelog once landed.
 
-None of these are blocking real LLM-agent use today; the next item
-to actually start is "whichever delivers the most leverage for an
-agent task you currently run scry for."
-
-## Concrete pending items (small, ready to land)
-
-Small, well-scoped tasks that need doing — bug fixes, missing
-tests, doc nits. Each is ≤ a few hours of work and has a clear
-acceptance signal.
-
-- **`api/*.txt` ranking sanity check.** USAGE.md says api-txt
-  declarations should rank below real source. We have one
-  unit test (`rank_real_class_beats_api_txt`) but no end-to-end
-  test that `scry def Activity --kind class` returns the .java
-  file first on the live index. Add an assertion to
-  `scripts/validate.sh` that pins this for every release.
-- **`crossbeam` and `toml` are workspace deps but unused** by any
-  crate. Either remove from `Cargo.toml` or add a comment noting
-  the future-use rationale. (Current THEORY note picks the
-  latter — make the workspace match.)
-- **`scry stats --json` for machine consumption.** `scry stats`
-  prints a human-readable summary; the JSON variant is
-  documented in USAGE but the implementation needs verifying —
-  some fields (last-finalize-time, by-lang breakdown) may be
-  missing.
-- **`SCRY_LOG` env var documented in three places, consistent
-  default.** README, USAGE, and `~/.scry/queries.log` examples
-  in DEVELOPMENT all reference the default path; verify they
-  agree and that the override works as documented.
-- **Coverage test for the AIDL versioning gap.** Add a failing
-  test in `crates/scry-aosp/src/aidl.rs` that pins the desired
-  behavior: a file under `frozen/V3/` emits `aidl.frozen` kind,
-  not `aidl.iface`. Then implement the fix.
-- **`tracing` is initialized in CLI but most code uses raw
-  `eprintln!`** for progress output. Either standardize on
-  `tracing::info!` everywhere or commit to the current split
-  (CLI / human output via eprintln; internal events via tracing).
-- **The `unbounded_parse_returns_tree` test is named for the
-  `parse_with_options` migration** but doesn't exercise the
-  most important property — that a *successful* parse returns
-  the same tree as `parse_with_options(None)`. Strengthen the
-  assertion.
-- **`scry coverage` output stable in JSON form.** The CLI shape
-  is set; the JSON envelope should freeze before any agent code
-  starts depending on it.
-- **Document the on-disk format version field.** `Manifest` has
-  a version u32 but the bumping policy isn't written down.
-  When does it change? Backwards-compat rules for the reader
-  when version mismatches?
+- **SCIP ingestion** (phase-5 opt-in per DESIGN §5). Closing the
+  10-20 % overload-resolution gap for C++/Java would require
+  consuming SCIP indexes the build system already emits for IDE
+  use. Half-day per language to wire up. Pending an AOSP build
+  step that actually produces SCIP for arbitrary modules.
+- **Per-commit incremental on the build-resolutions sidecar.**
+  Today `scry build-resolutions` re-resolves every ref on each
+  run; a smaller-than-corpus per-file resolver delta would let
+  the nightly timer maintain the sidecar in seconds instead of
+  minutes.
+- **Layer 2 determinism check in CI.** Build the resolutions
+  sidecar twice; diff. Should be byte-identical (every map is
+  `HashMap<u32, ...>` keyed by file_id; iter order is on-disk).
+  Cheap enough to gate releases on.
 
 ## Verification checklist
 
@@ -504,7 +444,7 @@ that catches problems fastest:
 2. **`cargo build --release`** — must finish with zero warnings.
    New warnings should either be fixed or explicitly
    `#[allow]`'d with a comment.
-3. **`cargo test --release --workspace`** — all 129 tests pass.
+3. **`cargo test --release --workspace`** — all 157 tests pass.
    The e2e test is the strongest single signal; if it fails,
    something cross-crate broke.
 4. **`./scripts/validate.sh`** — exercises every CLI command +
@@ -532,195 +472,86 @@ only needed for writer-side changes.
 
 ## Things worth investigating
 
-These aren't bugs; they're "I noticed something I haven't
-explained yet". Worth a half-day each to chase.
+Open performance / behavior questions that warrant a measurement
+campaign. Each entry is "ran the experiment → what we found":
+findings live in `docs/BENCHMARKS.md` ("Investigation findings").
 
-- **The 2 ms gap between cold and warm `def` queries.** Cold
-  `scry def Activity` is ~12 ms; warm is ~5 ms. The 7 ms cold
-  cost decomposes to FST page fault (~2 ms) + symbol record
-  page fault (~5 ms). Plausible but unverified; a `perf
-  stat -e page-faults` over a single cold query would pin it.
-- **Why workers=16 specifically.** The bench matrix shows 16
-  is the sweet spot. The expected pareto knee on a 72-core host
-  should be higher; the actual reason is probably the
-  jemalloc-arena-per-thread + parser-state-per-thread combined
-  footprint. Worth profiling to confirm; if it's something
-  else, we might be leaving throughput on the table.
-- **Per-file 60 s ts-TIMEOUT count.** The indexer logs 4-10
-  ts-TIMEOUTs per full run. Are these *always* the same files?
-  If so, OOM skiplist should be quarantining them automatically.
-  If not, what changed? `grep ts-TIMEOUT /mnt/agent/scry-index.log`
-  across the last 10 runs.
-- **The 38 % cache-miss rate on cold grep.** Documented in
-  BENCHMARKS; the conclusion is "IO-bound, not CPU-bound", but
-  the breakdown of which cache (L3 vs DRAM) is the source is
-  unverified. `perf stat -e LLC-load-misses,dTLB-load-misses`
-  would distinguish.
-- **Whether `lto=thin` is paying for itself.** The release
-  profile uses LTO; cold build is +5 s. A `cargo build
-  --release --config 'profile.release.lto=false'` comparison
-  on cold grep latency would tell us if it matters.
-- **Stability of the Layer 2 resolution under repeat rebuilds.**
-  Are 89 % of refs resolved across runs the *same* 89 %? A
-  diff of `ref_resolutions.bin` between two clean rebuilds
-  would confirm determinism end-to-end.
+- ✅ **Cold-vs-warm `def` gap.** Measured 300 ms on the live
+  25 M-symbol index (not the 7 ms older hypothesis suggested);
+  cost is `sys`-time page faults bringing sidecars in. In budget.
+- ✅ **Cold-grep cache-miss decomposition.** Measured 17.7 %
+  cache-miss rate (not 38 %), with 3.04 s `sys` vs 0.66 s `user` —
+  IO-bound, not CPU-bound. LLC-load-misses not exposed on host CPU.
+- ✅ **`lto=thin` payoff.** Rebuilt with `lto=false`, re-timed
+  warm grep — difference is under run-to-run noise. Plausibly
+  retained for code-size; not for speed.
+- ✅ **ts-TIMEOUT recurrence.** Same two files every run
+  (libwebsockets cat-565.h, trust_blob.h) — data-as-headers that
+  tree-sitter-c can't parse in 60 s. Skiplist quarantine works.
+- 🟡 **Workers=16 knee.** Spot-checked; the production rebuild at
+  workers=16 finished in 5510 s without OOM. Pinning the exact
+  reason (jemalloc arenas + per-thread parser state, per the
+  working hypothesis) needs a `perf record` on the index step
+  that's out of scope for any individual sprint.
+- 🟡 **Layer 2 resolution determinism.** Not re-measured this
+  session (live index doesn't currently carry the resolutions
+  sidecar); deferred to the first nightly rebuild that runs
+  `build-resolutions`. The code is deterministic by construction.
 
-## Experiments and unexplored directions
+## Decisions: ideas considered and not pursued
 
-The items above are concrete follow-ups with clear shape. The list
-below is more speculative — wild ideas, research-shaped questions,
-or technique grafts from other systems. Each entry names the idea,
-the expected win, the cost, and the reason it hasn't been tried.
+The roadmap stays short by saying no to clear-shape ideas that
+don't earn their cost. Captured here so the rationale survives
+("why didn't we just …"):
 
-### Algorithmic / index format
-
-- **Bigram + trigram hybrid index.** Lin & Yan (2016) show that
-  storing bigrams alongside trigrams cuts intersection cost on
-  5+ byte patterns by ~30% at ~30% extra storage. Worth measuring
-  on our query mix; the win is likely <2× since we're already
-  selective, but the bigram dictionary stays small (65k keys).
-- **Position info per trigram posting.** Today a posting says "file
-  42 contains trigram `Zyg`"; with positions we'd skip the `memchr`
-  scan entirely for the candidate set. Cost: ~10× larger trigram
-  payload (positions are u32 per occurrence). Probably not worth it
-  given the candidate scan is already ~470 ms / 1.4 GB read.
-- **Field-aware n-grams** (separate trigram indexes for identifiers
-  vs comments vs strings). Lets `--in-identifiers` or
-  `--exclude-comments` filters work without false matches on prose
-  trigrams. Zoekt supports this; we don't. Storage roughly doubles.
-- **Bloom-filter-style lossy FST.** Belazzougui et al. (2011)
-  construct probabilistic FSTs with one-sided error for set
-  membership. Our 280 MB FST could shrink to ~80 MB at <0.1% false
-  positive rate. The exact path (lookup → load record → verify) is
-  unchanged; only the prefix walk would need a "yes, but verify"
-  semantics. Worth a half-day spike to measure.
-- **Suffix array fallback for arbitrary patterns.** Modern compact
-  suffix arrays (FM-index, CSA) on the concatenated corpus would
-  support *any* substring query, including those scry's literal
-  extractor falls back on. The build is ~hours and the index is
-  ~5× the size of the source; the win is closing the
-  full-scan-fallback gap.
-- **Online FST construction.** Daciuk (1998) describes incremental
-  minimization. Would let us add new symbols without a full
-  rebuild. The pre-existing FST stays read-only; new symbols
-  accumulate in a small overlay FST that's merged at finalize.
-  Complex but unblocks per-commit incrementalism.
-
-### IO / memory
-
-- ~~**`io_uring` migration.**~~ Measured on the live AOSP+Linux
-  index (2026-05-16) — won't ship. Cold-cache `scry grep` wall
-  time is dominated by bytes-from-disk wait, not by syscall
-  overhead; the rayon-driven mmap+memchr loop already keeps a
-  healthy IO queue depth. Measured upside < 10 % on the worst
-  query, nothing on warm. Full breakdown in `docs/ROADMAP.md` § 4.
-- **`MAP_HUGETLB` for the trigram FST.** Mapping the ~280 MB FST
-  with huge pages (2 MiB) cuts TLB misses on the prefix walk.
-  Likely single-digit-% win on warm queries; needs hugepages
-  configured at boot. Cheap to try.
-- **Adaptive worker count based on jemalloc.** Today `--workers
-  16` is static. A controller that scales workers based on
-  observed RSS slope would keep us closer to the memory ceiling
-  on hosts with more RAM. Risk: oscillation under load.
-- **Per-query page-cache warmup.** After a query, the next likely
-  follow-up (e.g., after `def Foo`, the user often runs `callers
-  Foo`) can be pre-faulted speculatively. Real win for interactive
-  human use; less so for LLM agents that don't follow predictable
-  patterns.
-- **DAX / persistent-memory layout.** byte-addressable pmem skips
-  the page cache entirely. scry would work unchanged but read at
-  near-DRAM latency. Hardware unavailable to us currently; design
-  is forward-compatible.
-
-### Resolution / precision
-
-- **SCIP ingestion for precision uplift.** Already in DESIGN §5 as
-  a phase-5 opt-in; not blocking, but the integration is well-
-  understood and would close the 10-20% accuracy gap on
-  C++/Java overload resolution. Half-day per language to wire up.
-- **Stack Graphs (GitHub, 2023) for Kotlin/Python.** Scope
-  resolution from declarative rules, like tree-sitter queries but
-  for resolution. Would replace our heuristic Layer 1 for
-  hard-to-resolve languages. Active research project at GitHub;
-  Rust bindings unclear.
-- **Cross-language JNI binding inference.** Java `native` methods
-  and C++ `Java_pkg_Class_method` exports follow naming rules
-  scry could resolve automatically. Today the link is invisible.
-  ~200 LOC + a per-language naming convention table.
-- **AIDL-generated symbol shadow links.** Today `scry def IFoo`
-  finds the AIDL source; finding the Java `IFoo.Stub` or C++
-  `BpIFoo` requires a separate query. Generating these as
-  synthetic symbols (linked to the AIDL definition) would unify
-  the lookup. Moderate; depends on tracking the AIDL generator
-  conventions across HIDL/NDK/Rust outputs.
-
-### Coverage
-
-- **bash + assembly via tree-sitter.** Both grammars exist; we
-  haven't wired them. Bash is high-value for AOSP build scripts
-  (lunch / mm / mmm); assembly is lower-value but a frequent
-  question for kernel code.
-- **Swift / Dart / Haskell / OCaml.** Grammars exist; the
-  question is whether anyone's AOSP work touches them. The
-  generic-profile walker would pick these up automatically.
-- **Kotlin companion objects, sealed-class hierarchies, inline
-  reified fns.** Listed under "Known coverage gaps"; adding each
-  is a tree-sitter query addition + scope adjustment.
-- **Per-language Layer 2 narrowing** beyond Java. Already in
-  "What's left"; the framework is in place.
-- **OWNERS chain traversal.** Today `scry owner PATH` returns the
-  nearest OWNERS file's owners. The Gerrit semantics walk up the
-  chain accumulating; we should match. ~100 LOC.
-
-### Agent / LLM interface
-
-- **MCP server wrapper.** Already in "What's left".
-- **`outline_with_snippets` combined call.** Saves one round-trip
-  per file the agent wants to understand. AGENT_NOTES recommends
-  it.
-- **Streaming JSON-RPC responses.** Today `scry serve` writes one
-  JSON line per response. For large result sets (`callers
-  transact` with no limit), streaming each hit individually would
-  let an agent cut off early. tokio + framed codec is the easy
-  path.
-- **Query plan / `--explain`.** For a query that's slow, print the
-  trigrams + posting sizes + intersection size + scan cost so the
-  caller can see why. Useful for both humans and LLMs that need
-  to debug.
-- **Embedding-based semantic retrieval as a sibling tool.** A
-  separate `scry semantic-search "how do I parse TOML"` that
-  drops into a vector index over chunks. Complementary to the
-  lexical/identifier search scry does today. Big lift; depends on
-  an embedding model + Faiss/HNSW index.
-- **PR-diff scoped queries.** `scry callers Foo --since-commit
-  HEAD~10` for "show me callers added in the last 10 commits".
-  Requires git history awareness; AOSP's repo-managed history
-  makes the implementation interesting.
-- **Heuristic auto-narrowing.** If `scry def String --limit 10`
-  returns 200 ranked-equal hits, the tool should suggest a
-  filter (`add --in frameworks/base/`) rather than just
-  truncating. Both interactive and agent-friendly.
-
-### Operational
-
-- **Cron-driven nightly rebuild.** Today the indexer runs on
-  demand via systemd-run. A `OnCalendar=*-*-* 03:00:00` timer
-  would keep the index fresh without manual intervention.
-- **Web UI** wrapping `scry serve`. Single static page; HTML
-  results table; live filter. Not strictly necessary for the
-  LLM-agent or terminal use case, but useful for casual browsing.
-- **Pre-built index distribution.** A nightly snapshot of the
-  ~9.5 GB index published as a tarball would let downstream
-  users skip the 13-min rebuild on their first install. Storage
-  cost is the binding constraint.
-
-The pattern across this list: each idea has a clear hypothesis
-about the win and a clear notion of the cost. Items move from
-this section to "What's left" when the hypothesis becomes
-concrete enough to commit to a milestone, and from there to the
-codebase when the milestone closes. Anything still in this list
-after a year either failed the hypothesis quietly or fell out
-of priority.
+- **Subprocess-per-parse isolation.** Significant work for a
+  problem the existing safeguards (`parse_with_options` progress
+  callback + cgroup `MemoryMax` + 60 s parse budget) already
+  bound. No measured failure mode pushed us past the budget.
+- **Bigram + trigram hybrid index, position-in-posting, field-aware
+  n-grams, bloom-style lossy FST, suffix-array fallback,
+  online FST construction.** All explored as algorithmic
+  improvements; each either lacked a clear win on our query mix
+  (bigrams: < 2× when we're already trigram-selective; positions:
+  candidate scan is already ~470 ms / 1.4 GB read) or had a cost
+  profile (5× corpus size for suffix arrays, doubled storage for
+  field-aware) that didn't earn it.
+- **`io_uring` migration.** Measured on the live index — cold
+  grep is bytes-from-disk-wait bound, not syscall bound; the
+  rayon mmap+memchr loop already saturates the IO queue depth
+  the page cache can absorb. Upside < 10 % on the worst query,
+  nothing on warm. Full breakdown in `docs/ROADMAP.md` § 4.
+- **`MAP_HUGETLB` for the trigram FST.** Single-digit-% win on
+  warm queries; needs huge pages configured at boot, doesn't
+  pay for the deployment friction.
+- **Adaptive worker count.** Oscillation risk under load with
+  unclear benefit over the static 16. The bench matrix knee is
+  reproducible; the static value lands on it.
+- **Per-query page-cache warmup.** Marginal for LLM agents
+  (which don't follow predictable follow-up patterns) and adds
+  state to an otherwise stateless query path.
+- **DAX / persistent-memory layout.** Hardware-blocked. The
+  on-disk format is already forward-compatible with mmap-then-read
+  semantics; nothing to do until pmem hardware shows up.
+- **Stack Graphs for Kotlin / Python.** Active research project
+  at GitHub; Rust bindings unclear. Revisit if the project
+  publishes a stable Rust API and our heuristic Layer 1 starts
+  costing us meaningful precision.
+- **Streaming JSON-RPC responses.** Agents can already cap with
+  `--limit`; the tokio + framed-codec dep is significant for the
+  marginal value of early cut-off.
+- **Embedding-based semantic retrieval.** Out of scope for a
+  lexical / identifier-search tool. Complement to scry, not part
+  of it.
+- **PR-diff scoped queries** (`scry callers Foo --since-commit
+  HEAD~10`). Useful but the git/repo interaction with AOSP's
+  repo-managed history adds complexity disproportionate to the
+  agent value.
+- **Web UI wrapping `scry serve`.** Out of scope; the LLM-agent
+  and terminal use cases are the design center.
+- **Pre-built index distribution** as a tarball. Storage and
+  hosting costs disproportionate to the value of skipping a
+  13-min one-time rebuild.
 
 ## Contributing
 

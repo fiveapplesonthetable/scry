@@ -7,6 +7,97 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-16
+
+The DEVELOPMENT.md sweep. Worked the "What's left" / "Concrete
+pending" / "Experiments" backlog end-to-end: kept the ideas that
+earned it, deleted the ones that didn't, measured the ones that
+needed measuring. Every item now lives somewhere — implemented,
+discarded with a rationale in DEVELOPMENT § "Decisions", or
+sitting in BENCHMARKS § "Investigation findings" as a
+result-of-record.
+
+### Added
+
+- `scry stats --json` for machine consumption. Stable shape:
+  scry_version + manifest_version + indexed_at + roots +
+  files_total/parsed/failed + bytes_total + symbols + refs +
+  elapsed_ms + by_lang + by_kind histograms. Pinned by e2e.
+- `scry grep --explain` query plan dumper. Lists every extracted
+  trigram (smallest-first, with posting size), the final
+  candidate count, and a rough scan-cost estimate. Short-circuits
+  the scan; use to diagnose why a grep feels slow.
+- `scry owner PATH --accumulate` emits the union of emails across
+  every visited OWNERS layer (the Gerrit "potential approvers"
+  set). OWNERS chain walk now respects `set noparent` (and the
+  bare `noparent` form) per Gerrit semantics.
+- AIDL frozen-version kind (`aidl.frozen`). Files under
+  `aidl_api/<pkg>/<N>/` are promoted from `aidl.iface` so agents
+  can filter `--kind aidl.frozen` to scope to a specific frozen
+  surface version.
+- JNI binding shadows (`SymbolKind::JniBinding`, "jni"). Every
+  Java `native` method emits a synthetic symbol named after the
+  standard JNI mangling (`Java_<pkg>_<class>_<method>` with
+  `_`→`_1`, `$`→`_00024`, `;`→`_2`, `[`→`_3`). `scry def
+  Java_android_os_Parcel_nativeWriteString` now lands on the
+  Java declaration even when the C++ side is missing.
+- Kotlin companion-object coverage. Anonymous `companion object
+  { ... }` injects a synthetic Class symbol named "Companion"
+  scoped to the enclosing class; members get `[Outer, Companion]`
+  scope. Named companions captured directly.
+- Layer 2 narrowing for Kotlin and C++. Kotlin mirrors Java
+  (same-package → explicit import → wildcard → implicit-import
+  fallback over kotlin / kotlin.collections / kotlin.io /
+  kotlin.text / ...). C++ does same-namespace > using-namespace
+  > fallback via a new `RefKind::UsingNamespace`.
+- Bash tree-sitter wiring (`tree-sitter-bash 0.25`) — captures
+  function definitions + top-level variable assignments. Surfaces
+  AOSP envsetup.sh's `lunch / mm / mmm / croot` family.
+- Auto-narrow hint: when a result set saturates `--limit` and
+  shown paths share a 2+ segment common directory prefix, a
+  stderr line suggests `--in <prefix>/` to narrow. Suppressed
+  by `SCRY_QUIET=1`.
+- Nightly rebuild systemd .timer recipe in OPERATIONS.md.
+
+### Improved
+
+- `Manifest::version` hoisted to `MANIFEST_VERSION` const with a
+  documented bump policy.
+- Coverage `--json` shape pinned by an explicit e2e shape assertion.
+- `unbounded_parse_returns_tree` test strengthened: compares the
+  `timeout=0` result to a reference `parse_with_options(_, None)`
+  call (root kind, byte range, node count, no parse error).
+- `validate.sh` hard-fails if `def Activity --kind class` returns
+  an `api/*.txt` first hit instead of a `.java`/`.kt` source.
+- Resolver tests grew from 7 (Java only) to 13 (Java + Kotlin +
+  C++); resolve_one has line-by-line coverage of every narrowing
+  path it can take.
+
+### Removed
+
+- `tracing` + `tracing-subscriber` deps. The subscriber was
+  initialized in `main()` but no code emitted through it;
+  eprintln! is the convention. -127 Cargo.lock entries.
+- `crossbeam` + `toml` from workspace deps (declared but never
+  imported by any crate).
+
+### Investigated
+
+Findings in BENCHMARKS § "Investigation findings":
+- Cold-vs-warm `def` gap: ~300 ms (not 7 ms); page-fault dominated.
+- Cold-grep cache-miss rate: 17.7 % (not 38 %); IO-bound.
+- `lto=thin` payoff: sub-1 % perf delta on warm grep.
+- ts-TIMEOUT recurrence: same two libwebsockets files every run.
+
+### Documentation
+
+- DEVELOPMENT.md collapsed 747 → 578 lines. "Known coverage
+  gaps" / "What's left" / "Concrete pending" / "Experiments"
+  merged into "Roadmap" + "Things worth investigating" +
+  "Decisions: ideas considered and not pursued".
+- BENCHMARKS.md gets an "Investigation findings" appendix.
+- OPERATIONS.md documents the nightly-rebuild .timer recipe.
+
 ## [0.1.5] — 2026-05-16
 
 The capacity-caps + agent-affordances drop. Address the

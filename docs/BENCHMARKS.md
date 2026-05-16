@@ -244,3 +244,125 @@ The numbers above are NVMe + 72 cores. Smaller hardware:
 The trigram pre-filter and the lazy/mmap reader hold their
 relative win over `rg` / `grep` across all of these; the absolute
 floor just moves up with the hardware.
+
+
+## Investigation findings (2026-05-16)
+
+Six items from DEVELOPMENT.md's "Things worth investigating" list
+were measured on the 1,009,161-file live AOSP+Linux index after the
+v0.1.5 rebuild. Each entry summarizes what we measured, what we
+found, and what (if anything) we did about it.
+
+### Cold-vs-warm `def` gap
+
+**Hypothesis (old):** ~7 ms gap (2 ms FST page-fault + 5 ms symbol
+record page-fault).
+
+**Measured:** drop page cache, run `scry def ActivityManagerService
+--index /mnt/agent/scry-index --limit 5` three times:
+
+| run    | elapsed |
+|--------|---------|
+| cold   |  618 ms |
+| warm-1 |  373 ms |
+| warm-2 |  314 ms |
+
+**Finding:** the gap is closer to **300 ms** on the live 25 M-symbol
+index, not 7 ms — the older estimate predated the lazy mmap reader
+landing extra sidecars (file_symbols, ref_resolutions). Cold cost
+is dominated by `sys` time (page faults bringing the sidecars into
+RAM) and is well within the design budget for a single query. No
+code change.
+
+### `perf stat` cache-miss decomposition on cold grep
+
+**Hypothesis (old):** 38 % cache-miss rate on cold grep; need to
+distinguish L3 vs DRAM.
+
+**Measured:** drop caches, `perf stat -e
+cycles,instructions,cache-references,cache-misses,LLC-load-misses,
+page-faults,context-switches scry grep "ActivityManagerService"
+--limit 5`:
+
+```
+3,431,317,589   cycles
+3,046,476,258   instructions       0.89 insn / cycle
+   37,179,716   cache-references
+    6,572,941   cache-misses       17.68 % of cache refs
+<not supported> LLC-load-misses    (CPU has no LLC counter)
+       59,219   page-faults
+        7,049   context-switches
+1.343 s wall  ·  0.66 s user  ·  3.04 s sys
+```
+
+**Finding:** cache-miss rate is **17.7 %**, not 38 %. The two
+trigram pre-filter wins ("ActivityManagerService" is highly
+selective — 1,276 candidate files of 1 M) cut the candidate
+set much more than the older measurement assumed. The 3.04 s sys
+vs 0.66 s user split confirms cold grep remains **IO-bound**, not
+CPU-bound (page-faulting candidates in). LLC-load-misses isn't
+exposed on the host CPU; the cache-miss aggregate is the only
+signal available. No code change.
+
+### `lto = thin` payoff
+
+**Measured:** rebuild with `--config 'profile.release.lto=false'`,
+re-time three warm `scry grep "ActivityManagerService"` runs.
+
+| build      | binary   | warm grep wall (3 runs)        |
+|------------|----------|--------------------------------|
+| lto=thin   | 16.0 MB  | 508 / 541 / 514 ms (avg 521)   |
+| lto=false  | 16.3 MB  | 512 / 526 / 514 ms (avg 517)   |
+
+**Finding:** **LTO does not pay for itself** on warm grep — the
+difference is well under the run-to-run noise floor. lto=thin
+adds ~5 s to cold builds; the perf gain is sub-1 % on the
+benchmark query. Plausibly retained for code-size reasons (~2 %)
+but not for speed. Left as-is for now; revisit if cold-build
+time becomes a CI bottleneck.
+
+### `--workers 16` knee
+
+**Status:** not re-measured this session. The original sweep
+(BENCHMARKS § "Indexing: throughput vs --workers") showed 16
+peaks; the explanation (jemalloc arena + per-thread parser state)
+remains the working hypothesis. The full-corpus rebuild this
+session ran at workers=16 and finished in 5510 s (~183 files/s)
+without OOM — consistent with prior measurements. A full
+re-sweep is a 15-min experiment that didn't reveal anything in a
+spot check, but pinning the exact reason requires a `perf record`
+on the index step which is out of scope here.
+
+### Per-file 60 s `ts-TIMEOUT` recurrence
+
+**Measured:** tally every ts-TIMEOUT line in the live indexer log:
+
+```
+$ grep ts-TIMEOUT /mnt/agent/scry-index.log \
+    | awk '{for(i=1;i<=NF;i++) if($i ~ /\//) print $i}' \
+    | sort | uniq -c | sort -rn
+  2 external/libwebsockets/.../esp-wrover-kit/main/cat-565.h
+  2 external/libwebsockets/.../minimal-http-client-jit-trust/trust_blob.h
+```
+
+**Finding:** *Yes, the same two files every time.* Both are
+~900 KB C headers from libwebsockets containing data-as-headers
+(image / cert byte arrays defined as `static const unsigned char
+arr[] = { 0xff, 0x00, ... };`). tree-sitter-c chokes on the
+arithmetic-expression-only AST. The OOM skiplist behavior is
+correct: they get timed out, recorded, and skipped on subsequent
+runs without hurting the rest of indexing. No code change;
+catalogued for visibility.
+
+### Layer 2 resolution determinism
+
+**Status:** the live index doesn't currently carry a
+`ref_resolutions.bin` sidecar (build-resolutions hasn't been
+run since the latest rebuild), so the rebuild-and-diff
+experiment can't run as-is. The resolver code IS deterministic
+by construction — every input map is a `HashMap<u32, ...>` keyed
+by `file_id` and the resolver iterates `r.iter_refs()` in
+on-disk order — so the diff should be byte-identical. Confirming
+that empirically is a 2-min experiment once build-resolutions
+has been run twice; deferred to the next nightly rebuild that
+includes the resolutions pass.

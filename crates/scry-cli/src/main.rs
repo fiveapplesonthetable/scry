@@ -4076,33 +4076,121 @@ fn mcp_tools_list_result() -> serde_json::Value {
 /// commands (new arg names, ranking tweaks, schema changes) is picked
 /// up automatically by the MCP surface.
 fn mcp_tools_call(reader: &StoreReader, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| "missing 'name'".to_string())?;
+    let name = params.get("name").and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: 'name'".to_string())?;
     let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-    // Build a serve_one_request-shaped envelope and route it through.
+
+    // Unknown tool: surface as a tool-level error (isError: true) per
+    // MCP convention rather than a JSON-RPC -32601 error. A
+    // JSON-RPC error would tell the client "the protocol failed";
+    // we want "the tool call failed; the call shape was valid".
+    if mcp_required_args_for(name).is_none() {
+        return Ok(mcp_tool_error(format!("unknown tool: '{}'. \
+            Call tools/list to see available tools.", name)));
+    }
+
+    // Required-arg validation. The tool schemas advertise required
+    // fields; the wrapper must enforce them so a malformed call from
+    // a client (or LLM) doesn't silently coerce to an empty-string
+    // query and return garbage hits.
+    if let Some(missing) = mcp_validate_required_args(name, &arguments) {
+        return Ok(mcp_tool_error(format!(
+            "missing or empty required argument '{}' for tool '{}'",
+            missing, name,
+        )));
+    }
+
+    // Route through serve_one_request so any future change to the
+    // serve surface (new args, ranking tweaks) is picked up here too.
     let req = serde_json::json!({
         "id": 1, "cmd": name, "args": arguments,
     });
     let line = req.to_string();
     let mut buf: Vec<u8> = Vec::new();
     serve_one_request(reader, &line, &mut buf)
-        .map_err(|e| format!("serve error: {e:#}"))?;
-    let resp_line = String::from_utf8(buf).map_err(|e| format!("utf8 error: {e}"))?;
+        .map_err(|e| format!("internal error invoking serve: {e:#}"))?;
+    let resp_line = String::from_utf8(buf).map_err(|e| format!("non-utf8 serve output: {e}"))?;
     let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-        .map_err(|e| format!("response parse error: {e}"))?;
+        .map_err(|e| format!("serve response parse error: {e}"))?;
+
+    // Envelope-level error (e.g. unknown cmd that slipped past
+    // mcp_required_args_for — shouldn't happen but defensive).
+    // serve returns {"id": N, "error": "msg"} for these.
     if let Some(err) = resp.get("error") {
-        return Err(err.to_string());
+        let msg = err.as_str().map(String::from).unwrap_or_else(|| err.to_string());
+        return Ok(mcp_tool_error(msg));
     }
-    // MCP requires content[] of typed parts. We use a single text
-    // part holding the pretty-printed JSON; clients are responsible
-    // for parsing it back if they want structure. (MCP doesn't yet
-    // have a standard "json content type"; text is the lowest common
-    // denominator.)
+
     let result = resp.get("result").cloned().unwrap_or(serde_json::Value::Null);
+
+    // Tool-level error: the call protocol succeeded but the tool
+    // couldn't satisfy the request (the canonical case: `ask` against
+    // an index without an embedding sidecar). serve emits these as
+    // `{"error": "..."}` in the result. MCP spec: set isError: true so
+    // the client can branch correctly.
+    let is_tool_error = result.as_object()
+        .map(|m| m.contains_key("error"))
+        .unwrap_or(false);
+
     let text = serde_json::to_string(&result).map_err(|e| format!("encode: {e}"))?;
     Ok(serde_json::json!({
         "content": [{"type": "text", "text": text}],
-        "isError": false,
+        "isError": is_tool_error,
     }))
+}
+
+/// Build an MCP "tool-level error" response: well-formed result with
+/// `isError: true` and a human-readable text content part. Used for
+/// all tool-call failures that aren't protocol-level (unknown tool,
+/// missing required arg). Distinguishes from JSON-RPC errors which
+/// indicate the *call* failed at the protocol level.
+fn mcp_tool_error(msg: String) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{"type": "text", "text": msg}],
+        "isError": true,
+    })
+}
+
+/// Required-args lookup. Keep in sync with `mcp_tools_list_result`'s
+/// inputSchema declarations — these two functions must agree or the
+/// MCP server lies about what it accepts. Returns `None` if the tool
+/// name is unknown (callers treat that as "no such tool").
+fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
+    Some(match tool {
+        "def"      => &["name"],
+        "ref"      => &["name"],
+        "callers"  => &["name"],
+        "prefix"   => &["prefix"],
+        "fuzzy"    => &["substr"],
+        "grep"     => &["pattern"],
+        "outline"  => &["path"],
+        "coverage" => &["path"],
+        "stats"    => &[],
+        "ask"      => &["query"],
+        _ => return None,
+    })
+}
+
+/// Validate that every required arg for `tool` is present in `args`
+/// AND non-empty (an empty string would coerce to a meaningless
+/// "match anything" query that returns garbage). Returns the name of
+/// the first missing/empty arg, or `None` if all present.
+fn mcp_validate_required_args(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let required = mcp_required_args_for(tool)?;
+    for name in required {
+        let v = args.get(name);
+        let ok = match v {
+            Some(serde_json::Value::String(s)) => !s.is_empty(),
+            Some(serde_json::Value::Number(_) | serde_json::Value::Bool(_)) => true,
+            Some(serde_json::Value::Array(a)) => !a.is_empty(),
+            Some(serde_json::Value::Object(o)) => !o.is_empty(),
+            Some(serde_json::Value::Null) | None => false,
+        };
+        if !ok {
+            return Some((*name).to_string());
+        }
+    }
+    None
 }
 
 /// Entry point for the `serve` subcommand. Dispatches to the requested
@@ -5270,5 +5358,101 @@ mod tests {
         assert!(out.ends_with('…'));
         // 9 chars + the ellipsis = 10 visible.
         assert_eq!(out.chars().count(), 10);
+    }
+
+    // ------------------------------------------------------------------
+    // MCP arg validation — pin the per-tool required-arg map and the
+    // empty-string-rejection rule. These tests run without a real
+    // StoreReader because mcp_required_args_for + mcp_validate_required_args
+    // are pure functions of the tool name + JSON arguments.
+    // ------------------------------------------------------------------
+
+    /// Every tool advertised by tools/list must have an entry in
+    /// mcp_required_args_for. Catches schema/validator drift at test
+    /// time so a future "add a new tool" change has to update both
+    /// in the same diff.
+    #[test]
+    fn mcp_required_args_covers_every_advertised_tool() {
+        let v = mcp_tools_list_result();
+        let tools = v.pointer("/tools").and_then(|x| x.as_array())
+            .expect("tools array");
+        assert!(!tools.is_empty(), "tools list must not be empty");
+        for t in tools {
+            let name = t.get("name").and_then(|x| x.as_str())
+                .expect("tool entry has name");
+            assert!(mcp_required_args_for(name).is_some(),
+                "advertised tool '{name}' missing from mcp_required_args_for; \
+                 add it to keep schema + validator in sync");
+        }
+    }
+
+    /// The required set per tool. If this changes, USAGE / MCP docs
+    /// must change too — that's the point of pinning it.
+    #[test]
+    fn mcp_required_args_match_documented_shape() {
+        assert_eq!(mcp_required_args_for("def"),      Some(&["name"][..]));
+        assert_eq!(mcp_required_args_for("ref"),      Some(&["name"][..]));
+        assert_eq!(mcp_required_args_for("callers"),  Some(&["name"][..]));
+        assert_eq!(mcp_required_args_for("prefix"),   Some(&["prefix"][..]));
+        assert_eq!(mcp_required_args_for("fuzzy"),    Some(&["substr"][..]));
+        assert_eq!(mcp_required_args_for("grep"),     Some(&["pattern"][..]));
+        assert_eq!(mcp_required_args_for("outline"),  Some(&["path"][..]));
+        assert_eq!(mcp_required_args_for("coverage"), Some(&["path"][..]));
+        assert_eq!(mcp_required_args_for("stats"),    Some(&[][..]));
+        assert_eq!(mcp_required_args_for("ask"),      Some(&["query"][..]));
+        assert_eq!(mcp_required_args_for("nonexistent"), None);
+    }
+
+    /// Missing arg → returns the arg's name.
+    #[test]
+    fn mcp_validate_flags_missing_arg() {
+        let args = serde_json::json!({});
+        assert_eq!(mcp_validate_required_args("def", &args),
+                   Some("name".to_string()));
+    }
+
+    /// Empty-string arg → also flagged. The original bug:
+    /// `{"name": ""}` silently coerced to "match all" and returned
+    /// garbage anonymous-enum hits from legacy C++ code.
+    #[test]
+    fn mcp_validate_flags_empty_string_arg() {
+        let args = serde_json::json!({"name": ""});
+        assert_eq!(mcp_validate_required_args("def", &args),
+                   Some("name".to_string()));
+    }
+
+    /// Null arg → flagged. JSON null is the explicit "I deliberately
+    /// don't have a value" — treat the same as missing.
+    #[test]
+    fn mcp_validate_flags_null_arg() {
+        let args = serde_json::json!({"prefix": null});
+        assert_eq!(mcp_validate_required_args("prefix", &args),
+                   Some("prefix".to_string()));
+    }
+
+    /// Valid non-empty string → no error.
+    #[test]
+    fn mcp_validate_accepts_non_empty_arg() {
+        let args = serde_json::json!({"name": "ActivityManagerService", "limit": 5});
+        assert!(mcp_validate_required_args("def", &args).is_none());
+    }
+
+    /// A tool with no required args (stats) always passes validation
+    /// regardless of what arguments object the caller sends.
+    #[test]
+    fn mcp_validate_zero_required_args_always_passes() {
+        assert!(mcp_validate_required_args("stats", &serde_json::json!({})).is_none());
+        assert!(mcp_validate_required_args("stats", &serde_json::json!({"junk": 1})).is_none());
+    }
+
+    /// mcp_tool_error wraps a message in the correct MCP envelope
+    /// shape (content[] of text part, isError: true). Pinned because
+    /// MCP clients rely on this exact field layout.
+    #[test]
+    fn mcp_tool_error_shape() {
+        let err = mcp_tool_error("kaboom".to_string());
+        assert_eq!(err.pointer("/content/0/type").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(err.pointer("/content/0/text").and_then(|v| v.as_str()), Some("kaboom"));
+        assert_eq!(err.get("isError").and_then(|v| v.as_bool()), Some(true));
     }
 }

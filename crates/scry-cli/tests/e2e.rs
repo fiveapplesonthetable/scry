@@ -410,6 +410,9 @@ fn synthetic_tree_roundtrip() {
     let call: serde_json::Value = serde_json::from_str(mcp_lines[2]).unwrap();
     assert_eq!(call["id"], 3);
     assert!(call["result"]["content"].is_array(), "tools/call must return content[]: {call}");
+    // Successful tool calls must report isError: false.
+    assert_eq!(call["result"]["isError"].as_bool(), Some(false),
+               "successful tools/call must set isError: false; got {call}");
     let text = call["result"]["content"][0]["text"].as_str()
         .expect("first content part should be text");
     // The text is itself JSON — the serve result re-encoded. Parse
@@ -417,6 +420,88 @@ fn synthetic_tree_roundtrip() {
     let inner: serde_json::Value = serde_json::from_str(text).expect("text content is JSON");
     assert!(inner.as_array().map(|a| !a.is_empty()).unwrap_or(false),
             "tools/call def Binder should return at least one hit: {inner}");
+
+    // 8a. MCP error paths — exhaustive. A separate MCP session per
+    // call avoids state coupling. Each assertion pins one L7-grade
+    // contract the wrapper must keep.
+    fn mcp_call(scry: &std::path::Path, idx: &std::path::Path, body: &str) -> serde_json::Value {
+        use std::io::Write;
+        let mut child = Command::new(scry)
+            .args(["mcp", "--index"]).arg(idx)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().expect("spawn mcp");
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
+            writeln!(stdin, "{}", body).unwrap();
+        }
+        let out = child.wait_with_output().expect("mcp wait");
+        let lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap()
+            .lines().filter(|l| !l.is_empty()).collect();
+        // Last line is our test call's reply (after init).
+        serde_json::from_str(lines.last().expect("at least one reply"))
+            .expect("reply is JSON")
+    }
+
+    // Unknown tool → isError: true, well-formed envelope.
+    let r = mcp_call(&scry_bin(), &idx,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#);
+    assert_eq!(r["result"]["isError"].as_bool(), Some(true),
+               "unknown tool must isError:true; got {r}");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap_or("").contains("unknown tool"),
+            "unknown-tool message should say so; got {r}");
+
+    // Missing required arg → isError: true with named arg.
+    let r = mcp_call(&scry_bin(), &idx,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"def","arguments":{}}}"#);
+    assert_eq!(r["result"]["isError"].as_bool(), Some(true));
+    let text = r["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("name") && text.contains("def"),
+            "missing-arg error should name the arg and tool; got {text}");
+
+    // Empty-string required arg → also rejected. This was the L7 bug:
+    // {"name": ""} silently returned 50 garbage anonymous-enum hits.
+    let r = mcp_call(&scry_bin(), &idx,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"def","arguments":{"name":""}}}"#);
+    assert_eq!(r["result"]["isError"].as_bool(), Some(true),
+               "empty-string name must be rejected (was returning garbage hits)");
+
+    // Notification (no id) is silently consumed — exactly one response
+    // line should come back from a session that sends initialize +
+    // notification + nothing else.
+    let mut nchild = Command::new(scry_bin())
+        .args(["mcp", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn mcp for notification test");
+    {
+        use std::io::Write;
+        let stdin = nchild.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/somethingElse","params":{{}}}}"#).unwrap();
+    }
+    let nout = nchild.wait_with_output().expect("mcp wait");
+    let nlines: Vec<&str> = std::str::from_utf8(&nout.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(nlines.len(), 1,
+               "notifications must produce no reply; expected 1 line (init), got {}: {:?}",
+               nlines.len(), nlines);
+
+    // ping → empty result {} per MCP spec.
+    let r = mcp_call(&scry_bin(), &idx,
+        r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#);
+    assert_eq!(r["result"], serde_json::json!({}), "ping reply must be empty object; got {r}");
+
+    // Unknown method (not tools/call) → JSON-RPC error -32601.
+    let r = mcp_call(&scry_bin(), &idx,
+        r#"{"jsonrpc":"2.0","id":99,"method":"some/random/method"}"#);
+    assert_eq!(r["error"]["code"].as_i64(), Some(-32601),
+               "unknown method must return JSON-RPC -32601; got {r}");
 
     // 9. scry diff --since: turn the synthetic root into a git repo
     // with two commits, then assert `scry diff --since HEAD~1` finds

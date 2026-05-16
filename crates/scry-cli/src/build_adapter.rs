@@ -545,44 +545,85 @@ mod soong {
             }
         }
 
-        // File attribution via longest-prefix match. Build a sorted
-        // list of (path, module_id) sorted by path-length descending
-        // so longest prefixes are checked first. Then walk the tree
-        // assigning each file to the most specific match.
+        // File attribution: build a single dir→module_id map where the
+        // longest module path wins (sort length-desc, then or_insert).
+        // Then walk only the *non-overlapping* roots once, climbing
+        // each file's parent chain to find its owning module.
         //
-        // To avoid walking the whole AOSP tree from scratch (we'd
-        // duplicate scry's indexer work), we instead enumerate the
-        // module paths themselves and emit attribution entries for
-        // every source-ish file under each. The scry reader's path
-        // → file_id map handles the resolution.
-        let mut path_to_id: Vec<(String, u32)> = Vec::new();
+        // Why this matters: AOSP has ~120k Soong modules and many
+        // share path prefixes (e.g. `frameworks/base` plus dozens of
+        // `frameworks/base/services/*`). Walking each module's path
+        // independently re-walks the same subtrees N times — fatal
+        // at AOSP scale. Single walk + parent-climb is O(F·depth).
+        let mut module_paths: Vec<(String, u32)> = Vec::new();
         for (i, (_, info)) in compact_mods.iter().enumerate() {
             for p in &info.path {
                 if !p.is_empty() {
-                    path_to_id.push((p.clone(), i as u32));
+                    module_paths.push((p.clone(), i as u32));
                 }
             }
         }
-        // Sort by length descending so longest-prefix is found first.
-        path_to_id.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
+        module_paths.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
+        let mut dir_to_module: HashMap<String, u32> =
+            HashMap::with_capacity(module_paths.len());
+        for (p, id) in &module_paths {
+            dir_to_module.entry(p.clone()).or_insert(*id);
+        }
+
+        // Compute non-overlapping walk roots: sort paths ASC, then
+        // drop any whose ancestor is already in the walk set.
+        let mut sorted_asc: Vec<&String> = dir_to_module.keys().collect();
+        sorted_asc.sort();
+        let mut walk_roots: Vec<String> = Vec::new();
+        for p in sorted_asc {
+            let covered = walk_roots.last().is_some_and(|last| {
+                let with_sep = format!("{last}/");
+                p == last || p.starts_with(&with_sep)
+            });
+            if !covered {
+                walk_roots.push(p.clone());
+            }
+        }
+        eprintln!(
+            "[soong] {} modules, {} module-path entries → {} non-overlapping walk roots",
+            modules.len(), module_paths.len(), walk_roots.len(),
+        );
 
         let mut files: Vec<OutFile> = Vec::new();
         let mut seen_files: HashSet<String> = HashSet::new();
-        for (rel_path, module_id) in &path_to_id {
-            let abs_dir = root.join(rel_path);
-            if !abs_dir.is_dir() { continue; }
-            walk_soong_sources(&abs_dir, *module_id, &mut files, &mut seen_files);
+        let t_walk = std::time::Instant::now();
+        for (idx, rel_root) in walk_roots.iter().enumerate() {
+            let abs_root = root.join(rel_root);
+            if !abs_root.is_dir() { continue; }
+            walk_and_attribute(
+                &abs_root, root, &dir_to_module,
+                &mut files, &mut seen_files,
+            );
+            if idx % 1000 == 999 {
+                eprintln!(
+                    "[soong] walk progress: {}/{} roots, {} files attributed ({}s)",
+                    idx + 1, walk_roots.len(), files.len(),
+                    t_walk.elapsed().as_secs(),
+                );
+            }
         }
+        eprintln!(
+            "[soong] walk done: {} files attributed in {}s",
+            files.len(), t_walk.elapsed().as_secs(),
+        );
 
         Ok(OutGraphV1 { version: 1, modules, deps, files })
     }
 
-    /// Walk a Soong module's source dir, attributing source files.
-    /// Dedups: if a file was already attributed to a more-specific
-    /// module path (we sort longest-first), it stays with that one.
-    fn walk_soong_sources(
-        dir: &Path, module_id: u32,
-        out: &mut Vec<OutFile>, seen: &mut HashSet<String>,
+    /// Walk a subtree once. For each source file, find the longest
+    /// module-path prefix that owns it by climbing its parent chain
+    /// against `dir_to_module`.
+    fn walk_and_attribute(
+        dir: &Path,
+        root: &Path,
+        dir_to_module: &HashMap<String, u32>,
+        out: &mut Vec<OutFile>,
+        seen: &mut HashSet<String>,
     ) {
         let rd = match std::fs::read_dir(dir) { Ok(rd) => rd, _ => return };
         for entry in rd.flatten() {
@@ -591,19 +632,37 @@ mod soong {
             if let Some(n) = name.to_str() {
                 if n.starts_with('.') { continue; }
             }
-            if p.is_dir() {
-                walk_soong_sources(&p, module_id, out, seen);
-            } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if matches!(ext,
-                    "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" |
-                    "java" | "kt" | "rs" | "aidl" | "proto" | "hal"
-                ) {
-                    if let Some(s) = p.to_str() {
-                        if seen.insert(s.to_string()) {
-                            out.push(OutFile { path: s.to_string(), module_id });
+            // Skip well-known non-source dirs to keep the walk bounded.
+            // Top-level prebuilts/ + out/ should already be excluded by
+            // walk-root selection, but defend against nested cases.
+            let file_type = match entry.file_type() { Ok(t) => t, _ => continue };
+            if file_type.is_symlink() { continue; }
+            if file_type.is_dir() {
+                walk_and_attribute(&p, root, dir_to_module, out, seen);
+                continue;
+            }
+            let Some(ext) = p.extension().and_then(|e| e.to_str()) else { continue };
+            if !matches!(ext,
+                "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" |
+                "java" | "kt" | "rs" | "aidl" | "proto" | "hal"
+            ) { continue; }
+            let Ok(rel) = p.strip_prefix(root) else { continue };
+            let mut climb = rel.parent();
+            while let Some(d) = climb {
+                if let Some(s) = d.to_str() {
+                    if let Some(&id) = dir_to_module.get(s) {
+                        if let Some(ps) = p.to_str() {
+                            if seen.insert(ps.to_string()) {
+                                out.push(OutFile {
+                                    path: ps.to_string(),
+                                    module_id: id,
+                                });
+                            }
                         }
+                        break;
                     }
                 }
+                climb = d.parent();
             }
         }
     }

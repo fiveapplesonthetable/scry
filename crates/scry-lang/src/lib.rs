@@ -157,7 +157,162 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
     if kind == Kotlin {
         inject_anonymous_companions(source, &mut syms);
     }
+    if kind == Java {
+        inject_jni_shadows(source, &mut syms);
+    }
     Ok(syms)
+}
+
+/// JNI shadow injector. Walks the Java AST and for every method
+/// declaration carrying the `native` modifier, emits a synthetic
+/// `Function` symbol named after the JNI mangling rule the JVM uses
+/// when `RegisterNatives` isn't called explicitly:
+///
+/// `Java_<package_with_dots_to_underscores>_<class>_<method>`
+///
+/// Identifiers with literal underscores get `_1` in place of `_`
+/// (JNI's standard escape); `$` becomes `_00024`. Non-ASCII isn't
+/// emitted (AOSP names are all ASCII; an inner class containing
+/// non-ASCII would simply not produce a shadow rather than emit
+/// an incorrect one).
+///
+/// The shadow gets [`SymbolKind::JniBinding`], its own location at
+/// the Java method's site (so navigation lands on the declaration),
+/// and the same scope_path as the method. A C/C++ side that defines
+/// `Java_foo_Bar_baz(JNIEnv*, jobject, ...)` will collide on name —
+/// both records remain in the index; the Java shadow surfaces when
+/// the C++ side is missing or shared across many .cpp files.
+fn inject_jni_shadows(source: &[u8], syms: &mut Vec<RawSymbol>) {
+    PARSER.with(|cell| {
+        let mut parser = cell.borrow_mut();
+        if parser.set_language(java_spec().language).is_err() { return; }
+        let tree = match parser.parse(source, None) {
+            Some(t) => t,
+            None => return,
+        };
+        let mut collected = Vec::new();
+        visit_native_methods(tree.root_node(), source, &mut collected);
+        syms.extend(collected);
+    });
+}
+
+fn visit_native_methods(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawSymbol>) {
+    if node.kind() == "method_declaration" && method_has_native_modifier(node) {
+        let method_name = match node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok()) {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+        // Java's package_declaration is a SIBLING of class_declaration at
+        // the program root, so compute_scope (parent walk) never sees it.
+        // Find the package text by walking up to the file root then
+        // scanning siblings for `package_declaration`.
+        let scope = compute_scope(
+            node, source,
+            java_spec().scope_node_kinds,
+            java_spec().package_node_kind,
+        );
+        if scope.is_empty() { return; }  // need at least an enclosing class
+        let class = scope[scope.len() - 1].clone();
+        let pkg = java_package_text(node, source).unwrap_or_default();
+        if pkg.is_empty() { return; }
+        let mangled = jni_mangle(&pkg, &class, &method_name);
+        let start = node.start_position();
+        let mut full_scope = vec![pkg];
+        full_scope.extend(scope);
+        out.push(RawSymbol {
+            name: mangled,
+            kind: SymbolKind::JniBinding,
+            line: (start.row + 1) as u32,
+            col: (start.column + 1) as u32,
+            byte_start: node.start_byte() as u32,
+            byte_end:   node.end_byte()   as u32,
+            scope_path: full_scope,
+        });
+    }
+    let mut w = node.walk();
+    for c in node.named_children(&mut w) {
+        visit_native_methods(c, source, out);
+    }
+}
+
+/// Find the package text for a Java AST node by walking up to the
+/// `program` root and scanning its children for a `package_declaration`.
+/// Returns the verbatim text of the package's identifier (e.g.
+/// "android.os" or "com.foo"), or None if the file has no package.
+fn java_package_text(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cur = node;
+    while let Some(p) = cur.parent() { cur = p; }
+    let root = cur;
+    let mut w = root.walk();
+    for c in root.named_children(&mut w) {
+        if c.kind() != "package_declaration" { continue; }
+        // The package identifier is the only named child (a scoped or
+        // bare identifier). Try the "name" field first, fall back to
+        // the first named child.
+        let ident = match c.child_by_field_name("name") {
+            Some(n) => n,
+            None => {
+                let mut iw = c.walk();
+                let first = c.named_children(&mut iw).next();
+                match first {
+                    Some(n) => n,
+                    None => continue,
+                }
+            }
+        };
+        return ident.utf8_text(source).ok().map(String::from);
+    }
+    None
+}
+
+fn method_has_native_modifier(method: tree_sitter::Node) -> bool {
+    let mut w = method.walk();
+    for c in method.named_children(&mut w) {
+        if c.kind() != "modifiers" { continue; }
+        // tree-sitter-java exposes `native` as a named child of
+        // `modifiers` in current versions. Older grammar versions
+        // model it as an anonymous keyword token. Walk ALL children
+        // (named + anonymous via `child(i)`) so we catch either shape.
+        for i in 0..c.child_count() {
+            if let Some(kw) = c.child(i) {
+                if kw.kind() == "native" { return true; }
+            }
+        }
+    }
+    false
+}
+
+/// JNI mangling for the default (non-RegisterNatives) lookup path.
+/// Spec: <https://docs.oracle.com/en/java/javase/21/docs/specs/jni/design.html#resolving-native-method-names>.
+/// We implement the ASCII-only subset that covers ~all AOSP names:
+///   `.`  in package → `_`
+///   `_`  in any identifier → `_1`
+///   `$`  in inner class    → `_00024`
+/// Non-ASCII characters are passed through unchanged; agents wanting
+/// strict spec compliance can refine later.
+pub fn jni_mangle(pkg: &str, class: &str, method: &str) -> String {
+    let mut out = String::with_capacity(8 + pkg.len() + class.len() + method.len());
+    out.push_str("Java_");
+    push_jni_escaped(&mut out, pkg, /*pkg=*/ true);
+    out.push('_');
+    push_jni_escaped(&mut out, class, /*pkg=*/ false);
+    out.push('_');
+    push_jni_escaped(&mut out, method, /*pkg=*/ false);
+    out
+}
+
+fn push_jni_escaped(out: &mut String, s: &str, is_pkg: bool) {
+    for c in s.chars() {
+        match c {
+            '.' if is_pkg => out.push('_'),
+            '_' => out.push_str("_1"),
+            ';' => out.push_str("_2"),
+            '[' => out.push_str("_3"),
+            '$' => out.push_str("_00024"),
+            _ => out.push(c),
+        }
+    }
 }
 
 /// Anonymous Kotlin `companion object { ... }` lacks an identifier
@@ -1025,6 +1180,11 @@ fn cpp_refs_spec() -> &'static RefSpec {
         static Q: OnceLock<Query> = OnceLock::new();
         let lang = cpp_spec().language;
         let q = Q.get_or_init(|| {
+            // `using namespace X;` and `using namespace X::Y;` both bind
+            // the namespace identifier as a child of using_declaration.
+            // Capture the namespace-ish identifier — the resolver only
+            // cares about the leaf name (or last :: segment), which we
+            // record as the ref's name.
             Query::new(
                 lang,
                 r#"
@@ -1035,6 +1195,8 @@ fn cpp_refs_spec() -> &'static RefSpec {
                 (new_expression type: (type_identifier) @ref.ctor)
                 (base_class_clause (type_identifier) @ref.inherit)
                 (preproc_include path: (string_literal) @ref.import)
+                (using_declaration (qualified_identifier) @ref.using-ns)
+                (using_declaration (identifier) @ref.using-ns)
                 "#,
             )
             .expect("cpp refs")
@@ -1046,6 +1208,7 @@ fn cpp_refs_spec() -> &'static RefSpec {
                 ("ref.ctor", RefKind::Ctor),
                 ("ref.inherit", RefKind::InheritFrom),
                 ("ref.import", RefKind::Import),
+                ("ref.using-ns", RefKind::UsingNamespace),
             ],
         }
     })
@@ -1647,6 +1810,76 @@ int BBinder::transact(int code) { return 0; }
             assert!(names.contains(var),
                     "bash extraction missing variable `{var}`; got: {names:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture"]
+    fn dump_java_native_ast() {
+        let src = b"package x;\nclass C {\n  public static native String foo(long ptr);\n}\n";
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(java_spec().language).unwrap();
+            let tree = parser.parse(src.as_ref(), None).unwrap();
+            fn walk(n: tree_sitter::Node, src: &[u8], depth: usize) {
+                let text = n.utf8_text(src).unwrap_or("?");
+                let snippet = if text.len() < 50 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
+                println!("{:indent$}{} = {:?}", "", n.kind(), snippet, indent = depth*2);
+                for i in 0..n.child_count() {
+                    if let Some(c) = n.child(i) { walk(c, src, depth + 1); }
+                }
+            }
+            walk(tree.root_node(), src.as_ref(), 0);
+        });
+    }
+
+    /// JNI shadow: a Java `native` method produces a synthetic
+    /// `JniBinding` symbol whose name is the standard JNI mangling.
+    /// Lets `scry def Java_android_os_Parcel_nativeWriteString` find
+    /// the Java declaration even when the C/C++ implementation isn't
+    /// in the indexed tree or is shared across modules.
+    #[test]
+    fn java_native_method_emits_jni_shadow() {
+        let src = br#"
+            package android.os;
+            public final class Parcel {
+                public static native String nativeReadString(long ptr);
+                public static native void nativeWriteString(long ptr, String value);
+                public void notNative() {}
+                private int normal_field;
+            }
+        "#;
+        let syms = extract(FileKind::Java, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}", s.kind, s.name);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::JniBinding
+                                 && s.name == "Java_android_os_Parcel_nativeReadString"),
+                "missing JniBinding for nativeReadString. all:\n  {}",
+                all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::JniBinding
+                                 && s.name == "Java_android_os_Parcel_nativeWriteString"),
+                "missing JniBinding for nativeWriteString. all:\n  {}",
+                all.join("\n  "));
+        // Non-native methods MUST NOT produce a JniBinding.
+        assert!(!syms.iter().any(|s| s.kind == SymbolKind::JniBinding
+                                  && s.name.contains("notNative")),
+                "non-native method `notNative` should not have a JniBinding");
+    }
+
+    /// JNI mangling escapes underscores in identifiers ("_" → "_1")
+    /// and dots in the package ("." → "_") per the JNI spec.
+    #[test]
+    fn jni_mangle_escapes_underscores_and_dots() {
+        // Package dot → underscore; method underscore → "_1".
+        assert_eq!(
+            jni_mangle("com.weird_pkg", "MyClass", "my_method"),
+            "Java_com_weird_1pkg_MyClass_my_1method",
+        );
+        // Plain ASCII path stays simple.
+        assert_eq!(
+            jni_mangle("android.os", "Parcel", "nativeRead"),
+            "Java_android_os_Parcel_nativeRead",
+        );
     }
 
     /// Sealed-class hierarchies and inline reified fns are already

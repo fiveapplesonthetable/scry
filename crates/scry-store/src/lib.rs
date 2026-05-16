@@ -161,6 +161,12 @@ pub enum RefKind {
     FieldAccess = 3,
     Import = 4,
     InheritFrom = 5,
+    /// C++ `using namespace X;` directive. Same wire shape as Import
+    /// (name = the namespace text, e.g. "android::base"); separated
+    /// from Import so the Layer 2 resolver can route C++ refs through
+    /// the namespace-narrowing path instead of the package-narrowing
+    /// path (Java / Kotlin).
+    UsingNamespace = 6,
 }
 
 impl RefKind {
@@ -172,6 +178,7 @@ impl RefKind {
             RefKind::FieldAccess => "field",
             RefKind::Import => "import",
             RefKind::InheritFrom => "inherit",
+            RefKind::UsingNamespace => "using-ns",
         }
     }
 }
@@ -210,6 +217,14 @@ pub enum SymbolKind {
     /// `--kind aidl.frozen`, while changes to the live development source
     /// stay under `--kind aidl.iface`.
     AidlFrozen,
+    /// Synthetic shadow symbol for a Java `native` method's expected
+    /// C/C++ JNI counterpart. Emitted at the Java method's source
+    /// location with name = `Java_<pkg>_<class>_<method>` (the mangled
+    /// symbol the JVM's `RegisterNatives` defaults to looking up).
+    /// Lets `scry def Java_android_os_Parcel_nativeWriteString` land
+    /// on the Java declaration even when the C++ side hasn't been
+    /// indexed (or shares the name across multiple AOSP modules).
+    JniBinding,
     /// Synthetic shadow symbol for an AIDL-generated language binding.
     /// Emitted at AIDL parse time so `scry def IFoo.Stub` (Java) or
     /// `scry def BpIFoo` (C++) finds the AIDL source location instead
@@ -256,6 +271,7 @@ impl SymbolKind {
             SymbolKind::Macro => "macro",
             SymbolKind::Annotation => "annot",
             SymbolKind::Decorator => "deco",
+            SymbolKind::JniBinding => "jni",
             SymbolKind::AidlInterface => "aidl.iface",
             SymbolKind::AidlMethod => "aidl.method",
             SymbolKind::AidlParcelable => "aidl.parcel",
@@ -370,7 +386,7 @@ impl SymbolRecord {
             // Shadows are derived bindings; rank below the real AIDL/HIDL
             // declaration but above plain fields so they surface for the
             // common "find IFoo.Stub" question without burying the .aidl.
-            SymbolKind::AidlShadow | SymbolKind::HidlShadow => 78,
+            SymbolKind::AidlShadow | SymbolKind::HidlShadow | SymbolKind::JniBinding => 78,
             SymbolKind::ProtoMessage | SymbolKind::ProtoService | SymbolKind::ProtoEnum => 85,
             SymbolKind::SoongModule => 80,
             SymbolKind::InitService | SymbolKind::SepolicyType => 75,

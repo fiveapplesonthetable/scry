@@ -4138,22 +4138,27 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     // in the same pass to avoid double-iterating the symbol vec.
     let mut per_file_pkg: HashMap<u32, String> = HashMap::new();
     let mut pass1 = |s: SymbolRecord| {
+        // Java + Kotlin both emit one Package symbol per file (via the
+        // package_declaration / package_header capture). Use it as the
+        // per-file pkg key for the narrowing chain.
         if matches!(s.kind, SymbolKind::Package)
-            && matches!(s.lang, FileKind::Java) {
+            && matches!(s.lang, FileKind::Java | FileKind::Kotlin)
+        {
             per_file_pkg.insert(s.file_id, s.name.clone());
         }
         by_name.entry(s.name.clone()).or_default().push(ResolveDef {
             id: s.id, file_id: s.file_id, lang: s.lang,
-            pkg: None, // filled in pass1b for Java type-defs
+            pkg: None,
+            scope_path: s.scope_path.clone(),
         });
     };
     for s in r.iter_symbols() { pass1(s); }
-    // Pass1b: stamp pkg on Java type-defs (Class/Interface/Enum) — small
-    // overhead, lets the resolver short-circuit by-package lookups
+    // Pass1b: stamp pkg on Java + Kotlin type-defs (Class/Interface/Enum/Object) —
+    // small overhead, lets the resolver short-circuit by-package lookups
     // without re-resolving file_id → pkg on every ref.
     for entries in by_name.values_mut() {
         for e in entries.iter_mut() {
-            if matches!(e.lang, FileKind::Java) {
+            if matches!(e.lang, FileKind::Java | FileKind::Kotlin) {
                 if let Some(pkg) = per_file_pkg.get(&e.file_id) {
                     e.pkg = Some(pkg.clone());
                 }
@@ -4162,23 +4167,37 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     }
     eprintln!("[res] pass 1 (by-name + per-file-pkg) in {} ms", t1.elapsed().as_millis());
 
-    // --- Pass 2: per-file import lists (Java). ---
+    // --- Pass 2: per-file import lists (Java + Kotlin) + C++ using-directives. ---
     let t2 = Instant::now();
     let mut per_file_imports: HashMap<u32, Vec<(String, Option<String>)>> = HashMap::new();
+    // Per-file C++ using-namespace directives: rr.name == "X" for
+    // `using namespace X;`. Stored as Vec<String> per file.
+    let mut per_file_using_ns: HashMap<u32, Vec<String>> = HashMap::new();
     let mut process_import = |rr: &RefRecord| {
-        if !matches!(rr.kind, scry_store::RefKind::Import) { return; }
-        if !matches!(rr.lang, FileKind::Java) { return; }
-        // For Java, the importer emits the import ref with name = the full
-        // qualified path. Split into pkg + simple name.
-        let (pkg, simple) = match rr.name.rsplit_once('.') {
-            Some((p, s)) => (Some(p.to_string()), s.to_string()),
-            None => (None, rr.name.clone()),
-        };
-        per_file_imports.entry(rr.file_id).or_default().push((simple, pkg));
+        match rr.kind {
+            scry_store::RefKind::Import => {
+                // Java + Kotlin: the importer emits the import ref with
+                // name = the full qualified path. Split into pkg + simple.
+                if !matches!(rr.lang, FileKind::Java | FileKind::Kotlin) { return; }
+                let (pkg, simple) = match rr.name.rsplit_once('.') {
+                    Some((p, s)) => (Some(p.to_string()), s.to_string()),
+                    None => (None, rr.name.clone()),
+                };
+                per_file_imports.entry(rr.file_id).or_default().push((simple, pkg));
+            }
+            scry_store::RefKind::UsingNamespace => {
+                // C++ `using namespace X;` — name is X (possibly with ::).
+                if !matches!(rr.lang, FileKind::Cpp | FileKind::HeaderCpp | FileKind::Header) {
+                    return;
+                }
+                per_file_using_ns.entry(rr.file_id).or_default().push(rr.name.clone());
+            }
+            _ => {}
+        }
     };
     for rr in r.iter_refs() { process_import(&rr); }
-    eprintln!("[res] pass 2 (per-file imports: {} files) in {} ms",
-              per_file_imports.len(), t2.elapsed().as_millis());
+    eprintln!("[res] pass 2 (per-file imports: {} files, cpp using-ns: {} files) in {} ms",
+              per_file_imports.len(), per_file_using_ns.len(), t2.elapsed().as_millis());
 
     // --- Pass 3: resolve every ref, write sidecar. ---
     let t3 = Instant::now();
@@ -4188,7 +4207,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     let mut narrowed_count: u64 = 0;
     let mut resolve_ref = |rr: &RefRecord| -> Result<()> {
         let chosen_id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
-                                     &mut narrowed_count);
+                                     &per_file_using_ns, &mut narrowed_count);
         if chosen_id != 0 { resolved_count += 1; }
         ow.write_all(&chosen_id.to_le_bytes())?;
         Ok(())
@@ -4213,31 +4232,30 @@ fn resolve_one(
     by_name: &std::collections::HashMap<String, Vec<ResolveDef>>,
     per_file_pkg: &std::collections::HashMap<u32, String>,
     per_file_imports: &std::collections::HashMap<u32, Vec<(String, Option<String>)>>,
+    per_file_using_ns: &std::collections::HashMap<u32, Vec<String>>,
     narrowed: &mut u64,
 ) -> u64 {
     let cands = match by_name.get(&rr.name) {
         Some(c) if !c.is_empty() => c,
         _ => return 0,
     };
-    // Single candidate: trivially resolve.
     if cands.len() == 1 { return cands[0].id; }
 
-    // Same-lang preference (mirrors the old Layer 1 behavior).
     let same_lang: Vec<&ResolveDef> = cands.iter().filter(|c| c.lang == rr.lang).collect();
     let pool: &[&ResolveDef] = if !same_lang.is_empty() { &same_lang[..] } else {
-        // Fall back to all candidates if no same-lang match (rare).
-        // Need to convert &[ResolveDef] to &[&ResolveDef] for the type.
-        // Simpler: pick first cand and return.
         return cands[0].id;
     };
     if pool.len() == 1 { return pool[0].id; }
 
-    // Java-aware narrowing: prefer (same package) > (imported) > (java.lang) > anything.
-    if matches!(rr.lang, FileKind::Java) {
+    // Java / Kotlin share the same package-narrowing shape: same package
+    // → explicit import → wildcard import → implicit-import fallback.
+    // The implicit-import fallback differs per language (`java.lang` for
+    // Java; the kotlin.* / kotlin.collections.* / kotlin.io.* / kotlin.text.*
+    // family for Kotlin).
+    if matches!(rr.lang, FileKind::Java | FileKind::Kotlin) {
         let my_pkg = per_file_pkg.get(&rr.file_id);
         let imports = per_file_imports.get(&rr.file_id);
 
-        // 1. Same-package match.
         if let Some(pkg) = my_pkg {
             for c in pool {
                 if c.pkg.as_deref() == Some(pkg.as_str()) {
@@ -4246,8 +4264,6 @@ fn resolve_one(
                 }
             }
         }
-        // 2. Explicit import match: `import x.y.Bar;` → resolve `Bar` only
-        //    if c's package == "x.y".
         if let Some(imps) = imports {
             for (simple, pkg) in imps {
                 if simple == &rr.name {
@@ -4272,31 +4288,84 @@ fn resolve_one(
                 }
             }
         }
-        // 3. java.lang fallback.
+        let implicit_pkgs: &[&str] = match rr.lang {
+            FileKind::Java => &["java.lang"],
+            FileKind::Kotlin => &[
+                "kotlin",
+                "kotlin.annotation",
+                "kotlin.collections",
+                "kotlin.comparisons",
+                "kotlin.io",
+                "kotlin.ranges",
+                "kotlin.sequences",
+                "kotlin.text",
+                "kotlin.jvm",
+            ],
+            _ => &[],
+        };
         for c in pool {
-            if c.pkg.as_deref() == Some("java.lang") {
-                *narrowed += 1;
-                return c.id;
+            if let Some(p) = &c.pkg {
+                if implicit_pkgs.contains(&p.as_str()) {
+                    *narrowed += 1;
+                    return c.id;
+                }
             }
         }
     }
 
-    // 4. Layer 1 fallback: pick first same-lang candidate.
+    // C++ narrowing: prefer same-namespace > using-namespace > fallback.
+    // Approximation: the namespace of a definition is its scope_path
+    // (which compute_scope built from namespace_definition nodes). The
+    // ref's "current namespace" is its own scope_path. A candidate is
+    // "same namespace" if its scope_path equals OR is a prefix of the
+    // ref's scope. "Using-namespace" candidates have scope_path starting
+    // with one of the names in `using namespace X;` in the ref's file.
+    if matches!(rr.lang, FileKind::Cpp | FileKind::HeaderCpp | FileKind::Header) {
+        // 1. Same-namespace (or enclosing-namespace) match.
+        if !rr.scope_path.is_empty() {
+            for c in pool {
+                if !c.scope_path.is_empty() && rr.scope_path.starts_with(&c.scope_path) {
+                    *narrowed += 1;
+                    return c.id;
+                }
+            }
+        }
+        // 2. `using namespace X;` directive match.
+        if let Some(uses) = per_file_using_ns.get(&rr.file_id) {
+            for u in uses {
+                // `using namespace foo::bar;` → look for cand whose
+                // scope starts with [foo, bar].
+                let parts: Vec<&str> = u.split("::").collect();
+                for c in pool {
+                    if c.scope_path.len() >= parts.len()
+                        && c.scope_path.iter().zip(parts.iter()).all(|(a, b)| a == b)
+                    {
+                        *narrowed += 1;
+                        return c.id;
+                    }
+                }
+            }
+        }
+    }
+
     pool[0].id
 }
 
 /// One candidate definition for a ref. Loaded from the lazy symbols
 /// vec during the resolution pre-pass; the resolver then narrows by
-/// pkg (Java) or returns the first same-lang candidate. `file_id` is
-/// kept so pass1b can stamp each Java type-def with the package its
-/// file declares (resolver short-circuit: by-package lookup without
-/// re-resolving file_id → pkg on every ref).
+/// pkg (Java / Kotlin) or scope_path / using-namespace (C++), and
+/// falls back to "first same-lang candidate" otherwise. `file_id` is
+/// kept so pass1b can stamp each Java/Kotlin type-def with the package
+/// its file declares (resolver short-circuit: by-package lookup
+/// without re-resolving file_id → pkg on every ref). `scope_path` is
+/// the def's namespace nesting, used by the C++ narrowing path.
 #[derive(Clone)]
 struct ResolveDef {
     id: u64,
     file_id: u32,
     lang: FileKind,
     pkg: Option<String>,
+    scope_path: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -6693,7 +6762,13 @@ mod tests {
     use scry_store::RefKind;
 
     fn mk_def(id: u64, lang: FileKind, pkg: Option<&str>) -> ResolveDef {
-        ResolveDef { id, file_id: 0, lang, pkg: pkg.map(String::from) }
+        ResolveDef { id, file_id: 0, lang, pkg: pkg.map(String::from), scope_path: vec![] }
+    }
+    fn mk_def_scoped(id: u64, lang: FileKind, scope: &[&str]) -> ResolveDef {
+        ResolveDef {
+            id, file_id: 0, lang, pkg: None,
+            scope_path: scope.iter().copied().map(String::from).collect(),
+        }
     }
     fn mk_ref(name: &str, lang: FileKind, file_id: u32) -> RefRecord {
         RefRecord {
@@ -6702,6 +6777,15 @@ mod tests {
             scope_path: vec![], lang, resolved_to: None,
         }
     }
+    fn mk_ref_scoped(name: &str, lang: FileKind, file_id: u32, scope: &[&str]) -> RefRecord {
+        RefRecord {
+            name: name.into(), kind: RefKind::Call, file_id,
+            byte_start: 0, byte_end: 0, line: 1, col: 1,
+            scope_path: scope.iter().copied().map(String::from).collect(),
+            lang, resolved_to: None,
+        }
+    }
+    fn empty_ns() -> HashMap<u32, Vec<String>> { HashMap::new() }
 
     #[test]
     fn resolve_one_single_candidate_trivial() {
@@ -6709,9 +6793,9 @@ mod tests {
         by_name.insert("Foo".into(), vec![mk_def(42, FileKind::Java, None)]);
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
+        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
         assert_eq!(chosen, 42);
-        assert_eq!(n, 0, "single-cand shortcut shouldn't count as a Java-narrowed win");
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -6719,7 +6803,7 @@ mod tests {
         let by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 0);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 0);
     }
 
     #[test]
@@ -6732,12 +6816,9 @@ mod tests {
         ]);
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 200);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 200);
     }
 
-    /// Java narrowing: file's package matches ONE candidate's package →
-    /// that candidate wins even when other same-lang Java candidates
-    /// exist. Counts as a "narrowed" win.
     #[test]
     fn resolve_one_java_same_package_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
@@ -6750,12 +6831,10 @@ mod tests {
         pkg.insert(5u32, "android.app".to_string());
         let r = mk_ref("Activity", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &mut n), 22);
-        assert_eq!(n, 1, "same-package narrowing should bump counter");
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
     }
 
-    /// Java narrowing: no same-package match, but an explicit
-    /// `import x.y.Foo;` resolves it.
     #[test]
     fn resolve_one_java_import_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
@@ -6767,11 +6846,10 @@ mod tests {
         imports.insert(5u32, vec![("Binder".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &mut n), 22);
-        assert_eq!(n, 1, "explicit-import narrowing should bump counter");
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
     }
 
-    /// Wildcard `import x.y.*;` resolves any class in x.y.
     #[test]
     fn resolve_one_java_wildcard_import_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
@@ -6783,12 +6861,10 @@ mod tests {
         imports.insert(5u32, vec![("*".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
-    /// java.lang fallback: name like "String" with no same-pkg or import
-    /// match should land on the java.lang.String candidate.
     #[test]
     fn resolve_one_java_lang_fallback() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
@@ -6798,12 +6874,10 @@ mod tests {
         ]);
         let r = mk_ref("String", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n), 22);
-        assert_eq!(n, 1, "java.lang fallback should bump counter");
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
     }
 
-    /// When NO Java context narrows, falls back to the first same-lang
-    /// candidate (Layer 1 behavior). Counter should NOT bump.
     #[test]
     fn resolve_one_java_no_narrowing_fallback() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
@@ -6813,9 +6887,96 @@ mod tests {
         ]);
         let r = mk_ref("Foo", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &mut n);
-        assert_eq!(got, 11, "should pick first same-lang candidate");
-        assert_eq!(n, 0, "no narrowing happened");
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        assert_eq!(got, 11);
+        assert_eq!(n, 0);
+    }
+
+    // ---- Kotlin Layer 2 ----
+
+    /// Kotlin same-package narrowing mirrors Java: a file's package
+    /// matches one candidate → that one wins.
+    #[test]
+    fn resolve_one_kotlin_same_package_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Activity".into(), vec![
+            mk_def(11, FileKind::Kotlin, Some("com.other")),
+            mk_def(22, FileKind::Kotlin, Some("android.app")),
+        ]);
+        let mut pkg = HashMap::new();
+        pkg.insert(5u32, "android.app".to_string());
+        let r = mk_ref("Activity", FileKind::Kotlin, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
+    }
+
+    /// Kotlin `kotlin.collections` fallback: `List` lands on the
+    /// kotlin.collections candidate when no same-package / explicit-import
+    /// hit applies.
+    #[test]
+    fn resolve_one_kotlin_implicit_collections_fallback() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("List".into(), vec![
+            mk_def(11, FileKind::Kotlin, Some("com.other")),
+            mk_def(22, FileKind::Kotlin, Some("kotlin.collections")),
+        ]);
+        let r = mk_ref("List", FileKind::Kotlin, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
+    }
+
+    /// Kotlin explicit import wins over both same-package and implicit.
+    #[test]
+    fn resolve_one_kotlin_explicit_import_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Bundle".into(), vec![
+            mk_def(11, FileKind::Kotlin, Some("com.other")),
+            mk_def(22, FileKind::Kotlin, Some("android.os")),
+        ]);
+        let mut imports = HashMap::new();
+        imports.insert(5u32, vec![("Bundle".to_string(), Some("android.os".to_string()))]);
+        let r = mk_ref("Bundle", FileKind::Kotlin, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
+    }
+
+    // ---- C++ Layer 2 ----
+
+    /// C++ same/enclosing-namespace match: a ref in namespace `android::os`
+    /// prefers a candidate scoped to `android::os` or one of its
+    /// prefixes (`android`).
+    #[test]
+    fn resolve_one_cpp_same_namespace_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("Parcel".into(), vec![
+            mk_def_scoped(11, FileKind::Cpp, &["other", "ns"]),
+            mk_def_scoped(22, FileKind::Cpp, &["android", "os"]),
+            mk_def_scoped(33, FileKind::Cpp, &["unrelated"]),
+        ]);
+        let r = mk_ref_scoped("Parcel", FileKind::Cpp, 5, &["android", "os"]);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(n, 1);
+    }
+
+    /// C++ `using namespace android::base;` directive: pick the
+    /// candidate whose namespace begins with `android::base`.
+    #[test]
+    fn resolve_one_cpp_using_namespace_narrowing() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("StringPrintf".into(), vec![
+            mk_def_scoped(11, FileKind::Cpp, &["other"]),
+            mk_def_scoped(22, FileKind::Cpp, &["android", "base"]),
+        ]);
+        let mut using = HashMap::new();
+        using.insert(5u32, vec!["android::base".to_string()]);
+        let r = mk_ref("StringPrintf", FileKind::Cpp, 5);
+        let mut n = 0u64;
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &using, &mut n), 22);
+        assert_eq!(n, 1);
     }
 
     // ------------------------------------------------------------------

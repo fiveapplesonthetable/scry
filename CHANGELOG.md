@@ -7,6 +7,75 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-05-16
+
+The "works on non-Android repos too" drop. Wires six new tree-sitter
+parsers — TypeScript, Proto (proto2 + proto3), HTML, CSS, SCSS,
+Markdown — so a single scry binary covers the perfetto trace_viewer,
+its own Rust source, scry-ui, and any web-shaped repo with the same
+zero-config flow as AOSP. Pure addition: every existing AOSP
+extractor stays where it was; the new parsers slot in via the
+existing FormatRegistry trait. Zero Android regressions (164 tests
+pass, was 158).
+
+### Added — language support
+
+- **TypeScript** (`tree-sitter-typescript 0.23`) wired for `.ts` /
+  `.tsx`. Captures class / interface / function / method / enum /
+  type-alias / top-level variable. Built for the perfetto
+  trace_viewer's ~5500 .ts files; works for any TS project.
+- **Proto** (`tree-sitter-proto 0.4`) — proto2 + proto3 in one
+  grammar. Captures message / enum / service / rpc. Uses the
+  existing `ProtoMessage` / `ProtoEnum` / `ProtoService`
+  SymbolKinds that were defined but unused before this release.
+- **HTML** (`tree-sitter-html 0.23`) — captures `id=` / `name=` /
+  any `attribute_value` text as XmlId symbols so JS-side
+  `getElementById("x")` calls have a definition to resolve to.
+- **CSS** (`tree-sitter-css 0.25`) — class selectors → Class,
+  id selectors → XmlId, `@keyframes` names → Type.
+- **SCSS** (`tree-sitter-scss 1.0`) — superset of CSS captures
+  plus `@mixin` and `@function` definitions as Function-kind.
+  perfetto's UI uses SCSS as the primary stylesheet format.
+- **Markdown** (`tree-sitter-md 0.5`) — atx + setext headings as
+  Module-kind symbols. `scry def "Verification checklist"` jumps
+  to that section of DEVELOPMENT.md without grepping.
+
+### Added — corpora validated this release
+
+| Corpus     | Files | Symbols | Notes                          |
+|------------|------:|--------:|--------------------------------|
+| perfetto   | 40478 | 1.26 M  | TS UI + proto + C++/Python + SCSS/CSS/HTML + GN — full coverage, 8 min on 12 workers |
+| scry repo  |    53 |    1357 | Rust + Bash + Markdown headings; 591 ms cold |
+| scry-ui    |    43 |     746 | TypeScript + SCSS + HTML; 100 ms cold |
+
+All three exercised end-to-end this release. `scry def Track --lang
+TypeScript` lands on the interface in `perfetto/ui/src/public/track.ts`;
+`scry def TracePacket --kind proto.msg` lands on the proto definition;
+`scry def "Quickstart"` finds every Markdown Quickstart heading in
+the perfetto docs tree.
+
+### Improved
+
+- `short_lang()` (the display-side lang chip on result rows) now
+  knows ts/html/css/scss/md so result lines say `(iface ts)` not
+  `(iface ?)`.
+- README "Also works on" section names the three non-AOSP corpora
+  scry was exercised against this release, with the indexed
+  file/symbol/time numbers.
+- DEVELOPMENT.md's "Known coverage gaps" tightened to reflect
+  reality — assembly stays a gap; bash / TS / proto / HTML / CSS
+  / SCSS / Markdown have moved out of "gap" and into the
+  positive-coverage table above it.
+
+### Migration notes
+
+None. The added grammars are pure additions to scry-lang; the
+walker just learned five new file extensions (`.ts` / `.tsx` /
+`.html` / `.htm` / `.css` / `.scss`) to classify (Markdown
+classification was already in place). Existing AOSP indexes can
+be reused; rebuild only if you want symbol coverage on web /
+proto / docs files that were walked-but-not-symbolized before.
+
 ## [0.1.6] — 2026-05-16
 
 The DEVELOPMENT.md sweep. Worked the "What's left" / "Concrete

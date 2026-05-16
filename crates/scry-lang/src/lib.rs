@@ -151,6 +151,12 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
         Go => go_spec(),
         Python => python_spec(),
         Bash => bash_spec(),
+        TypeScript => typescript_spec(),
+        Proto => proto_spec(),
+        Html => html_spec(),
+        Css => css_spec(),
+        Scss => scss_spec(),
+        Markdown => markdown_spec(),
         _ => return Ok(Vec::new()),
     };
     let mut syms = extract_with(spec, source)?;
@@ -1075,6 +1081,268 @@ fn bash_spec() -> &'static LangSpec {
     })
 }
 
+// ---------------------------------------------------------------------------
+// TypeScript / TSX — perfetto trace_viewer UI, general TS coverage.
+//
+// tree-sitter-typescript ships two grammars: plain TS and TSX. We use
+// the TS grammar (handles .ts well); .tsx files also parse acceptably
+// with TS in practice, just without JSX-specific node kinds — fine for
+// scry's identifier-capture purpose.
+// ---------------------------------------------------------------------------
+
+fn typescript_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (class_declaration name: (type_identifier) @name) @def.class
+                (interface_declaration name: (type_identifier) @name) @def.interface
+                (function_declaration name: (identifier) @name) @def.function
+                (method_definition name: (property_identifier) @name) @def.method
+                (enum_declaration name: (identifier) @name) @def.enum
+                (type_alias_declaration name: (type_identifier) @name) @def.type
+                (variable_declarator name: (identifier) @name) @def.var
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(program) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.class", SymbolKind::Class),
+                ("def.interface", SymbolKind::Interface),
+                ("def.function", SymbolKind::Function),
+                ("def.method", SymbolKind::Method),
+                ("def.enum", SymbolKind::Enum),
+                ("def.type", SymbolKind::Type),
+                ("def.var", SymbolKind::Variable),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &[
+                "class_declaration",
+                "interface_declaration",
+                "function_declaration",
+                "method_definition",
+                "enum_declaration",
+            ],
+            package_node_kind: None,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Proto — proto2 + proto3 IDL files (perfetto, gRPC, AOSP trace_processor).
+//
+// tree-sitter-proto handles both proto2 and proto3 syntax in one grammar.
+// Captures messages, enums, services, and rpc methods as their own kinds
+// (ProtoMessage / ProtoEnum / ProtoService) so agents can filter
+// `--kind proto.msg`.
+// ---------------------------------------------------------------------------
+
+fn proto_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_proto::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (message (message_name (identifier) @name)) @def.message
+                (enum (enum_name (identifier) @name)) @def.enum
+                (service (service_name (identifier) @name)) @def.service
+                (rpc (rpc_name (identifier) @name)) @def.method
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(source_file) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.message", SymbolKind::ProtoMessage),
+                ("def.enum", SymbolKind::ProtoEnum),
+                ("def.service", SymbolKind::ProtoService),
+                ("def.method", SymbolKind::Method),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &["message", "service", "enum"],
+            package_node_kind: Some("package"),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// HTML — perfetto UI templates + general HTML.
+//
+// Captures elements with `id` and `name` attributes as XmlId symbols
+// (reusing the existing AOSP XmlId kind — same intent: "thing JS code
+// will reference by name"). Tag names aren't captured (too noisy on a
+// large UI). Targeting the cross-reference value: `getElementById("x")`
+// in TS should resolve to id="x" in an .html template.
+// ---------------------------------------------------------------------------
+
+fn html_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_html::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (attribute
+                  (quoted_attribute_value (attribute_value) @name)) @def.xmlid
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(document) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.xmlid", SymbolKind::XmlId),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &[],
+            package_node_kind: None,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CSS — class selectors, ID selectors, and @keyframes / @font-face names.
+//
+// The high-value captures for a code-search tool are the things JS / TS
+// code references back into: `.my-class` → DOM toggleClass, `#main` →
+// querySelector. Pseudo-classes and descendant combinators aren't
+// indexed (no agent question shaped like "where is :hover defined").
+// ---------------------------------------------------------------------------
+
+fn css_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_css::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (class_selector (class_name) @name) @def.class
+                (id_selector (id_name) @name) @def.xmlid
+                (keyframes_statement (keyframes_name) @name) @def.type
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(stylesheet) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.class", SymbolKind::Class),
+                ("def.xmlid", SymbolKind::XmlId),
+                ("def.type", SymbolKind::Type),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &[],
+            package_node_kind: None,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SCSS — perfetto UI primary stylesheet format. Adds @mixin and
+// @function captures on top of the CSS surface; the rest reuses
+// css-shape patterns (tree-sitter-scss is a superset of CSS).
+// ---------------------------------------------------------------------------
+
+fn scss_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        // tree-sitter-scss exposes `language()` (a function) rather than
+        // the newer LANGUAGE const — the grammar predates the convention.
+        let lang = LANG.get_or_init(tree_sitter_scss::language);
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (class_selector (class_name) @name) @def.class
+                (id_selector (id_name) @name) @def.xmlid
+                (mixin_statement (identifier) @name) @def.function
+                (function_statement (identifier) @name) @def.function
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(stylesheet) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.class", SymbolKind::Class),
+                ("def.xmlid", SymbolKind::XmlId),
+                ("def.function", SymbolKind::Function),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &[],
+            package_node_kind: None,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Markdown — heading-level navigation for the docs-heavy case
+// (scry's own docs/, perfetto's docs/, AOSP design notes).
+//
+// Captures all six heading levels as Module-kind symbols named after
+// the heading text. Cheap; agents can `scry def "Verification checklist"`
+// to find that section of DEVELOPMENT.md without grepping.
+// ---------------------------------------------------------------------------
+
+fn markdown_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_md::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (atx_heading (inline) @name) @def.module
+                (setext_heading (paragraph) @name) @def.module
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(document) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            scope_node_kinds: &[],
+            package_node_kind: None,
+        }
+    })
+}
+
 // ===========================================================================
 // REF QUERIES — one per language. Phase 2 focuses on call sites + ctors +
 // inheritance edges, which gives us callers/callees/impls cheaply. Generic
@@ -1368,7 +1636,8 @@ fn ts_unified(kind: FileKind, src: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
 
 /// Built-in tree-sitter source-language parsers. Call this from your
 /// FormatRegistry setup to get C / C++ / Header / Java / Kotlin / Rust /
-/// Go / Python / Bash coverage out of the box.
+/// Go / Python / Bash / TypeScript / Proto / HTML / CSS / SCSS / Markdown
+/// coverage out of the box.
 pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
     vec![
         Box::new(FnAdapter { name: "ts-java", kinds: &[FileKind::Java], f: ts_unified }),
@@ -1379,6 +1648,12 @@ pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
         Box::new(FnAdapter { name: "ts-go", kinds: &[FileKind::Go], f: ts_unified }),
         Box::new(FnAdapter { name: "ts-python", kinds: &[FileKind::Python], f: ts_unified }),
         Box::new(FnAdapter { name: "ts-bash", kinds: &[FileKind::Bash], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-typescript", kinds: &[FileKind::TypeScript], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-proto", kinds: &[FileKind::Proto], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-html", kinds: &[FileKind::Html], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-css", kinds: &[FileKind::Css], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-scss", kinds: &[FileKind::Scss], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-markdown", kinds: &[FileKind::Markdown], f: ts_unified }),
     ]
 }
 
@@ -1810,6 +2085,255 @@ int BBinder::transact(int code) { return 0; }
             assert!(names.contains(var),
                     "bash extraction missing variable `{var}`; got: {names:?}");
         }
+    }
+
+    /// TypeScript extraction — class / interface / function / method /
+    /// enum / type-alias / top-level var captures. The perfetto UI is
+    /// ~5500 .ts files; this is the gold-standard test that the
+    /// trace_viewer side gets covered the same way as C++/Java.
+    #[test]
+    fn typescript_minimal_extraction() {
+        let src = br#"
+            export interface Foo {
+                bar(): string;
+            }
+            export class FooImpl implements Foo {
+                bar(): string { return "x"; }
+                static create(): FooImpl { return new FooImpl(); }
+            }
+            export function topLevel(x: number): number { return x + 1; }
+            export type Id = string;
+            export enum Direction { Up, Down }
+            export const MAX_RETRIES: number = 5;
+        "#;
+        let syms = extract(FileKind::TypeScript, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}", s.kind, s.name);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Interface && s.name == "Foo"),
+                "missing interface Foo. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Class && s.name == "FooImpl"),
+                "missing class FooImpl. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Method && s.name == "bar"),
+                "missing method bar. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Method && s.name == "create"),
+                "missing static method create. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Function && s.name == "topLevel"),
+                "missing fn topLevel. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Type && s.name == "Id"),
+                "missing type Id. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Enum && s.name == "Direction"),
+                "missing enum Direction. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Variable && s.name == "MAX_RETRIES"),
+                "missing var MAX_RETRIES. all:\n  {}", all.join("\n  "));
+    }
+
+    /// Proto extraction — proto3-style message / enum / service / rpc.
+    /// perfetto's trace.proto family + AOSP's framework protos.
+    #[test]
+    fn proto_message_enum_service_rpc() {
+        let src = br#"
+            syntax = "proto3";
+            package perfetto.protos;
+
+            message TracePacket {
+                string name = 1;
+                uint64 timestamp = 2;
+            }
+
+            enum Verbosity {
+                INFO = 0;
+                WARN = 1;
+                ERROR = 2;
+            }
+
+            service Recorder {
+                rpc StartTrace(StartRequest) returns (StartResponse);
+                rpc StopTrace(StopRequest) returns (StopResponse);
+            }
+        "#;
+        let syms = extract(FileKind::Proto, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}", s.kind, s.name);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::ProtoMessage && s.name == "TracePacket"),
+                "missing message TracePacket. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::ProtoEnum && s.name == "Verbosity"),
+                "missing enum Verbosity. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::ProtoService && s.name == "Recorder"),
+                "missing service Recorder. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Method && s.name == "StartTrace"),
+                "missing rpc StartTrace. all:\n  {}", all.join("\n  "));
+    }
+
+    /// proto2 syntax — distinct from proto3 in field rules (required /
+    /// optional). The grammar's the same; we just need the high-level
+    /// captures to keep firing.
+    #[test]
+    fn proto2_messages_capture() {
+        let src = br#"
+            syntax = "proto2";
+            package legacy;
+            message ConfigV1 {
+                required string name = 1;
+                optional int32 count = 2;
+            }
+        "#;
+        let syms = extract(FileKind::Proto, src).unwrap();
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::ProtoMessage && s.name == "ConfigV1"),
+                "proto2 message not captured. got: {:?}",
+                syms.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    /// CSS extraction — class selectors, ID selectors, @keyframes
+    /// names. The perfetto UI bundles its own; same patterns appear in
+    /// any web frontend.
+    #[test]
+    fn css_class_id_keyframes() {
+        let src = br#"
+            .main-panel { background: white; }
+            .nested .child { color: red; }
+            #app-root { padding: 1em; }
+            @keyframes fadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+        "#;
+        let syms = extract(FileKind::Css, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}", s.kind, s.name);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        for cls in &["main-panel", "nested", "child"] {
+            assert!(syms.iter().any(|s| s.kind == SymbolKind::Class && s.name == *cls),
+                    "css class `{cls}` missing. all:\n  {}", all.join("\n  "));
+        }
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::XmlId && s.name == "app-root"),
+                "css id `app-root` missing. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Type && s.name == "fadeIn"),
+                "@keyframes name missing. all:\n  {}", all.join("\n  "));
+    }
+
+    /// SCSS extraction — perfetto UI's primary stylesheet format.
+    /// Adds @mixin / @function captures on top of CSS-shape patterns.
+    #[test]
+    fn scss_class_mixin_function() {
+        let src = br#"
+            .panel { color: black; }
+            #root { padding: 0; }
+
+            @mixin reset {
+                margin: 0;
+                padding: 0;
+            }
+
+            @function pow($base, $exp) {
+                @return $base * $exp;
+            }
+        "#;
+        let syms = extract(FileKind::Scss, src).unwrap();
+        let pretty = |s: &RawSymbol| format!("{:?}/{}", s.kind, s.name);
+        let all: Vec<String> = syms.iter().map(pretty).collect();
+
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Class && s.name == "panel"),
+                "scss class `panel` missing. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::XmlId && s.name == "root"),
+                "scss id `root` missing. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Function && s.name == "reset"),
+                "scss @mixin `reset` missing. all:\n  {}", all.join("\n  "));
+        assert!(syms.iter().any(|s| s.kind == SymbolKind::Function && s.name == "pow"),
+                "scss @function `pow` missing. all:\n  {}", all.join("\n  "));
+    }
+
+    /// HTML extraction — id/name attribute values. JS code referencing
+    /// `getElementById("x")` should be able to find id="x" in the
+    /// .html that defines it. Conservative: capture nothing else
+    /// (tag names are noise on a real UI tree).
+    #[test]
+    fn html_attribute_value_capture() {
+        let src = br#"
+            <html>
+              <body>
+                <div id="app-root">
+                  <button name="submit-btn">Go</button>
+                  <input id="search-input" />
+                </div>
+              </body>
+            </html>
+        "#;
+        let syms = extract(FileKind::Html, src).unwrap();
+        let names: std::collections::HashSet<&str> =
+            syms.iter().map(|s| s.name.as_str()).collect();
+        for must_have in &["app-root", "submit-btn", "search-input"] {
+            assert!(names.contains(must_have),
+                    "html attribute value `{must_have}` missing; got: {names:?}");
+        }
+    }
+
+    /// Markdown extraction — atx + setext headings as Module-kind
+    /// symbols. Lets `scry def "Verification checklist"` jump to that
+    /// section of DEVELOPMENT.md.
+    #[test]
+    fn markdown_headings_capture() {
+        let src = br#"# Top Title
+
+Some intro.
+
+## Section One
+
+Body.
+
+### Subsection
+
+Body.
+
+Setext Heading
+==============
+
+Body.
+"#;
+        let syms = extract(FileKind::Markdown, src).unwrap();
+        let names: std::collections::HashSet<String> =
+            syms.iter().map(|s| s.name.trim().to_string()).collect();
+        for must_have in &["Top Title", "Section One", "Subsection", "Setext Heading"] {
+            assert!(names.contains(*must_have),
+                    "markdown heading `{must_have}` missing; got: {names:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture"]
+    fn dump_scss_ast() {
+        let src = b".panel { color: black; }\n#root { padding: 0; }\n@mixin reset { margin: 0; }\n@function pow($a) { @return $a; }\n";
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(&tree_sitter_scss::language()).unwrap();
+            let tree = parser.parse(src.as_ref(), None).unwrap();
+            fn walk(n: tree_sitter::Node, src: &[u8], depth: usize) {
+                let text = n.utf8_text(src).unwrap_or("?");
+                let snip = if text.len() < 40 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
+                println!("{:indent$}{} = {:?}", "", n.kind(), snip, indent = depth*2);
+                for i in 0..n.child_count() { if let Some(c) = n.child(i) { walk(c, src, depth + 1); } }
+            }
+            walk(tree.root_node(), src.as_ref(), 0);
+        });
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture"]
+    fn dump_html_ast() {
+        let src = b"<div id=\"foo\"><button name=\"bar\">x</button></div>\n";
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(&tree_sitter_html::LANGUAGE.into()).unwrap();
+            let tree = parser.parse(src.as_ref(), None).unwrap();
+            fn walk(n: tree_sitter::Node, src: &[u8], depth: usize) {
+                let text = n.utf8_text(src).unwrap_or("?");
+                let snip = if text.len() < 40 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
+                println!("{:indent$}{} = {:?}", "", n.kind(), snip, indent = depth*2);
+                for i in 0..n.child_count() { if let Some(c) = n.child(i) { walk(c, src, depth + 1); } }
+            }
+            walk(tree.root_node(), src.as_ref(), 0);
+        });
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub enum FileKind {
     Go,
     Python,
     Bash,
+    TypeScript,    // *.ts / *.tsx — perfetto trace_viewer UI, general TS
+    Html,          // *.html / *.htm — perfetto UI templates
+    Css,           // *.css
+    Scss,          // *.scss — perfetto UI primary stylesheet format
     Proto,
     Aidl,
     Hidl,          // *.hal — legacy AOSP IPC
@@ -128,6 +132,10 @@ impl FileKind {
             FileKind::Go => "Go",
             FileKind::Python => "Python",
             FileKind::Bash => "Bash",
+            FileKind::TypeScript => "TypeScript",
+            FileKind::Html => "Html",
+            FileKind::Css => "Css",
+            FileKind::Scss => "Scss",
             FileKind::Proto => "Proto",
             FileKind::Aidl => "Aidl",
             FileKind::Hidl => "Hidl",
@@ -205,6 +213,10 @@ impl FileKind {
             "go" => FileKind::Go,
             "py" => FileKind::Python,
             "sh" | "bash" => FileKind::Bash,
+            "ts" | "tsx" => FileKind::TypeScript,
+            "html" | "htm" => FileKind::Html,
+            "css" => FileKind::Css,
+            "scss" => FileKind::Scss,
             "proto" => FileKind::Proto,
             "aidl" => FileKind::Aidl,
             "hal" => FileKind::Hidl,
@@ -237,7 +249,9 @@ impl FileKind {
             self,
             FileKind::C | FileKind::Cpp | FileKind::Header | FileKind::HeaderCpp |
             FileKind::Java | FileKind::Kotlin | FileKind::Rust | FileKind::Go |
-            FileKind::Python | FileKind::Bash | FileKind::Proto | FileKind::Aidl |
+            FileKind::Python | FileKind::Bash | FileKind::TypeScript |
+            FileKind::Html | FileKind::Css | FileKind::Scss |
+            FileKind::Proto | FileKind::Aidl |
             FileKind::Hidl | FileKind::Assembly
         )
     }

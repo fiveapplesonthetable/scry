@@ -132,6 +132,24 @@ to `.tmp/` and atomically renamed into place. The `StoreReader`
 `mmap`s every sidecar; queries decode one record at a time without
 loading the full 10 GB columnar payload.
 
+## Also works on
+
+The language set above is broad enough to cover other
+non-Android tree-of-source-files projects out of the box. Indexed
+in this release with zero per-corpus configuration:
+
+| Corpus                | Files indexed | What stands out                            |
+|-----------------------|--------------:|--------------------------------------------|
+| **perfetto**          | ~40 k         | TypeScript trace_viewer UI (~29 k TS syms), proto schemas (~6 k messages + enums), C++ trace_processor, SCSS, GN/GNI builds. 1.26 M symbols in 8 min on a 12-worker run. |
+| **scry itself**       | 53            | Rust + Bash scripts + Markdown headings. 591 ms cold; `scry def "Verification checklist"` jumps to that section of `DEVELOPMENT.md`. |
+| **scry-ui** (sibling) | 43            | TypeScript + SCSS + HTML; 100 ms cold.    |
+
+No project-specific code paths run for these — they exercise the
+generic walker + the tree-sitter parsers wired in `scry-lang`.
+The AOSP-specific format parsers (Soong, AIDL, init.rc, sepolicy,
+manifest, …) stay in `scry-aosp`, behind an extension trait, so
+they don't activate when there are no matching files.
+
 ## Why not just $existing_tool
 
 - **ctags / gtags / cscope** — tag-only, no scope, no AOSP-specific

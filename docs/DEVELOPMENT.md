@@ -397,15 +397,37 @@ jq -r '.cmd' ~/.scry/queries.log | sort | uniq -c | sort -rn
   warnings, `cargo clippy --release --workspace --all-targets`); a
   new warning fails CI before it gets a chance to merge.
 
+## Language coverage
+
+scry today wires tree-sitter for: C, C++ (incl. `.h`/`.hpp`), Java,
+Kotlin, Rust, Go, Python, Bash, TypeScript (incl. `.tsx`), Proto
+(proto2 + proto3), HTML, CSS, SCSS, Markdown. Plus the hand-rolled
+AOSP / build-format parsers: Soong, AIDL, HIDL, OWNERS, aconfig,
+init.rc, sepolicy, AndroidManifest.xml, Bazel, CMake, GN, api/*.txt.
+
+This covers the headline corpora end-to-end:
+
+| Corpus                | Languages it actually uses             | Coverage      |
+|-----------------------|-----------------------------------------|---------------|
+| AOSP + Linux          | C/C++/Java/Kotlin/Python + Soong/AIDL/HIDL/init.rc/sepolicy/manifest | full |
+| Perfetto              | TypeScript (UI) + Proto + C++/Python + SCSS/CSS/HTML + GN | full |
+| scry itself           | Rust + Bash + Markdown + TOML*          | full (TOML deferred) |
+
+*TOML files are classified as `FileKind::Toml` and walked but not
+parsed; Cargo.toml's structural content is low-value for symbol
+search and high-cost to model uniformly. Likely not worth adding
+unless a downstream user shows up needing it.
+
 ## Known coverage gaps
 
 The intentionally short list of things scry does not understand yet.
 Each entry is something an agent or human would reasonably expect to
 find and currently won't.
 
+- **TOML** files (Cargo.toml, etc.) are walked but not symbolized.
+  See above.
 - **Swift / Dart / Haskell / OCaml** are not wired (tree-sitter
-  grammars exist; AOSP work doesn't touch them, so the cost
-  hasn't earned itself a slot).
+  grammars exist; no headline corpus exercises them).
 - **Assembly** (kernel `.S` / `.s`) is not wired. The generic-profile
   walker classifies these files but no symbol extractor runs;
   agents asking after asm functions get no hits today.

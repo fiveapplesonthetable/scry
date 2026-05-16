@@ -23,6 +23,12 @@ tree-sitter-go = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-kotlin-ng = "1.1"   # active community grammar, kotlin
 tree-sitter-bash = "0.25"        # AOSP build scripts (lunch/mm/mmm) + envsetup.sh
+tree-sitter-typescript = "0.23"  # perfetto trace_viewer UI + general TypeScript
+tree-sitter-proto = "0.4"        # .proto IDL files (perfetto, gRPC, etc.)
+tree-sitter-html = "0.23"        # perfetto UI template files + general HTML
+tree-sitter-css = "0.25"         # perfetto UI stylesheets
+tree-sitter-scss = "1.0"         # perfetto UI uses SCSS — the dominant style format
+tree-sitter-md = "0.5"           # markdown headings — docs/*.md navigation
 
 [lints]
 workspace = true

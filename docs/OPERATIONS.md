@@ -50,6 +50,7 @@ explicit.
 | `--max-file-bytes N` | 100 MiB | refuse to open files larger | only files larger than this are binaries (.git packs, prebuilt jars) |
 | `SCRY_PARSE_TIMEOUT_MS` | 0 (unlimited) | per-file tree-sitter parse | set to 60000 in production; pathological grammars then fail loudly per-file instead of OOM-killing |
 | `MALLOC_CONF` | (jemalloc default) | how aggressively the allocator returns pages | set `dirty_decay_ms:100,muzzy_decay_ms:100,narenas:1` so RSS tracks workload |
+| `--build-trigrams` | off | builds a trigram index (3-byte n-grams) alongside the symbol index — enables 100× faster `scry grep` for literal patterns. Doubles disk usage. Recommended for production indexes used by LLM agents. |
 
 
 ## What --resume does
@@ -180,12 +181,34 @@ final index contains:
 ├── roots.bin               # Vec<RootEntry>
 ├── files.bin               # Vec<FileEntry>
 ├── symbols.bin             # Vec<SymbolRecord> (cat'd from chunks)
+├── symbols_offsets.bin     # u64 byte offset per symbol (lazy reader)
 ├── refs.bin                # Vec<RefRecord>
+├── refs_offsets.bin        # u64 byte offset per ref (lazy reader)
 ├── names.fst               # FST: symbol name → posting offset
 ├── name_postings.bin       # u32 indices into symbols.bin
 ├── ref_names.fst           # FST: ref name → posting offset
-└── ref_postings.bin        # u32 indices into refs.bin
+├── ref_postings.bin        # u32 indices into refs.bin
+├── trigrams.fst            # FST: 3-byte trigram → posting offset    (--build-trigrams)
+└── trigram_postings.bin    # delta+varint encoded file_id lists      (--build-trigrams)
 ```
+
+## Adding optimizations to an existing index
+
+If your index is missing offsets or trigrams (old format, or
+`--build-trigrams` wasn't passed), you can retrofit them without
+re-parsing:
+
+```sh
+# Lazy reader sidecars — ~30 sec at full-AOSP scale
+scry build-offsets --index /mnt/agent/scry-index
+
+# Trigram index — ~15-20 min at full-AOSP scale
+scry build-trigrams --index /mnt/agent/scry-index --workers 16
+```
+
+Both are atomic — they stage into a tmp dir, then rename into the
+final index. Safe to run on an index that's actively serving queries
+(reader picks up the new files on next open).
 
 Validate against real AOSP symbols:
 ```sh

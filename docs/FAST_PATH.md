@@ -1,9 +1,12 @@
 # scry — fast-path design (the "100x faster than rg" plan)
 
-Two pieces of work that, together, would let scry beat rg by 1-2
-orders of magnitude for the common query types. Both are well-
-understood techniques (Google Code Search, livegrep, Hound) — not
-research. Both are independent, can ship in either order.
+**Status (2026-05-16): both pieces SHIPPED.** Lazy reader: 1041f2b.
+Trigram index: e96a4ee + d1e507a. Measured wins documented below.
+
+Two pieces of work that, together, let scry beat rg by 1-2 orders
+of magnitude for the common query types. Both are well-understood
+techniques (Google Code Search, livegrep, Hound) — not research.
+Independent.
 
 
 ## 1. Lazy / mmap StoreReader  (saves 10 GB open cost)

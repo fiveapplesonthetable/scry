@@ -684,6 +684,28 @@ returns the longest valid prefix of the log.
 
 ## Index admin
 
+### Automatic stale-index warning
+
+If the index you're querying was built with a different `scry`
+version than the running binary, you'll see a one-line stderr
+warning on every command that opens it:
+
+```
+[scry] WARNING: this index was built with scry 0.0.1; running 0.1.2.
+       Older builds may have stale records (e.g. the Java/C++
+       scope_path bug fixed in 0.1.2). Rebuild with
+       `scry index <ROOT> -o /mnt/agent/scry-index` or
+       `scry index --incremental <ROOT> -o /mnt/agent/scry-index`.
+       Suppress this warning with SCRY_QUIET=1.
+```
+
+The warning is informational — queries still run. Set
+`SCRY_QUIET=1` to suppress (CI, scripted use). When in doubt,
+rebuild; an incremental rebuild on top of the existing index is
+sub-second for small change sets.
+
+### Indexing commands
+
 ```sh
 # Full indexing (production: use scripts/run_index.sh which wraps this
 # with the right knobs + cgroup-protected systemd unit).

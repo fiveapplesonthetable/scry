@@ -7,6 +7,29 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-16
+
+The user-shouldn't-have-to-know drop. The stale-index version
+skew check that v0.1.2 added to `scry health` was the right
+diagnostic but the wrong UX — most users won't think to run
+`scry health` before believing query results. Fixed: scry now
+warns automatically.
+
+### Added
+- **Auto stale-index warning.** Every command that opens an
+  index now emits a one-line stderr warning if the manifest's
+  `scry_version` doesn't match the running binary. The warning
+  is informational — queries still run — and includes the exact
+  rebuild command. Catches the silent-bad-data class of bug
+  (e.g. the pre-0.1.2 Java/C++ scope_path double-encoding) the
+  moment it could mislead a result.
+- **`SCRY_QUIET=1`** env var to suppress the warning. For CI,
+  scripted use, or operators who've consciously decided to keep
+  using a known-older index.
+- New e2e regression test `stale_index_emits_warning_on_every_open`
+  pinning: warning fires by default, `SCRY_QUIET=1` suppresses,
+  matching versions stay silent.
+
 ## [0.1.2] — 2026-05-16
 
 The LLM-self-test drop: drove `scry mcp` end-to-end as an agent
@@ -157,7 +180,8 @@ First tagged release. Full feature surface implemented and tested.
 - Zero clippy warnings under strict `[workspace.lints]` policy.
 - Pre-release discipline: no backward-compat shims carried.
 
-[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fiveapplesonthetable/scry/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/fiveapplesonthetable/scry/releases/tag/v0.1.0

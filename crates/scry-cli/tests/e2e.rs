@@ -1398,3 +1398,75 @@ fn sigpipe_does_not_panic_on_truncated_stdout() {
     assert!(!stderr.contains("BrokenPipe"),
             "scry must not surface BrokenPipe to stderr; stderr was:\n{stderr}");
 }
+
+// ===========================================================================
+// Stale-index warning: any query against an index whose manifest
+// scry_version differs from the running binary's must emit a one-
+// line stderr warning. SCRY_QUIET=1 must suppress. Catches the
+// silent-bad-data regression where an index built with the
+// pre-0.1.2 Java/C++ scope_path bug would return wrong scope
+// without telling the operator anything was off.
+// ===========================================================================
+
+#[test]
+fn stale_index_emits_warning_on_every_open() {
+    use std::process::Command;
+
+    let base = std::env::temp_dir().join(format!("scry-stale-{}", std::process::id()));
+    let src = base.join("src");
+    let idx = base.join("idx");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("Hello.java"),
+        "package x;\npublic class Hello {\n}\n").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("index for stale test");
+    assert!(out.status.success());
+
+    // Forge the manifest to claim an older scry version.
+    let manifest_path = idx.join("manifest.json");
+    let mut m: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).unwrap()
+    ).unwrap();
+    m["scry_version"] = serde_json::json!("0.0.99-pretend-old");
+    std::fs::write(&manifest_path, m.to_string()).unwrap();
+
+    // Default open → must warn.
+    let out = Command::new(scry_bin())
+        .args(["def", "Hello", "--index"]).arg(&idx)
+        .output().expect("def on stale index");
+    assert!(out.status.success(),
+            "query must still succeed despite stale index");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("WARNING"),
+            "stale-index warning must fire on every open; stderr:\n{stderr}");
+    assert!(stderr.contains("0.0.99-pretend-old"),
+            "warning must name the on-disk version; stderr:\n{stderr}");
+
+    // SCRY_QUIET=1 → must NOT warn.
+    let out = Command::new(scry_bin())
+        .env("SCRY_QUIET", "1")
+        .args(["def", "Hello", "--index"]).arg(&idx)
+        .output().expect("def with SCRY_QUIET=1");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("WARNING"),
+            "SCRY_QUIET=1 must suppress the stale warning; stderr:\n{stderr}");
+
+    // Matching version → no warning even without SCRY_QUIET.
+    let mut m: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).unwrap()
+    ).unwrap();
+    m["scry_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    std::fs::write(&manifest_path, m.to_string()).unwrap();
+    let out = Command::new(scry_bin())
+        .args(["def", "Hello", "--index"]).arg(&idx)
+        .output().expect("def on current index");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("WARNING"),
+            "matching version must NOT warn; stderr:\n{stderr}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

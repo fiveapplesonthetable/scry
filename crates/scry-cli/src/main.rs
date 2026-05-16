@@ -1575,7 +1575,38 @@ fn open_index(index: Option<PathBuf>) -> Result<StoreReader> {
             p.display(), p.display(),
         );
     }
-    StoreReader::open(&p).with_context(|| format!("open index {}", p.display()))
+    let reader = StoreReader::open(&p)
+        .with_context(|| format!("open index {}", p.display()))?;
+    warn_if_index_stale(&reader);
+    Ok(reader)
+}
+
+/// Emit a one-line stderr warning if the index was built with a
+/// different scry version than the running binary. Silent on match,
+/// silent on absent `scry_version` field (very old indexes); never
+/// fails or blocks the query. Set `SCRY_QUIET=1` to suppress.
+///
+/// Triggered automatically on every index open so users don't have
+/// to remember to run `scry health` themselves — the most common
+/// stale-index symptom (e.g. the pre-0.1.2 Java scope_path bug)
+/// surfaces the moment it could mislead a query result.
+fn warn_if_index_stale(r: &StoreReader) {
+    if std::env::var("SCRY_QUIET").is_ok_and(|v| !v.is_empty()) {
+        return;
+    }
+    let built_with = r.manifest.scry_version.as_str();
+    let running = env!("CARGO_PKG_VERSION");
+    if built_with.is_empty() || built_with == running {
+        return;
+    }
+    eprintln!(
+        "[scry] WARNING: this index was built with scry {built_with}; \
+         running {running}. Older builds may have stale records (e.g. the \
+         Java/C++ scope_path bug fixed in 0.1.2). Rebuild with `scry index \
+         <ROOT> -o {}` or `scry index --incremental <ROOT> -o {}`. \
+         Suppress this warning with SCRY_QUIET=1.",
+        r.paths.root.display(), r.paths.root.display(),
+    );
 }
 
 fn cmd_def(

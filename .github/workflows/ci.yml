@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Mirror the dev-time gate: any new warning fails the build.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: build + test + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.79+)
+        # rust-toolchain.toml isn't committed; pick a recent stable.
+        # The workspace declares rust-version = "1.79".
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add clippy rustfmt
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+        # rustfmt's defaults are fine; we don't ship a rustfmt.toml.
+        # Letting this fail CI keeps style consistent across PRs.
+        continue-on-error: true
+        # We don't currently enforce `cargo fmt` in the local dev
+        # workflow, so don't break CI over it yet — surface it as a
+        # warning. Flip to required once formatting is normalized.
+
+      - name: cargo build --release --workspace
+        run: cargo build --release --workspace
+
+      - name: cargo test --release --workspace
+        run: cargo test --release --workspace
+
+      - name: cargo clippy --release --workspace --all-targets
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
+
+      - name: scry --version (smoke test)
+        run: ./target/release/scry --version
+
+      - name: scry completions bash (smoke test)
+        # Catch regressions where the clap derivation breaks
+        # completion generation.
+        run: ./target/release/scry completions bash | head -5
+
+      - name: scry man (smoke test)
+        run: ./target/release/scry man | head -5

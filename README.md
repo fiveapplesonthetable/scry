@@ -24,10 +24,42 @@ newline-delimited JSON-RPC on stdin and replies on stdout. Every
 invocation prints a stats footer and appends one JSON line to
 `~/.scry/queries.log` so past sessions are auditable.
 
+## Install
+
+### Prebuilt binary (Linux x86_64)
+
+```sh
+curl -L https://github.com/fiveapplesonthetable/scry/releases/latest/download/scry-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz
+sudo install scry /usr/local/bin/scry
+scry --version
+```
+
+### From source
+
+Requires stable Rust 1.79+; `cargo build --release` produces a static
+binary at `target/release/scry`. See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
+for the full prerequisites + first-time-setup walkthrough.
+
+```sh
+cargo install --git https://github.com/fiveapplesonthetable/scry --bin scry
+# or, for active development:
+git clone https://github.com/fiveapplesonthetable/scry && cd scry
+cargo build --release
+./target/release/scry --help
+```
+
+### Shell completions + man page
+
+```sh
+scry completions bash > /etc/bash_completion.d/scry         # or zsh / fish / powershell / elvish
+scry man | gzip > /usr/local/share/man/man1/scry.1.gz
+```
+
 ## Quickstart
 
 ```sh
-. ./env.sh                                       # CARGO_HOME pinned
+. ./env.sh                                       # optional: CARGO_HOME pinning
 cargo build --release                            # ~20 s cold, ~5 s incremental
 ./target/release/scry def ActivityManagerService --kind class      # ~8 ms
 ./target/release/scry callers transact --lang Java --limit 10      # ~80 ms

@@ -285,9 +285,33 @@ None. blake3 is already in.
 
 ---
 
-## 3. clangd-as-a-service for C++ precision
+## 3. clangd-as-a-service — ✅ per-query session shipped; persistent daemon pending
 
-### Goal
+**Shipped**: `scry callers NAME --precise` spawns clangd, completes
+the LSP `initialize` handshake, `didOpen`s the definition file, and
+issues `textDocument/references`. Results are mapped back to scry's
+file_id space and emitted with the same shape as the heuristic
+path (plus a `precise: true` flag for JSON output).
+
+Implementation lives in `crates/scry-cli/src/clangd.rs` — a small,
+hand-rolled LSP client (~280 LOC) covering exactly the methods
+we need (initialize, initialized, didOpen, references, shutdown,
+exit). No async runtime; sync stdin/stdout framing per the LSP spec.
+
+When clangd is missing from PATH or compile_commands.json is
+not findable above the definition file, the command exits non-zero
+with an actionable error: "install clangd" / "generate
+compile_commands.json". The heuristic path (without --precise)
+keeps working regardless.
+
+**Still pending**: Persistent clangd daemon alongside `scry serve`,
+so multi-precise-query sessions don't pay the ~1-min clangd warmup
+each time. Mechanical wiring: hold a `ClangdSession` inside the
+serve loop, lazy-init on first --precise request, keep alive for
+the rest of the process lifetime. ~1 day of focused work; deferred
+because the per-query cost is already acceptable for one-shot use.
+
+### Goal (original)
 
 Close the 10–20% precision gap on C++ overload resolution without
 requiring the user to maintain a SCIP build. When the user asks

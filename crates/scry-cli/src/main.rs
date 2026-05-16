@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod clangd;
+
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
 // keeps a high-water-mark — fine for short jobs, disastrous for our pattern
 // of "allocate millions of Strings per batch, drop them, repeat". Switching
@@ -154,6 +156,13 @@ enum Cmd {
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
+    ///
+    /// With --precise: route to clangd via LSP for type-aware C++
+    /// resolution. Closes the 10-20% accuracy gap on overloaded
+    /// method names by asking the real compiler instead of relying
+    /// on scry's heuristic name match. Requires `clangd` on PATH
+    /// and a `compile_commands.json` somewhere in the file's
+    /// ancestry; errors with an actionable message otherwise.
     Callers {
         name: String,
         #[arg(long)]
@@ -166,6 +175,12 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Use clangd for precise (type-aware) reference resolution.
+        /// C++ only today (clangd is C++-shaped). Falls back to the
+        /// heuristic path with a clear error if clangd or
+        /// compile_commands.json are missing.
+        #[arg(long)]
+        precise: bool,
     },
     /// Look up exact symbol definitions by name. LSP analogue:
     /// textDocument/definition; ctags/gtags analogue: tag lookup.
@@ -620,7 +635,12 @@ fn main() -> Result<()> {
         Cmd::Ref { name, index, lang, kind, in_, limit, json } => {
             cmd_ref(name, index, lang, kind, in_, limit, json)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise } => {
+            if precise {
+                return cmd_callers_precise(name, index, lang, in_, limit, json);
+            }
+            // Fall through to the heuristic path.
+            let _ = (); // explicit no-op for the fallback marker.
             cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
@@ -2789,6 +2809,125 @@ fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
     std::fs::rename(&tmp, paths.tombstones())?;
     eprintln!("[tombstone] marked {} file(s) ({} newly); bitmap is {} bytes",
         matches.len(), newly_marked, bitmap.len());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// callers --precise (clangd-driven, type-aware C++ references)
+// ---------------------------------------------------------------------------
+//
+// Flow:
+//   1. Look up NAME via scry's heuristic path to find a definition
+//      site (file + line + column).
+//   2. Spawn clangd, send initialize + didOpen for that file.
+//   3. Send textDocument/references at the definition position.
+//   4. Map LSP Locations back to scry file_ids via path.
+//   5. Emit using the same format as `cmd_callers` so the caller
+//      doesn't see a different shape just because they passed
+//      --precise.
+//
+// Falls back to the heuristic path with a clear error when clangd
+// or compile_commands.json is missing.
+fn cmd_callers_precise(
+    name: String,
+    index: Option<PathBuf>,
+    _lang: Option<String>,
+    in_: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let t = Instant::now();
+    if !clangd::clangd_available() {
+        anyhow::bail!(
+            "clangd not on PATH. --precise requires clangd for type-aware C++ \
+             reference resolution.\n\
+             Install: apt install clangd  (Debian/Ubuntu)\n\
+             Or rerun without --precise for the heuristic path."
+        );
+    }
+    let r = open_index(index)?;
+
+    // 1. Pick the definition site to anchor the references query at.
+    // We prefer a C++ Function/Method/Class definition matching the
+    // name, since clangd is C++-shaped. If we can't find one, fall
+    // back to the first match of any kind.
+    let candidates = r.lookup_exact(&name);
+    let def_site = candidates.iter()
+        .find(|s| matches!(s.lang, FileKind::Cpp | FileKind::Header | FileKind::HeaderCpp))
+        .or_else(|| candidates.first())
+        .ok_or_else(|| anyhow::anyhow!("no definitions of '{name}' in the index"))?;
+    let def_path = r.files.get(def_site.file_id as usize)
+        .map(|f| f.display_path(&r.roots))
+        .ok_or_else(|| anyhow::anyhow!("def file_id {} out of range", def_site.file_id))?;
+    let def_path = PathBuf::from(def_path);
+
+    // 2. Discover compile_commands.json; clangd needs it for C++
+    // resolution. If missing, error early — clangd would otherwise
+    // run but every reference would come back wrong.
+    let cc_dir = clangd::find_compile_commands(&def_path)
+        .ok_or_else(|| anyhow::anyhow!(
+            "no compile_commands.json found above {}\n\
+             Generate one via `bear -- m` or your build system's equivalent.",
+            def_path.display(),
+        ))?;
+    eprintln!("[precise] clangd OK; compile_commands.json under {}",
+        cc_dir.display());
+
+    // 3. Spawn clangd, didOpen the definition file, query references.
+    let mut session = clangd::ClangdSession::start(Some(&cc_dir))
+        .with_context(|| "starting clangd session")?;
+    let lang_id = match def_site.lang {
+        FileKind::C => "c",
+        _ => "cpp",
+    };
+    session.did_open(&def_path, lang_id)?;
+    // Clangd accepts 0-based char positions; def_site.col is 1-based.
+    let char_0 = def_site.col.saturating_sub(1);
+    let locs = session.references(&def_path, def_site.line, char_0, /* include_decl */ false)?;
+    eprintln!("[precise] clangd returned {} locations in {} ms",
+        locs.len(), t.elapsed().as_millis());
+
+    // 4. Build a (path -> file_id) lookup so we can map LSP results
+    // back to scry's path display + lang.
+    let in_prefix = in_.as_deref().unwrap_or("");
+    let by_path: std::collections::HashMap<String, &FileEntry> =
+        r.files.iter().map(|fe| (fe.display_path(&r.roots), fe)).collect();
+    let mut emitted = 0usize;
+    if !json {
+        for loc in &locs {
+            let p = match loc.fs_path() { Some(p) => p, None => continue };
+            let p_str = p.display().to_string();
+            if !in_prefix.is_empty() && !p_str.contains(in_prefix) { continue; }
+            let lang = by_path.get(&p_str).map(|fe| fe.kind.as_str()).unwrap_or("?");
+            println!("{}:{}:{}  (ref-precise {})  {}",
+                p_str, loc.line, loc.character, lang, name);
+            emitted += 1;
+            if emitted >= limit { break; }
+        }
+    } else {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for loc in &locs {
+            let p = match loc.fs_path() { Some(p) => p, None => continue };
+            let p_str = p.display().to_string();
+            if !in_prefix.is_empty() && !p_str.contains(in_prefix) { continue; }
+            let lang = by_path.get(&p_str).map(|fe| fe.kind.as_str()).unwrap_or("?");
+            let obj = serde_json::json!({
+                "name": name,
+                "ref_kind": "call",
+                "lang": lang,
+                "path": p_str,
+                "line": loc.line,
+                "col": loc.character,
+                "precise": true,
+            });
+            writeln!(out, "{}", obj)?;
+            emitted += 1;
+            if emitted >= limit { break; }
+        }
+    }
+    log_query(&r, "callers-precise", &name, locs.len(), emitted, t);
     Ok(())
 }
 

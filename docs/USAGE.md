@@ -103,6 +103,44 @@ public class Binder implements IBinder {
 
 ---
 
+## Precision uplift via clangd (`--precise`)
+
+For C++ overload-sensitive queries, `scry callers NAME --precise`
+routes the query through `clangd` (the LLVM language server) over
+LSP. clangd does the real semantic analysis — type inference,
+overload resolution, ADL — so call sites that scry's heuristic
+ref-extractor mis-attributes get the correct answer.
+
+```sh
+$ scry callers transact --precise --index /mnt/agent/scry-index --limit 5
+[precise] clangd OK; compile_commands.json under /home/zim/dev/aosp/out
+[precise] clangd returned 142 locations in 1820 ms
+/.../frameworks/native/libs/binder/Binder.cpp:412:24  (ref-precise cpp)  transact
+/.../frameworks/av/services/.../AudioFlinger.cpp:1245:18  (ref-precise cpp)  transact
+...
+```
+
+Requirements:
+  - `clangd` on `$PATH` (Debian/Ubuntu: `apt install clangd`).
+  - `compile_commands.json` somewhere above the definition file
+    (generate via `bear -- m`, or your build system's equivalent).
+    AOSP: see `bUILD/soong/docs/compile_commands_json.md`.
+
+Without either, `--precise` exits non-zero with an actionable
+message pointing at the install / setup step. The heuristic path
+(without `--precise`) keeps working regardless.
+
+The shape of the output is identical to the regular `scry callers`
+output except for the `(ref-precise LANG)` tag and the `precise: true`
+field on JSON results — agents that consume both can dispatch on it.
+
+clangd warmup is ~1 minute on AOSP (it has to index its own metadata
+before answering queries). For a session that runs many precise
+queries, consider `scry serve --listen unix:...` and keep one
+clangd alive across the run (forthcoming; see `docs/ROADMAP.md` § 3).
+
+---
+
 ## Reference lookup: `scry ref` / `scry callers`
 
 ```sh

@@ -628,6 +628,48 @@ public class Binder {
         assert!(h["end_line"].as_u64().is_some(), "missing end_line: {h}");
     }
 
+    // 12. `scry callers --precise` clangd integration. Two cases:
+    //  - clangd not on PATH (the common one in CI / fresh dev hosts):
+    //    the command must exit non-zero with an actionable message
+    //    instead of segfaulting or hanging.
+    //  - clangd present: smoke that the LSP client can complete
+    //    a session against a minimal compile_commands.json.
+    let clangd_ok = Command::new("clangd").arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    if !clangd_ok {
+        // The interesting test case for environments without clangd:
+        // we assert the bail-out message is what the docs promise.
+        let out = Command::new(scry_bin())
+            .args(["callers", "Binder", "--precise", "--index"]).arg(&idx)
+            .output().expect("scry callers --precise");
+        assert!(!out.status.success(),
+                "scry callers --precise should error when clangd missing");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("clangd not on PATH"),
+                "error message should mention clangd; got: {stderr}");
+        assert!(stderr.contains("apt install clangd"),
+                "error message should include install hint; got: {stderr}");
+    } else {
+        // clangd present — smoke the absence-of-compile-commands path.
+        // (Generating a real compile_commands.json for the synthetic
+        // tree is out of scope; the test just confirms we error out
+        // with the right message instead of spawning into a broken
+        // clangd session.)
+        let out = Command::new(scry_bin())
+            .args(["callers", "Binder", "--precise", "--index"]).arg(&idx)
+            .output().expect("scry callers --precise (clangd present)");
+        // Either it errored on compile_commands missing OR it
+        // succeeded (unlikely on the synthetic tree without a real
+        // build). Both are acceptable; what matters is it didn't
+        // hang or panic.
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("compile_commands.json")
+                    || stderr.contains("clangd"),
+                    "if --precise errored, message should explain why; got: {stderr}");
+        }
+    }
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

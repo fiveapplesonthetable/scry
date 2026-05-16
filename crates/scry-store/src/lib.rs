@@ -31,7 +31,7 @@
 use anyhow::{anyhow, Context, Result};
 use scry_walker::{FileKind, Profile};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};

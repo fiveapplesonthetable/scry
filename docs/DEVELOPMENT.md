@@ -333,6 +333,123 @@ None of these are blocking real LLM-agent use today; the next item
 to actually start is "whichever delivers the most leverage for an
 agent task you currently run scry for."
 
+## Concrete pending items (small, ready to land)
+
+Small, well-scoped tasks that need doing — bug fixes, missing
+tests, doc nits. Each is ≤ a few hours of work and has a clear
+acceptance signal.
+
+- **`api/*.txt` ranking sanity check.** USAGE.md says api-txt
+  declarations should rank below real source. We have one
+  unit test (`rank_real_class_beats_api_txt`) but no end-to-end
+  test that `scry def Activity --kind class` returns the .java
+  file first on the live index. Add an assertion to
+  `scripts/validate.sh` that pins this for every release.
+- **`crossbeam` and `toml` are workspace deps but unused** by any
+  crate. Either remove from `Cargo.toml` or add a comment noting
+  the future-use rationale. (Current THEORY note picks the
+  latter — make the workspace match.)
+- **`scry stats --json` for machine consumption.** `scry stats`
+  prints a human-readable summary; the JSON variant is
+  documented in USAGE but the implementation needs verifying —
+  some fields (last-finalize-time, by-lang breakdown) may be
+  missing.
+- **`SCRY_LOG` env var documented in three places, consistent
+  default.** README, USAGE, and `~/.scry/queries.log` examples
+  in DEVELOPMENT all reference the default path; verify they
+  agree and that the override works as documented.
+- **Coverage test for the AIDL versioning gap.** Add a failing
+  test in `crates/scry-aosp/src/aidl.rs` that pins the desired
+  behavior: a file under `frozen/V3/` emits `aidl.frozen` kind,
+  not `aidl.iface`. Then implement the fix.
+- **`tracing` is initialized in CLI but most code uses raw
+  `eprintln!`** for progress output. Either standardize on
+  `tracing::info!` everywhere or commit to the current split
+  (CLI / human output via eprintln; internal events via tracing).
+- **The `unbounded_parse_returns_tree` test is named for the
+  `parse_with_options` migration** but doesn't exercise the
+  most important property — that a *successful* parse returns
+  the same tree as `parse_with_options(None)`. Strengthen the
+  assertion.
+- **`scry coverage` output stable in JSON form.** The CLI shape
+  is set; the JSON envelope should freeze before any agent code
+  starts depending on it.
+- **Document the on-disk format version field.** `Manifest` has
+  a version u32 but the bumping policy isn't written down.
+  When does it change? Backwards-compat rules for the reader
+  when version mismatches?
+
+## Verification checklist
+
+Things to run after non-trivial changes, in roughly the order
+that catches problems fastest:
+
+1. **`cargo fmt --check`** — formatting. Cheap; fails before
+   compile.
+2. **`cargo build --release`** — must finish with zero warnings.
+   New warnings should either be fixed or explicitly
+   `#[allow]`'d with a comment.
+3. **`cargo test --release --workspace`** — all 80 tests pass.
+   The e2e test is the strongest single signal; if it fails,
+   something cross-crate broke.
+4. **`./scripts/validate.sh`** — exercises every CLI command +
+   JSON-RPC shape against the live index. Catches CLI-shape
+   regressions the e2e test misses (real index, real corpus).
+5. **`./scripts/bench_grep.sh` quick mode** —
+   `BENCH_INCLUDE_GREP=0 ./scripts/bench_grep.sh` runs scry vs
+   rg in ~5 min. Sanity-check that scry's per-pattern numbers
+   are within ~20% of the BENCHMARKS table; large regressions
+   are the most useful single perf signal.
+6. **`scry stats --index /mnt/agent/scry-index`** — checks the
+   reader can open the production index after any
+   reader-format change.
+7. **Spot-check `~/.scry/queries.log`** — every command writes
+   one JSON line; if your change touched the CLI loop, verify
+   the log still works (`tail -1 ~/.scry/queries.log | jq .`).
+8. **For format changes (writer-side)**, the cycle is:
+   delete `/mnt/agent/scry-index/*`, re-run `scripts/run_index.sh`,
+   wait for the finalize email, then run validate + bench.
+   ~14 minutes; only needed when the on-disk schema changes.
+
+The first three should run on every PR. Items 4-7 run before
+landing format/CLI changes. Item 8 is the full reindex and is
+only needed for writer-side changes.
+
+## Things worth investigating
+
+These aren't bugs; they're "I noticed something I haven't
+explained yet". Worth a half-day each to chase.
+
+- **The 2 ms gap between cold and warm `def` queries.** Cold
+  `scry def Activity` is ~12 ms; warm is ~5 ms. The 7 ms cold
+  cost decomposes to FST page fault (~2 ms) + symbol record
+  page fault (~5 ms). Plausible but unverified; a `perf
+  stat -e page-faults` over a single cold query would pin it.
+- **Why workers=16 specifically.** The bench matrix shows 16
+  is the sweet spot. The expected pareto knee on a 72-core host
+  should be higher; the actual reason is probably the
+  jemalloc-arena-per-thread + parser-state-per-thread combined
+  footprint. Worth profiling to confirm; if it's something
+  else, we might be leaving throughput on the table.
+- **Per-file 60 s ts-TIMEOUT count.** The indexer logs 4-10
+  ts-TIMEOUTs per full run. Are these *always* the same files?
+  If so, OOM skiplist should be quarantining them automatically.
+  If not, what changed? `grep ts-TIMEOUT /mnt/agent/scry-index.log`
+  across the last 10 runs.
+- **The 38 % cache-miss rate on cold grep.** Documented in
+  BENCHMARKS; the conclusion is "IO-bound, not CPU-bound", but
+  the breakdown of which cache (L3 vs DRAM) is the source is
+  unverified. `perf stat -e LLC-load-misses,dTLB-load-misses`
+  would distinguish.
+- **Whether `lto=thin` is paying for itself.** The release
+  profile uses LTO; cold build is +5 s. A `cargo build
+  --release --config 'profile.release.lto=false'` comparison
+  on cold grep latency would tell us if it matters.
+- **Stability of the Layer 2 resolution under repeat rebuilds.**
+  Are 89 % of refs resolved across runs the *same* 89 %? A
+  diff of `ref_resolutions.bin` between two clean rebuilds
+  would confirm determinism end-to-end.
+
 ## Experiments and unexplored directions
 
 The items above are concrete follow-ups with clear shape. The list

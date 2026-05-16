@@ -91,8 +91,8 @@ impl<'a> P<'a> {
         let _ = self.parse_ident();
         self.ws();
         if self.peek() == b'(' {
-            let mut depth = 0i32;
-            self.advance(); depth = 1;
+            self.advance();
+            let mut depth: i32 = 1;
             while !self.at_end() && depth > 0 {
                 let c = self.peek();
                 if c == b'(' { self.advance(); depth += 1; }

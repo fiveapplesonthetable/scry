@@ -100,10 +100,20 @@ enum Cmd {
         /// size-based heuristic. 0 = no backpressure.
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
-        /// Batch size (files) between unconditional flushes when streaming.
-        /// Bounds steady-state RAM regardless of corpus size.
+        /// Hard upper bound on files per batch. With --flush-bytes set this
+        /// is just a sanity cap; the actual batch size adapts to hit the byte
+        /// target. With --flush-bytes 0 this is the only knob (file-count
+        /// flushing, with proxy-for-memory semantics).
         #[arg(long, default_value_t = 50_000)]
         flush_every: usize,
+        /// Target in-RAM record bytes per batch (MiB). The batch size adapts
+        /// every iteration from a rolling avg of bytes/file so accumulated
+        /// records stay close to this target. Bounded above by --flush-every.
+        /// 0 = disabled (fall back to file-count). Default 1024 MiB — bounds
+        /// steady-state record RAM to ~1 GiB on top of transient parse
+        /// allocation. Tune down on memory-constrained hosts.
+        #[arg(long, default_value_t = 1024)]
+        flush_bytes: u32,
         /// Resume from a previous run's checkpoint. If `<index>.tmp/`
         /// contains `batch.NNNNNN.done` markers, skip those batches' files
         /// and continue from the next one. Pairs with systemd
@@ -285,10 +295,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index {
             roots, profile, out, count_only, limit, no_refs, workers,
-            max_file_bytes, big_file_bytes, mem_cap, flush_every, resume,
+            max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes, resume,
         } => cmd_index(
             roots, profile, out, count_only, limit, no_refs, workers,
-            max_file_bytes, big_file_bytes, mem_cap, flush_every, resume,
+            max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes, resume,
         ),
         Cmd::Def { name, index, lang, kind, limit, json, md, budget } => {
             cmd_def(name, index, lang, kind, limit, json, md, budget)
@@ -337,6 +347,7 @@ fn cmd_index(
     big_file_bytes: u64,
     mem_cap: u32,
     flush_every: usize,
+    flush_bytes: u32,
     resume: bool,
 ) -> Result<()> {
     if let Some(n) = workers {
@@ -365,13 +376,17 @@ fn cmd_index(
     // Memory accounting is INTERNAL: we sum each record's estimated_bytes()
     // and call flush_*_chunk() when crossing the soft threshold from mem_cap
     // (or unconditionally at the end of every batch). No /proc polling.
-    let streaming = flush_every > 0 || mem_cap > 0;
+    let streaming = flush_every > 0 || flush_bytes > 0 || mem_cap > 0;
     let mem_cap_bytes: u64 = (mem_cap as u64) * 1024 * 1024 * 1024;
     let soft_cap: u64 = if mem_cap_bytes == 0 { u64::MAX } else { (mem_cap_bytes as f64 * 0.85) as u64 };
-    let batch_files: usize = if flush_every == 0 { usize::MAX } else { flush_every };
+    let batch_files_cap: usize = if flush_every == 0 { usize::MAX } else { flush_every };
+    // Bytes-target flush: the batch size adapts each iteration to hit this
+    // many bytes of records, using a rolling avg of bytes/file. flush_every
+    // becomes a sanity ceiling. 0 = disabled (file-count only).
+    let flush_bytes_target: u64 = (flush_bytes as u64) * 1024 * 1024;
     eprintln!(
-        "[index] streaming={} flush_every={} mem_cap={} GiB (soft {})",
-        streaming, flush_every, mem_cap,
+        "[index] streaming={} flush_every={} flush_bytes={} MiB mem_cap={} GiB (soft {})",
+        streaming, flush_every, flush_bytes, mem_cap,
         if mem_cap_bytes == 0 { "none".into() } else { human_bytes(soft_cap) },
     );
 
@@ -614,16 +629,32 @@ fn cmd_index(
         let file_entries: &[FileEntry] = &pr.file_entries;
         if count_only { continue; }
         let n_files = files.len();
-        let total_batches = (n_files + batch_files - 1) / batch_files.max(1);
+        // Rolling avg of bytes-of-records per file. Seeded with a pessimistic
+        // prior so the very first batch (no observations yet) stays small.
+        // Updated after every batch as a 70/30 EMA — slow enough to ride
+        // through one bad file, fast enough to react to a region shift
+        // (e.g., entering AOSP's massive generated-Java test trees).
+        let mut avg_bytes_per_file: f64 = 8_000.0;
         let mut batch_no = 0usize;
         let mut start = 0usize;
         let parse_total = Instant::now();
         while start < n_files {
+            let batch_files: usize = if flush_bytes_target > 0 {
+                let by_bytes = (flush_bytes_target as f64
+                    / avg_bytes_per_file.max(100.0)) as usize;
+                by_bytes.clamp(100, batch_files_cap)
+            } else {
+                batch_files_cap
+            };
             let end = (start + batch_files).min(n_files);
             let batch_files_slice = &files[start..end];
             let batch_entries_slice = &file_entries[start..end];
             batch_no += 1;
             let batch_end_id = batch_entries_slice.last().unwrap().id;
+            // Estimate remaining batches just for the log line; not used for
+            // anything load-bearing.
+            let remaining = n_files.saturating_sub(end);
+            let total_batches = batch_no + (remaining + batch_files - 1) / batch_files.max(1);
             if resume && batch_end_id < watermark {
                 start = end;
                 continue;
@@ -754,10 +785,18 @@ fn cmd_index(
                 }
             }
 
+            // Update rolling avg bytes/file. EMA over batches keeps a single
+            // pathological batch from blowing up the next batch's size.
+            let files_in_batch = batch_files_slice.len() as u64;
+            if files_in_batch > 0 && parsed_n > 0 {
+                let observed = (bytes_n as f64) / (parsed_n as f64);
+                avg_bytes_per_file = avg_bytes_per_file * 0.7 + observed * 0.3;
+            }
             eprintln!(
-                "[parse] batch {}/{}  {} files / {} syms / {} refs / ~{} in-RAM / {} ms",
+                "[parse] batch {}/{}  {} files / {} syms / {} refs / ~{} in-RAM / {} ms (avg {} B/file)",
                 batch_no, total_batches, parsed_n, syms_n, refs_n,
                 human_bytes(bytes_n), batch_start.elapsed().as_millis(),
+                avg_bytes_per_file as u64,
             );
 
             // Soft cap warning if a single batch already exceeded it.

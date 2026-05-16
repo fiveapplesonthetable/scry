@@ -32,7 +32,9 @@ fi
 exec /mnt/agent/scry/target/release/scry index \
   "${USE_ROOTS[@]}" \
   --resume \
-  --flush-every 25000 \
-  --mem-cap 100 \
-  --big-file-bytes 65536 \
+  --workers 24 \
+  --flush-bytes 1024 \
+  --flush-every 1000 \
+  --mem-cap 60 \
+  --big-file-bytes 8192 \
   -o /mnt/agent/scry-index

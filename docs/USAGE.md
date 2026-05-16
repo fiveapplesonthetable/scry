@@ -672,11 +672,20 @@ $ scry build-digests --index /mnt/agent/scry-index
 [digests] DONE. 32293312 bytes written → /mnt/agent/scry-index/file_digests.bin
 ```
 
-## Incremental indexing foundation
+## Incremental indexing
 
 ```sh
-# What would change if we re-indexed right now? (Requires
-# file_digests.bin from `scry build-digests`.)
+# Re-parse only changed + added files; replay unchanged from the
+# old index; atomically swap into place. The old index stays
+# queryable for the whole duration — if the process dies mid-build
+# the old index is still there.
+$ scry index --incremental ~/dev/aosp /mnt/agent/dev/linux \
+    -o /mnt/agent/scry-index
+[incremental] diff: 1009160 unchanged, 4 changed, 2 added, 0 removed
+[incremental] parsing 6 files...
+[incremental] finalized in 412 ms (full rebuild would have been 13 min)
+
+# Preview-only: report what *would* change without writing.
 $ scry index-diff ~/dev/aosp /mnt/agent/dev/linux
 [index-diff] walked 1009166 files in 25340 ms
 unchanged: 1009160
@@ -684,7 +693,7 @@ changed:   4 (would re-parse)
 added:     2 (would parse fresh)
 removed:   0
 
-# Verbose mode lists every changed/added/removed path:
+# Verbose mode lists every changed/added/removed path.
 $ scry index-diff --verbose ~/dev/aosp /mnt/agent/dev/linux
 
 # Manually tombstone a file (next query of any kind skips it).
@@ -694,13 +703,12 @@ $ scry rm-tombstone deleted_file.java --index /mnt/agent/scry-index
 [tombstone] marked 1 file(s) (1 newly); bitmap is 126146 bytes
 ```
 
-The full `scry index --incremental` that re-parses only the changed
-files and appends to the existing index is roadmapped (see
-`docs/ROADMAP.md` § 2); today the supported pattern is:
-`build-digests` → `index-diff` to preview → `tombstone` to drop
-specific files → full `scry index` to re-parse from scratch when the
-churn justifies it. The current foundation gives O(seconds)
-freshness for deletes and O(walk-time) preview for any change set.
+**Pattern**: after the initial full `scry index`, run
+`scry build-digests` once. From then on, `scry index --incremental`
+is the supported editor-loop refresh — sub-second on small change
+sets, atomic, never leaves the old index in a partial state.
+`scry compact` is the future tombstone-reclaim pass (placeholder
+today; in-place rewrite TODO).
 
 ## Semantic retrieval: `scry ask`
 

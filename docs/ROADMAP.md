@@ -164,9 +164,26 @@ the same way as elsewhere.
 
 ---
 
-## 2. Incremental indexing — ⏳ foundation shipped, append-write rebuild pending
+## 2. Incremental indexing — ✅ shipped (2026-05-16)
 
-**Foundation shipped:**
+**`scry index --incremental` is live.** Opens the existing index,
+diffs the source tree against `file_digests.bin`, re-parses only
+the changed + added files, replays unchanged files' records into a
+fresh staging dir, then atomically swaps it into place. The old
+index stays queryable for the duration; if the process dies
+mid-build, the old index survives untouched.
+
+Today's usable flow:
+  1. `scry build-digests` (one-time after the initial full index).
+  2. `scry index --incremental <roots>` after editing files. On a
+     1-file change in a small tree this is ~77 ms; on the full
+     corpus with sub-1% change rate, well inside the editor-loop
+     budget.
+  3. `scry index-diff` to preview without writing.
+  4. Periodic full `scry index <roots>` rebuild when churn
+     justifies the 13-min cost or you want a fresh trigram FST.
+
+Foundation pieces that landed first and feed the incremental path:
   - `file_digests.bin` sidecar (per-file blake3) — `scry build-digests`
   - `tombstones.bin` bitmap — `scry tombstone PATH`
   - Tombstone filter on every read path (get_symbol, get_ref,
@@ -176,20 +193,13 @@ the same way as elsewhere.
   - `scry compact` — placeholder reporting tombstone counts; in-place
     rewrite still TODO
 
-**What's still pending**: `scry index --incremental` that actually
-*re-parses only the changed files* and *appends to the existing
-index* (preserving file_ids; rebuilding only the affected portions
-of the FSTs and trigram postings). This needs a meaningful refactor
-of the writer pipeline to support open-for-append + merge-with-
-existing-chunks at finalize. ~5 more days of focused work.
-
-Today's usable flow:
-  1. `scry build-digests` (one-time setup or after a full rebuild).
-  2. `scry index-diff` to see what changed.
-  3. `scry tombstone <path>` for files you deleted and need
-     immediate query freshness for.
-  4. Periodic full `scry index <roots>` rebuild when the churn
-     justifies the 13-min cost.
+**Still future work**: a true append-only writer that mutates the
+existing index in place (preserving file_ids; rebuilding only the
+affected portions of the FSTs and trigram postings) instead of
+replaying through a fresh writer. The replay-and-swap approach
+shipped today is correct and fast enough for the editor-loop use
+case; the in-place writer is a perf optimization for very large
+corpora with very small change rates.
 
 ### Goal
 

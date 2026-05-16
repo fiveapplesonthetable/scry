@@ -41,39 +41,42 @@ scry/
 
 ## Build
 
-The whole workspace builds with stable Rust 1.73+ (uses `div_ceil`,
-otherwise vanilla 2021 edition):
+The whole workspace builds with stable Rust 1.79+ (vanilla 2021
+edition; clippy lints in `[workspace.lints]` rely on the 1.74
+manifest-lints feature):
 
 ```sh
 . ./env.sh                  # CARGO_HOME / RUSTUP_HOME under /mnt/agent/cargo
 cargo build --release       # ~20 s cold, ~5 s incremental
+cargo clippy --release --workspace --all-targets   # must be clean
 ```
 
-Two pre-existing warnings (a dead-code `write_postings_and_fst` in
-scry-store and an `unused_assignments` in scry-aosp::aidl) are
-tolerated; everything else compiles clean.
+The workspace builds and lints clean — zero warnings across all
+targets. Don't merge a change that introduces one; either fix it or
+explicitly allow it with a comment explaining why.
 
 ## Test
 
 ```sh
-cargo test --release        # 80 tests, ~1 s total
+cargo test --release --workspace    # 129 tests, ~3 s total
 ```
 
-Breakdown:
+Breakdown (counts as of 2026-05-16):
 
-| crate       | tests | what they cover                                                                                              |
-|-------------|------:|--------------------------------------------------------------------------------------------------------------|
-| scry-aosp   |    15 | one happy-path per format parser (Soong, AIDL, HIDL, OWNERS, aconfig, init.rc, sepolicy, manifest, Bazel, CMake, GN, api-txt) plus the `cmake_comments_with_unbalanced_paren` regression that took down indexing |
-| scry-cli    |    18 | regex literal extractor (7), file_symbols + lazy + epoch_iso (refactor-out tests), Layer 2 resolve_one (8 branches), Java pkg/import narrowing edge cases |
-| scry-cli e2e |   1 | end-to-end: synthetic 5-file tree → real `scry index` subprocess → `def` / `outline` / `grep` / `callers` queries via CLI and JSON-RPC, assertions on every shape |
-| scry-lang   |   7+2 | per-language minimal extraction (Java / Cpp / Rust / Go / Python), Cpp out-of-line method bare-name + scope, Kotlin extension receiver scoping, progress-callback abort, unbounded-parse sanity. 2 ignored AST-dump helpers (`-- --ignored --nocapture` to see) |
-| scry-store  |    35 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder (round-trip / OOB / empty / truncated), trigram posting wire format (round-trip + empty + truncated count + truncated varint + malformed varint), name posting wire format (round-trip + truncated + empty + OOB), rank_score tier ordering, epoch_to_iso8601 known values + leap year + pre-epoch, trigram extraction + query + intersection |
-| scry-walker |     2 | FileKind classification |
+| crate        | tests | what they cover                                                                                              |
+|--------------|------:|--------------------------------------------------------------------------------------------------------------|
+| scry-aosp    |    19 | one happy-path per format parser (Soong, AIDL, HIDL, OWNERS, aconfig, init.rc, sepolicy, manifest, Bazel, CMake, GN, api-txt) plus the `cmake_comments_with_unbalanced_paren` regression that took down indexing |
+| scry-cli     |    47 | regex literal extractor, file_symbols + lazy + epoch_iso, Layer 2 resolve_one branches, Java pkg/import narrowing edge cases, MCP arg validation (7), MCP version negotiation (4), OWNERS parser, ranking & path penalties |
+| scry-cli e2e |     1 | end-to-end: synthetic source tree → real `scry index` subprocess → every CLI + JSON-RPC + MCP path; round-trips `scry index --incremental` (modify + add a file, replay unchanged) |
+| scry-lang    |     9 | per-language minimal extraction (Java / Cpp / Rust / Go / Python), Cpp out-of-line method bare-name + scope, Kotlin extension receiver scoping, progress-callback abort, unbounded-parse sanity. 2 ignored AST-dump helpers (`-- --ignored --nocapture` to see) |
+| scry-store   |    51 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder, trigram posting wire format (round-trip + truncation + malformed-varint), name posting wire format, rank_score tier ordering, epoch_to_iso8601 known values + leap year + pre-epoch, trigram extraction + query + intersection, file_digest absent-sidecar accessor |
+| scry-walker  |     2 | FileKind classification |
 
 The e2e test is the strongest single signal — it runs the just-built
 binary against a synthetic source tree, exercises writer + reader +
-CLI + JSON-RPC + Layer 2 resolution + trigram grep, finishes in 0.4 s.
-Any cross-crate API drift surfaces there.
+CLI + JSON-RPC + MCP + incremental indexing + Layer 2 resolution +
+trigram grep, finishes in ~2 s. Any cross-crate API drift surfaces
+there.
 
 ### Adding a test
 
@@ -274,6 +277,17 @@ jq -r '.cmd' ~/.scry/queries.log | sort | uniq -c | sort -rn
   the intersection-by-smallest-first invariant; the lazy reader has
   random-access round-trip tests. A future refactor that subtly
   breaks either gets caught at `cargo test`.
+- **Strict clippy lints workspace-wide** via `[workspace.lints]` in
+  the top-level `Cargo.toml`: `clippy::correctness` denied,
+  `suspicious` / `perf` / `style` / `complexity` warned, plus a
+  curated pedantic subset (redundant_closure_for_method_calls,
+  explicit_iter_loop, match_wildcard_for_single_variants,
+  inefficient_to_string, implicit_clone). Noisy lints
+  (needless_pass_by_value, unnecessary_wraps, doc_lazy_continuation,
+  match_same_arms) are documented-and-omitted in the manifest so the
+  choice can't drift silently. The workspace is clippy-clean (0
+  warnings, `cargo clippy --release --workspace --all-targets`); a
+  new warning fails CI before it gets a chance to merge.
 
 ## Known coverage gaps
 
@@ -307,18 +321,11 @@ The project is in production use against the live AOSP + Linux index;
 everything in `README.md` and `USAGE.md` works. The following items
 exist but aren't critical-path:
 
-- **Incremental indexing.** Today every run is a full re-parse. A
-  per-file mtime-based incremental pass would save the ~13 min cost
-  when a single AOSP module changes. Requires per-file digest in the
-  index format.
 - **Layer 2: wider language coverage.** The build-resolutions sidecar
   has a Java-aware narrowing path (same-package → explicit import →
   wildcard import → java.lang fallback). Kotlin and C++ have the
   framework in place but no language-specific narrowing yet — the
   fallback to "first same-lang candidate" is what they get.
-- **MCP server wrapper.** `scry serve` is stdin/stdout JSON-RPC; an
-  MCP wrapper would expose the same surface to any MCP-aware client.
-  Mechanical port; nothing in the core needs to change.
 - **Subprocess-per-parse isolation.** A single rogue tree-sitter
   parse can't OOM the host (parse_with_options + cgroup MemoryMax
   catch it), but it can still chew CPU for the budgeted 60 s. A

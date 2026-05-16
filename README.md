@@ -46,6 +46,13 @@ indexing phase, so it pays the full ~20 s walk cost on every
 query forever. Full per-pattern bench table and reproducibility
 recipe in [`docs/BENCHMARKS.md`].
 
+After the first full index, edits are picked up by
+`scry index --incremental` — it diffs the source tree against the
+stored content digests, reparses only changed + added files,
+replays unchanged records, and atomically swaps the new index into
+place. The old index stays queryable for the entire rebuild. Sub-
+second on small change sets; the editor-loop refresh path.
+
 Full command reference, JSON-RPC schema table, and exhaustive output
 examples from the live AOSP index: [`docs/USAGE.md`].
 
@@ -65,7 +72,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
 | [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
 | [`docs/MCP.md`]              | Model Context Protocol integration — wire shape, error semantics, client recipes (Claude Desktop / Cursor / Continue / custom) |
-| [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (transformer embeddings, full incremental writer, persistent clangd, io_uring) |
+| [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (transformer embeddings, in-place incremental writer, persistent clangd, io_uring) |
 
 [`docs/USAGE.md`]: docs/USAGE.md
 [`docs/BENCHMARKS.md`]: docs/BENCHMARKS.md

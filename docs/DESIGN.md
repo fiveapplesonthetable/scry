@@ -596,13 +596,19 @@ Status of each risk as of 2026-05-16. ✅ = mitigated/shipped,
    The shadow-name set is pinned by tests so a toolchain rename
    is loud.
 
-4. ⏳ **Incremental index correctness.** *Foundation shipped;
-   full append-write deferred.* `file_digests.bin` + tombstone
-   bitmap + reader-side filter on every query path + `scry
-   index-diff` + `scry tombstone` + `scry health` are all in
-   (commits c89ed40, e711c15). The remaining append-only writer
-   that preserves `file_id`s across incremental runs is
-   documented in `docs/ROADMAP.md` § 2.
+4. ✅ **Incremental index correctness.** *Shipped 2026-05-16.*
+   `scry index --incremental` opens the existing index, diffs the
+   source tree against `file_digests.bin`, re-parses only the
+   changed + added files, replays unchanged records into a fresh
+   staging dir, and atomically swaps it into place. The old index
+   stays queryable for the whole rebuild; a mid-process crash
+   leaves the old index intact. Foundation: `file_digests.bin` +
+   tombstone bitmap + reader-side filter on every query path +
+   `scry index-diff` + `scry tombstone` + `scry health` (commits
+   c89ed40, e711c15, c2c8b9e). The remaining true append-only
+   writer that mutates the index in place (preserving `file_id`s)
+   is a perf-only optimization for huge corpora with tiny change
+   rates — `docs/ROADMAP.md` § 2.
 
 5. ✅ **Memory pressure during cold index.** *Mitigation
    shipped — 8-layer envelope.* cgroup `MemoryMax=60G` (outer),
@@ -707,8 +713,10 @@ the status header reflects what shipped vs what was scoped down.
 - Streaming responses + `--budget BYTES` (commit e9784e1).
 - Output formatters: `--json`, `--md` shipped; `--jsonl` is the
   default serve format.
-- Incremental indexing foundation shipped (commit c89ed40);
-  full append-only writer in `docs/ROADMAP.md` § 2.
+- Incremental indexing shipped end-to-end: foundation
+  (commit c89ed40) + selective-reparse rebuild (commit c2c8b9e).
+  Atomic two-rename swap; old index stays queryable for the
+  duration. True in-place append writer in `docs/ROADMAP.md` § 2.
 - **Exit gate met**: warm `def` ~ 8 ms; grep is **30–45× faster
   than `rg`** (not within-2x — exceeded expectation).
 

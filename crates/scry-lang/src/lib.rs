@@ -284,6 +284,18 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
                 }
             }
             let (Some(name_node), Some(kind)) = (name_node, kind) else { continue };
+            // C++ out-of-line method definitions (`Foo::bar() { ... }`)
+            // capture the whole qualified_identifier as @name. Drill in
+            // to extract the bare name + harvest the qualifiers into
+            // scope_path so a search for `def bar` finds it AND its
+            // scope reads `[Foo]` instead of the symbol being literally
+            // named `Foo::bar`.
+            let (name_node, qualified_prefix): (tree_sitter::Node, Vec<String>) =
+                if name_node.kind() == "qualified_identifier" {
+                    drill_qualified_identifier(name_node, source)
+                } else {
+                    (name_node, Vec::new())
+                };
             let name = match name_node.utf8_text(source) {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
@@ -294,6 +306,14 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
                 spec.scope_node_kinds,
                 spec.package_node_kind,
             );
+            // Prepend any qualifiers we drilled out of the
+            // qualified_identifier (e.g. ["BBinder"] for BBinder::transact)
+            // AFTER the ancestor-derived scope (the enclosing namespace),
+            // so a method on android::BBinder reads as
+            // ["android", "BBinder"] → "android::BBinder::transact".
+            if !qualified_prefix.is_empty() {
+                scope_path.extend(qualified_prefix);
+            }
             // Receiver-typed declaration (Kotlin extension fn / property):
             // - extension function name's parent IS function_declaration
             // - extension property name's parent is variable_declaration,
@@ -342,6 +362,46 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
 /// tree-sitter query syntax cleanly (return-type user_type would also
 /// match), so this runs as a post-process on each function_decl /
 /// property_decl match.
+/// Split a C++ `qualified_identifier` AST node like `android::BBinder::transact`
+/// into the bare-name node ("transact") and the scope prefix
+/// (["android", "BBinder"]). Handles nested qualified_identifier when
+/// the C++ grammar wraps deeper qualifications. Returns the input node
+/// itself + an empty prefix if the node has no named children (defensive).
+fn drill_qualified_identifier<'a>(
+    qid: tree_sitter::Node<'a>,
+    src: &[u8],
+) -> (tree_sitter::Node<'a>, Vec<String>) {
+    let mut cursor = qid.walk();
+    let children: Vec<tree_sitter::Node> = qid.named_children(&mut cursor).collect();
+    if children.is_empty() {
+        return (qid, Vec::new());
+    }
+    let last = *children.last().unwrap();
+    let mut prefix: Vec<String> = Vec::new();
+    for p in &children[..children.len() - 1] {
+        if let Ok(s) = p.utf8_text(src) {
+            // A nested qualified_identifier in the prefix position
+            // serializes as "A::B" etc. — splitting still gives the
+            // canonical scope segments without us having to recurse
+            // here.
+            for part in s.split("::") {
+                if !part.is_empty() {
+                    prefix.push(part.to_string());
+                }
+            }
+        }
+    }
+    // If the last child is itself a qualified_identifier (rare; happens
+    // with template-instantiated names), recurse so we always return an
+    // atomic identifier for `name`.
+    if last.kind() == "qualified_identifier" {
+        let (inner_name, inner_prefix) = drill_qualified_identifier(last, src);
+        prefix.extend(inner_prefix);
+        return (inner_name, prefix);
+    }
+    (last, prefix)
+}
+
 fn kotlin_receiver_for_decl(
     decl: tree_sitter::Node,
     name_node: tree_sitter::Node,
@@ -1174,6 +1234,87 @@ mod tests {
         // Method on a class -> scope = ["Holder"] (normal class scope, not receiver)
         assert_eq!(by_name.get("method"), Some(&vec!["Holder".to_string()]),
                    "Holder.method scope, got {:?}", by_name.get("method"));
+    }
+
+    /// C++ out-of-line method definitions (`Foo::bar() {}` outside the
+    /// class body) used to capture `Foo::bar` as the SYMBOL NAME — so
+    /// `scry def bar` returned nothing for any C++ method defined out
+    /// of line, which is how Binder.cpp / SurfaceFlinger.cpp / most of
+    /// real C++ AOSP code is written.
+    ///
+    /// After the drill_qualified_identifier change: bare name is `bar`,
+    /// scope_path includes the qualifier (and any enclosing namespaces).
+    #[test]
+    fn cpp_qualified_method_def_is_bare_name() {
+        let src = br#"
+            namespace android {
+            class BBinder {
+            public:
+                int transact(int code);
+            };
+            int BBinder::transact(int code) { return 0; }
+            }
+        "#;
+        let syms = extract(FileKind::Cpp, src).unwrap();
+        let by_name: std::collections::HashMap<_, Vec<_>> = syms.iter()
+            .fold(std::collections::HashMap::new(), |mut acc, s| {
+                acc.entry(s.name.clone()).or_insert_with(Vec::new).push(s.scope_path.clone());
+                acc
+            });
+        // Expect `transact` to appear twice — once for the in-class
+        // declaration (scope ["android", "BBinder"] from compute_scope's
+        // ancestor walk) and once for the out-of-line definition
+        // (scope ["android", "BBinder"] from the namespace ancestor +
+        // the drilled-out qualifier).
+        // The out-of-line `int BBinder::transact(int code) { ... }` is a
+        // function_definition; the in-class `int transact(int code);` is
+        // just a function_declaration, so only the out-of-line def
+        // matches the cpp query — that's the one we used to lose entirely
+        // and the one this fix recovers.
+        let transacts = by_name.get("transact")
+            .unwrap_or_else(|| panic!("expected `transact` symbol (the out-of-line def), got names: {:?}",
+                                       by_name.keys().collect::<Vec<_>>()));
+        assert_eq!(transacts.len(), 1,
+                   "expected exactly one out-of-line transact def, got {} with scopes {:?}",
+                   transacts.len(), transacts);
+        assert_eq!(transacts[0], vec!["android".to_string(), "BBinder".to_string()],
+                   "out-of-line def scope should be ['android','BBinder'], got {:?}",
+                   transacts[0]);
+        // The qualified form must NOT appear as a symbol name (regression —
+        // it used to be the ONLY way to find this symbol).
+        assert!(!by_name.contains_key("BBinder::transact"),
+                "qualified form leaked into the bare name field");
+        assert!(!by_name.contains_key("android::BBinder::transact"),
+                "fully-qualified form leaked into the bare name field");
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture to see C++ AST"]
+    fn dump_cpp_qualified_ast() {
+        let src = br#"
+namespace android {
+class BBinder {
+public:
+    int transact(int code);
+};
+}
+namespace android {
+int BBinder::transact(int code) { return 0; }
+}
+"#;
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(cpp_spec().language).unwrap();
+            let tree = parser.parse(src.as_ref(), None).unwrap();
+            fn walk(n: tree_sitter::Node, src: &[u8], depth: usize) {
+                let text = n.utf8_text(src).unwrap_or("?");
+                let snippet = if text.len() < 60 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
+                println!("{:indent$}{} = {:?}", "", n.kind(), snippet, indent = depth*2);
+                let mut w = n.walk();
+                for c in n.named_children(&mut w) { walk(c, src, depth + 1); }
+            }
+            walk(tree.root_node(), src.as_ref(), 0);
+        });
     }
 
     #[test]

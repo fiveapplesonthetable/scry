@@ -4,6 +4,8 @@
 //! deliberately small and tolerant — bad files yield best-effort partial
 //! output rather than failing the whole indexing run.
 
+#![forbid(unsafe_code)]
+
 pub mod bp;
 pub mod aidl;
 pub mod owners;

@@ -1,5 +1,7 @@
 //! scry-lang: per-language symbol extraction via tree-sitter.
 
+#![forbid(unsafe_code)]
+
 use anyhow::Result;
 use scry_store::{RefKind, SymbolKind};
 use scry_walker::FileKind;

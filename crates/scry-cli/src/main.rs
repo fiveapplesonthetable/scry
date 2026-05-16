@@ -1,5 +1,7 @@
 //! scry: semantic code search and cross-reference engine for AOSP and Linux.
 
+#![forbid(unsafe_code)]
+
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
 // keeps a high-water-mark — fine for short jobs, disastrous for our pattern
 // of "allocate millions of Strings per batch, drop them, repeat". Switching
@@ -134,46 +136,51 @@ enum Cmd {
         name: String,
         #[arg(long)]
         index: Option<PathBuf>,
-        #[arg(long)]
+        /// Language to filter by — `-t` for short, ripgrep-style.
+        #[arg(long, short = 't')]
         lang: Option<String>,
-        #[arg(long)]
+        /// Kind to filter by (class, fn, method, soong, …).
+        #[arg(long, short = 'k')]
         kind: Option<String>,
-        /// Restrict to refs whose file path starts with PREFIX (subdir scope).
-        #[arg(long, value_name = "PREFIX")]
+        /// Restrict to refs whose file path contains the SUBSTRING
+        /// (subdir scope). Matches both root-relative ("frameworks/base/")
+        /// and absolute prefixes; same semantics as gtags' --path filter.
+        #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// Find callers of NAME (refs with kind=call).
+    /// Find callers of NAME (refs with kind=call). LSP analogue:
+    /// callHierarchy/incomingCalls.
     Callers {
         name: String,
         #[arg(long)]
         index: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, short = 't')]
         lang: Option<String>,
-        /// Restrict to callers whose file path starts with PREFIX (subdir scope).
-        #[arg(long, value_name = "PREFIX")]
+        #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// Look up exact symbol definitions by name.
+    /// Look up exact symbol definitions by name. LSP analogue:
+    /// textDocument/definition; ctags/gtags analogue: tag lookup.
     Def {
         name: String,
         #[arg(long)]
         index: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, short = 't')]
         lang: Option<String>,
-        #[arg(long)]
+        #[arg(long, short = 'k')]
         kind: Option<String>,
-        /// Restrict to symbols whose file path starts with PREFIX.
+        /// Restrict to symbols whose file path contains the SUBSTRING.
         /// Lets you query a subdir of an indexed root, e.g.
         /// `scry def Activity --in frameworks/base/services/`.
-        #[arg(long, value_name = "PREFIX")]
+        #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
@@ -1447,27 +1454,37 @@ fn rank_symbols(syms: &mut [SymbolRecord], r: &StoreReader) {
 /// (which holds the StoreReader) can compute. Negative adjustments for
 /// fixtures/tests/sample paths; small positive for the shortest paths
 /// (closest to repo root = usually canonical).
+// Ranking weights. Tuned by eyeballing real `def Activity` /
+// `def Foo` results against the live AOSP+Linux index; tweak with
+// regression tests, not in isolation. All values are deductions —
+// the kind score from SymbolRecord::rank_score() provides the
+// positive baseline.
+const PENALTY_TEST_PATH: i64 = 25;
+const PENALTY_SAMPLE_PATH: i64 = 15;
+const PENALTY_GENERATED_PATH: i64 = 20;
+/// Path depth past PATH_DEPTH_FREE_SEGMENTS starts costing 1 point per
+/// extra slash, up to PATH_DEPTH_MAX_PENALTY. Mild signal — won't
+/// dominate the kind/lang ordering. ("free" = the first N slashes are
+/// the repo root and don't say anything about the file's canonicalness.)
+const PATH_DEPTH_FREE_SEGMENTS: i64 = 6;
+const PATH_DEPTH_MAX_PENALTY: i64 = 8;
+
 fn symbol_total_score(s: &SymbolRecord, path: &str) -> i64 {
     let mut score = s.rank_score();
-    // Path-shape penalties: test fixtures, sample code, generated code
-    // are usually NOT what an agent asking "where is X defined?" wants.
     let path_lower = path.to_ascii_lowercase();
     if path_lower.contains("/test/") || path_lower.contains("/tests/")
         || path_lower.contains("/testing/") {
-        score -= 25;
+        score -= PENALTY_TEST_PATH;
     }
     if path_lower.contains("/sample") || path_lower.contains("/example") {
-        score -= 15;
+        score -= PENALTY_SAMPLE_PATH;
     }
     if path_lower.contains("/generated/") || path_lower.contains("/gen/")
         || path_lower.contains(".pb.") || path_lower.contains("_pb2.") {
-        score -= 20;
+        score -= PENALTY_GENERATED_PATH;
     }
-    // Mild shorter-is-better signal: a path with fewer segments is closer
-    // to a repo root and tends to be the canonical home. Capped so it
-    // can't dominate the kind/lang signal.
-    let depth = path.bytes().filter(|b| *b == b'/').count();
-    score -= ((depth as i64) - 6).max(0).min(8);
+    let depth = path.bytes().filter(|b| *b == b'/').count() as i64;
+    score -= (depth - PATH_DEPTH_FREE_SEGMENTS).max(0).min(PATH_DEPTH_MAX_PENALTY);
     score
 }
 
@@ -2142,10 +2159,16 @@ fn resolve_one(
     pool[0].id
 }
 
+/// One candidate definition for a ref. Loaded from the lazy symbols
+/// vec during the resolution pre-pass; the resolver then narrows by
+/// pkg (Java) or returns the first same-lang candidate. `file_id` is
+/// kept so pass1b can stamp each Java type-def with the package its
+/// file declares (resolver short-circuit: by-package lookup without
+/// re-resolving file_id → pkg on every ref).
 #[derive(Clone)]
 struct ResolveDef {
     id: u64,
-    #[allow(dead_code)] file_id: u32,
+    file_id: u32,
     lang: scry_walker::FileKind,
     pkg: Option<String>,
 }

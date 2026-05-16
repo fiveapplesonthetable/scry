@@ -3,6 +3,30 @@
 //! Phase 1: a simple bincode-serialized store plus an FST over symbol names
 //! for prefix/fuzzy lookup. Phase 4 replaces this with a custom mmap'd
 //! columnar layout; the public API stays.
+//!
+//! # Unsafe policy
+//!
+//! This is the ONLY crate in the scry workspace that uses `unsafe`. Every
+//! other crate (scry-walker, scry-lang, scry-aosp, scry-cli) is
+//! `#![forbid(unsafe_code)]`. The unsafe here is exclusively the
+//! `memmap2::Mmap::map` call — fundamentally unsafe in Rust because the
+//! kernel can change the file's contents (or truncate it) under the
+//! reader, and a `&[u8]` view of the mapping breaks Rust's aliasing
+//! invariants if that happens.
+//!
+//! All callers go through [`safe_mmap`] (this file). Invariants the
+//! helper assumes and the caller must uphold:
+//!   - The mmap'd path lives under an index directory that the indexer
+//!     has finalized (atomic rename → no concurrent writers in steady
+//!     state).
+//!   - Old indexes are deleted only AFTER the reader is dropped (the
+//!     CLI is one-shot; long-lived `scry serve` callers must not
+//!     re-finalize the same index directory under them — but a fresh
+//!     finalize creates a NEW dir, so re-opening works).
+//!
+//! Anything that would invalidate the mapping (truncating the file,
+//! editing it in place, deleting it from under a live reader) is a
+//! caller bug; the scry CLI's own invocation patterns never do this.
 
 use anyhow::{anyhow, Context, Result};
 use scry_walker::{FileKind, Profile};
@@ -13,6 +37,28 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub mod trigram;
+
+/// Open `path` and mmap it. Single source of truth for the only
+/// `unsafe` block in the workspace; see the module-level "Unsafe
+/// policy" docs for the contract callers must uphold (no concurrent
+/// truncation / in-place editing of `path` while the returned mmap
+/// is live). Returns an error with `path` in the context on either
+/// the open() or the mmap call failing — important because a missing
+/// or partial sidecar should produce a legible error, not a panic.
+fn safe_mmap(path: &Path) -> Result<memmap2::Mmap> {
+    let f = File::open(path)
+        .with_context(|| format!("open {} for mmap", path.display()))?;
+    // SAFETY: see module-level "Unsafe policy". The scry indexer
+    // writes via tmp+rename so a finalized index file is never
+    // mutated in place. The CLI is a one-shot process. `scry serve`
+    // holds the mmap for its lifetime and the only producer
+    // (the indexer) is a separate process; if a user re-runs the
+    // indexer against the same INDEX while serve is running, the
+    // rename creates a NEW inode and the old mmap stays valid until
+    // serve is restarted.
+    unsafe { memmap2::Mmap::map(&f) }
+        .with_context(|| format!("mmap {}", path.display()))
+}
 
 /// On-disk bincode'd `Vec<T>` backed by an mmap + a u64-LE offsets sidecar.
 /// Random-access decode of a single record is a u64 read + a bincode deserialize
@@ -30,12 +76,8 @@ pub struct LazyVec<T: for<'de> serde::Deserialize<'de>> {
 
 impl<T: for<'de> serde::Deserialize<'de>> LazyVec<T> {
     pub fn open(data_path: &Path, offsets_path: &Path) -> Result<Self> {
-        let df = File::open(data_path)
-            .with_context(|| format!("open {}", data_path.display()))?;
-        let of = File::open(offsets_path)
-            .with_context(|| format!("open {}", offsets_path.display()))?;
-        let data_mmap = unsafe { memmap2::Mmap::map(&df)? };
-        let offsets_mmap = unsafe { memmap2::Mmap::map(&of)? };
+        let data_mmap = safe_mmap(data_path)?;
+        let offsets_mmap = safe_mmap(offsets_path)?;
         Ok(Self { data_mmap, offsets_mmap, _phantom: std::marker::PhantomData })
     }
 
@@ -1355,48 +1397,41 @@ impl StoreReader {
         } else {
             Vec::new()
         };
-        let fst_file = File::open(paths.names_fst())?;
-        let fst_mmap = unsafe { memmap2::Mmap::map(&fst_file)? };
-        let fst = fst::Map::new(fst_mmap)?;
-        let postings_file = File::open(paths.name_postings())?;
-        let postings_mmap = unsafe { memmap2::Mmap::map(&postings_file)? };
+        let fst = fst::Map::new(safe_mmap(&paths.names_fst())?)?;
+        let postings_mmap = safe_mmap(&paths.name_postings())?;
         // Refs map is always written during finalize (even if empty). For
         // backwards compatibility with pre-Phase-2 indexes that don't have
         // it, callers should re-index.
-        let rf = File::open(paths.ref_names_fst())
-            .with_context(|| format!("open {} (re-run \"scry index\" if missing)", paths.ref_names_fst().display()))?;
-        let ref_fst_mmap = unsafe { memmap2::Mmap::map(&rf)? };
-        let ref_fst = fst::Map::new(ref_fst_mmap)?;
-        let pf = File::open(paths.ref_postings())?;
-        let ref_postings_mmap = unsafe { memmap2::Mmap::map(&pf)? };
+        let ref_fst = fst::Map::new(safe_mmap(&paths.ref_names_fst())
+            .with_context(|| format!("open {} (re-run \"scry index\" if missing)",
+                                      paths.ref_names_fst().display()))?)?;
+        let ref_postings_mmap = safe_mmap(&paths.ref_postings())?;
         // Trigram index is optional — old indexes don't have it. Try to open,
         // and silently fall through if missing.
-        let (trigram_fst, trigram_postings_mmap) = match (File::open(paths.trigram_fst()), File::open(paths.trigram_postings())) {
-            (Ok(tf), Ok(tp)) => {
-                let tf_mmap = unsafe { memmap2::Mmap::map(&tf)? };
-                let tp_mmap = unsafe { memmap2::Mmap::map(&tp)? };
-                let tfst = fst::Map::new(tf_mmap)?;
-                (Some(tfst), Some(tp_mmap))
-            }
-            _ => (None, None),
+        let (trigram_fst, trigram_postings_mmap) = if paths.trigram_fst().exists()
+            && paths.trigram_postings().exists()
+        {
+            let tfst = fst::Map::new(safe_mmap(&paths.trigram_fst())?)?;
+            let tp = safe_mmap(&paths.trigram_postings())?;
+            (Some(tfst), Some(tp))
+        } else {
+            (None, None)
         };
         // file_symbols sidecar — present only on newly built indexes or
         // ones retrofitted via build-file-symbols. Optional everywhere
         // (linear scan still works), so just attempt to open.
-        let (file_symbols_mmap, file_symbols_offsets_mmap) = match
-            (File::open(paths.file_symbols()), File::open(paths.file_symbols_offsets()))
+        let (file_symbols_mmap, file_symbols_offsets_mmap) = if
+            paths.file_symbols().exists() && paths.file_symbols_offsets().exists()
         {
-            (Ok(d), Ok(o)) => {
-                let dm = unsafe { memmap2::Mmap::map(&d)? };
-                let om = unsafe { memmap2::Mmap::map(&o)? };
-                (Some(dm), Some(om))
-            }
-            _ => (None, None),
+            (Some(safe_mmap(&paths.file_symbols())?), Some(safe_mmap(&paths.file_symbols_offsets())?))
+        } else {
+            (None, None)
         };
         // Per-ref resolution overrides (Layer 2 sidecar). Optional.
-        let ref_resolutions_mmap = match File::open(paths.ref_resolutions()) {
-            Ok(f) => Some(unsafe { memmap2::Mmap::map(&f)? }),
-            Err(_) => None,
+        let ref_resolutions_mmap = if paths.ref_resolutions().exists() {
+            Some(safe_mmap(&paths.ref_resolutions())?)
+        } else {
+            None
         };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,

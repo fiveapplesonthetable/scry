@@ -1,6 +1,8 @@
 //! scry-walker: gitignore-aware, per-profile parallel walker over source roots.
 //!
 //! Phase 0: walk roots, classify files into FileKind, return counts.
+
+#![forbid(unsafe_code)]
 //! Later phases will hand each (path, kind) to language-specific parsers.
 
 use anyhow::{anyhow, Result};

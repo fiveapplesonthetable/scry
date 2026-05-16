@@ -418,6 +418,79 @@ fn synthetic_tree_roundtrip() {
     assert!(inner.as_array().map(|a| !a.is_empty()).unwrap_or(false),
             "tools/call def Binder should return at least one hit: {inner}");
 
+    // 9. scry diff --since: turn the synthetic root into a git repo
+    // with two commits, then assert `scry diff --since HEAD~1` finds
+    // the file we modified between commits. Skips silently if `git`
+    // isn't on PATH so the test stays portable.
+    let git_ok = Command::new("git").arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    if git_ok {
+        // Initialize a quiet repo + identity in the fixture root (= `src`
+        // in this test). The index in `idx` was built against `src`, so
+        // the file table's relpath/root mapping matches what git diff
+        // will report.
+        let run = |args: &[&str]| -> bool {
+            Command::new("git").arg("-C").arg(&src).args(args)
+                .output().map(|o| o.status.success()).unwrap_or(false)
+        };
+        assert!(run(&["init", "-q", "-b", "main"]), "git init failed");
+        // Inline identity so commits work in CI without a global config.
+        assert!(run(&["config", "user.email", "test@scry.local"]));
+        assert!(run(&["config", "user.name",  "scry-e2e"]));
+        assert!(run(&["add", "."]));
+        assert!(run(&["commit", "-q", "-m", "initial fixture"]));
+
+        // Modify Activity.java and commit again — this is the file the
+        // diff should surface.
+        std::fs::write(
+            src.join("frameworks/base/core/java/android/app/Activity.java"),
+            r#"package android.app;
+public class Activity {
+    public void onCreate() {
+        Binder b = new Binder();
+        b.transact();
+        // changed for diff e2e
+    }
+    public static class InnerHelper {
+        public void noop() {}
+    }
+}
+"#,
+        ).unwrap();
+        assert!(run(&["add", "."]));
+        assert!(run(&["commit", "-q", "-m", "tweak Activity.java"]));
+
+        // Re-index so the fresh file content is in the index.
+        let out = Command::new(scry_bin())
+            .args(["index"])
+            .arg(&src)
+            .arg("-o").arg(&idx)
+            .args(["--workers", "2"])
+            .output()
+            .expect("re-index after git commits");
+        assert!(out.status.success(),
+                "re-index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+        // Now ask scry diff --since HEAD~1 — should surface Activity.java.
+        let out = Command::new(scry_bin())
+            .args(["diff", "--since", "HEAD~1", "--index"])
+            .arg(&idx)
+            .args(["--json"])
+            .output()
+            .expect("scry diff --since");
+        assert!(out.status.success(),
+                "scry diff failed: {}", String::from_utf8_lossy(&out.stderr));
+        let entries: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+            .lines().filter(|l| !l.is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert!(entries.iter().any(|e| e["path"].as_str().unwrap_or("")
+                .ends_with("Activity.java")),
+                "diff should report Activity.java as changed; got {entries:?}");
+    } else {
+        eprintln!("git not on PATH — skipping diff e2e");
+    }
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

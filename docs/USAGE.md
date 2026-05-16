@@ -478,6 +478,47 @@ through MCP without extra implementation effort.
 
 ---
 
+## Changed-since-commit view: `scry diff`
+
+Surfaces files in the index that have changed since a git commit-ish.
+Useful for code review and for agents working on a PR: pair with
+`scry callers X --in <changed-path>` to focus on the symbols that
+matter for the patch.
+
+```sh
+$ scry diff --since main
+8 changed files since main (showing 8)
+  frameworks/base/core/java/android/app/Activity.java (Java) — 12 symbols
+  frameworks/base/core/java/android/app/ActivityManager.java (Java) — 47 symbols
+  frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java (Java) — 318 symbols
+  …
+
+$ scry diff --since HEAD~5 --in frameworks/base/services --verbose --limit 3
+3 changed files since HEAD~5 (showing 3)
+  frameworks/base/services/.../ActivityManagerService.java (Java) — 318 symbols
+      543:14  (class)    ActivityManagerService
+      612:18  (method)   startActivityAsCaller
+      621:18  (method)   bindServiceAsUser
+      …
+
+$ scry diff --since HEAD~10 --json | jq -c '{path,symbol_count}' | head -5
+```
+
+For each indexed root that is a git repo (has a `.git/` dir),
+shells out to `git -C ROOT diff --name-only SINCE..HEAD`, intersects
+the changed paths with the file table, emits per-file symbol counts.
+Roots that aren't git trees are skipped with a one-line warning to
+stderr; the rest are reported.
+
+Flags:
+  `--since REV`      commit-ish to compare HEAD against (required)
+  `--in PREFIX`      substring filter on the display path
+  `--verbose`        list every changed symbol, not just per-file counts
+  `--limit N`        cap files reported (default 50)
+  `--json`           one JSON object per changed file, ready for `jq`
+
+---
+
 ## Query memory: `scry recall`
 
 A thin memory primitive over `~/.scry/queries.log`. Useful for

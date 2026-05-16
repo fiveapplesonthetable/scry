@@ -280,6 +280,39 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
     },
+    /// Symbols and references in files that changed since a git
+    /// commit. Useful for code review and for agents working on a
+    /// PR — "what callers exist for the function I just modified" is
+    /// `scry diff --since main --then-callers`-shaped without scry
+    /// having to know about the PR.
+    ///
+    /// For each indexed root that is a git repo, shells out to:
+    ///     git -C ROOT diff --name-only COMMITISH..HEAD
+    /// then intersects the changed paths with the file table and emits
+    /// per-file symbol counts (and the symbols themselves with --verbose).
+    /// Roots that aren't git trees are skipped with a one-line warning.
+    Diff {
+        /// Commit-ish to compare HEAD against. Anything `git rev-parse`
+        /// accepts works: a SHA, a tag, HEAD~N, a branch name.
+        #[arg(long)]
+        since: String,
+        /// Optional path-prefix filter, same semantics as elsewhere
+        /// (substring match against the display path).
+        #[arg(long = "in")]
+        in_: Option<String>,
+        /// Print every changed symbol, not just per-file counts.
+        #[arg(long)]
+        verbose: bool,
+        /// Cap the number of files reported. Default 50.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Index dir override.
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Machine-readable output: one JSON object per changed file.
+        #[arg(long)]
+        json: bool,
+    },
     /// Replay recent queries from ~/.scry/queries.log. Useful as a
     /// thin memory primitive for LLM agents that want to know "what
     /// did I already search for this session" without re-running the
@@ -495,6 +528,8 @@ fn main() -> Result<()> {
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
+        Cmd::Diff { since, in_, verbose, limit, index, json } =>
+            cmd_diff(since, in_, verbose, limit, index, json),
         Cmd::Mod { name, index, limit, json } => {
             cmd_def(name, index, None, Some("soong".into()), None, limit, json, false, None)
         }
@@ -2780,6 +2815,135 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
     }
     eprintln!("\n{} module(s)", out.len());
     Ok(())
+}
+
+/// `scry diff --since COMMITISH` — surface symbols/refs in files
+/// that have changed since a git revision. Per-root: shell out to
+/// `git -C ROOT diff --name-only COMMITISH..HEAD`, intersect the
+/// resulting paths with the file table, emit per-file summaries.
+///
+/// Roots that aren't git repos are skipped with a one-line warning;
+/// we don't try to be clever about repo discovery (the user knows
+/// their tree better than we do; if they want per-project AOSP
+/// behavior they can `scry diff --in PROJECT/`).
+fn cmd_diff(
+    since: String,
+    in_: Option<String>,
+    verbose: bool,
+    limit: usize,
+    index: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let reader = open_index(index)?;
+    let in_filter = in_.unwrap_or_default();
+
+    // Collect changed (root_id, relpath) pairs from every git root.
+    let mut changed: std::collections::HashSet<(u8, String)> = std::collections::HashSet::new();
+    for root in &reader.roots {
+        let root_path = std::path::Path::new(&root.path);
+        if !root_path.join(".git").exists() {
+            eprintln!("[scry diff] skipping non-git root: {}", root.path);
+            continue;
+        }
+        match git_changed_files(root_path, &since) {
+            Ok(paths) => {
+                for p in paths {
+                    changed.insert((root.id, p));
+                }
+            }
+            Err(e) => {
+                eprintln!("[scry diff] git failed in {}: {e}", root.path);
+            }
+        }
+    }
+    if changed.is_empty() {
+        if !json {
+            eprintln!("(no changed files in any indexed git root since {})", since);
+        }
+        return Ok(());
+    }
+
+    // Intersect with the file table. We index files by (root_id, relpath)
+    // so the lookup is O(N) in the changed set, not O(N×M).
+    let mut hits: Vec<&FileEntry> = reader.files.iter()
+        .filter(|fe| changed.contains(&(fe.root_id, fe.relpath.clone())))
+        .filter(|fe| in_filter.is_empty()
+            || fe.display_path(&reader.roots).contains(&in_filter))
+        .collect();
+    // Sort by path for a deterministic output ordering.
+    hits.sort_by(|a, b| a.relpath.cmp(&b.relpath));
+    hits.truncate(limit);
+
+    if json {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        use std::io::Write;
+        for fe in &hits {
+            let symbols: Vec<u32> = reader.symbols_for_file(fe.id).unwrap_or_default();
+            let entry = serde_json::json!({
+                "path": fe.display_path(&reader.roots),
+                "lang": fe.kind.as_str(),
+                "symbol_count": symbols.len(),
+                "symbols": if verbose {
+                    Some(symbols.iter()
+                        .filter_map(|i| reader.get_symbol(*i))
+                        .map(|s| symbol_to_json(&reader, &s))
+                        .collect::<Vec<_>>())
+                } else {
+                    None
+                },
+            });
+            writeln!(out, "{}", entry)?;
+        }
+    } else {
+        println!("{} changed file{} since {} (showing {})",
+                 changed.len(),
+                 if changed.len() == 1 { "" } else { "s" },
+                 since,
+                 hits.len());
+        for fe in &hits {
+            let symbols: Vec<u32> = reader.symbols_for_file(fe.id).unwrap_or_default();
+            println!("  {} ({}) — {} symbol{}",
+                     fe.display_path(&reader.roots),
+                     fe.kind.as_str(),
+                     symbols.len(),
+                     if symbols.len() == 1 { "" } else { "s" });
+            if verbose {
+                for sym_id in symbols.iter().take(20) {
+                    if let Some(s) = reader.get_symbol(*sym_id) {
+                        println!("      {}:{}  ({})  {}", s.line, s.col, s.kind.short(), s.name);
+                    }
+                }
+                if symbols.len() > 20 {
+                    println!("      … {} more", symbols.len() - 20);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run `git -C ROOT diff --name-only SINCE..HEAD` and parse the output
+/// as a list of repo-relative paths. Returns `Err` with stderr context
+/// if git fails (bad revision, not a repo, etc.) so the caller can
+/// report a clear message per-root.
+fn git_changed_files(root: &std::path::Path, since: &str) -> Result<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(root)
+        .arg("diff").arg("--name-only")
+        .arg(format!("{since}..HEAD"))
+        .output()
+        .with_context(|| format!("spawn git in {}", root.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("git diff exit {:?}: {}",
+                                   out.status.code(), stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect())
 }
 
 /// One parsed entry from the `~/.scry/queries.log` ops log. The fields

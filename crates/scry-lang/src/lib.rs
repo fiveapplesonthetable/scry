@@ -1246,16 +1246,60 @@ def top_level():
         });
     }
 
-    /// Sanity: with timeout=0 we get unbounded parsing and a real tree.
+    /// timeout=0 takes the no-progress-callback path. Verify it is
+    /// functionally equivalent to a vanilla `parse_with_options(_, None)`
+    /// call: same node kind, same node count, same source range — so a
+    /// future refactor that subtly drops options on the timeout=0 branch
+    /// would break this assertion before it broke real parsing. Catches
+    /// the "we accidentally pass a stale progress callback even when the
+    /// timeout is zero" class of bug.
     #[test]
     fn unbounded_parse_returns_tree() {
-        let src = b"int main() { return 0; }";
+        let src = b"int main() { int x = 1; int y = 2; return x + y; }";
+
+        // Reference: vanilla parse_with_options(_, None).
+        let mut reference_parser = Parser::new();
+        reference_parser.set_language(cpp_spec().language).unwrap();
+        let len = src.len();
+        let mut read = |i: usize, _: tree_sitter::Point| -> &[u8] {
+            if i < len { &src[i..] } else { &[] }
+        };
+        let reference_tree = reference_parser
+            .parse_with_options(&mut read, None, None)
+            .expect("reference parse must succeed");
+        let ref_root = reference_tree.root_node();
+        let ref_kind = ref_root.kind();
+        let ref_byte_range = ref_root.byte_range();
+        let ref_node_count = walk_node_count(&ref_root);
+
+        // System-under-test: parse_with_explicit_timeout with timeout=0.
         PARSER.with(|cell| {
             let mut parser = cell.borrow_mut();
             parser.set_language(cpp_spec().language).unwrap();
             let (outcome, _) = parse_with_explicit_timeout(&mut parser, src, 0);
-            assert!(matches!(outcome, ParseOutcome::Tree(_)));
+            let tree = match outcome {
+                ParseOutcome::Tree(t) => t,
+                ParseOutcome::TimedOut => panic!("timeout=0 must never report TimedOut"),
+                ParseOutcome::Failed => panic!("timeout=0 on valid C++ must not fail"),
+            };
+            let root = tree.root_node();
+            assert_eq!(root.kind(), ref_kind, "root kind diverged from reference");
+            assert_eq!(root.byte_range(), ref_byte_range, "root range diverged");
+            assert_eq!(walk_node_count(&root), ref_node_count,
+                       "node count diverged from reference parse");
+            // A real syntax tree never has its root as a parse error.
+            assert!(!root.has_error(), "root reports has_error on a valid program");
         });
+    }
+
+    fn walk_node_count(node: &tree_sitter::Node) -> usize {
+        let mut n = 1;
+        for i in 0..node.child_count() {
+            if let Some(c) = node.child(i) {
+                n += walk_node_count(&c);
+            }
+        }
+        n
     }
 
     /// Kotlin extension function gets its receiver type prepended to the

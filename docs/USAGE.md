@@ -806,9 +806,9 @@ version than the running binary, you'll see a one-line stderr
 warning on every command that opens it:
 
 ```
-[scry] WARNING: this index was built with scry 0.0.1; running 0.1.2.
+[scry] WARNING: this index was built with scry 0.1.0; running 0.1.6.
        Older builds may have stale records (e.g. the Java/C++
-       scope_path bug fixed in 0.1.2). Rebuild with
+       scope_path bug fixed in 0.1.3). Rebuild with
        `scry index <ROOT> -o /mnt/agent/scry-index` or
        `scry index --incremental <ROOT> -o /mnt/agent/scry-index`.
        Suppress this warning with SCRY_QUIET=1.
@@ -954,8 +954,8 @@ suitable for `jq`, `DuckDB read_ndjson_auto`, BigQuery
 
 ```sh
 $ tail -2 ~/.scry/queries.log
-{"ts":1778922191,"cmd":"def","query":"ActivityManagerService","hits":4,"shown":1,"files_total":1009166,"candidate_files":null,"elapsed_ms":321,"index":"/mnt/agent/scry-index","scry_version":"0.1.2","pid":520994}
-{"ts":1778922192,"cmd":"grep","query":"Activity","hits":2,"shown":2,"files_total":1009166,"candidate_files":30482,"elapsed_ms":392,"index":"/mnt/agent/scry-index","scry_version":"0.1.2","pid":520994}
+{"ts":1778922191,"cmd":"def","query":"ActivityManagerService","hits":4,"shown":1,"files_total":1009166,"candidate_files":null,"elapsed_ms":321,"index":"/mnt/agent/scry-index","scry_version":"0.1.6","pid":520994}
+{"ts":1778922192,"cmd":"grep","query":"Activity","hits":2,"shown":2,"files_total":1009166,"candidate_files":30482,"elapsed_ms":392,"index":"/mnt/agent/scry-index","scry_version":"0.1.6","pid":520994}
 ```
 
 ### Fields

@@ -269,6 +269,11 @@ enum Cmd {
     Stats {
         #[arg(long)]
         index: Option<PathBuf>,
+        /// Emit one JSON object instead of the human-readable text.
+        /// Includes by_lang and by_kind histograms. Stable shape; new
+        /// fields may be appended but existing keys won't move.
+        #[arg(long)]
+        json: bool,
     },
     /// Subtree coverage: files / bytes / symbols broken down by FileKind
     /// for any directory within an indexed root. Useful for "what
@@ -702,14 +707,6 @@ fn main() -> Result<()> {
     // scry-store because that's the only crate that allows unsafe.
     scry_store::restore_default_sigpipe();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Index {
@@ -747,7 +744,7 @@ fn main() -> Result<()> {
             // Fall through to the heuristic path.
             cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format)
         }
-        Cmd::Stats { index } => cmd_stats(index),
+        Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
         Cmd::Outline { path, index, json, limit, with_snippets } =>
             cmd_outline(path, index, json, limit, with_snippets),
@@ -1800,8 +1797,46 @@ fn cmd_ref(
     Ok(())
 }
 
-fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
+fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
     let r = open_index(index)?;
+
+    let mut by_lang: std::collections::HashMap<FileKind, u64> = std::collections::HashMap::new();
+    let mut by_kind: std::collections::HashMap<SymbolKind, u64> =
+        std::collections::HashMap::new();
+    for s in r.iter_symbols() {
+        *by_lang.entry(s.lang).or_default() += 1;
+        *by_kind.entry(s.kind).or_default() += 1;
+    }
+
+    if json {
+        let by_lang_map: serde_json::Map<String, serde_json::Value> = by_lang.iter()
+            .map(|(k, c)| (k.as_str().to_string(), serde_json::json!(c)))
+            .collect();
+        let by_kind_map: serde_json::Map<String, serde_json::Value> = by_kind.iter()
+            .map(|(k, c)| (k.short().to_string(), serde_json::json!(c)))
+            .collect();
+        let roots: Vec<serde_json::Value> = r.roots.iter()
+            .map(|root| serde_json::json!({"path": root.path, "profile": format!("{:?}", root.profile)}))
+            .collect();
+        let out = serde_json::json!({
+            "scry_version":    r.manifest.scry_version,
+            "manifest_version": r.manifest.version,
+            "indexed_at":      r.manifest.indexed_at,
+            "roots":           roots,
+            "files_total":     r.manifest.stats.files_total,
+            "files_parsed":    r.manifest.stats.files_parsed,
+            "files_failed":    r.manifest.stats.files_failed,
+            "bytes_total":     r.manifest.stats.bytes_total,
+            "symbols":         r.manifest.stats.symbols,
+            "refs":            r.manifest.stats.refs,
+            "elapsed_ms":      r.manifest.stats.elapsed_ms,
+            "by_lang":         serde_json::Value::Object(by_lang_map),
+            "by_kind":         serde_json::Value::Object(by_kind_map),
+        });
+        println!("{}", out);
+        return Ok(());
+    }
+
     println!("scry-version: {}", r.manifest.scry_version);
     println!("indexed-at:   {}", r.manifest.indexed_at);
     println!("roots:        {}", r.roots.len());
@@ -1816,13 +1851,6 @@ fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
     println!("refs:         {}", r.manifest.stats.refs);
     println!("elapsed-ms:   {}", r.manifest.stats.elapsed_ms);
 
-    let mut by_lang: std::collections::HashMap<FileKind, u64> = std::collections::HashMap::new();
-    let mut by_kind: std::collections::HashMap<SymbolKind, u64> =
-        std::collections::HashMap::new();
-    for s in r.iter_symbols() {
-        *by_lang.entry(s.lang).or_default() += 1;
-        *by_kind.entry(s.kind).or_default() += 1;
-    }
     println!("\nby language:");
     let mut lv: Vec<_> = by_lang.into_iter().collect();
     lv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));

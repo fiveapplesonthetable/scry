@@ -425,6 +425,25 @@ impl SymbolRecord {
 // Manifest
 // ---------------------------------------------------------------------------
 
+/// Current on-disk format version. Stamped into every manifest the writer
+/// produces. Bumped only when the *layout* of files in the index changes
+/// in a way that a reader compiled against the new layout cannot tolerate
+/// against an old index (or vice versa) — e.g. new required sidecar, wire
+/// format change in a primary file, breaking schema change in a record.
+///
+/// Sidecar additions are NOT bumps: every sidecar (file_symbols, lazy
+/// offsets, trigram postings, ref_resolutions, file_digests, chunks,
+/// embeddings) is opened with `.exists()` first, and missing-sidecar
+/// degrades gracefully to the eager / unfiltered path.
+///
+/// Mismatch handling today: readers do not refuse to open higher versions.
+/// The version field is informational; the per-command stale-index warning
+/// compares the `scry_version` string instead, which fires on any
+/// release-to-release drift regardless of whether the layout changed.
+/// Forward-incompatible bumps would need a refuse-on-higher check at
+/// `StoreReader::open` if the layout actually breaks.
+pub const MANIFEST_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
@@ -923,7 +942,7 @@ impl StoreWriter {
         }
 
         let manifest = Manifest {
-            version: 1,
+            version: MANIFEST_VERSION,
             scry_version: env!("CARGO_PKG_VERSION").to_string(),
             indexed_at: now_iso(),
             roots: self.roots.clone(),
@@ -996,7 +1015,7 @@ impl StoreWriter {
         )?;
 
         let manifest = Manifest {
-            version: 1,
+            version: MANIFEST_VERSION,
             scry_version: env!("CARGO_PKG_VERSION").to_string(),
             indexed_at: now_iso(),
             roots: self.roots.clone(),

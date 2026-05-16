@@ -695,6 +695,58 @@ fn synthetic_tree_roundtrip() {
     assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
 
+    // 8h-bis-coverage. Pin the coverage --json envelope shape so that an
+    // agent (or downstream consumer) can rely on field names. Adding new
+    // top-level fields is allowed; renaming or removing any of these is
+    // a breaking change that must bump the manifest version.
+    let out = Command::new(scry_bin())
+        .args(["coverage", ".", "--json", "--by-kind", "--index"]).arg(&inc_idx)
+        .output().expect("coverage --json --by-kind");
+    assert!(out.status.success(),
+            "coverage --json --by-kind failed: {}", String::from_utf8_lossy(&out.stderr));
+    let cov: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("coverage --json must emit valid JSON");
+    for k in &["path", "files_total", "bytes_total", "symbols_total", "by_lang"] {
+        assert!(cov.get(*k).is_some(),
+                "coverage --json missing top-level key '{k}': {cov}");
+    }
+    let by_lang = cov.get("by_lang").and_then(|v| v.as_object())
+        .expect("coverage by_lang must be a JSON object");
+    let (some_lang, some_bucket) = by_lang.iter().next()
+        .expect("coverage by_lang must be non-empty for synthetic tree");
+    for k in &["files", "bytes", "symbols"] {
+        assert!(some_bucket.get(*k).is_some(),
+                "coverage by_lang['{some_lang}'] missing '{k}': {some_bucket}");
+    }
+    // --by-kind requires the per-lang bucket to carry by_kind too.
+    assert!(some_bucket.get("by_kind").is_some(),
+            "coverage --by-kind must populate by_kind on every lang bucket: {some_bucket}");
+
+    // 8h-bis-stats. Pin the stats --json envelope shape. Same compat
+    // contract: new fields ok, renames / removals not.
+    let out = Command::new(scry_bin())
+        .args(["stats", "--json", "--index"]).arg(&inc_idx)
+        .output().expect("stats --json");
+    assert!(out.status.success(),
+            "stats --json failed: {}", String::from_utf8_lossy(&out.stderr));
+    let st: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stats --json must emit valid JSON");
+    for k in &[
+        "scry_version", "manifest_version", "indexed_at", "roots",
+        "files_total", "files_parsed", "files_failed",
+        "bytes_total", "symbols", "refs", "elapsed_ms",
+        "by_lang", "by_kind",
+    ] {
+        assert!(st.get(*k).is_some(),
+                "stats --json missing key '{k}': {st}");
+    }
+    assert!(st["roots"].is_array(), "stats roots must be array: {st}");
+    assert!(st["by_lang"].is_object(), "stats by_lang must be object: {st}");
+    assert!(st["by_kind"].is_object(), "stats by_kind must be object: {st}");
+    let manifest_version = st["manifest_version"].as_u64()
+        .expect("manifest_version must be a u64");
+    assert!(manifest_version >= 1, "manifest_version must be >= 1, got {manifest_version}");
+
     // 8h-bis. `scry tldr PATH` — one-call file summary. JSON shape
     // must include path, lang, symbols_total, by_kind, top, first_line.
     let out = Command::new(scry_bin())

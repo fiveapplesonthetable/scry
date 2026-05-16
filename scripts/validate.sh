@@ -70,5 +70,20 @@ printf '%s\n' \
   '{"id":6,"cmd":"stats"}' \
   | $SCRY serve --index "$INDEX"
 
+# Ranking sanity: `def Activity --kind class` should rank real source
+# above api/*.txt declarations. The first hit's path must end in `.java`
+# (or `.kt`); a `.txt` first hit means the rank_score lang_penalty for
+# ApiTxt regressed. Hard-fail the validation if it does.
+hr "ranking sanity: def Activity --kind class — first hit is real source, not api/*.txt"
+first_path=$($SCRY def Activity --index "$INDEX" --kind class --json --limit 1 \
+  | python3 -c 'import sys, json; rows=json.load(sys.stdin); print(rows[0]["path"] if rows else "")')
+echo "first hit: $first_path"
+case "$first_path" in
+  *.java|*.kt) echo "PASS: real source ranks first" ;;
+  "")          echo "FAIL: no def hits for Activity --kind class" >&2; exit 1 ;;
+  *.txt)       echo "FAIL: api/*.txt first ($first_path) — rank_score regressed" >&2; exit 1 ;;
+  *)           echo "FAIL: unexpected first-hit extension ($first_path)" >&2; exit 1 ;;
+esac
+
 echo
 echo "VALIDATION DONE"

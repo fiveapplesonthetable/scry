@@ -210,6 +210,64 @@ fn synthetic_tree_roundtrip() {
     assert!(outline_names.contains(&"onCreate"),
             "RPC outline should include onCreate, got {:?}", outline_names);
 
+    // 5. Run build-trigrams + grep — exercises grep_candidates +
+    // read_trigram_posting + intersection on a small real index. Without
+    // this assertion, an off-by-one in the trigram posting decode would
+    // surface only as silently-empty greps in production.
+    let out = Command::new(scry_bin())
+        .args(["build-trigrams", "--index"])
+        .arg(&idx)
+        .output()
+        .expect("spawn scry build-trigrams");
+    assert!(out.status.success(),
+            "scry build-trigrams failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["grep", "transact", "--index"])
+        .arg(&idx)
+        .args(["--json"])
+        .output()
+        .expect("spawn scry grep");
+    assert!(out.status.success(),
+            "scry grep transact failed: {}", String::from_utf8_lossy(&out.stderr));
+    let hits: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(hits.iter().any(|h| h["path"].as_str().unwrap_or("").contains("Activity.java")),
+            "grep should hit Activity.java's b.transact() call, got {:?}",
+            hits.iter().map(|h| h["path"].clone()).collect::<Vec<_>>());
+    assert!(hits.iter().any(|h| h["path"].as_str().unwrap_or("").contains("Binder.java")),
+            "grep should hit Binder.java's transact() definition, got {:?}",
+            hits.iter().map(|h| h["path"].clone()).collect::<Vec<_>>());
+
+    // 6. Run build-resolutions + assert Java refs get resolved_to set.
+    // This pins the Layer 2 sidecar end-to-end — apply_resolution_override
+    // in get_ref + the build-resolutions writer + the JSON serializer
+    // all have to work together for resolved_to to show up.
+    let out = Command::new(scry_bin())
+        .args(["build-resolutions", "--index"])
+        .arg(&idx)
+        .output()
+        .expect("spawn scry build-resolutions");
+    assert!(out.status.success(),
+            "scry build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["callers", "transact", "--index"])
+        .arg(&idx)
+        .args(["--json"])
+        .output()
+        .expect("spawn scry callers");
+    let lines: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(!lines.is_empty(), "expected at least one transact caller");
+    let resolved_count = lines.iter()
+        .filter(|l| l["resolved_to"].as_u64().is_some()).count();
+    assert!(resolved_count > 0,
+            "build-resolutions should have populated at least one resolved_to, got 0/{} (refs: {:?})",
+            lines.len(), lines);
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

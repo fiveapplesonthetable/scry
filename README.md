@@ -101,21 +101,39 @@ warm mmap'd index.
 $ printf '%s\n' \
     '{"id":1,"cmd":"def","args":{"name":"Binder","limit":3}}' \
     '{"id":2,"cmd":"callers","args":{"name":"transact","in":"frameworks/base/","limit":3}}' \
-    '{"id":3,"cmd":"grep","args":{"name":"ZygoteInit","limit":5}}' \
+    '{"id":3,"cmd":"grep","args":{"pattern":"ZygoteInit","limit":5}}' \
+    '{"id":4,"cmd":"outline","args":{"path":"app_main.cpp"}}' \
   | scry serve --index /mnt/agent/scry-index
 {"id":1,"result":[{"name":"Binder","kind":"class","lang":"Java","path":"…","line":85,...}]}
 {"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","path":"…","line":1234,...}]}
-{"id":3,"result":[{"path":"…","line":42,"col":7,"snippet":"…ZygoteInit…"}]}
+{"id":3,"result":[{"path":"…","line":42,"col":7,"snippet":"…ZygoteInit…","lang":"Cpp"}]}
+{"id":4,"result":{"path":"…/app_main.cpp","lang":"Cpp","symbols_total":13,"symbols_shown":13,"symbols":[…]}}
 ```
 
-Supported commands: `def`, `ref`, `callers`, `prefix`, `fuzzy`, `grep`,
-`outline`, `stats`. All search commands accept an optional `"in"` arg
-(root-relative subdir prefix) to narrow the search — same semantics as
-the CLI's `--in`. `grep` is literal-only (regex queries belong on the
-CLI where rayon parallelism is available); it shares the same trigram
-pre-filter for sub-ms matches on selective patterns. `outline` takes
-a `"path"` arg (full path or suffix like `app_main.cpp`) and returns
-every symbol defined in that file, sorted by line.
+Per-command argument schema (LLM-friendly, all field names lowercase
+snake-case, all optional except where noted):
+
+| `cmd`       | required arg | other args                          | result shape           |
+|-------------|--------------|-------------------------------------|------------------------|
+| `def`       | `name`       | `lang`, `kind`, `in`, `limit`       | `[symbol, …]`          |
+| `ref`       | `name`       | `lang`, `kind`, `in`, `limit`       | `[ref, …]`             |
+| `callers`   | `name`       | `lang`, `in`, `limit`               | `[ref, …]` (kind=call) |
+| `prefix`    | `prefix`     | `in`, `limit`                       | `[symbol, …]`          |
+| `fuzzy`     | `substr`     | `in`, `limit`                       | `[symbol, …]`          |
+| `grep`      | `pattern`    | `lang`, `in`, `limit`               | `[hit, …]` (literal)   |
+| `outline`   | `path`       | `limit`                             | `{path, lang, symbols_total, symbols_shown, symbols: […]}` |
+| `stats`     | —            | —                                   | metadata object        |
+
+All search commands accept `"in"` (root-relative subdir prefix); same
+substring semantics as the CLI's `--in`. `grep` is literal-only (regex
+queries belong on the CLI where rayon parallelism is available); it
+shares the same trigram pre-filter for sub-ms matches on selective
+patterns. `outline` takes a `path` (full path or suffix like
+`app_main.cpp`) and returns every symbol defined in that file.
+
+Back-compat: all commands also accept `"name"` as a fallback for
+their primary arg, so older callers that hardcoded `{"name":…}` for
+grep / prefix / fuzzy / outline still work.
 
 ## Architecture (one paragraph)
 

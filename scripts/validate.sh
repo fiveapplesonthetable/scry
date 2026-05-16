@@ -65,7 +65,7 @@ printf '%s\n' \
   '{"id":1,"cmd":"def","args":{"name":"Binder","limit":3}}' \
   '{"id":2,"cmd":"callers","args":{"name":"transact","limit":3}}' \
   '{"id":3,"cmd":"def","args":{"name":"Activity","in":"frameworks/base/","limit":3}}' \
-  '{"id":4,"cmd":"grep","args":{"name":"ZygoteInit","limit":3}}' \
+  '{"id":4,"cmd":"grep","args":{"pattern":"ZygoteInit","limit":3}}' \
   '{"id":5,"cmd":"outline","args":{"path":"app_process/app_main.cpp","limit":3}}' \
   '{"id":6,"cmd":"stats"}' \
   | $SCRY serve --index "$INDEX"

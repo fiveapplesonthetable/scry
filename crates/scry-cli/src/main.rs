@@ -2448,21 +2448,34 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
         let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
         let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let lang = args.get("lang").and_then(|v| v.as_str());
         let kind = args.get("kind").and_then(|v| v.as_str());
         let in_ = args.get("in").and_then(|v| v.as_str());
 
+        // Per-command primary arg name. Each command also accepts "name"
+        // as a fallback so existing callers don't break, but the
+        // semantic field is what the docs and examples use:
+        //   def/ref/callers      → "name"
+        //   prefix               → "prefix"
+        //   fuzzy                → "substr"
+        //   grep                 → "pattern"
+        //   outline              → "path"
+        let arg_str = |primary: &str| -> &str {
+            args.get(primary).and_then(|v| v.as_str())
+                .or_else(|| args.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("")
+        };
+
         let result = match cmd {
-            "def" => serve_def(&reader, name, lang, kind, in_, limit),
-            "prefix" => serve_prefix(&reader, name, in_, limit),
-            "fuzzy" => serve_fuzzy(&reader, name, in_, limit),
-            "ref" => serve_ref(&reader, name, lang, kind, in_, limit),
-            "callers" => serve_ref(&reader, name, lang, Some("call"), in_, limit),
-            "grep" => serve_grep(&reader, name, lang, in_, limit),
-            "outline" => serve_outline(&reader, args.get("path").and_then(|v| v.as_str()).unwrap_or(""), limit),
-            "stats" => serve_stats(&reader),
-            other => serde_json::json!({"error": format!("unknown cmd: {other}")}),
+            "def"     => serve_def(&reader, arg_str("name"), lang, kind, in_, limit),
+            "prefix"  => serve_prefix(&reader, arg_str("prefix"), in_, limit),
+            "fuzzy"   => serve_fuzzy(&reader, arg_str("substr"), in_, limit),
+            "ref"     => serve_ref(&reader, arg_str("name"), lang, kind, in_, limit),
+            "callers" => serve_ref(&reader, arg_str("name"), lang, Some("call"), in_, limit),
+            "grep"    => serve_grep(&reader, arg_str("pattern"), lang, in_, limit),
+            "outline" => serve_outline(&reader, arg_str("path"), limit),
+            "stats"   => serve_stats(&reader),
+            other     => serde_json::json!({"error": format!("unknown cmd: {other}")}),
         };
 
         let resp = serde_json::json!({

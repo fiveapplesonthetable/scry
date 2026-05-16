@@ -337,14 +337,22 @@ fn kotlin_spec() -> &'static LangSpec {
         static QUERY: OnceLock<Query> = OnceLock::new();
         let lang = LANG.get_or_init(|| tree_sitter_kotlin_ng::LANGUAGE.into());
         let q = QUERY.get_or_init(|| {
+            // tree-sitter-kotlin-NG uses `identifier` for class/function/property
+            // names (NOT `type_identifier` / `simple_identifier` — those are
+            // the older tree-sitter-kotlin grammar). For extension functions
+            // and properties, the receiver is wrapped in a `user_type` node,
+            // so a direct `(function_declaration (identifier) @name)` query
+            // captures the function NAME identifier (the receiver's
+            // identifier is nested inside user_type, not a direct child).
             Query::new(
                 lang,
                 r#"
-                (class_declaration (type_identifier) @name) @def.class
-                (object_declaration (type_identifier) @name) @def.class
-                (function_declaration (simple_identifier) @name) @def.function
-                (property_declaration (variable_declaration (simple_identifier) @name)) @def.field
-                (type_alias (type_identifier) @name) @def.type
+                (class_declaration (identifier) @name) @def.class
+                (object_declaration (identifier) @name) @def.class
+                (function_declaration (identifier) @name) @def.function
+                (property_declaration (variable_declaration (identifier) @name)) @def.field
+                (type_alias (identifier) @name) @def.type
+                (enum_entry (identifier) @name) @def.variant
                 "#,
             )
             .unwrap_or_else(|_| Query::new(lang, "(source_file) @def.module").unwrap())
@@ -357,6 +365,7 @@ fn kotlin_spec() -> &'static LangSpec {
                 ("def.function", SymbolKind::Function),
                 ("def.field", SymbolKind::Field),
                 ("def.type", SymbolKind::Type),
+                ("def.variant", SymbolKind::EnumVariant),
                 ("def.module", SymbolKind::Module),
             ],
             name_capture: "name",
@@ -642,11 +651,19 @@ fn kotlin_refs_spec() -> &'static RefSpec {
         static Q: OnceLock<Query> = OnceLock::new();
         let lang = kotlin_spec().language;
         let q = Q.get_or_init(|| {
+            // tree-sitter-kotlin-NG: direct calls are `call_expression (identifier)`;
+            // method calls are `call_expression (navigation_expression ...)`;
+            // imports use the `import` node containing `qualified_identifier`.
+            // The receiver identifier in a navigation IS a real reference too
+            // (could be a class name like `Bar.process`), so we capture
+            // navigation identifiers as FieldAccess — best-effort kind label.
             Query::new(
                 lang,
                 r#"
-                (call_expression (simple_identifier) @ref.call)
-                (import_header (identifier (simple_identifier) @ref.import))
+                (call_expression (identifier) @ref.call)
+                (navigation_expression (identifier) @ref.field)
+                (import (qualified_identifier) @ref.import)
+                (user_type (identifier) @ref.type)
                 "#,
             )
             .unwrap_or_else(|_| Query::new(lang, "(source_file) @noop").unwrap())
@@ -655,7 +672,9 @@ fn kotlin_refs_spec() -> &'static RefSpec {
             query: q,
             capture_kinds: &[
                 ("ref.call", RefKind::Call),
+                ("ref.field", RefKind::FieldAccess),
                 ("ref.import", RefKind::Import),
+                ("ref.type", RefKind::TypeUse),
             ],
         }
     })

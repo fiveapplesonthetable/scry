@@ -97,7 +97,19 @@ fn tokenize_cmake_args(s: &str) -> Vec<String> {
         }
         let start = i;
         while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b')' { i += 1; }
-        tokens.push(s[start..i].to_string());
+        if i == start {
+            // No progress: bytes[i] is `)` (the only single-byte case that
+            // hits neither the whitespace nor the identifier loops). Without
+            // an explicit advance we infinite-loop pushing empty tokens, which
+            // is what blew up on ctags' cmake-comments test fixture: a `)`
+            // inside a `# comment` is invisible to find_matching_paren's
+            // comment-aware scan but VISIBLE to tokenize_cmake_args here
+            // because we entered tokenize with the args slice already past
+            // the comment context. Defensive skip.
+            i += 1;
+        } else {
+            tokens.push(s[start..i].to_string());
+        }
     }
     tokens
 }

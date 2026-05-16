@@ -28,13 +28,23 @@ invocation prints a stats footer and appends one JSON line to
 
 ```sh
 . ./env.sh                                       # CARGO_HOME pinned
-cargo build --release
-./target/release/scry def ActivityManagerService --kind class
-./target/release/scry callers transact --lang Java --limit 10
-./target/release/scry grep ZygoteInit
-./target/release/scry outline frameworks/base/cmds/app_process/app_main.cpp
-./target/release/scry coverage frameworks/base/services
+cargo build --release                            # ~20 s cold, ~5 s incremental
+./target/release/scry def ActivityManagerService --kind class      # ~8 ms
+./target/release/scry callers transact --lang Java --limit 10      # ~80 ms
+./target/release/scry grep ZygoteInit                              # ~580 ms (rg: 21.2 s — 36×)
+./target/release/scry outline frameworks/base/cmds/app_process/app_main.cpp   # ~600 ms
+./target/release/scry coverage frameworks/base/services            # ~250 ms
 ```
+
+Times above are warm-cache P50 on the live AOSP + Linux index
+(1,009,166 files, 70.4 GB source). The `rg` comparison is `rg -j4
+ZygoteInit ~/dev/aosp` against the same tree.
+
+Indexing the whole corpus from scratch is **13.3 minutes** wall on
+a 72-core host at `--workers 16`; ripgrep doesn't have an
+indexing phase, so it pays the full ~20 s walk cost on every
+query forever. Full per-pattern bench table and reproducibility
+recipe in [`docs/BENCHMARKS.md`].
 
 Full command reference, JSON-RPC schema table, and exhaustive output
 examples from the live AOSP index: [`docs/USAGE.md`].
@@ -53,6 +63,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/FAST_PATH.md`]        | Russ Cox-style trigram pre-filter + lazy/mmap reader design                |
 | [`docs/OPERATIONS.md`]       | production knobs, the systemd recipe, troubleshooting                      |
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
+| [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
 
 [`docs/USAGE.md`]: docs/USAGE.md
 [`docs/BENCHMARKS.md`]: docs/BENCHMARKS.md
@@ -61,6 +72,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 [`docs/FAST_PATH.md`]: docs/FAST_PATH.md
 [`docs/OPERATIONS.md`]: docs/OPERATIONS.md
 [`docs/DEVELOPMENT.md`]: docs/DEVELOPMENT.md
+[`docs/AGENT_NOTES.md`]: docs/AGENT_NOTES.md
 
 ## One-paragraph architecture
 

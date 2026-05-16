@@ -37,6 +37,7 @@ because every later chapter rests on them.
 
 - [Chapter 0 — prerequisites and notation](#chapter-0--prerequisites-and-notation)
 - [Chapter 0.5 — Rust, the language and how scry uses it](#chapter-05--rust-the-language-and-how-scry-uses-it)
+- [Chapter 0.6 — the toolbox (every dependency, what it does, why we picked it)](#chapter-06--the-toolbox-every-dependency-what-it-does-why-we-picked-it)
 - [Chapter 1 — the workload, in numbers](#chapter-1--the-workload-in-numbers)
 - [Chapter 1.5 — a brief history of code indexing](#chapter-15--a-brief-history-of-code-indexing)
 - [Chapter 2 — the memory hierarchy and the external-memory model](#chapter-2--the-memory-hierarchy-and-the-external-memory-model)
@@ -364,6 +365,466 @@ newtypes, atomic cross-thread state, error context).
   naturally. Today we work around the NLL borrow checker's
   conservatism with manual index-based iteration in a couple
   of places. The pattern is well-understood.
+
+---
+
+## Chapter 0.6 — the toolbox (every dependency, what it does, why we picked it)
+
+scry has ~22 direct dependencies. Each is doing genuine work; we
+didn't pull in any "framework" or "utility belt" crates. This
+chapter is a per-dependency tour: what the crate does, why scry
+needs it, what we'd reach for if we couldn't use it, and which
+chapter of this doc explains the theory the crate implements.
+
+The list is organized by *role in the system*, not alphabetically.
+The roles are: filesystem walking, parsing, storage, parallelism,
+allocator, CLI plumbing, error handling, logging.
+
+### Filesystem walking — `ignore`
+
+[`ignore`][ignore] (Andrew Gallant, 2016) is the gitignore-aware
+parallel directory walker extracted from `ripgrep`. It honors
+`.gitignore`, `.ignore`, parent-directory ignore files, and
+custom skiplists. Its parallel walker is what feeds scry's
+indexer with file paths.
+
+[ignore]: https://docs.rs/ignore/
+
+Why this crate specifically:
+
+- It's the reference implementation. `ripgrep` is the most-
+  battle-tested tool that walks 100k-file trees daily; we
+  inherit the same code.
+- The parallel walker yields files to a callback as it finds
+  them. We collect into a single `Vec<PathBuf>` first
+  (cheap — paths are small), then sort by file size before
+  handing to the parser pool (ch. 9).
+- The ignore semantics match programmer intuition: a file the
+  user has put in `.gitignore` is not "missing" or "extra" —
+  it's correctly absent.
+
+Alternative if it didn't exist: `walkdir` (simpler, no ignore
+support) + manual gitignore parsing. ~1000 LOC of work for
+worse semantics.
+
+### Source parsing — `tree-sitter` family
+
+[`tree-sitter`][ts-crate] (Max Brunsfeld, 2018) is the GLR
+parser generator covered in ch. 10. scry depends on the runtime
+crate (`tree-sitter`) plus one grammar per supported language:
+
+[ts-crate]: https://docs.rs/tree-sitter/
+
+| crate                       | language                            |
+|-----------------------------|-------------------------------------|
+| `tree-sitter-c`             | C                                   |
+| `tree-sitter-cpp`           | C++                                 |
+| `tree-sitter-java`          | Java                                |
+| `tree-sitter-kotlin-ng`     | Kotlin (community grammar, the `-ng` fork is actively maintained) |
+| `tree-sitter-rust`          | Rust                                |
+| `tree-sitter-go`            | Go                                  |
+| `tree-sitter-python`        | Python                              |
+| `tree-sitter-language`      | shared loader API for the grammars  |
+| `streaming-iterator`        | tree-sitter's query iterator returns this trait |
+
+Why this set:
+
+- All seven languages are first-class in AOSP (Java framework,
+  C/C++ native, Kotlin services, Rust safety code, Go build
+  tooling, Python build scripts) or the Linux kernel (C +
+  shell + a smattering of Python). Adding bash is on the
+  roadmap (tree-sitter-bash exists; we haven't wired it).
+- Kotlin's grammar is the weakest — tree-sitter-kotlin-ng is a
+  fork of the original tree-sitter-kotlin because the upstream
+  maintainer went inactive. The fork compiles cleanly and
+  handles modern Kotlin (sealed classes, smart casts) better.
+- `streaming-iterator` is a small crate whose only job is to
+  provide the `StreamingIterator` trait that tree-sitter's
+  `QueryCursor` needs. It's the kind of pure-interface crate
+  that exists because Rust's `Iterator` doesn't allow yielding
+  references to internal state, and `StreamingIterator` does.
+
+Alternative if it didn't exist: per-language hand-written
+parsers. ~10 000+ LOC of work for worse error recovery and no
+shared API.
+
+### AOSP-specific parsers — written in scry
+
+Soong (`Android.bp`), Android.mk, AIDL, HIDL, Bazel BUILD, GN,
+CMake, Kconfig, init.rc, sepolicy `.te`, AndroidManifest.xml,
+aconfig, OWNERS, `api/*.txt` — these don't have good
+tree-sitter grammars (or none at all), so scry has 12 custom
+parsers in `crates/scry-aosp/src/`. Each is ~200-500 LOC of
+hand-written recursive-descent.
+
+The one external dep here is **`quick-xml`** for the XML
+formats (AndroidManifest.xml in scry-aosp; some resource files
+later). It's the fastest pull-parser in the Rust ecosystem and
+handles the XML quirks correctly.
+
+Why hand-written rather than a parser generator: the grammars
+are small (200-500 production rules each); error recovery
+needs to be lenient (an `Android.bp` with a single broken
+module should still index the rest); and the parsers don't
+need to round-trip the source — they only need to extract
+symbols.
+
+### Storage primitives — `bincode`, `memmap2`, `fst`, `blake3`, `libc`
+
+#### `bincode`
+
+[`bincode`][bincode] is a binary serialization format for Rust.
+It encodes `Serialize`-derived types into a compact binary
+representation (smaller than JSON, no field names, length-
+prefixed strings, native endian). scry uses it for every on-
+disk record (`SymbolRecord`, `RefRecord`, `FileEntry`, ...).
+
+[bincode]: https://docs.rs/bincode/
+
+Why this crate:
+
+- Zero-overhead with `Serialize`-derived types. We write the
+  same struct that we read; no IDL, no schema file.
+- Stable on-disk format across point releases (we pin
+  `bincode = "1.3"` rather than the 2.x major because the
+  format is locked).
+- Fast: ~hundreds of MB/s decode on modern hardware. The
+  byte-offset sidecar pattern (ch. 8) makes the decode-cost
+  irrelevant for the warm path, but it still matters for the
+  finalize step that decodes 22 M symbols once.
+
+Tradeoff: bincode encodes language-internal types, so the
+format is *language-coupled*. A non-Rust reader would have to
+reimplement the bincode format spec. We accept this because
+scry's reader and writer are both Rust.
+
+#### `memmap2`
+
+[`memmap2`][memmap2] is the maintained successor to `memmap`
+(deprecated). It wraps `mmap(2)` and `munmap(2)` in safe-ish
+Rust. The "ish" is because the OS allows other processes to
+modify the file while it's mapped, and Rust's borrow checker
+can't see this — so the public API has `unsafe fn map`. We
+contain that `unsafe` to one helper (`safe_mmap` in
+`crates/scry-store/src/lib.rs`).
+
+[memmap2]: https://docs.rs/memmap2/
+
+Why this crate:
+
+- The de-facto standard. `ripgrep`, `tantivy`, `fst` all use it.
+- Clean RAII: when the `Mmap` drops, the mapping is released.
+  No need to remember `munmap`.
+- Supports `Madvise` and `MAP_HUGETLB` hints (we don't use
+  them yet; possible future tuning).
+
+Alternative: raw `libc::mmap` + manual lifetime management.
+~50 LOC of unsafe per call site. memmap2 saves us from
+writing that 11 times.
+
+#### `fst`
+
+[`fst`][fst-crate-toolbox] (Andrew Gallant, 2017) is the
+minimized FST library covered in ch. 6. We use the `Set` and
+`Map` builders for symbol-name dictionaries and the trigram
+dictionary, and the `Automaton` trait for fuzzy and prefix
+search.
+
+[fst-crate-toolbox]: https://docs.rs/fst/
+
+Why this crate:
+
+- Production-grade implementation of the FST data structure.
+  The minimization is correct; the on-disk format is stable;
+  the build API supports streaming construction from a sorted
+  iterator.
+- Levenshtein automaton intersection built in (the
+  `fst::automaton::Levenshtein` type), which is what
+  `scry fuzzy` runs on.
+- Same author as `ripgrep` and `memchr` — consistent quality
+  bar across the Rust text-processing ecosystem.
+
+Alternative: a B-tree or hash map per dictionary. Loses prefix
+walk, loses fuzzy, loses minimization. The fst crate is doing
+real work that would be ~2000 LOC of careful code to replace.
+
+#### `blake3`
+
+[`blake3`][blake3] is a cryptographic hash function (BLAKE3,
+2020) optimized for SIMD and parallel hashing. scry uses it
+*non-cryptographically* — for deterministic symbol IDs. The
+input is the symbol's fully-qualified name + kind; the output is
+a 128-bit ID that's stable across rebuilds.
+
+[blake3]: https://docs.rs/blake3/
+
+Why a crypto hash rather than `fnv` or `xxhash`:
+
+- Determinism across machines. blake3 produces the same bytes
+  on any host; `fnv` and `xxhash` are non-cryptographic but
+  *also* deterministic across platforms, so this isn't a
+  blake3-specific win.
+- Collision resistance. With 22 M symbols and 128 bits of ID,
+  the birthday-paradox collision probability is ~2^-44 — well
+  below "ever happens in practice". `fnv` or 64-bit `xxhash`
+  would have measurable collisions at this scale.
+- Speed. blake3 hashes at ~3 GB/s per core with SIMD; we hash a
+  few bytes per symbol so this isn't a bottleneck either way.
+
+Tradeoff: we're using a crypto hash for non-crypto purposes,
+which sometimes triggers code-review eyebrows. The honest answer
+is "we picked the strongest of the fast hashes because it's
+free", not "we need crypto properties".
+
+#### `libc`
+
+[`libc`][libc-crate] gives us raw FFI bindings to the C standard
+library and POSIX. scry uses exactly one symbol: `posix_fadvise`
+with `POSIX_FADV_WILLNEED`, for the grep candidate prefetch
+(commit `014b061`).
+
+[libc-crate]: https://docs.rs/libc/
+
+Why a 3rd-party crate just for one syscall: there's no stdlib
+wrapper for `posix_fadvise`. The alternative is `nix` (a richer
+POSIX wrapper) which would pull in more code than we use.
+
+### Parallelism — `rayon`, `parking_lot`, `crossbeam`
+
+#### `rayon`
+
+[`rayon`][rayon] is the work-stealing parallel iterator covered
+in ch. 9. scry uses it for the parser pool and for parallel
+post-finalize passes.
+
+[rayon]: https://docs.rs/rayon/
+
+Why this crate:
+
+- Implements Blumofe-Leiserson work-stealing with strong
+  empirical performance.
+- The `par_iter()` API turns a sequential iterator into a
+  parallel one with a one-character change. The user-facing
+  API is what makes it usable.
+- Configurable global pool (`ThreadPoolBuilder::num_threads`)
+  for tuning vs. core count.
+
+Alternative: raw `std::thread::scope` + a hand-rolled
+work-queue. We'd write ~300 LOC and lose the work-stealing
+properties.
+
+#### `parking_lot`
+
+[`parking_lot`][parking-lot] provides drop-in replacements for
+`std::sync::Mutex`, `RwLock`, and `Condvar` that are faster
+under contention and *not* poisoned by panics. scry uses the
+`Mutex` in the writer's append paths.
+
+[parking-lot]: https://docs.rs/parking_lot/
+
+Why:
+
+- 2-5× faster than std under contention (the std `Mutex` is
+  pthread mutex; parking_lot uses a parking-lot algorithm).
+- No `PoisonError` to unwrap. If a thread panics holding the
+  lock, parking_lot's lock is still usable; std's `Mutex`
+  permanently fails.
+- The std `Mutex` improvements in recent Rust releases close
+  some of the gap. We could probably switch back; we haven't
+  bothered because the difference doesn't show up in our
+  profile.
+
+#### `crossbeam`
+
+[`crossbeam`][crossbeam] is referenced in the workspace `Cargo.toml`
+for the channel and atomic primitives, though our actual usage is
+light (most cross-thread coordination is via rayon and atomics).
+It's there for future use; specifically, the OOM heartbeat thread
+could move from a polled atomic to a crossbeam channel if we
+needed back-pressure signaling.
+
+[crossbeam]: https://docs.rs/crossbeam/
+
+### String / regex — `memchr`, `regex`, `regex-syntax`
+
+#### `memchr`
+
+[`memchr`][memchr-crate] (Andrew Gallant) is SIMD-accelerated
+byte searching. `memchr(b, slice)` finds the first byte equal to
+`b` in `slice`. Throughput is ~50 GB/s on AVX2; falls back to
+SSE2/scalar where needed. scry uses it for every per-file scan
+in `cmd_grep`.
+
+[memchr-crate]: https://docs.rs/memchr/
+
+Why:
+
+- Single-byte search is the inner loop of literal grep.
+  `memchr` is the fastest implementation in the Rust ecosystem
+  by a meaningful margin (5-20× over naive `slice.iter().position(|&b| b == n)`).
+- Multi-byte (`memmem`) is included for substring search.
+
+Alternative: hand-roll SIMD. We won't.
+
+#### `regex`
+
+[`regex`][regex-crate] is the regex engine from the ripgrep
+project. Compiles patterns to a state machine; provides both
+"is there a match" and "where are the matches" APIs. Bounded
+worst-case (no catastrophic backtracking like PCRE).
+
+[regex-crate]: https://docs.rs/regex/
+
+scry uses it for the regex-mode grep (`scry grep PATTERN
+--regex`) and for the literal-extractor's regex parsing.
+
+Why this crate:
+
+- Same lineage as everything else in this ecosystem
+  (Gallant, ripgrep).
+- Bounded worst case is required. We can't have a user's regex
+  hang the indexer.
+
+#### `regex-syntax`
+
+[`regex-syntax`][regex-syntax-crate] is the *parser* for regex
+patterns; produces an AST (the HIR — High-level Intermediate
+Representation). scry's literal extractor (ch. 5) walks the
+HIR to find prefix and suffix literal anchors.
+
+[regex-syntax-crate]: https://docs.rs/regex-syntax/
+
+Why we pull this in directly (rather than going through the
+`regex` crate): the `regex` crate hides the HIR; we need
+direct access to the AST to walk it.
+
+### Allocator — `tikv-jemallocator` + `tikv-jemalloc-ctl`
+
+[`tikv-jemallocator`][jemalloc-crate] is the TiKV team's
+maintained binding to jemalloc. scry uses it as the global
+allocator, with `MALLOC_CONF=dirty_decay_ms:100,muzzy_decay_ms:100`
+to aggressively return freed pages to the kernel (covered in
+ch. 11).
+
+[jemalloc-crate]: https://docs.rs/tikv-jemallocator/
+
+`tikv-jemalloc-ctl` is the API for reading jemalloc's runtime
+statistics (`stats.allocated`, `stats.resident`, etc.). The OOM
+heartbeat thread polls `stats.allocated` every 100 ms.
+
+Why jemalloc rather than glibc malloc:
+
+- Better thread-local arenas → lower contention under parallel
+  workloads.
+- The `decay_ms` knobs that let us bound RSS for the cgroup
+  envelope. glibc malloc doesn't expose this.
+- Runtime stats. We can ask jemalloc "how much memory are you
+  holding?" and act on the answer; glibc malloc has nothing
+  comparable.
+
+Tradeoff: jemalloc adds ~1 MB to the binary and 1-2 MB of
+metadata RSS at startup. Both are noise at our scale.
+
+### CLI — `clap`
+
+[`clap`][clap-crate] is the de-facto CLI parser for Rust. We
+use the `derive` feature: declare the CLI as a struct, clap
+generates the parser, help text, and error messages.
+
+[clap-crate]: https://docs.rs/clap/
+
+Why:
+
+- The derive API is genuinely good. Struct definitions read
+  almost like the CLI docs they generate.
+- Subcommands, flags, argument parsing, default values, env
+  var fallback — all handled.
+
+Alternative: `argh` is smaller; `pico-args` is tiny. Neither
+generates the help text we want without manual work.
+
+### Error handling — `anyhow`
+
+[`anyhow`][anyhow-crate] is the trait-object error type for
+contexts where the caller doesn't need to match on specific
+error variants. scry uses `anyhow::Result<T>` throughout.
+
+[anyhow-crate]: https://docs.rs/anyhow/
+
+Why:
+
+- `?` propagation just works.
+- `.with_context(|| format!("opening {}", path.display()))`
+  attaches context as the error unwinds. Final error message
+  is a chain of contexts back to the original cause —
+  invaluable for debugging.
+- We don't have any callers that need to match on specific
+  variants. If we did, we'd use `thiserror`.
+
+### Logging — `tracing` + `tracing-subscriber`
+
+[`tracing`][tracing-crate] is the structured-logging successor
+to `log`. `tracing-subscriber` is the renderer (formats
+messages, applies env-filter, etc.).
+
+[tracing-crate]: https://docs.rs/tracing/
+
+scry uses `tracing::info!` / `warn!` / `error!` macros for
+status messages from the indexer and reader. The subscriber is
+configured with `EnvFilter` so `RUST_LOG=debug` selects
+verbosity per crate.
+
+Why:
+
+- Tree-structured spans let us attribute time to phases ("walk",
+  "parse", "finalize") with `tracing::info_span!`.
+- Compatible with `tracing-flame` for flamegraphs (we haven't
+  needed this; left as a tool for future profiling).
+
+### Serialization — `serde` + `serde_json`
+
+`serde` is the *trait* for "this type can be serialized". `bincode`
+implements it for binary; `serde_json` implements it for JSON.
+
+scry uses `serde_json` for the JSON output formats (`--json`,
+`scry serve` requests/responses) and `bincode` for the on-disk
+columnar files.
+
+The split (`serde` as trait, separate impl crates) is what
+lets us use the same `#[derive(Serialize, Deserialize)]` on a
+struct and get both encodings for free.
+
+### Putting the toolbox into perspective
+
+The dependency count looks high (~22 direct) but every entry is
+doing one specific job and almost all are by ~2 authors (Andrew
+Gallant for the text-processing stack, dtolnay for the
+serialization + error stack). The "two main authors" pattern is
+the standard one in the Rust text-tooling community; we're not
+assembling a fragile pile of weakly-maintained crates.
+
+If we had to replace each crate with our own implementation
+the work would be roughly:
+
+| crate                    | replacement effort  |
+|--------------------------|---------------------|
+| `ignore`                 | ~1 000 LOC          |
+| `tree-sitter` + grammars | ~50 000 LOC         |
+| `bincode`                | ~300 LOC            |
+| `memmap2`                | ~150 LOC            |
+| `fst`                    | ~2 000 LOC          |
+| `blake3`                 | ~3 000 LOC          |
+| `rayon`                  | ~1 500 LOC          |
+| `memchr`                 | ~2 000 LOC (SIMD)   |
+| `regex`                  | ~10 000 LOC         |
+| `clap`                   | ~500 LOC (minimal)  |
+| `serde` + `serde_json`   | ~3 000 LOC          |
+| `tikv-jemallocator`      | (allocator port)    |
+| `anyhow` / `tracing` / etc. | ~500 LOC each    |
+
+Total ~75 000 LOC of *just the libraries* before we'd have a
+working scry. Compare: scry itself is ~7 500 LOC. The
+ecosystem leverage is the design's biggest hidden lever.
 
 ---
 

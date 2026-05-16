@@ -2121,4 +2121,130 @@ mod tests {
         assert!(soong.rank_score() > field.rank_score());
         assert!(init.rank_score() > field.rank_score());
     }
+
+    // -----------------------------------------------------------------
+    // Wire-format tests for the on-disk posting decoders. These pin the
+    // exact byte layouts so a future "let me change one little thing"
+    // refactor can't silently corrupt every index in the world.
+    // -----------------------------------------------------------------
+
+    /// Build a trigram posting body (count u32-LE + delta-varint sequence)
+    /// from a sorted list of file IDs. Mirrors what kway_merge_trigrams_to_fst
+    /// writes; the read path is read_trigram_posting.
+    fn build_trigram_posting_bytes(ids_sorted: &[u32]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + ids_sorted.len() * 2);
+        buf.extend_from_slice(&(ids_sorted.len() as u32).to_le_bytes());
+        let mut prev: u32 = 0;
+        for &id in ids_sorted {
+            let mut delta = id.wrapping_sub(prev);
+            loop {
+                let b = (delta & 0x7f) as u8;
+                delta >>= 7;
+                if delta == 0 {
+                    buf.push(b);
+                    break;
+                }
+                buf.push(b | 0x80);
+            }
+            prev = id;
+        }
+        buf
+    }
+
+    #[test]
+    fn trigram_posting_roundtrip() {
+        // Sorted, dense and sparse mixed; includes 0 (corner case for
+        // delta encoding) and a large jump that uses multi-byte varint.
+        let ids = vec![0u32, 1, 5, 100, 100_000, 100_001, 5_000_000];
+        let bytes = build_trigram_posting_bytes(&ids);
+        let got = read_trigram_posting(&bytes, 0);
+        for id in &ids {
+            assert!(got.contains(id), "missing {id} from {got:?}");
+        }
+        assert_eq!(got.len(), ids.len(), "extra entries: {got:?}");
+    }
+
+    #[test]
+    fn trigram_posting_empty_count_returns_empty() {
+        // Count = 0 → no further reads should happen; returned set empty.
+        let bytes = 0u32.to_le_bytes().to_vec();
+        let got = read_trigram_posting(&bytes, 0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn trigram_posting_truncated_count_returns_empty() {
+        // Buf shorter than 4 bytes — can't even read the count.
+        let bytes = vec![0xff, 0xff]; // 2 bytes
+        let got = read_trigram_posting(&bytes, 0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn trigram_posting_truncated_varint_returns_partial() {
+        // Count = 3 but only one full varint follows; second varint has
+        // the continuation bit set but no following byte. Decoder must
+        // stop cleanly rather than read past the buffer.
+        let mut bytes = 3u32.to_le_bytes().to_vec();
+        bytes.push(0x05);              // first id = 5, complete varint
+        bytes.push(0x80);              // second id varint truncated (continuation, no next)
+        let got = read_trigram_posting(&bytes, 0);
+        // The first id should be present; the truncated one must not
+        // panic or produce a garbage entry.
+        assert!(got.contains(&5));
+        assert!(got.len() <= 1, "got {got:?}");
+    }
+
+    #[test]
+    fn trigram_posting_malformed_varint_returns_partial() {
+        // varint claims to extend > 32 bits — read_trigram_posting must
+        // bail rather than overflow the shift.
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        // 6 bytes all with continuation bit; shift would reach 35 > 32.
+        for _ in 0..6 {
+            bytes.push(0x80);
+        }
+        // Must not panic.
+        let _got = read_trigram_posting(&bytes, 0);
+    }
+
+    /// read_posting (the simple u32-LE list, used for name postings)
+    /// round-trips its writer's output and tolerates truncation.
+    #[test]
+    fn name_posting_roundtrip() {
+        let ids = vec![10u32, 200, 3000, 40_000];
+        let mut bytes = (ids.len() as u32).to_le_bytes().to_vec();
+        for id in &ids {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        let got = read_posting(&bytes, 0);
+        assert_eq!(got, ids);
+    }
+
+    #[test]
+    fn name_posting_truncated_returns_partial() {
+        // Count = 3 but only 2 u32 bodies present. Decoder reads what's
+        // there and stops rather than panicking on the third.
+        let mut bytes = 3u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        // No third u32.
+        let got = read_posting(&bytes, 0);
+        assert_eq!(got, vec![10, 20]);
+    }
+
+    #[test]
+    fn name_posting_empty_count_returns_empty() {
+        let bytes = 0u32.to_le_bytes().to_vec();
+        let got = read_posting(&bytes, 0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn name_posting_oob_offset_returns_empty() {
+        // Offset past the end of the buffer must not panic.
+        let bytes = vec![0u8; 4];
+        let got = read_posting(&bytes, 1000);
+        assert!(got.is_empty());
+    }
 }

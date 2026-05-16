@@ -1145,6 +1145,61 @@ mod tests {
         assert!(names.contains(&"foo"));
     }
 
+    #[test]
+    fn go_minimal() {
+        let src = br#"
+            package foo
+
+            type Bar struct {
+                X int
+            }
+
+            func (b *Bar) Baz() int { return b.X }
+
+            func TopLevel() int { return 0 }
+
+            const Pi = 3
+            var Counter = 0
+        "#;
+        let syms = extract(FileKind::Go, src).unwrap();
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Bar"), "type Bar; names: {:?}", names);
+        assert!(names.contains(&"Baz"), "method Baz; names: {:?}", names);
+        assert!(names.contains(&"TopLevel"), "func TopLevel; names: {:?}", names);
+        assert!(names.contains(&"Pi"), "const Pi; names: {:?}", names);
+        assert!(names.contains(&"Counter"), "var Counter; names: {:?}", names);
+    }
+
+    #[test]
+    fn python_minimal() {
+        let src = br#"
+class Foo:
+    def bar(self):
+        return 1
+
+    def baz(self):
+        return 2
+
+def top_level():
+    return 0
+"#;
+        let syms = extract(FileKind::Python, src).unwrap();
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "class Foo; names: {:?}", names);
+        assert!(names.contains(&"bar"), "method bar; names: {:?}", names);
+        assert!(names.contains(&"baz"), "method baz; names: {:?}", names);
+        assert!(names.contains(&"top_level"), "func top_level; names: {:?}", names);
+
+        // Methods should carry their class as scope; top_level should not.
+        let by_name: std::collections::HashMap<_, _> = syms.iter()
+            .map(|s| (s.name.clone(), s.scope_path.clone()))
+            .collect();
+        assert_eq!(by_name.get("bar"), Some(&vec!["Foo".to_string()]),
+                   "Foo.bar scope = [Foo]; got {:?}", by_name.get("bar"));
+        assert_eq!(by_name.get("top_level"), Some(&vec![]),
+                   "top_level scope = empty; got {:?}", by_name.get("top_level"));
+    }
+
     /// The progress callback path must actually abort runaway parses.
     /// We feed the cpp grammar a synthetic input large enough to take
     /// far more than 1 microsecond and assert it returns TimedOut well

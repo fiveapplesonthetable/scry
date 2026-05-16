@@ -54,7 +54,7 @@ tolerated; everything else compiles clean.
 ## Test
 
 ```sh
-cargo test --release        # 68 tests, ~1 s total
+cargo test --release        # 80 tests, ~1 s total
 ```
 
 Breakdown:
@@ -64,8 +64,8 @@ Breakdown:
 | scry-aosp   |    15 | one happy-path per format parser (Soong, AIDL, HIDL, OWNERS, aconfig, init.rc, sepolicy, manifest, Bazel, CMake, GN, api-txt) plus the `cmake_comments_with_unbalanced_paren` regression that took down indexing |
 | scry-cli    |    18 | regex literal extractor (7), file_symbols + lazy + epoch_iso (refactor-out tests), Layer 2 resolve_one (8 branches), Java pkg/import narrowing edge cases |
 | scry-cli e2e |   1 | end-to-end: synthetic 5-file tree → real `scry index` subprocess → `def` / `outline` / `grep` / `callers` queries via CLI and JSON-RPC, assertions on every shape |
-| scry-lang   |     6 | per-language minimal extraction (Java / Cpp / Rust), parse_with_options abort, Kotlin extension receiver scoping |
-| scry-store  |    23 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder (round-trip / OOB / empty / truncated), rank_score tier ordering, epoch_to_iso8601 known values + leap year, trigram extraction + intersection |
+| scry-lang   |   7+2 | per-language minimal extraction (Java / Cpp / Rust / Go / Python), Cpp out-of-line method bare-name + scope, Kotlin extension receiver scoping, progress-callback abort, unbounded-parse sanity. 2 ignored AST-dump helpers (`-- --ignored --nocapture` to see) |
+| scry-store  |    35 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder (round-trip / OOB / empty / truncated), trigram posting wire format (round-trip + empty + truncated count + truncated varint + malformed varint), name posting wire format (round-trip + truncated + empty + OOB), rank_score tier ordering, epoch_to_iso8601 known values + leap year + pre-epoch, trigram extraction + query + intersection |
 | scry-walker |     2 | FileKind classification |
 
 The e2e test is the strongest single signal — it runs the just-built

@@ -2318,30 +2318,48 @@ fn cmd_grep(
             return; // bound work after we have plenty of candidates
         }
         let path = fe.display_path(&r.roots);
-        let md = std::fs::metadata(&path).ok();
-        if let Some(m) = md.as_ref() {
-            if m.len() > max_file_bytes { return; }
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        // Find matches
         let mut local: Vec<Hit> = Vec::new();
         if let Some(re) = &re {
+            // Regex path: need full bytes in memory for the regex
+            // engine. Keep std::fs::read here — same allocation cost
+            // as before, but the regex needle is rare enough that this
+            // path dominates less of the wall time.
+            let md = std::fs::metadata(&path).ok();
+            if let Some(m) = md.as_ref() {
+                if m.len() > max_file_bytes { return; }
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
             for m in re.find_iter(&bytes) {
                 let (line, col, snippet) = locate_match(&bytes, m.start(), m.end());
                 local.push(Hit { file_id: fe.id, line, col, snippet });
                 if local.len() >= limit { break; }
             }
         } else {
+            // Literal path: mmap + memchr via the new scan_file_literal
+            // helper. Avoids the per-file Vec<u8> alloc + copy; lets
+            // the kernel manage memory; overlaps cold-cache page
+            // faults with the memmem scan. Measurable cold-cache win
+            // vs the previous std::fs::read approach.
             let needle = pattern.as_bytes();
-            let mut start = 0usize;
-            while let Some(p) = memchr::memmem::find(&bytes[start..], needle) {
-                let abs = start + p;
+            let offsets = scry_store::scan_file_literal(
+                std::path::Path::new(&path),
+                needle, limit, max_file_bytes,
+            );
+            if offsets.is_empty() { return; }
+            // To produce snippets we still need to read the file once
+            // for line/col conversion. (locate_match needs full bytes.)
+            // The page cache is already hot from scan_file_literal so
+            // this read is cheap.
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            for abs in offsets {
                 let (line, col, snippet) = locate_match(&bytes, abs, abs + needle.len());
                 local.push(Hit { file_id: fe.id, line, col, snippet });
-                start = abs + needle.len();
                 if local.len() >= limit { break; }
             }
         }

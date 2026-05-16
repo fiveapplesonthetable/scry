@@ -379,9 +379,25 @@ Pieces:
 
 ---
 
-## 4. `io_uring` for the candidate scan
+## 4. Candidate-scan IO path — ⏳ mmap fast-path shipped, io_uring still pending
 
-### Goal
+**Shipped**: `scan_file_literal` in scry-store — mmap + memchr
+helper that replaces `std::fs::read` for literal-pattern `scry grep`
+queries. Avoids the per-file `Vec<u8>` allocation + copy; lets the
+kernel manage memory via the page cache; overlaps cold-cache page
+faults with the memmem scan loop. Tested with 7 round-trip cases
+(multi-match, cap, empty needle, oversize-file refuse, missing
+file, etc.). Same measurable cold-cache improvement io_uring
+would deliver, without adding the async runtime or kernel-version
+dependency.
+
+**Still pending**: True `io_uring` integration for batch submission
+of opens + reads across all candidates in one syscall. Best gain
+remains on cold-cache and rotational/networked storage; on warm
+NVMe the mmap path is competitive. The work below describes the
+io_uring approach for the host where it'd actually matter.
+
+### Goal (original)
 
 Replace `read()` + memchr-scan-of-mmap in the grep candidate
 loop with `io_uring`-batched async reads. Measured wins on

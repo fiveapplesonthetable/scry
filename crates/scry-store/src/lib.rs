@@ -1975,6 +1975,60 @@ fn fuzzy_sort_score(query: &[u8], name: &[u8], wf: u32) -> u32 {
     wf + (q_len as u32 * 2).max(4)
 }
 
+/// Scan a single file for the literal needle, returning all match
+/// byte-offsets up to `max_per_file` hits. Uses mmap + memchr::memmem
+/// rather than `std::fs::read` so:
+///
+///   1. We don't pay a per-file Vec<u8> allocation + copy. The mmap
+///      memory is page-cache-backed and managed by the kernel; once
+///      the bytes are searched the page is just another LRU page.
+///   2. Cold-cache page faults overlap with the search loop, since
+///      memchr::memmem walks sequentially and the kernel's readahead
+///      pulls ahead of the cursor.
+///   3. Memory footprint per scan is bounded by the file size, but
+///      shared across the page cache — under memory pressure the
+///      kernel evicts pages we're done with naturally.
+///
+/// Returns Vec<usize> of match start offsets. Caller is responsible
+/// for stopping early; this helper returns ALL hits up to the cap.
+///
+/// max_file_bytes: refuse to open files larger than this. Prevents
+/// a single multi-GB binary blob the walker missed from blowing up
+/// the page cache.
+pub fn scan_file_literal(
+    path: &std::path::Path,
+    needle: &[u8],
+    max_per_file: usize,
+    max_file_bytes: u64,
+) -> Vec<usize> {
+    if needle.is_empty() { return Vec::new(); }
+    let f = match File::open(path) { Ok(f) => f, Err(_) => return Vec::new() };
+    let md = match f.metadata() { Ok(m) => m, Err(_) => return Vec::new() };
+    if md.len() == 0 || md.len() > max_file_bytes {
+        return Vec::new();
+    }
+    // SAFETY: The file is opened read-only and the mmap is read-only.
+    // We don't expose the slice past the lifetime of this fn — it
+    // doesn't escape. memmap2::Mmap holds the mapping; dropping it
+    // unmaps. Same audited pattern as safe_mmap above.
+    let mm = match unsafe { memmap2::Mmap::map(&f) } { Ok(m) => m, Err(_) => return Vec::new() };
+    let bytes = &mm[..];
+    let mut out = Vec::with_capacity(8.min(max_per_file));
+    let mut start = 0usize;
+    while out.len() < max_per_file {
+        match memchr::memmem::find(&bytes[start..], needle) {
+            Some(off) => {
+                let abs = start + off;
+                out.push(abs);
+                start = abs + needle.len().max(1);
+                if start >= bytes.len() { break; }
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 /// Wagner-Fischer edit distance between two byte slices.
 ///
 /// O(|a| * |b|) time; O(min(|a|, |b|)) space via two rolling rows. Used
@@ -2753,6 +2807,50 @@ mod tests {
             }
         });
         assert!(digest.is_none());
+    }
+
+    /// scan_file_literal: round-trips simple cases against a temp file.
+    /// Covers empty needle (Vec empty), needle longer than file (Vec
+    /// empty), single match, multi-match cap, and oversize-file refuse.
+    #[test]
+    fn scan_file_literal_basic_cases() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(
+            format!("scry-scan-{}", std::process::id())
+        );
+        // Multi-match: "foo" appears 3x in "foo bar foo baz foo".
+        std::fs::write(&tmp, b"foo bar foo baz foo").unwrap();
+        let m = scan_file_literal(&tmp, b"foo", 100, 1 << 20);
+        assert_eq!(m, vec![0, 8, 16]);
+        // Cap honored.
+        let m2 = scan_file_literal(&tmp, b"foo", 2, 1 << 20);
+        assert_eq!(m2.len(), 2);
+        // Empty needle: bails.
+        let m3 = scan_file_literal(&tmp, b"", 10, 1 << 20);
+        assert!(m3.is_empty());
+        // Oversize-file refuse: max_file_bytes=10 < actual file size.
+        let m4 = scan_file_literal(&tmp, b"foo", 10, 10);
+        assert!(m4.is_empty());
+        // No match: empty.
+        let m5 = scan_file_literal(&tmp, b"xyz", 10, 1 << 20);
+        assert!(m5.is_empty());
+        // Missing file: empty (no panic).
+        let m6 = scan_file_literal(
+            std::path::Path::new("/nonexistent/path/here"),
+            b"foo", 10, 1 << 20,
+        );
+        assert!(m6.is_empty());
+        // Write a partial-write helper test: file with no trailing
+        // newline still scans correctly.
+        let tmp2 = std::env::temp_dir().join(
+            format!("scry-scan-2-{}", std::process::id())
+        );
+        let mut f = std::fs::File::create(&tmp2).unwrap();
+        f.write_all(b"abcd").unwrap();
+        let m7 = scan_file_literal(&tmp2, b"bc", 5, 1 << 20);
+        assert_eq!(m7, vec![1]);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp2);
     }
 
     /// Tombstone bitmap accessor: bit 0 of byte 0 = file_id 0, bit 3 of

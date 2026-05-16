@@ -1776,3 +1776,100 @@ fn unix_serve_max_conns_drops_over_cap() {
     child.wait().ok();
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn subclasses_e2e_via_cli_and_rpc() {
+    // Fixture: a Java parent class + a child class that extends it,
+    // plus a grand-child to validate transitive depth. Tiny enough
+    // to index in <100 ms.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-subclasses-e2e-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("java/zoo")).unwrap();
+    std::fs::write(src.join("java/zoo/Animal.java"), r#"package zoo;
+public class Animal { public void speak() {} }
+"#).unwrap();
+    std::fs::write(src.join("java/zoo/Dog.java"), r#"package zoo;
+public class Dog extends Animal { public void bark() {} }
+"#).unwrap();
+    std::fs::write(src.join("java/zoo/Puppy.java"), r#"package zoo;
+public class Puppy extends Dog { public void yip() {} }
+"#).unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(), "index failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+
+    // CLI: direct subclasses of Animal → {Dog}.
+    let out = Command::new(scry_bin())
+        .args(["subclasses", "Animal", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "20"])
+        .output().expect("spawn scry subclasses");
+    assert!(out.status.success(), "subclasses Animal failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+    let direct: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let names: Vec<&str> = direct.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(names.contains(&"Dog"),
+            "direct subclasses of Animal should include Dog; got {names:?}");
+    assert!(!names.contains(&"Puppy"),
+            "direct subclasses must NOT include Puppy (depth=0); got {names:?}");
+
+    // CLI: transitive subclasses of Animal at depth 2 → {Dog, Puppy}.
+    let out = Command::new(scry_bin())
+        .args(["subclasses", "Animal", "--depth", "2", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "20"])
+        .output().expect("spawn scry subclasses --depth=2");
+    assert!(out.status.success(), "subclasses --depth=2 failed");
+    let trans: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let names: Vec<&str> = trans.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(names.contains(&"Dog") && names.contains(&"Puppy"),
+            "depth=2 subclasses of Animal should include Dog and Puppy; got {names:?}");
+
+    // CLI: `implementations` is an alias.
+    let out = Command::new(scry_bin())
+        .args(["implementations", "Animal", "--index"]).arg(&idx)
+        .args(["--json"]).output().expect("spawn scry implementations");
+    assert!(out.status.success());
+    let impls: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let names: Vec<&str> = impls.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(names.contains(&"Dog"),
+            "implementations alias should match subclasses; got {names:?}");
+
+    // JSON-RPC: subclasses tool over stdio.
+    use std::io::Write;
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"subclasses","args":{{"name":"Animal","depth":2,"limit":20}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(), "serve failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+    let line = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().find(|l| !l.is_empty())
+        .expect("at least one response line");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    let names: Vec<&str> = v["result"].as_array().unwrap().iter()
+        .filter_map(|s| s["name"].as_str()).collect();
+    assert!(names.contains(&"Dog") && names.contains(&"Puppy"),
+            "RPC subclasses should include Dog and Puppy; got {names:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

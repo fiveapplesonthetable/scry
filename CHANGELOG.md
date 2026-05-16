@@ -7,6 +7,42 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.15] — 2026-05-16
+
+Type-hierarchy queries: `scry subclasses NAME` and `scry implementations
+NAME` (alias). LSP analogues `typeHierarchy/subtypes` and
+`implementationProvider`. No new sidecar — walks the tree-sitter
+`InheritFrom` refs that the indexer already records, with a same-file
+scope-anchored resolution so the child class lands as a real
+SymbolRecord (kind/lang/scope intact).
+
+**CLI:**
+
+- `scry subclasses Activity --in frameworks/base/` → 597 direct
+  subclasses on AOSP, ranked. `--depth N` walks transitively (BFS,
+  bounded to keep pathological hierarchies tractable; `--depth 0`
+  = direct only).
+- `scry implementations IBinder` — same algorithm, Java-flavored naming.
+
+**JSON-RPC + MCP:**
+
+- New tools `subclasses` and `implementations`, both taking `name`
+  (required), `in`, `limit`, `depth`. Behaviorally identical;
+  exposed as separate tools so LLM clients pick the right verb
+  for the domain (Java callers vs C++ inheritance).
+
+**Internals:**
+
+- New `StoreReader::subclasses(parent)` / `subclasses_transitive(parent, depth)`.
+  For each `InheritFrom` ref to `parent`, the child is identified by
+  `scope_path.last()`; the outer scope (`scope_path[..last]`) +
+  `file_id` resolve back to a SymbolRecord via the existing name FST.
+- E2E test (`subclasses_e2e_via_cli_and_rpc`) builds a 3-class Java
+  hierarchy (Animal → Dog → Puppy) and validates direct + transitive
+  + alias + JSON-RPC paths in one fixture, well under a second.
+- Updated `mcp_required_args_for` so the schema/validator drift test
+  keeps catching new tools at compile time.
+
 ## [0.1.14] — 2026-05-16
 
 `--clang-precise` ref/callers filter — Path B's payoff. Uses the

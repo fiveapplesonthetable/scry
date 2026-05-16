@@ -2172,6 +2172,63 @@ impl StoreReader {
             .collect()
     }
 
+    /// Direct subclasses of `parent_name` — type/class/interface decls
+    /// that have an `InheritFrom` ref to `parent_name`. The result is
+    /// the SymbolRecord of each child class (deduped by id).
+    ///
+    /// The lookup walks tree-sitter's existing inherit refs (no new
+    /// sidecar needed): for each inherit ref site, the child class is
+    /// `scope_path.last()` and its outer scope is `scope_path[..last]`.
+    /// We resolve that pair back to a SymbolRecord by re-using the
+    /// existing name FST + same-file filter.
+    ///
+    /// Use [`subclasses_transitive`] for the full subtree.
+    pub fn subclasses(&self, parent_name: &str) -> Vec<SymbolRecord> {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut out: Vec<SymbolRecord> = Vec::new();
+        for r in self.lookup_refs_exact(parent_name) {
+            if r.kind != RefKind::InheritFrom { continue; }
+            let Some(child_name) = r.scope_path.last() else { continue };
+            let outer = &r.scope_path[..r.scope_path.len() - 1];
+            for s in self.lookup_exact(child_name) {
+                if s.file_id != r.file_id { continue; }
+                if s.scope_path.as_slice() != outer { continue; }
+                if seen.insert(s.id) {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// Transitive subclasses — direct subclasses plus their
+    /// subclasses, recursively. BFS, bounded by `max_depth` to keep
+    /// pathological hierarchies (deep tag traits, etc.) tractable.
+    /// `max_depth = 0` returns just the direct children (== subclasses).
+    pub fn subclasses_transitive(
+        &self,
+        parent_name: &str,
+        max_depth: usize,
+    ) -> Vec<SymbolRecord> {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut frontier: Vec<String> = vec![parent_name.to_string()];
+        let mut out: Vec<SymbolRecord> = Vec::new();
+        for _ in 0..=max_depth {
+            let mut next: Vec<String> = Vec::new();
+            for name in &frontier {
+                for s in self.subclasses(name) {
+                    if seen.insert(s.id) {
+                        next.push(s.name.clone());
+                        out.push(s);
+                    }
+                }
+            }
+            if next.is_empty() { break; }
+            frontier = next;
+        }
+        out
+    }
+
     pub fn lookup_exact(&self, name: &str) -> Vec<SymbolRecord> {
         let off = match self.fst.get(name.as_bytes()) {
             Some(v) => v,

@@ -272,6 +272,41 @@ enum Cmd {
         #[arg(long)]
         budget: Option<usize>,
     },
+    /// Find direct (or transitive) subclasses of a type. LSP analogue:
+    /// typeHierarchy/subtypes. Walks tree-sitter `InheritFrom` refs;
+    /// the child class is resolved via scope_path. Works across all
+    /// languages that emit inherit refs (Java/Kotlin/C++/Rust impls/…).
+    Subclasses {
+        /// Parent type/class/interface name.
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Restrict to children whose file path contains the SUBSTRING.
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
+        /// Walk the hierarchy this many levels deep. 0 = direct only.
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find implementations of an interface (Java/Kotlin idiom).
+    /// Alias for `subclasses`; symmetric LSP analogue.
+    Implementations {
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Prefix-match symbol names.
     Prefix {
         prefix: String,
@@ -944,6 +979,10 @@ fn main() -> Result<()> {
             cmd_clang_index(compile_commands, index, root, workers, max_file_bytes),
         Cmd::ClangStats { index } => cmd_clang_stats(index),
         Cmd::ClangLookup { index, path, offset } => cmd_clang_lookup(index, &path, offset),
+        Cmd::Subclasses { name, index, in_, depth, limit, json } =>
+            cmd_subclasses(name, index, in_, depth, limit, json),
+        Cmd::Implementations { name, index, in_, depth, limit, json } =>
+            cmd_subclasses(name, index, in_, depth, limit, json),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -2109,6 +2148,44 @@ fn cmd_def(
         print_results(&r, &filtered, limit, json);
     }
     log_query(&r, "def", &name, filtered.len(), filtered.len().min(limit), t);
+    Ok(())
+}
+
+/// `scry subclasses NAME` / `scry implementations NAME` — type-hierarchy
+/// lookup. `depth = 0` returns direct children; higher walks transitively.
+/// Output is one-line-per-child in the same scheme as `scry def`, or
+/// JSON when --json is set.
+fn cmd_subclasses(
+    name: String,
+    index: Option<PathBuf>,
+    in_: Option<String>,
+    depth: usize,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let t = Instant::now();
+    let r = open_index(index)?;
+    let results = if depth == 0 {
+        r.subclasses(&name)
+    } else {
+        r.subclasses_transitive(&name, depth)
+    };
+    let mut filtered: Vec<SymbolRecord> = results.into_iter()
+        .filter(|s| match in_.as_deref() {
+            None => true,
+            Some(p) => r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        })
+        .collect();
+    rank_symbols(&mut filtered, &r);
+    print_results(&r, &filtered, limit, json);
+    if !json {
+        eprintln!(
+            "[scry] cmd=subclasses q={:?} depth={} hits={} shown={} elapsed={}ms",
+            name, depth, filtered.len(),
+            filtered.len().min(limit), t.elapsed().as_millis(),
+        );
+    }
     Ok(())
 }
 
@@ -6023,6 +6100,31 @@ fn mcp_tools_list_result() -> serde_json::Value {
             })),
         ),
         tool(
+            "subclasses",
+            "Direct (or transitive) subclasses of a type. LSP \
+             typeHierarchy/subtypes. Set `depth: N` to walk the \
+             hierarchy N levels (default 0 = direct children only).",
+            obj(&["name"], serde_json::json!({
+                "name":  {"type": "string"},
+                "in":    in_prop,
+                "limit": limit_prop,
+                "depth": {"type": "integer", "minimum": 0, "default": 0,
+                    "description": "BFS depth. 0 = direct subclasses; 1 = grandchildren too; etc."},
+            })),
+        ),
+        tool(
+            "implementations",
+            "Implementations of an interface — alias for `subclasses` \
+             with Java/Kotlin-flavored naming. LSP \
+             implementationProvider/implementationsForType.",
+            obj(&["name"], serde_json::json!({
+                "name":  {"type": "string"},
+                "in":    in_prop,
+                "limit": limit_prop,
+                "depth": {"type": "integer", "minimum": 0, "default": 0},
+            })),
+        ),
+        tool(
             "prefix",
             "Symbols whose name starts with PREFIX (FST-backed \
              completion). Useful for 'what's everything starting \
@@ -6234,6 +6336,8 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "def"      => &["name"],
         "ref"      => &["name"],
         "callers"  => &["name"],
+        "subclasses"      => &["name"],
+        "implementations" => &["name"],
         "prefix"   => &["prefix"],
         "fuzzy"    => &["substr"],
         "grep"     => &["pattern"],
@@ -6740,6 +6844,12 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise)
         }
+        "subclasses" | "implementations" => {
+            let depth = args.get("depth")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize).unwrap_or(0);
+            serve_subclasses(reader, arg_str("name"), in_, depth, limit)
+        }
         "grep"    => {
             let ci = args.get("case_insensitive")
                 .and_then(serde_json::Value::as_bool)
@@ -7039,6 +7149,30 @@ fn serve_ref(
             }
         }
         out.push(ref_to_json(r, &rr));
+    }
+    serde_json::Value::Array(out)
+}
+
+/// `subclasses` / `implementations` JSON-RPC handler. Direct (depth=0)
+/// or transitive (depth>0) subtypes; --in prefix narrows to a subtree.
+fn serve_subclasses(
+    r: &StoreReader,
+    name: &str,
+    in_: Option<&str>,
+    depth: usize,
+    limit: usize,
+) -> serde_json::Value {
+    let prefix = in_.unwrap_or("");
+    let results = if depth == 0 {
+        r.subclasses(name)
+    } else {
+        r.subclasses_transitive(name, depth)
+    };
+    let mut out = Vec::new();
+    for s in results.into_iter() {
+        if out.len() >= limit { break; }
+        if !prefix.is_empty() && !file_in_prefix(r, s.file_id, prefix) { continue; }
+        out.push(symbol_to_json(r, &s));
     }
     serde_json::Value::Array(out)
 }

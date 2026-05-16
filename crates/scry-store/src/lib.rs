@@ -1476,3 +1476,230 @@ fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     bincode::deserialize_from(f)
         .map_err(|e| anyhow!("decode {}: {e}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scry_walker::FileKind;
+
+    /// Build a LazyVec-compatible pair on disk: data file holds an 8-byte
+    /// u64-LE length prefix followed by each record bincode-serialized
+    /// back to back; offsets file holds one u64-LE per record giving its
+    /// byte offset within the data file. Matches the on-disk format
+    /// produced by StoreWriter::finalize_streaming.
+    fn write_lazy_vec_files<T: serde::Serialize>(
+        dir: &Path,
+        items: &[T],
+    ) -> (PathBuf, PathBuf) {
+        let data_path = dir.join("data.bin");
+        let off_path = dir.join("offsets.bin");
+        let mut data = std::fs::File::create(&data_path).unwrap();
+        let mut off = std::fs::File::create(&off_path).unwrap();
+        let len = items.len() as u64;
+        std::io::Write::write_all(&mut data, &len.to_le_bytes()).unwrap();
+        let mut byte_pos: u64 = 8;
+        for it in items {
+            std::io::Write::write_all(&mut off, &byte_pos.to_le_bytes()).unwrap();
+            let bytes = bincode::serialize(it).unwrap();
+            std::io::Write::write_all(&mut data, &bytes).unwrap();
+            byte_pos += bytes.len() as u64;
+        }
+        (data_path, off_path)
+    }
+
+    fn unique_tmpdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("scry-store-test-{tag}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn sample_symbols() -> Vec<SymbolRecord> {
+        // Deliberately variable-size: different name lengths + scope_path
+        // sizes so the byte-offset arithmetic actually matters. A test
+        // built on fixed-stride records would not catch an offset bug.
+        vec![
+            SymbolRecord {
+                id: 1, name: "a".into(), fqn: None,
+                kind: SymbolKind::Class, file_id: 0,
+                byte_start: 0, byte_end: 1, line: 1, col: 1,
+                scope_path: vec![], lang: FileKind::Java,
+            },
+            SymbolRecord {
+                id: 2,
+                name: "ActivityManagerServiceWithAReallyVeryLongIdentifier".into(),
+                fqn: Some("com.android.server.am.ActivityManagerServiceWithAReallyVeryLongIdentifier".into()),
+                kind: SymbolKind::Method, file_id: 42,
+                byte_start: 100, byte_end: 1024, line: 999, col: 13,
+                scope_path: vec!["com".into(), "android".into(), "server".into(), "am".into()],
+                lang: FileKind::Java,
+            },
+            SymbolRecord {
+                id: 3, name: "x".into(), fqn: Some("x".into()),
+                kind: SymbolKind::Variable, file_id: 7,
+                byte_start: 0, byte_end: 1, line: 1, col: 1,
+                scope_path: vec!["one".into()], lang: FileKind::Rust,
+            },
+            SymbolRecord {
+                id: 4, name: "fourth".into(), fqn: None,
+                kind: SymbolKind::SoongModule, file_id: 1234,
+                byte_start: 12345, byte_end: 67890, line: 88, col: 4,
+                scope_path: vec![], lang: FileKind::Soong,
+            },
+            SymbolRecord {
+                id: 5, name: "transact".into(),
+                fqn: Some("android.os.Binder.transact".into()),
+                kind: SymbolKind::Method, file_id: 999,
+                byte_start: 5000, byte_end: 5500, line: 250, col: 17,
+                scope_path: vec!["android".into(), "os".into(), "Binder".into()],
+                lang: FileKind::Java,
+            },
+        ]
+    }
+
+    fn assert_symbol_eq(a: &SymbolRecord, b: &SymbolRecord) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.fqn, b.fqn);
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.file_id, b.file_id);
+        assert_eq!(a.byte_start, b.byte_start);
+        assert_eq!(a.byte_end, b.byte_end);
+        assert_eq!(a.line, b.line);
+        assert_eq!(a.col, b.col);
+        assert_eq!(a.scope_path, b.scope_path);
+        assert_eq!(a.lang, b.lang);
+    }
+
+    /// Sequential get(0..N) returns byte-identical records to the input.
+    #[test]
+    fn lazy_vec_sequential_roundtrip() {
+        let dir = unique_tmpdir("seq");
+        let syms = sample_symbols();
+        let (d, o) = write_lazy_vec_files(&dir, &syms);
+        let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
+        assert_eq!(lv.len(), syms.len());
+        for i in 0..syms.len() {
+            let got = lv.get(i).expect("in-range get must succeed");
+            assert_symbol_eq(&got, &syms[i]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reverse-order access catches "we accidentally assumed sequential
+    /// scan" — the lazy reader's job is random access via the offsets
+    /// sidecar; a bug that only worked when reading forwards would slip
+    /// past a sequential-only test.
+    #[test]
+    fn lazy_vec_reverse_access() {
+        let dir = unique_tmpdir("rev");
+        let syms = sample_symbols();
+        let (d, o) = write_lazy_vec_files(&dir, &syms);
+        let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
+        for i in (0..syms.len()).rev() {
+            let got = lv.get(i).unwrap();
+            assert_symbol_eq(&got, &syms[i]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Random-permutation access. Same correctness guarantee, harder to
+    /// satisfy with any caching-by-position scheme.
+    #[test]
+    fn lazy_vec_random_access() {
+        let dir = unique_tmpdir("rand");
+        let syms = sample_symbols();
+        let (d, o) = write_lazy_vec_files(&dir, &syms);
+        let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
+        for &i in &[3usize, 0, 4, 1, 2, 4, 3, 0] {
+            let got = lv.get(i).unwrap();
+            assert_symbol_eq(&got, &syms[i]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// iter() must yield ALL records in order — the production cmd_stats
+    /// lazy path relies on this for "iterate the index without loading it".
+    #[test]
+    fn lazy_vec_iter_full_passthrough() {
+        let dir = unique_tmpdir("iter");
+        let syms = sample_symbols();
+        let (d, o) = write_lazy_vec_files(&dir, &syms);
+        let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
+        let collected: Vec<SymbolRecord> = lv.iter().collect();
+        assert_eq!(collected.len(), syms.len());
+        for (a, b) in collected.iter().zip(syms.iter()) {
+            assert_symbol_eq(a, b);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Out-of-bounds must be None, never panic. This is the LLM-side
+    /// safety net: a stale symbol id from a fresher index that got
+    /// looked up against an older one must not crash the reader.
+    #[test]
+    fn lazy_vec_out_of_bounds_returns_none() {
+        let dir = unique_tmpdir("oob");
+        let syms = sample_symbols();
+        let (d, o) = write_lazy_vec_files(&dir, &syms);
+        let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
+        assert!(lv.get(syms.len()).is_none());
+        assert!(lv.get(syms.len() + 100).is_none());
+        assert!(lv.get(usize::MAX).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Empty vec edge case: open succeeds, len == 0, iter is empty,
+    /// any get is None. Matters because finalize_streaming will emit
+    /// zero-length sidecars for a corpus with no symbols of a kind
+    /// (e.g. a Linux-only index has no Java SymbolRecords, but the
+    /// file structure is still produced).
+    #[test]
+    fn lazy_vec_empty() {
+        let dir = unique_tmpdir("empty");
+        let syms: Vec<SymbolRecord> = vec![];
+        let (d, o) = write_lazy_vec_files(&dir, &syms);
+        let lv = LazyVec::<SymbolRecord>::open(&d, &o).unwrap();
+        assert_eq!(lv.len(), 0);
+        assert!(lv.is_empty());
+        assert!(lv.get(0).is_none());
+        assert_eq!(lv.iter().count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// LazyVec is generic over T — works equally for RefRecord. Pin
+    /// that so future T-specific changes don't quietly skip refs.
+    #[test]
+    fn lazy_vec_refs_also_roundtrip() {
+        let dir = unique_tmpdir("refs");
+        let refs = vec![
+            RefRecord {
+                name: "transact".into(), kind: RefKind::Call, file_id: 1,
+                byte_start: 100, byte_end: 108, line: 50, col: 12,
+                scope_path: vec!["Foo".into()], lang: FileKind::Java,
+                resolved_to: None,
+            },
+            RefRecord {
+                name: "Binder".into(), kind: RefKind::TypeUse, file_id: 2,
+                byte_start: 0, byte_end: 6, line: 1, col: 1,
+                scope_path: vec![], lang: FileKind::Java,
+                resolved_to: Some(12345),
+            },
+        ];
+        let (d, o) = write_lazy_vec_files(&dir, &refs);
+        let lv = LazyVec::<RefRecord>::open(&d, &o).unwrap();
+        assert_eq!(lv.len(), refs.len());
+        for (i, expected) in refs.iter().enumerate() {
+            let got = lv.get(i).unwrap();
+            assert_eq!(got.name, expected.name);
+            assert_eq!(got.kind, expected.kind);
+            assert_eq!(got.file_id, expected.file_id);
+            assert_eq!(got.line, expected.line);
+            assert_eq!(got.resolved_to, expected.resolved_to);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

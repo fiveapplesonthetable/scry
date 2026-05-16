@@ -132,6 +132,24 @@ to `.tmp/` and atomically renamed into place. The `StoreReader`
 `mmap`s every sidecar; queries decode one record at a time without
 loading the full 10 GB columnar payload.
 
+## Editor bindings
+
+First-class plugins for Emacs, Vim, and VS Code live in
+[`editors/`](editors/). Each spawns one long-lived `scry serve`
+per editor session and hooks into the editor's standard
+autocomplete / jump-to-def / find-references APIs:
+
+| editor   | install                                               | autocomplete    | jump-to-def | find-refs | outline |
+|----------|-------------------------------------------------------|:---------------:|:-----------:|:---------:|:-------:|
+| Emacs    | [editors/emacs/README.md](editors/emacs/README.md)    | ✓ CAPF          | ✓ M-./xref  | ✓ M-?/xref| ✓       |
+| Vim      | [editors/vim/README.md](editors/vim/README.md)        | ✓ omnifunc      | ✓ :ScryDef  | ✓         | ✓       |
+| VS Code  | [editors/vscode/README.md](editors/vscode/README.md)  | ✓ provider API  | ✓ F12       | ✓ Sh+F12  | ✓       |
+
+All three pass an end-to-end suite (`editors/tests/run_all.sh`)
+that exercises every primitive against a real index. Sub-10 ms
+warm-cache round-trips inside the editor are the design point —
+fast enough for keystroke-driven completion.
+
 ## Also works on
 
 The language set above is broad enough to cover other

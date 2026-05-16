@@ -1,0 +1,83 @@
+{
+  "name": "scry-vscode",
+  "displayName": "scry",
+  "description": "Lightning-fast code intel (autocomplete + jump-to-def + find-refs) backed by the scry static binary.",
+  "version": "0.1.0",
+  "publisher": "fiveapplesonthetable",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fiveapplesonthetable/scry"
+  },
+  "categories": ["Programming Languages", "Other"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "scry",
+      "properties": {
+        "scry.binary": {
+          "type": "string",
+          "default": "scry",
+          "description": "Path to the scry binary. Resolved via PATH if relative."
+        },
+        "scry.indexDir": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the scry index directory. Empty = scry's own default ($SCRY_INDEX or /mnt/agent/scry-index)."
+        },
+        "scry.socketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Unix socket path used to talk to the per-window scry daemon. Empty = /tmp/scry-vscode-${pid}.sock."
+        },
+        "scry.maxCompletions": {
+          "type": "number",
+          "default": 50,
+          "description": "Max number of candidates `scry prefix` returns for autocomplete."
+        },
+        "scry.minCompletionLength": {
+          "type": "number",
+          "default": 2,
+          "description": "Minimum prefix length before autocomplete fires."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "scry.def",
+        "title": "scry: Go to definition (any kind)"
+      },
+      {
+        "command": "scry.callers",
+        "title": "scry: Find callers"
+      },
+      {
+        "command": "scry.outline",
+        "title": "scry: Outline current file"
+      },
+      {
+        "command": "scry.stats",
+        "title": "scry: Show daemon stats"
+      },
+      {
+        "command": "scry.restart",
+        "title": "scry: Restart daemon"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

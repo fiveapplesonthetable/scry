@@ -7,6 +7,110 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-05-16
+
+The editor-bindings drop. scry now ships first-class plugins for
+the three editors that matter: Emacs (gold-standard), Vim,
+VS Code. All three speak the same JSON-RPC to a long-lived
+`scry serve` over a unix socket — autocomplete + jump-to-def +
+find-refs land at the standard editor APIs (`completion-at-point` /
+`xref` for Emacs, `omnifunc` / quickfix for Vim, the four LSP-style
+provider APIs for VS Code). Headless e2e suite for each (`emacs
+--batch` / `vim -nu` / `node + ScryClient`) covers 23 assertions
+total; all 3 suites green this release.
+
+### Added — `editors/`
+
+- **`editors/emacs/scry.el`** — single-file Emacs 29+ plugin.
+  Registers a `scry` xref backend so `M-.` / `M-?` work out of
+  the box, plus a `completion-at-point` provider with rich
+  annotations (kind + lang + filename per candidate). `scry-mode`
+  per-buffer; `global-scry-mode` for prog-mode-wide. Bignum-safe
+  JSON parser (uses `json-read-from-string`, since `json-parse-string`
+  rejects scry's u64 symbol IDs). 9 customization variables for
+  binary path / index dir / socket path / completion length / etc.
+  9 interactive commands (`scry-def`, `scry-callers`, `scry-ref`,
+  `scry-outline`, `scry-prefix`, `scry-fuzzy`, `scry-stats`,
+  `scry-restart`, plus `scry-mode` / `global-scry-mode`).
+- **`editors/vim/`** — vim 8+ plugin (`plugin/scry.vim` +
+  `autoload/scry.vim`). Async via vim 8 channels (`ch_open` on
+  unix sockets). 7 commands (`:ScryDef`, `:ScryCallers`,
+  `:ScryRef`, `:ScryPrefix`, `:ScryFuzzy`, `:ScryOutline`,
+  `:ScryStats`, `:ScryRestart`) all populating the quickfix list,
+  plus `scry#omnifunc` for `:setlocal omnifunc=scry#omnifunc`-style
+  completion wiring.
+- **`editors/vscode/`** — TypeScript extension (`package.json` +
+  `tsconfig.json` + `src/extension.ts`). Registers
+  `CompletionItemProvider`, `DefinitionProvider`,
+  `ReferenceProvider`, `DocumentSymbolProvider` against every
+  language scry knows. 5 commands (`scry.def`, `scry.callers`,
+  `scry.outline`, `scry.stats`, `scry.restart`). 5 configuration
+  settings. Bignum-safe JSON via a pre-parse rewrite of the `id`
+  field so `JSON.parse` doesn't blow Number.MAX_SAFE_INTEGER.
+
+### Added — protocol + tests
+
+- **`editors/common/PROTOCOL.md`** — the wire-shape contract
+  every plugin targets: request/response shape, the ~7 commands
+  plugins actually use, latency budgets, the persistent-socket
+  pattern, expected error modes. Stable; doesn't change without
+  a minor-version bump.
+- **`editors/tests/e2e_emacs.sh`** — emacs `--batch` driver that
+  exercises every public function plus the xref-backend / CAPF
+  integration points. 8 assertions.
+- **`editors/tests/e2e_vim.sh`** — vim `-nu` driver, same coverage
+  via `scry#request` + `scry#omnifunc`. 8 assertions.
+- **`editors/tests/e2e_vscode.sh`** — node driver that imports the
+  compiled `extension.js`'s `ScryClient` directly (no VS Code
+  binary needed in CI). 7 assertions, including a u64-ID
+  precision check that catches JSON parser regressions.
+- **`editors/tests/run_all.sh`** — master harness. Builds the
+  scry binary + a scry-of-scry index if missing, runs all three
+  suites, reports pass/fail. Exits 0 when all 3 green.
+
+### Per-editor READMEs
+
+Each editor directory carries an install + index + use guide:
+- `editors/README.md` — overview matrix.
+- `editors/emacs/README.md` — load-path / use-package / global recipes,
+  full keybinding table, troubleshooting, headless-verify command.
+- `editors/vim/README.md` — vim-plug / packer.nvim / manual install,
+  recommended keymaps, omnifunc wiring.
+- `editors/vscode/README.md` — developer install + future `.vsix`
+  install, settings table, troubleshooting.
+
+Linux is the supported platform (unix-socket transport).
+
+### Validated
+
+All three plugins pass their headless e2e on the scry-of-scry
+index (1357 symbols, 53 files, 591 ms cold build). The full
+matrix:
+
+| primitive  | Emacs | Vim | VS Code |
+|------------|:-----:|:---:|:-------:|
+| `stats`    | ✓     | ✓   | ✓       |
+| `prefix`   | ✓     | ✓   | ✓       |
+| `def`      | ✓     | ✓   | ✓       |
+| `callers`  | ✓     | ✓   | ✓       |
+| `outline`  | ✓     | ✓   | ✓       |
+| `fuzzy`    | ✓     | ✓   | ✓       |
+| `xref-backend-definitions` integration | ✓ | — | — |
+| `completion-at-point` CAPF shape | ✓ | — | — |
+| `omnifunc` findstart + candidates | — | ✓ | — |
+| u64 ID JSON precision | (via json.el) | (via json_decode) | ✓ explicit assertion |
+
+### Notes
+
+- The `serve` daemon was already capable of every primitive
+  editors need; this release adds zero new CLI / JSON-RPC
+  surface. The work is in the plugins themselves + the
+  protocol documentation + the e2e harness.
+- u64 symbol IDs are the only protocol-level edge case plugin
+  authors hit. Each binding handles it differently because each
+  language's JSON parser handles bignums differently. All three
+  approaches are documented in their respective plugin source.
+
 ## [0.1.8] — 2026-05-16
 
 The "walked-but-not-symbolized" cleanup. Two more tree-sitter parsers

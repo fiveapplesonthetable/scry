@@ -150,6 +150,7 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
         Rust => rust_spec(),
         Go => go_spec(),
         Python => python_spec(),
+        Bash => bash_spec(),
         _ => return Ok(Vec::new()),
     };
     let mut syms = extract_with(spec, source)?;
@@ -875,6 +876,50 @@ fn python_spec() -> &'static LangSpec {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Bash — AOSP build scripts (envsetup.sh, soong_ui.bash, etc.).
+//
+// Coverage is deliberately tight: function definitions + variable
+// assignments at command-level. The high-value targets are the
+// `lunch`, `mm`, `mmm`, `croot`, `cgrep` family of build commands
+// users actually invoke; these are all just bash `name() { ... }`
+// declarations in envsetup.sh.
+// ---------------------------------------------------------------------------
+
+fn bash_spec() -> &'static LangSpec {
+    static SPEC: OnceLock<LangSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static LANG: OnceLock<Language> = OnceLock::new();
+        static QUERY: OnceLock<Query> = OnceLock::new();
+        let lang = LANG.get_or_init(|| tree_sitter_bash::LANGUAGE.into());
+        let q = QUERY.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (function_definition name: (word) @name) @def.function
+                (variable_assignment name: (variable_name) @name) @def.var
+                "#,
+            )
+            .unwrap_or_else(|_| Query::new(lang, "(program) @def.module").unwrap())
+        });
+        LangSpec {
+            language: lang,
+            query: q,
+            capture_kinds: &[
+                ("def.function", SymbolKind::Function),
+                ("def.var", SymbolKind::Variable),
+                ("def.module", SymbolKind::Module),
+            ],
+            name_capture: "name",
+            // No nesting scopes: bash function definitions inside other
+            // functions are exceedingly rare in AOSP scripts and would
+            // just produce noise. A flat name-list is the right shape.
+            scope_node_kinds: &[],
+            package_node_kind: None,
+        }
+    })
+}
+
 // ===========================================================================
 // REF QUERIES — one per language. Phase 2 focuses on call sites + ctors +
 // inheritance edges, which gives us callers/callees/impls cheaply. Generic
@@ -1160,7 +1205,7 @@ fn ts_unified(kind: FileKind, src: &[u8]) -> (Vec<RawSymbol>, Vec<RawRef>) {
 
 /// Built-in tree-sitter source-language parsers. Call this from your
 /// FormatRegistry setup to get C / C++ / Header / Java / Kotlin / Rust /
-/// Go / Python coverage out of the box.
+/// Go / Python / Bash coverage out of the box.
 pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
     vec![
         Box::new(FnAdapter { name: "ts-java", kinds: &[FileKind::Java], f: ts_unified }),
@@ -1170,6 +1215,7 @@ pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
         Box::new(FnAdapter { name: "ts-rust", kinds: &[FileKind::Rust], f: ts_unified }),
         Box::new(FnAdapter { name: "ts-go", kinds: &[FileKind::Go], f: ts_unified }),
         Box::new(FnAdapter { name: "ts-python", kinds: &[FileKind::Python], f: ts_unified }),
+        Box::new(FnAdapter { name: "ts-bash", kinds: &[FileKind::Bash], f: ts_unified }),
     ]
 }
 
@@ -1564,6 +1610,43 @@ int BBinder::transact(int code) { return 0; }
             "named companion fun must scope to [H2, Builder]. all:\n  {}",
             all.join("\n  "),
         );
+    }
+
+    /// Bash extraction — the AOSP build script case. envsetup.sh
+    /// defines `lunch`, `mm`, `mmm`, `croot`, `cgrep` etc. as plain
+    /// `name() { ... }` declarations; we should pick those up.
+    #[test]
+    fn bash_envsetup_functions() {
+        let src = br#"
+            #!/bin/bash
+            BUILD_TOP=$(pwd)
+            export TARGET_PRODUCT=aosp_arm64
+
+            function lunch() {
+                local _lunch_combo=$1
+                echo "lunched $_lunch_combo"
+            }
+
+            mm() {
+                m -j "$@"
+            }
+
+            mmm() {
+                m -j "$@"
+            }
+        "#;
+        let syms = extract(FileKind::Bash, src).unwrap();
+        let names: std::collections::HashSet<&str> =
+            syms.iter().map(|s| s.name.as_str()).collect();
+        for must_have in &["lunch", "mm", "mmm"] {
+            assert!(names.contains(must_have),
+                    "bash extraction missing function `{must_have}`; got: {names:?}");
+        }
+        // The variable assignments at top level should be captured too.
+        for var in &["BUILD_TOP", "TARGET_PRODUCT"] {
+            assert!(names.contains(var),
+                    "bash extraction missing variable `{var}`; got: {names:?}");
+        }
     }
 
     /// Sealed-class hierarchies and inline reified fns are already

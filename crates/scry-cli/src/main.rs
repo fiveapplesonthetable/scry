@@ -366,6 +366,14 @@ enum Cmd {
         /// is cut early and the output is marked as truncated. 0 = unlimited.
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
+        /// Dump the query plan to stderr instead of running the search:
+        /// extracted literals + per-trigram posting sizes + intersection
+        /// candidate count + a rough scan-cost estimate. Use when a grep
+        /// feels too slow and you want to know why. Implies --limit 0
+        /// (no rows printed); suppresses the JSON / lines / count
+        /// formats.
+        #[arg(long)]
+        explain: bool,
     },
     /// Symbols and references in files that changed since a git
     /// commit. Useful for code review and for agents working on a
@@ -598,14 +606,24 @@ enum Cmd {
     /// from the nearest enclosing OWNERS files until the root. The
     /// closest-to-PATH owner list comes first, more-distant
     /// inherited owners after — matches Gerrit's evaluation order.
-    /// Supports --include-deep to show every level; default shows
-    /// only the nearest non-empty owner set.
+    ///
+    /// Default shows the nearest non-empty owner set. --include-deep
+    /// shows every layer. --accumulate emits the *union* of emails
+    /// across every layer the walk visited (the Gerrit "approvers"
+    /// set). All three modes respect `set noparent`: when an OWNERS
+    /// file declares it, the walk stops at that level and inherited
+    /// owners above are not considered.
     Owner {
         path: PathBuf,
         #[arg(long)]
         index: Option<PathBuf>,
         #[arg(long)]
         include_deep: bool,
+        /// Emit the union of emails across all visited OWNERS layers
+        /// (the Gerrit "potential approvers" set), sorted and
+        /// deduplicated.
+        #[arg(long)]
+        accumulate: bool,
         #[arg(long)]
         json: bool,
     },
@@ -751,10 +769,10 @@ fn main() -> Result<()> {
         Cmd::Tldr { path, index, json } => cmd_tldr(path, index, json),
         Cmd::Grep {
             pattern, index, regex, lang, in_, limit, json, workers,
-            max_file_bytes, mem_cap, format,
+            max_file_bytes, mem_cap, format, explain,
         } => cmd_grep(
             pattern, index, regex, lang, in_, limit, json, workers,
-            max_file_bytes, mem_cap, format,
+            max_file_bytes, mem_cap, format, explain,
         ),
         Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
         Cmd::Mcp { index } => cmd_mcp(index),
@@ -764,8 +782,8 @@ fn main() -> Result<()> {
             cmd_diff(since, in_, verbose, limit, index, json),
         Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
         Cmd::Health { index, json } => cmd_health(index, json),
-        Cmd::Owner { path, index, include_deep, json } =>
-            cmd_owner(path, index, include_deep, json),
+        Cmd::Owner { path, index, include_deep, accumulate, json } =>
+            cmd_owner(path, index, include_deep, accumulate, json),
         Cmd::BuildTrigrams { index, workers, max_file_bytes } => {
             cmd_build_trigrams(index, workers, max_file_bytes)
         }
@@ -2616,6 +2634,50 @@ fn print_results(reader: &StoreReader, syms: &[SymbolRecord], limit: usize, json
         );
     }
     eprintln!("\n{} results (showing {})", syms.len(), syms.len().min(limit));
+    emit_narrow_hint(reader, syms, limit);
+}
+
+/// Heuristic auto-narrow hint. When the result list saturates the
+/// limit AND there are visibly more candidates than shown, append a
+/// one-line stderr suggestion pointing at the most useful filter
+/// dimension: the dominant directory prefix of the shown results.
+/// Suppressed by SCRY_QUIET=1 (matches the stale-index warning).
+///
+/// We only fire when:
+///   - the caller asked for ≥ 2 results (limit=1 is a deliberate
+///     "I want the top hit" — no point nudging)
+///   - we hit the cap (syms.len() >= limit)
+///   - the visible hits actually share a common 2-segment prefix
+///     deeper than the indexed roots (so the suggestion is concrete)
+fn emit_narrow_hint(reader: &StoreReader, syms: &[SymbolRecord], limit: usize) {
+    if limit < 2 || syms.len() < limit { return; }
+    if std::env::var("SCRY_QUIET").map(|v| v == "1").unwrap_or(false) { return; }
+    // Collect display paths of the shown rows.
+    let paths: Vec<String> = syms.iter().take(limit)
+        .filter_map(|s| reader.files.get(s.file_id as usize)
+            .map(|f| f.display_path(&reader.roots)))
+        .collect();
+    if paths.len() < limit { return; }
+    // Find the longest common path prefix (segment-wise) and shave
+    // until it's at least 2 segments deep — single-segment hints
+    // like "--in frameworks/" aren't useful.
+    let split: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect()).collect();
+    let max = split.iter().map(Vec::len).min().unwrap_or(0);
+    let mut common = 0;
+    for i in 0..max {
+        let first = split[0][i];
+        if split.iter().all(|s| s[i] == first) { common += 1; } else { break; }
+    }
+    if common < 2 { return; }
+    // Drop the last segment if it looks like a filename; we want a
+    // directory prefix, not a single file.
+    while common >= 2 {
+        let seg = split[0][common - 1];
+        if seg.contains('.') { common -= 1; } else { break; }
+    }
+    if common < 2 { return; }
+    let hint = split[0][..common].join("/");
+    eprintln!("[scry] hit --limit; try `--in {hint}/` to narrow, or tighten --kind / --lang.");
 }
 
 fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool) {
@@ -2677,6 +2739,7 @@ fn cmd_grep(
     max_file_bytes: u64,
     mem_cap: u32,
     format: Option<String>,
+    explain: bool,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2688,6 +2751,52 @@ fn cmd_grep(
                 "--format must be one of: lines, count (got '{f}')"
             );
         }
+    }
+    if explain {
+        // --explain short-circuits the actual scan: dump the query
+        // plan to stdout, exit. Works on literal patterns; for regex
+        // we report that the pre-filter does literal-extraction
+        // analysis instead.
+        let r = open_index(index)?;
+        if is_regex {
+            println!("regex pattern; trigram pre-filter runs literal-extraction analysis.");
+            println!("(use a literal pattern with --explain for a per-trigram breakdown)");
+            // For regex, still show whether ANY trigram filter is feasible.
+            let cs = grep_candidates_for_regex(&r, &pattern);
+            match cs {
+                Some(c) => println!("regex→trigram pre-filter candidates: {}", c.len()),
+                None => println!("regex has no extractable literal — would full-scan."),
+            }
+            return Ok(());
+        }
+        let exp = r.grep_explain(pattern.as_bytes());
+        println!("query:      {:?}", pattern);
+        match exp {
+            None => {
+                println!("plan:       no trigram pre-filter (pattern < 3 bytes OR no trigram index)");
+                println!("scan-cost:  full-scan of every file matching --lang/--in (worst case)");
+            }
+            Some(e) => {
+                println!("trigrams ({} extracted, smallest-first intersection):", e.per_trigram.len());
+                // Sort visualization smallest-first so the reader can see
+                // which trigram drove the intersection.
+                let mut rows = e.per_trigram.clone();
+                rows.sort_by_key(|(_, n)| *n);
+                for (t, n) in &rows {
+                    println!("  {:<6} {:>10} files", format!("{:?}", t), n);
+                }
+                println!("candidates: {} files post-intersection", e.candidates);
+                // Rough scan cost: average file size on this index × candidates.
+                let avg_bytes = if !r.files.is_empty() {
+                    let total: u64 = r.files.iter().map(|f| f.size).sum();
+                    total / r.files.len() as u64
+                } else { 0 };
+                let est_bytes = (e.candidates as u64).saturating_mul(avg_bytes);
+                println!("scan-cost:  ~{} estimated I/O ({} candidates × {} avg file size)",
+                    human_bytes(est_bytes), e.candidates, human_bytes(avg_bytes));
+            }
+        }
+        return Ok(());
     }
     let t = Instant::now();
     if let Some(n) = workers {
@@ -4631,6 +4740,7 @@ fn cmd_owner(
     path: PathBuf,
     index: Option<PathBuf>,
     include_deep: bool,
+    accumulate: bool,
     json: bool,
 ) -> Result<()> {
     let r = open_index(index)?;
@@ -4646,8 +4756,12 @@ fn cmd_owner(
         None => path.clone(),  // not in the index; still walk fs path
     };
 
-    // Collect OWNERS files by walking up from the target.
-    let mut layers: Vec<(PathBuf, Vec<String>, Vec<String>)> = Vec::new();
+    // Collect OWNERS files by walking up from the target. Gerrit's
+    // semantics: walk continues until either the filesystem root or
+    // an OWNERS file that declares `set noparent`. The set-noparent
+    // file itself IS visited and its emails count; only the inherited
+    // chain above it is cut.
+    let mut layers: Vec<OwnersLayer> = Vec::new();
     let mut cur = if target_path.is_file() {
         target_path.parent().map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("/"))
@@ -4657,16 +4771,27 @@ fn cmd_owner(
     loop {
         let owners_path = cur.join("OWNERS");
         if owners_path.is_file() {
-            let (emails, per_file) = parse_owners_file(&owners_path);
-            if include_deep || !emails.is_empty() || !per_file.is_empty() {
-                layers.push((owners_path.clone(), emails.clone(), per_file));
+            let parsed = parse_owners_file(&owners_path);
+            // Always record set-noparent layers (the user wants to know
+            // a boundary was reached) and any layer with content.
+            let has_content = !parsed.emails.is_empty() || !parsed.per_file.is_empty();
+            if include_deep || accumulate || has_content || parsed.noparent {
+                layers.push(OwnersLayer {
+                    file: owners_path.clone(),
+                    emails: parsed.emails.clone(),
+                    per_file: parsed.per_file,
+                    noparent: parsed.noparent,
+                });
             }
-            // Default behavior: stop after the first OWNERS file that
-            // resolves to at least one direct email entry. AOSP often
-            // uses per-file-only directories before bottoming out at a
-            // top-level OWNERS with explicit emails — this matches
-            // "who do I @-mention" intent.
-            if !include_deep && !emails.is_empty() {
+            // Nearest-non-empty: legacy default. Stop after first
+            // direct-email hit. Does NOT trigger when accumulate or
+            // include-deep is set — those want the full walk.
+            if !include_deep && !accumulate && !parsed.emails.is_empty() {
+                break;
+            }
+            // set noparent always stops the walk after visiting this
+            // file, regardless of mode.
+            if parsed.noparent {
                 break;
             }
         }
@@ -4680,30 +4805,62 @@ fn cmd_owner(
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        let arr: Vec<serde_json::Value> = layers.iter().map(|(p, emails, per_file)| serde_json::json!({
-            "owners_file": p.display().to_string(),
-            "emails": emails,
-            "per_file_rules": per_file,
+        let arr: Vec<serde_json::Value> = layers.iter().map(|l| serde_json::json!({
+            "owners_file":    l.file.display().to_string(),
+            "emails":         l.emails,
+            "per_file_rules": l.per_file,
+            "set_noparent":   l.noparent,
         })).collect();
-        writeln!(out, "{}", serde_json::json!({
-            "path": target_path.display().to_string(),
+        let mut envelope = serde_json::json!({
+            "path":   target_path.display().to_string(),
             "layers": arr,
-        }))?;
+        });
+        if accumulate {
+            let mut all: Vec<String> = layers.iter()
+                .flat_map(|l| l.emails.iter().cloned()).collect();
+            all.sort();
+            all.dedup();
+            envelope["approvers"] = serde_json::json!(all);
+        }
+        writeln!(out, "{}", envelope)?;
     } else if layers.is_empty() {
         println!("(no OWNERS file above {})", target_path.display());
     } else {
         println!("owners for {}:", target_path.display());
-        for (p, emails, per_file) in &layers {
-            println!("  via {}", p.display());
-            for e in emails { println!("    {e}"); }
-            for pf in per_file { println!("    per-file: {pf}"); }
+        for l in &layers {
+            let np = if l.noparent { " [set noparent]" } else { "" };
+            println!("  via {}{}", l.file.display(), np);
+            for e in &l.emails { println!("    {e}"); }
+            for pf in &l.per_file { println!("    per-file: {pf}"); }
+        }
+        if accumulate {
+            let mut all: Vec<String> = layers.iter()
+                .flat_map(|l| l.emails.iter().cloned()).collect();
+            all.sort();
+            all.dedup();
+            println!();
+            println!("approvers ({}):", all.len());
+            for e in &all { println!("  {e}"); }
         }
     }
     Ok(())
 }
 
-/// Parse an OWNERS file: collect direct email entries AND per-file
-/// rules separately. Returns (emails, per_file_rules).
+struct OwnersLayer {
+    file: PathBuf,
+    emails: Vec<String>,
+    per_file: Vec<String>,
+    noparent: bool,
+}
+
+struct OwnersParsed {
+    emails: Vec<String>,
+    per_file: Vec<String>,
+    noparent: bool,
+}
+
+/// Parse an OWNERS file: collect direct email entries, per-file rules,
+/// and the `set noparent` flag.
 ///
 /// Direct emails are lines containing `@` with no spaces — the most
 /// common form (`alice@example.com`). `per-file PATTERN = EMAILS_OR_FILE`
@@ -4711,33 +4868,41 @@ fn cmd_owner(
 /// the caller can see "this dir has no direct owners but ActivityManager*
 /// is owned by file:/ACTIVITY_MANAGER_OWNERS".
 ///
-/// Skipped: comments (`#…`), `set noparent`, `include …` (those would
-/// require following the include chain — out of scope for v1).
-fn parse_owners_file(path: &Path) -> (Vec<String>, Vec<String>) {
+/// `set noparent` is a Gerrit-defined directive meaning "do not inherit
+/// from any OWNERS file above this one". cmd_owner uses this to halt
+/// the walk. `include …` directives still aren't followed (out of
+/// scope; would require recursive resolution against the indexed tree).
+fn parse_owners_file(path: &Path) -> OwnersParsed {
     let txt = match std::fs::read_to_string(path) {
-        Ok(s) => s, Err(_) => return (Vec::new(), Vec::new()),
+        Ok(s) => s,
+        Err(_) => return OwnersParsed { emails: Vec::new(), per_file: Vec::new(), noparent: false },
     };
     let mut emails = Vec::new();
     let mut per_file = Vec::new();
+    let mut noparent = false;
     for line in txt.lines() {
         let trim = line.trim();
         if trim.is_empty() || trim.starts_with('#') { continue; }
+        // Gerrit accepts both "set noparent" and the bare "noparent" form
+        // in practice; honor both.
+        if trim == "set noparent" || trim == "noparent" {
+            noparent = true;
+            continue;
+        }
         if trim.starts_with("set ") || trim.starts_with("include ") { continue; }
         if let Some(rest) = trim.strip_prefix("per-file") {
             per_file.push(rest.trim().to_string());
             continue;
         }
         if trim.starts_with("file:") {
-            // Top-level file:... reference; treat similarly to per-file.
             per_file.push(trim.to_string());
             continue;
         }
-        // Plain email line.
         if trim.contains('@') && !trim.contains(' ') {
             emails.push(trim.to_string());
         }
     }
-    (emails, per_file)
+    OwnersParsed { emails, per_file, noparent }
 }
 
 /// `scry diff --since COMMITISH` — surface symbols/refs in files
@@ -7031,38 +7196,56 @@ mod tests {
              file:/TOP_LEVEL_REF\n\
              not_an_email_just_text\n"
         ).unwrap();
-        let (emails, per_file) = parse_owners_file(&tmp);
-        // Two emails, in file order; comments + set + include skipped.
-        assert_eq!(emails, vec![
+        let parsed = parse_owners_file(&tmp);
+        // Two emails, in file order; comments + plain `set <other>` + include skipped.
+        assert_eq!(parsed.emails, vec![
             "alice@example.com".to_string(),
             "bob@example.com".to_string(),
         ]);
         // Two per-file rules + the top-level file: reference (= 3 entries).
-        assert_eq!(per_file.len(), 3);
-        assert!(per_file.iter().any(|p| p.contains("ActivityManager*")));
-        assert!(per_file.iter().any(|p| p.contains("carol@example.com")));
-        assert!(per_file.iter().any(|p| p.starts_with("file:")));
+        assert_eq!(parsed.per_file.len(), 3);
+        assert!(parsed.per_file.iter().any(|p| p.contains("ActivityManager*")));
+        assert!(parsed.per_file.iter().any(|p| p.contains("carol@example.com")));
+        assert!(parsed.per_file.iter().any(|p| p.starts_with("file:")));
+        // The `set noparent` line in the fixture sets the flag.
+        assert!(parsed.noparent, "set noparent must be recognized");
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Missing file → empty pair, never panics.
+    /// Missing file → empty parsed record, never panics.
     #[test]
     fn parse_owners_missing_file_returns_empty() {
-        let (e, p) = parse_owners_file(Path::new("/no/such/OWNERS"));
-        assert!(e.is_empty());
-        assert!(p.is_empty());
+        let parsed = parse_owners_file(Path::new("/no/such/OWNERS"));
+        assert!(parsed.emails.is_empty());
+        assert!(parsed.per_file.is_empty());
+        assert!(!parsed.noparent);
     }
 
-    /// Comments-only file → empty pair.
+    /// Comments-only file → empty parsed record.
     #[test]
     fn parse_owners_comments_only() {
         let tmp = std::env::temp_dir().join(
             format!("scry-owners-comments-{}", std::process::id())
         );
         std::fs::write(&tmp, "# just\n# comments\n\n").unwrap();
-        let (e, p) = parse_owners_file(&tmp);
-        assert!(e.is_empty());
-        assert!(p.is_empty());
+        let parsed = parse_owners_file(&tmp);
+        assert!(parsed.emails.is_empty());
+        assert!(parsed.per_file.is_empty());
+        assert!(!parsed.noparent);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Bare `noparent` (without the `set ` prefix) is also accepted —
+    /// some AOSP OWNERS files use the shorter form.
+    #[test]
+    fn parse_owners_bare_noparent_recognized() {
+        let tmp = std::env::temp_dir().join(
+            format!("scry-owners-bare-noparent-{}", std::process::id())
+        );
+        std::fs::write(&tmp, "noparent\nlocal@example.com\n").unwrap();
+        let parsed = parse_owners_file(&tmp);
+        assert!(parsed.noparent, "bare `noparent` must set the flag");
+        assert_eq!(parsed.emails, vec!["local@example.com".to_string()]);
         let _ = std::fs::remove_file(&tmp);
     }
 }

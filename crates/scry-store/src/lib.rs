@@ -433,6 +433,20 @@ impl SymbolRecord {
 // Manifest
 // ---------------------------------------------------------------------------
 
+/// Diagnostic payload returned by [`StoreReader::grep_explain`]:
+/// the trigrams extracted from the query and how many files each one
+/// covers, plus the final intersection (the candidate set the grep
+/// scanner actually visits). Plain data; no formatting.
+#[derive(Debug, Clone)]
+pub struct GrepExplain {
+    /// (trigram text, posting size) in input order. A 0-size entry
+    /// means the trigram was absent from the FST — the intersection
+    /// is necessarily empty.
+    pub per_trigram: Vec<(String, usize)>,
+    /// Final candidate file count after intersection + tombstone filter.
+    pub candidates: usize,
+}
+
 /// Current on-disk format version. Stamped into every manifest the writer
 /// produces. Bumped only when the *layout* of files in the index changes
 /// in a way that a reader compiled against the new layout cannot tolerate
@@ -1824,6 +1838,55 @@ impl StoreReader {
             result.retain(|f| !self.is_tombstoned(*f));
         }
         Some(result)
+    }
+
+    /// Diagnostic version of [`Self::grep_candidates`] that returns the
+    /// per-trigram posting sizes alongside the final candidate count.
+    /// Powers `scry grep --explain` — agents and humans can see *why*
+    /// a query is slow (a rare trigram → tiny candidate set is good;
+    /// every trigram returning 100k+ files is what we'd want to
+    /// suggest a tighter pattern for).
+    ///
+    /// Returns None on the same paths as `grep_candidates`: no trigram
+    /// FST present, or the needle is shorter than 3 bytes so trigram
+    /// extraction is empty.
+    pub fn grep_explain(&self, needle: &[u8]) -> Option<GrepExplain> {
+        let fst = self.trigram_fst.as_ref()?;
+        let postings = self.trigram_postings_mmap.as_ref()?;
+        let qts = trigram::trigrams_of_query(needle);
+        if qts.is_empty() { return None; }
+        let mut per_trigram: Vec<(String, usize)> = Vec::with_capacity(qts.len());
+        let mut lists: Vec<std::collections::HashSet<u32>> = Vec::with_capacity(qts.len());
+        let mut all_present = true;
+        for t in &qts {
+            let label = String::from_utf8_lossy(t.as_slice()).into_owned();
+            match fst.get(t.as_slice()) {
+                Some(off) => {
+                    let list = read_trigram_posting(postings, off);
+                    per_trigram.push((label, list.len()));
+                    lists.push(list);
+                }
+                None => {
+                    // Trigram missing entirely — 0 candidates would
+                    // intersect with anything. Mark it and stop after
+                    // recording.
+                    per_trigram.push((label, 0));
+                    all_present = false;
+                }
+            }
+        }
+        let candidates = if !all_present || lists.is_empty() {
+            0
+        } else {
+            lists.sort_by_key(std::collections::HashSet::len);
+            let mut result = lists.swap_remove(0);
+            for s in lists { result.retain(|f| s.contains(f)); if result.is_empty() { break; } }
+            if self.tombstones_mmap.is_some() {
+                result.retain(|f| !self.is_tombstoned(*f));
+            }
+            result.len()
+        };
+        Some(GrepExplain { per_trigram, candidates })
     }
 
     pub fn lookup_refs_exact(&self, name: &str) -> Vec<RefRecord> {

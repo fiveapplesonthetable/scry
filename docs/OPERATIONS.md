@@ -168,6 +168,47 @@ The subject line carries enough info to read at a glance:
 ```
 
 
+## Scheduled nightly rebuild
+
+The recommended pattern for keeping the index fresh on a long-lived
+host is a single systemd timer rather than ad-hoc rebuilds. The unit
+already exists (`scry-index.service` from the TL;DR recipe is reusable
+by templating it as a `.service` file under `~/.config/systemd/user/`);
+add a sibling `.timer` file:
+
+```ini
+# ~/.config/systemd/user/scry-index.timer
+[Unit]
+Description=Nightly scry index rebuild
+
+[Timer]
+# 03:17 local — off-minute so the fleet doesn't all wake at :00
+OnCalendar=*-*-* 03:17:00
+Persistent=true     # catch up if the host was off at fire time
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable:
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now scry-index.timer
+systemctl --user list-timers --all     # confirm next-fire-time
+```
+
+`Persistent=true` matters: it makes the timer remember a missed
+nightly window (the host was off / asleep / in maintenance) and
+trigger the build the next time it boots, so the index can't quietly
+drift weeks stale during downtime. Pair with `--incremental`
+(the runner's default in `run_index.sh`) so each nightly is sub-second
+on a no-change tree and bounded by the actual changeset otherwise.
+
+The `auto_recover.sh` 5-minute cron still complements this: the timer
+schedules the *intentional* rebuild; auto_recover restarts after a
+crash / OOM during one.
+
+
 ## When the index finalizes
 
 `scry index` exits 0. systemd marks the unit inactive. The

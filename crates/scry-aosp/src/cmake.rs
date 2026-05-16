@@ -96,7 +96,18 @@ fn tokenize_cmake_args(s: &str) -> Vec<String> {
             continue;
         }
         let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b')' { i += 1; }
+        // Stop also at `#` — CMake treats # as comment-start ANYWHERE, not
+        // just at token boundaries. Without this, `good_target# trailing
+        // comment` parses as the single token `good_target#`, which is
+        // wrong (it should be the identifier `good_target` followed by a
+        // comment-to-newline).
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b')'
+            && bytes[i] != b'#'
+        {
+            i += 1;
+        }
         if i == start {
             // No progress: bytes[i] is `)` (the only single-byte case that
             // hits neither the whitespace nor the identifier loops). Without
@@ -172,6 +183,39 @@ fn process_cmake_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: tokenize_cmake_args used to infinite-loop on `)` inside
+    /// a comment that was passed through find_matching_paren. This fixture
+    /// is verbatim from ctags/Units/parser-cmake.r/cmake-comments.d/input.cmake
+    /// — the exact 605-byte file that hung the indexer for >2 minutes before
+    /// being cgroup-OOM-killed. Test must complete in well under 1 second.
+    #[test]
+    fn cmake_comments_with_unbalanced_paren() {
+        let src = br#"# this is a test of comments set(DO_NOT_TAG "foo")
+
+#[[
+multi-linecomments
+option(DO_NOT_TAG "foo" OFF)
+] not the end
+]]set(tag_this)
+
+add_custom_target(# comment set(NO_TAG "foo")
+    # anothe rline comment
+    good_target# this is legal comment placement set(NO_TAG foo)
+    ALL)
+
+add_library(another_good_target# <-- target
+    SHARED # set(NO_TAG bar)
+    gmock-all.cc
+    )
+"#;
+        let t = std::time::Instant::now();
+        let (syms, _refs) = parse(src);
+        assert!(t.elapsed().as_millis() < 1000, "parse should be sub-second");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"good_target"), "got: {:?}", names);
+        assert!(names.contains(&"another_good_target"), "got: {:?}", names);
+    }
 
     #[test]
     fn basic_cmake() {

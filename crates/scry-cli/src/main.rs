@@ -434,6 +434,12 @@ enum Cmd {
         substr: String,
         #[arg(long)]
         index: Option<PathBuf>,
+        /// Restrict results to symbols whose file path contains SUBSTR.
+        /// Same semantics as `--in` on `def` / `ref` / `callers` —
+        /// applied post-rank, so the `--limit` cap counts post-filter
+        /// hits.
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
         /// Levenshtein distance bound for typo tolerance. The actual
         /// per-result distance shown in output is computed exactly
         /// via Wagner-Fischer; this flag only caps the candidate set
@@ -1084,8 +1090,8 @@ fn main() -> Result<()> {
         Cmd::Prefix { prefix, index, limit, json } => {
             cmd_prefix(prefix, index, limit, json)
         }
-        Cmd::Fuzzy { substr, index, distance, limit, json } => {
-            cmd_fuzzy(substr, index, distance, limit, json)
+        Cmd::Fuzzy { substr, index, in_, distance, limit, json } => {
+            cmd_fuzzy(substr, index, in_, distance, limit, json)
         }
         Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise } => {
             cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise)
@@ -2711,6 +2717,7 @@ fn cmd_prefix(prefix: String, index: Option<PathBuf>, limit: usize, json: bool) 
 fn cmd_fuzzy(
     substr: String,
     index: Option<PathBuf>,
+    in_: Option<String>,
     distance: u32,
     limit: usize,
     json: bool,
@@ -2718,8 +2725,15 @@ fn cmd_fuzzy(
     let t = Instant::now();
     let r = open_index(index)?;
     // Ranked path: substring matches + Levenshtein-bounded matches,
-    // deduped, re-sorted by exact Wagner-Fischer distance.
-    let scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(&substr, distance, limit);
+    // deduped, re-sorted by exact Wagner-Fischer distance. Apply
+    // --in AFTER the ranked walk so the ranker sees the full
+    // candidate set first; the prefix filter is then a cheap
+    // path-substring test on the (typically small) ranked output.
+    let mut scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(&substr, distance, limit);
+    if let Some(prefix) = in_.as_deref() {
+        scored.retain(|(s, _)| r.files.get(s.file_id as usize)
+            .is_some_and(|fe| fe.display_path(&r.roots).contains(prefix)));
+    }
     let shown = scored.len();
     print_fuzzy_results(&r, &scored, json);
     log_query(&r, "fuzzy", &substr, shown, shown, t);

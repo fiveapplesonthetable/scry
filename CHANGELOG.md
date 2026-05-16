@@ -7,6 +7,24 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.22] — 2026-05-17
+
+CLI inconsistency fix: `scry fuzzy` now accepts `--in PREFIX`,
+matching the same flag on `def` / `ref` / `callers` / `grep` /
+`subclasses` / `impact` / `callgraph`. Previously the daemon
+(JSON-RPC + MCP) `fuzzy` tool already honored an `in` arg via
+`serve_fuzzy_with_distance`; the CLI alone was the outlier.
+The fuzzy ranker still sees the full candidate set; the prefix
+test is applied to the ranked output so a tight subdir filter
+doesn't bury closer matches.
+
+```
+scry fuzzy bindservice --in frameworks/base/services/ --distance 4
+```
+
+Caught by a cold-start eval agent who reasonably expected
+`--in` to be uniform across symbol-name queries.
+
 ## [0.1.21] — 2026-05-16
 
 \`scry finalize\` — one-shot post-index sidecar pipeline. Rebuilds

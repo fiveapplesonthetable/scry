@@ -580,6 +580,54 @@ public class Binder {
     assert!(!any_binder,
             "tombstoned Binder.java symbols must not appear in def results: {hits:?}");
 
+    // 11. Semantic retrieval — build-embeddings + ask + verify the
+    // query routes to the right file. Re-index first so the tombstone
+    // doesn't bias the chunk set.
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src)
+        .arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("re-index for embeddings test");
+    assert!(out.status.success(),
+            "re-index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = Command::new(scry_bin())
+        .args(["build-embeddings", "--index"]).arg(&idx)
+        .args(["--dim", "32", "--chunk-lines", "20", "--chunk-overlap", "5"])
+        .output().expect("scry build-embeddings");
+    assert!(out.status.success(),
+            "build-embeddings failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(idx.join("chunks.bin").exists(), "chunks.bin must exist");
+    assert!(idx.join("embeddings.bin").exists(), "embeddings.bin must exist");
+
+    let out = Command::new(scry_bin())
+        .args(["ask", "transact binder", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "3"])
+        .output().expect("scry ask");
+    assert!(out.status.success(),
+            "scry ask failed: {}", String::from_utf8_lossy(&out.stderr));
+    let hits: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(!hits.is_empty(), "ask should return at least one chunk");
+    // The query has both "transact" and "binder" tokens — the highest-
+    // ranked chunk should come from a file containing those words.
+    // Binder.java or Activity.java (which calls b.transact()) are the
+    // expected top hits.
+    let top_path = hits[0]["path"].as_str().unwrap_or("");
+    assert!(
+        top_path.contains("Binder.java") || top_path.contains("Activity.java")
+        || top_path.contains("IBinder.cpp"),
+        "top ask hit should be a binder-related file, got {top_path}; full hits={hits:?}"
+    );
+    // Every hit must carry the expected envelope shape.
+    for h in &hits {
+        assert!(h["score"].as_f64().is_some(), "missing score: {h}");
+        assert!(h["start_line"].as_u64().is_some(), "missing start_line: {h}");
+        assert!(h["end_line"].as_u64().is_some(), "missing end_line: {h}");
+    }
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

@@ -507,6 +507,51 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Compute and store per-chunk text embeddings (chunks.bin +
+    /// embeddings.bin). Default model is a deterministic hash-based
+    /// bag-of-tokens embedding (no model download, no extra deps);
+    /// good enough for vocabulary-overlap retrieval which catches
+    /// most "how do I X" code-search questions. Powers `scry ask`.
+    ///
+    /// Storage: ~70 MB chunks + (chunk_count × dim × 4) bytes for
+    /// embeddings. At default dim=64 and ~3 M chunks that's ~770 MB.
+    BuildEmbeddings {
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Vector dimension. Trade-off: higher = better discrimination,
+        /// more storage. Default 64 (good for code-search vocabulary
+        /// overlap; ~770 MB on full corpus).
+        #[arg(long, default_value = "64")]
+        dim: usize,
+        /// Chunk size in lines. Standard RAG sizing for code is
+        /// 50–150; default 100.
+        #[arg(long, default_value = "100")]
+        chunk_lines: usize,
+        /// Overlap between consecutive chunks, in lines. Catches
+        /// definitions that straddle chunk boundaries.
+        #[arg(long, default_value = "20")]
+        chunk_overlap: usize,
+        /// Parallelism for the embedding pass. Default = num_cpus.
+        #[arg(long, default_value = "0")]
+        workers: usize,
+    },
+    /// Semantic retrieval: find code chunks whose embedded text is
+    /// most similar to QUERY. Useful for "how do I parse TOML in this
+    /// codebase" — questions where you don't know the identifier name
+    /// to grep for. Requires `scry build-embeddings` to have run.
+    Ask {
+        query: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Substring path filter, same semantics as elsewhere.
+        #[arg(long = "in")]
+        in_: Option<String>,
+        /// Number of top-K chunks to return.
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -609,6 +654,10 @@ fn main() -> Result<()> {
         Cmd::IndexDiff { roots, index, profile, verbose, workers, json } =>
             cmd_index_diff(roots, index, profile, verbose, workers, json),
         Cmd::Tombstone { path, index } => cmd_tombstone(path, index),
+        Cmd::BuildEmbeddings { index, dim, chunk_lines, chunk_overlap, workers } =>
+            cmd_build_embeddings(index, dim, chunk_lines, chunk_overlap, workers),
+        Cmd::Ask { query, index, in_, limit, json } =>
+            cmd_ask(query, index, in_, limit, json),
     }
 }
 
@@ -2726,6 +2775,183 @@ fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// build-embeddings (chunk every file, embed each chunk, write sidecars)
+// ---------------------------------------------------------------------------
+//
+// Two outputs:
+//   chunks.bin       bincode-encoded Vec<ChunkEntry> (file_id + line range)
+//   embeddings.bin   8-byte header (dim u32 LE, count u32 LE) then
+//                    `count` rows × `dim` × f32 LE
+//
+// The embedding model is the deterministic FNV-1a hashing trick in
+// scry-store::embed — no model download, no external deps, identical
+// across machines. Quality-wise: catches vocabulary overlap (the
+// dominant signal for code search). A future feature-flagged
+// transformer model can replace `embed_text` without changing the
+// sidecar format.
+fn cmd_build_embeddings(
+    index: Option<PathBuf>,
+    dim: usize,
+    chunk_lines: usize,
+    chunk_overlap: usize,
+    workers: usize,
+) -> Result<()> {
+    use rayon::prelude::*;
+    use scry_store::embed;
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    if workers > 0 {
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
+    }
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+    let r = scry_store::StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+    let n_files = r.files.len();
+    eprintln!("[embed] {} files; dim={}, chunk={}+{}overlap",
+        n_files, dim, chunk_lines, chunk_overlap);
+
+    let t = Instant::now();
+    // Per-file: read source, chunk, embed each chunk. Returns a Vec
+    // of (ChunkEntry, embedding) which we'll flatten + sort by
+    // file_id + start_line for stable on-disk ordering.
+    let per_file: Vec<Vec<(embed::ChunkEntry, Vec<f32>)>> = r.files.par_iter().map(|fe| {
+        let path = fe.display_path(&r.roots);
+        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => return Vec::new() };
+        let src = match std::str::from_utf8(&bytes) { Ok(s) => s, Err(_) => return Vec::new() };
+        let mut out = Vec::new();
+        for (start, end, body) in embed::chunk_lines(src, chunk_lines, chunk_overlap) {
+            let v = embed::embed_text(body, dim);
+            out.push((embed::ChunkEntry { file_id: fe.id, start_line: start, end_line: end }, v));
+        }
+        out
+    }).collect();
+
+    let mut all: Vec<(embed::ChunkEntry, Vec<f32>)> = per_file.into_iter().flatten().collect();
+    // Stable sort: (file_id ASC, start_line ASC) so consumers can
+    // binary-search by file_id or scan by file order.
+    all.sort_by(|a, b| (a.0.file_id, a.0.start_line).cmp(&(b.0.file_id, b.0.start_line)));
+    eprintln!("[embed] computed {} chunks in {} ms", all.len(), t.elapsed().as_millis());
+
+    // Write chunks.bin (bincode Vec<ChunkEntry>).
+    {
+        let chunks_only: Vec<embed::ChunkEntry> = all.iter().map(|(c, _)| c.clone()).collect();
+        let tmp = paths.chunks().with_extension("bin.tmp");
+        let f = std::fs::File::create(&tmp)?;
+        bincode::serialize_into(std::io::BufWriter::new(f), &chunks_only)
+            .map_err(|e| anyhow::anyhow!("bincode encode chunks: {e}"))?;
+        std::fs::rename(&tmp, paths.chunks())?;
+    }
+
+    // Write embeddings.bin (header + packed f32).
+    {
+        use std::io::Write;
+        let tmp = paths.embeddings().with_extension("bin.tmp");
+        let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
+        f.write_all(&(dim as u32).to_le_bytes())?;
+        f.write_all(&(all.len() as u32).to_le_bytes())?;
+        for (_, v) in &all {
+            for x in v {
+                f.write_all(&x.to_le_bytes())?;
+            }
+        }
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, paths.embeddings())?;
+    }
+    let total_bytes = std::fs::metadata(paths.embeddings()).map(|m| m.len()).unwrap_or(0);
+    eprintln!("[embed] DONE. {} chunks × {} dim → {} ({} ms)",
+        all.len(), dim, human_bytes(total_bytes), t.elapsed().as_millis());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ask (semantic retrieval — embed query, cosine-rank chunks)
+// ---------------------------------------------------------------------------
+
+fn cmd_ask(
+    query: String,
+    index: Option<PathBuf>,
+    in_: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let t = Instant::now();
+    let r = open_index(index)?;
+    if r.embeddings_mmap.is_none() || r.chunks.is_none() {
+        anyhow::bail!(
+            "index has no embedding sidecar — run `scry build-embeddings` first"
+        );
+    }
+    let dim = r.embedding_dim as usize;
+    // Embed query with the same kernel + dim used at build-time.
+    let q_vec = scry_store::embed::embed_text(&query, dim);
+
+    // Over-fetch from the ranker so the --in path filter can drop
+    // some without starving the result count.
+    let cap = limit.saturating_mul(if in_.is_some() { 8 } else { 1 }).max(limit);
+    let ranked = r.semantic_rank(&q_vec, cap);
+
+    let in_prefix = in_.as_deref().unwrap_or("");
+    let mut shown = 0usize;
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    for (chunk_idx, sim) in ranked {
+        let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
+            Some(e) => e, None => continue,
+        };
+        let fe = match r.files.get(entry.file_id as usize) { Some(f) => f, None => continue };
+        let path = fe.display_path(&r.roots);
+        if !in_prefix.is_empty() && !path.contains(in_prefix) { continue; }
+        // Read a slice of the file to show context (best-effort).
+        let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
+        if json {
+            hits.push(serde_json::json!({
+                "path": path,
+                "lang": fe.kind.as_str(),
+                "start_line": entry.start_line,
+                "end_line": entry.end_line,
+                "score": sim,
+                "snippet": snippet,
+            }));
+        } else {
+            println!("{}:{}-{}  (score={:.3})  ({})",
+                path, entry.start_line, entry.end_line, sim, fe.kind.as_str());
+            if !snippet.is_empty() {
+                // First 2 non-blank lines of the chunk as a tiny preview.
+                for line in snippet.lines().filter(|l| !l.trim().is_empty()).take(2) {
+                    println!("    {}", line.trim_end());
+                }
+            }
+        }
+        shown += 1;
+        if shown >= limit { break; }
+    }
+    if json {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for h in &hits {
+            writeln!(out, "{}", h)?;
+        }
+    }
+    log_query(&r, "ask", &query, shown, shown, t);
+    Ok(())
+}
+
+/// Read the chunk's byte range from disk for snippet display.
+/// Best-effort: returns an empty string on any IO error so the
+/// caller never crashes on a missing file.
+fn chunk_snippet(path: &str, start_line: u32, end_line: u32) -> String {
+    let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return String::new() };
+    let src = match std::str::from_utf8(&bytes) { Ok(s) => s, Err(_) => return String::new() };
+    let lines: Vec<&str> = src.lines().collect();
+    let s = (start_line as usize).saturating_sub(1).min(lines.len());
+    let e = (end_line as usize).min(lines.len());
+    if s >= e { return String::new(); }
+    // Cap snippet size so large chunks don't blow out token budgets.
+    let take = (e - s).min(8);
+    lines[s..s + take].join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // compact (rewrite the index dropping tombstoned records)
 // ---------------------------------------------------------------------------
 //
@@ -3671,6 +3897,11 @@ fn mcp_tools_list_result() -> serde_json::Value {
         tool("stats", "Index metadata (size, files, freshness).", serde_json::json!({
             "type": "object", "properties": serde_json::json!({}),
         })),
+        tool("ask", "Semantic retrieval: find code chunks whose content is most similar to the natural-language query. Use when the agent doesn't know which identifier to search for. Requires `scry build-embeddings` to have run on the index.", obj(&["query"], serde_json::json!({
+            "query": {"type": "string"},
+            "in":    in_prop,
+            "limit": limit_prop,
+        }))),
     ];
     // Silence the unused name_prop warning — it's kept for symmetry
     // with the other shared property fragments above and may be
@@ -3927,6 +4158,7 @@ fn serve_one_request<W: std::io::Write>(
         "coverage" => serve_coverage(reader, arg_str("path"),
             args.get("by_kind").and_then(|v| v.as_bool()).unwrap_or(false)),
         "stats"   => serve_stats(reader),
+        "ask"     => serve_ask(reader, arg_str("query"), in_, limit),
         other     => {
             let resp = serde_json::json!({
                 "id": id, "error": format!("unknown cmd: {other}"),
@@ -4349,6 +4581,40 @@ fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Val
         "symbols_total": by_lang.values().map(|b| b.symbols).sum::<u64>(),
         "by_lang": by_lang_json,
     })
+}
+
+/// JSON-RPC semantic-retrieval handler. Returns an empty array (not
+/// an error) when the index lacks the embedding sidecar — agents can
+/// detect by length zero + a `stats` query that reports the dim is 0.
+fn serve_ask(r: &StoreReader, query: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
+    if r.embeddings_mmap.is_none() || r.chunks.is_none() {
+        return serde_json::json!({"error": "no embedding sidecar — run `scry build-embeddings`"});
+    }
+    let dim = r.embedding_dim as usize;
+    let q_vec = scry_store::embed::embed_text(query, dim);
+    let cap = limit.saturating_mul(if in_.is_some() { 8 } else { 1 }).max(limit);
+    let ranked = r.semantic_rank(&q_vec, cap);
+    let in_prefix = in_.unwrap_or("");
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    for (chunk_idx, sim) in ranked {
+        let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
+            Some(e) => e, None => continue,
+        };
+        let fe = match r.files.get(entry.file_id as usize) { Some(f) => f, None => continue };
+        let path = fe.display_path(&r.roots);
+        if !in_prefix.is_empty() && !path.contains(in_prefix) { continue; }
+        let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
+        out.push(serde_json::json!({
+            "path": path,
+            "lang": fe.kind.as_str(),
+            "start_line": entry.start_line,
+            "end_line": entry.end_line,
+            "score": sim,
+            "snippet": snippet,
+        }));
+        if out.len() >= limit { break; }
+    }
+    serde_json::Value::Array(out)
 }
 
 fn serve_stats(r: &StoreReader) -> serde_json::Value {

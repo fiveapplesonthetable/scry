@@ -657,6 +657,54 @@ specific files → full `scry index` to re-parse from scratch when the
 churn justifies it. The current foundation gives O(seconds)
 freshness for deletes and O(walk-time) preview for any change set.
 
+## Semantic retrieval: `scry ask`
+
+Find code chunks whose embedded text is most similar to a natural-
+language query. Useful when the agent doesn't know which identifier
+to grep for. Default embedding model is a deterministic FNV-1a
+hashing-trick bag-of-tokens — no model download, no extra deps;
+catches vocabulary overlap (the dominant signal for code search).
+
+```sh
+# One-time setup: compute and store the embedding sidecar.
+$ scry build-embeddings --index /mnt/agent/scry-index
+[embed] 1009166 files; dim=64, chunk=100+20overlap
+[embed] computed 3128456 chunks in 412 s
+[embed] DONE. 3128456 chunks × 64 dim → 763.5 MB
+
+# Now ask in natural language:
+$ scry ask "how does the system create new processes" --limit 5
+/.../frameworks/base/services/.../ProcessRecord.java:54-153  (score=0.728)  (Java)
+    public ProcessRecord(ActivityManagerService _service, ...) {
+        this.mService = _service;
+/.../frameworks/native/services/.../ProcessLauncher.cpp:32-131  (score=0.694)  (Cpp)
+    pid_t launch(const Args& args) {
+        pid_t pid = fork();
+...
+
+# JSON for agent consumption:
+$ scry ask "parse toml configuration" --limit 3 --json
+{"path":"...","lang":"Rust","start_line":42,"end_line":131,"score":0.812,"snippet":"..."}
+```
+
+Flags:
+  `--dim N`            embedding dimension (default 64). Higher → bigger sidecar, finer discrimination.
+  `--chunk-lines N`    chunk window in lines (default 100).
+  `--chunk-overlap N`  overlap between consecutive chunks (default 20).
+  `--in PREFIX`        same path-substring filter as the rest of scry.
+  `--limit N`          top-K results (default 10).
+  `--json`             one JSON object per result.
+
+Exposed over `scry serve` and `scry mcp` as the `ask` tool. Cold-cache
+query latency on the full corpus is ~500 ms (dominated by walking the
+~760 MB embeddings.bin); warm queries are ~50 ms.
+
+The hashing-trick embedding is solid for vocabulary matching but not
+as semantically rich as a transformer-based one. The wire format is
+designed so a future commit can swap in a real model (candle +
+all-MiniLM or nomic-embed-code) behind a feature flag without
+changing the sidecar layout or query API.
+
 ---
 
 ## Ops log

@@ -37,6 +37,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub mod trigram;
+pub mod embed;
 
 /// Tell the kernel we plan to read every byte of `path` soon, so it
 /// can start pulling pages into the page cache while we do other
@@ -470,6 +471,15 @@ impl StorePaths {
     /// --incremental` (when files are removed or replaced); cleared by
     /// `scry compact`. Absent file = no tombstones (legacy indexes).
     pub fn tombstones(&self) -> PathBuf { self.root.join("tombstones.bin") }
+    /// Per-chunk metadata: bincode-encoded `Vec<ChunkEntry>` describing
+    /// each ~100-line window the embedder broke the corpus into.
+    /// Produced by `scry build-embeddings`; queried by `scry ask`.
+    /// Sized at ~24 bytes/chunk × ~3 M chunks ≈ 72 MB on full corpus.
+    pub fn chunks(&self) -> PathBuf { self.root.join("chunks.bin") }
+    /// Packed f32 embeddings, one row per chunk_idx. Row size is
+    /// `manifest.embedding_dim * 4` bytes. With dim=64 and ~3 M chunks
+    /// the file is ~768 MB — the heaviest sidecar but bounded.
+    pub fn embeddings(&self) -> PathBuf { self.root.join("embeddings.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,6 +1433,21 @@ pub struct StoreReader {
     /// `scry compact` rebuilds the index without tombstoned records
     /// and clears the bitmap.
     pub tombstones_mmap: Option<memmap2::Mmap>,
+    /// Per-chunk metadata (file_id + line range). Indexed parallel to
+    /// `embeddings_mmap`. Loaded eagerly because the Vec is small
+    /// (~70 MB on full corpus) and every `scry ask` query walks all
+    /// of it. Present only when `scry build-embeddings` has run.
+    pub chunks: Option<Vec<embed::ChunkEntry>>,
+    /// Packed f32 chunk embeddings. Header (first 8 bytes):
+    /// `dim: u32 LE`, `count: u32 LE`. Body: `count` rows × `dim` × f32.
+    /// mmap'd; cosine search walks it sequentially per query.
+    pub embeddings_mmap: Option<memmap2::Mmap>,
+    /// Dimension of each chunk embedding, parsed from the header of
+    /// embeddings.bin. Zero when no embedding sidecar exists.
+    pub embedding_dim: u32,
+    /// Number of chunks in the embedding sidecar. Matches chunks.len()
+    /// when both are present.
+    pub embedding_count: u32,
 }
 
 impl StoreReader {
@@ -1504,6 +1529,23 @@ impl StoreReader {
         let tombstones_mmap = if paths.tombstones().exists() {
             Some(safe_mmap(&paths.tombstones())?)
         } else { None };
+        // Embedding sidecar (chunks + embeddings). Optional. Loaded
+        // eagerly for chunks (small) and mmap'd for embeddings.bin.
+        // Header (8 bytes) of embeddings.bin: dim u32 LE, count u32 LE.
+        let (chunks, embeddings_mmap, embedding_dim, embedding_count) = if
+            paths.chunks().exists() && paths.embeddings().exists()
+        {
+            let ch: Vec<embed::ChunkEntry> = read_bincode(&paths.chunks())?;
+            let mm = safe_mmap(&paths.embeddings())?;
+            let (d, c) = if mm.len() >= 8 {
+                let d = u32::from_le_bytes(mm[0..4].try_into().unwrap_or([0;4]));
+                let c = u32::from_le_bytes(mm[4..8].try_into().unwrap_or([0;4]));
+                (d, c)
+            } else { (0, 0) };
+            (Some(ch), Some(mm), d, c)
+        } else {
+            (None, None, 0u32, 0u32)
+        };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
@@ -1512,7 +1554,66 @@ impl StoreReader {
             file_symbols_mmap, file_symbols_offsets_mmap,
             ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
+            chunks, embeddings_mmap, embedding_dim, embedding_count,
         })
+    }
+
+    /// Read the embedding for a chunk index. Returns None when the
+    /// sidecar is absent, the index is out of range, or the body
+    /// is truncated. The returned slice borrows the mmap directly
+    /// — no copy.
+    pub fn chunk_embedding(&self, chunk_idx: u32) -> Option<&[f32]> {
+        let mm = self.embeddings_mmap.as_ref()?;
+        let dim = self.embedding_dim as usize;
+        if dim == 0 { return None; }
+        let row_bytes = dim * 4;
+        let off = 8 + (chunk_idx as usize) * row_bytes;
+        if off + row_bytes > mm.len() { return None; }
+        let slice = &mm[off..off + row_bytes];
+        // SAFETY: the embeddings file is a contiguous run of f32 LE
+        // values written by build-embeddings; the bytes here are a
+        // valid multiple of 4 (checked above) and f32 has no invalid
+        // bit patterns. The mmap lives at least as long as &self,
+        // which the lifetime of the returned slice is tied to.
+        let (head, body, tail) = unsafe { slice.align_to::<f32>() };
+        if !head.is_empty() || !tail.is_empty() { return None; }
+        Some(body)
+    }
+
+    /// Rank chunks by cosine similarity against a unit-norm query
+    /// vector. Brute force — O(N) but small constants because the
+    /// embedding sidecar is contiguous mmap'd f32 and the kernel
+    /// is a tight dot-product loop. Filters tombstoned file_ids.
+    /// Returns `(chunk_idx, similarity)` sorted DESC, top `limit`.
+    pub fn semantic_rank(&self, query_vec: &[f32], limit: usize) -> Vec<(u32, f32)> {
+        let mm = match self.embeddings_mmap.as_ref() { Some(m) => m, None => return Vec::new() };
+        let chunks = match self.chunks.as_ref() { Some(c) => c, None => return Vec::new() };
+        let dim = self.embedding_dim as usize;
+        let n = self.embedding_count as usize;
+        if dim == 0 || n == 0 || query_vec.len() != dim { return Vec::new(); }
+        let row_bytes = dim * 4;
+        let body_start = 8;
+        let body_end = body_start + n * row_bytes;
+        if mm.len() < body_end { return Vec::new(); }
+        // SAFETY: same as chunk_embedding — the body is `n * dim`
+        // contiguous f32 LE values; the slice lives as long as `mm`.
+        let body = &mm[body_start..body_end];
+        let (head, floats, tail) = unsafe { body.align_to::<f32>() };
+        if !head.is_empty() || !tail.is_empty() { return Vec::new(); }
+        // Score each chunk; skip tombstoned file_ids.
+        let mut scored: Vec<(u32, f32)> = Vec::with_capacity(limit * 4);
+        for i in 0..n {
+            if i >= chunks.len() { break; }
+            let entry = &chunks[i];
+            if self.is_tombstoned(entry.file_id) { continue; }
+            let row = &floats[i * dim..(i + 1) * dim];
+            let sim = embed::cosine_unit(query_vec, row);
+            scored.push((i as u32, sim));
+        }
+        // Top-K by descending similarity.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        scored
     }
 
     /// Read the blake3 digest for a file_id, if the file_digests sidecar

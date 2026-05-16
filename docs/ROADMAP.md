@@ -21,9 +21,31 @@ Each section follows the same shape: **goal**, **why now**,
 
 ---
 
-## 1. Semantic retrieval as a sibling tool (`scry ask`)
+## 1. Semantic retrieval — ✅ foundation shipped with hashing-trick embedding
 
-### Goal
+**Shipped** in `scry build-embeddings` + `scry ask`. Defaults:
+chunks of 100 lines with 20-line overlap; 64-dim FNV-1a hashing-
+trick embeddings; brute-force cosine search over the mmap'd
+sidecar. Exposed via `serve` and `mcp` as the `ask` tool.
+
+The hashing-trick embedding (Weinberger et al. 2009) catches
+vocabulary overlap — the dominant signal for "how do I X in this
+codebase" queries — without requiring a model download or any
+new heavyweight dependencies. The wire format (chunks.bin +
+embeddings.bin with dim/count header) is designed so a future
+commit can swap in a transformer-based embedding (candle +
+all-MiniLM or nomic-embed-code) behind a feature flag without
+changing the sidecar layout or query API.
+
+What's still future work for true transformer quality:
+  - Add `--features transformer` that pulls in `candle-core` +
+    `candle-transformers` + `tokenizers`.
+  - Download model weights once at first run (or via separate
+    `scry fetch-embedding-model` subcommand).
+  - Per-chunk inference: ~3 ms × 3M chunks = 2.5 hours for the
+    full corpus full build — within the "one cup of coffee" envelope.
+
+### Goal (original)
 
 Answer "how do I X in this codebase" questions where X isn't a
 known identifier. Today scry can find `parse_toml` if it exists by

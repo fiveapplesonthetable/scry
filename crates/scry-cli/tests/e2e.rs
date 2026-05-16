@@ -1873,3 +1873,80 @@ public class Puppy extends Dog { public void yip() {} }
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn impact_e2e_via_cli_and_rpc() {
+    // Reuse the Animal/Dog/Puppy Java fixture from `subclasses_e2e_via_cli_and_rpc`'s
+    // shape: parent + child + grandchild + a caller in a separate file.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-impact-e2e-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("zoo")).unwrap();
+    std::fs::write(src.join("zoo/Animal.java"), r#"package zoo;
+public class Animal { public void speak() {} }
+"#).unwrap();
+    std::fs::write(src.join("zoo/Dog.java"), r#"package zoo;
+public class Dog extends Animal {}
+"#).unwrap();
+    std::fs::write(src.join("zoo/Puppy.java"), r#"package zoo;
+public class Puppy extends Dog {}
+"#).unwrap();
+    std::fs::write(src.join("zoo/Caller.java"), r#"package zoo;
+public class Caller { public void run() { new Animal().speak(); } }
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(), "index failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+
+    // CLI --json: impact of Animal should report
+    //   subclasses ≥ 1 (Dog; Puppy at depth ≥ 2)
+    //   callers ≥ 1 (Caller.run() calls speak() on an Animal)
+    // files_touched should include at least Dog.java and Caller.java.
+    let out = Command::new(scry_bin())
+        .args(["impact", "Animal", "--index"]).arg(&idx)
+        .args(["--subclass-depth", "2", "--json", "--limit", "20"])
+        .output().expect("spawn scry impact");
+    assert!(out.status.success(), "impact Animal failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let subclass_names: Vec<&str> = v["subclasses"].as_array().unwrap().iter()
+        .filter_map(|s| s["name"].as_str()).collect();
+    assert!(subclass_names.contains(&"Dog"),
+            "impact Animal should include Dog as subclass; got {subclass_names:?}");
+    assert!(subclass_names.contains(&"Puppy"),
+            "impact Animal at depth=2 should include Puppy; got {subclass_names:?}");
+    let files: Vec<&str> = v["files_touched"].as_array().unwrap().iter()
+        .filter_map(serde_json::Value::as_str).collect();
+    assert!(files.iter().any(|f| f.ends_with("Dog.java")),
+            "impact files_touched should include Dog.java; got {files:?}");
+
+    // JSON-RPC: same shape over stdio.
+    use std::io::Write;
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"impact","args":{{"name":"Animal","subclass_depth":2,"limit":20}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(), "serve failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+    let line = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().find(|l| !l.is_empty()).expect("at least one response line");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    let subclass_names: Vec<&str> = v["result"]["subclasses"].as_array().unwrap().iter()
+        .filter_map(|s| s["name"].as_str()).collect();
+    assert!(subclass_names.contains(&"Dog"),
+            "RPC impact Animal should include Dog; got {subclass_names:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

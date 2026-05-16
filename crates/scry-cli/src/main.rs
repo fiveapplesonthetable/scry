@@ -283,6 +283,30 @@ enum Cmd {
         #[arg(long)]
         budget: Option<usize>,
     },
+    /// "What breaks if I change NAME?" — composes callers +
+    /// subclasses (transitive) into a single deduped impact set
+    /// of files + symbols. Useful before refactors and as an LLM-
+    /// shaped pre-flight check ("is this change small or huge?").
+    /// Composes with --reachable (defaults to off; on means the
+    /// impact set is build-graph-pruned).
+    Impact {
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Restrict to symbols/files whose path contains SUBSTR.
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
+        /// Walk subclass hierarchy this many levels deep.
+        #[arg(long, default_value_t = 2)]
+        subclass_depth: usize,
+        /// Build-graph reachability filter on callers; off by default.
+        #[arg(long)]
+        reachable: bool,
+        #[arg(long, default_value = "200")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Find direct (or transitive) subclasses of a type. LSP analogue:
     /// typeHierarchy/subtypes. Walks tree-sitter `InheritFrom` refs;
     /// the child class is resolved via scope_path. Works across all
@@ -1028,6 +1052,8 @@ fn main() -> Result<()> {
         Cmd::ScipImport { scip, index, root } => cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => cmd_scip_lookup(index, &path, offset),
+        Cmd::Impact { name, index, in_, subclass_depth, reachable, limit, json } =>
+            cmd_impact(name, index, in_, subclass_depth, reachable, limit, json),
         Cmd::Subclasses { name, index, in_, depth, limit, json } =>
             cmd_subclasses(name, index, in_, depth, limit, json),
         Cmd::Implementations { name, index, in_, depth, limit, json } =>
@@ -2197,6 +2223,129 @@ fn cmd_def(
         print_results(&r, &filtered, limit, json);
     }
     log_query(&r, "def", &name, filtered.len(), filtered.len().min(limit), t);
+    Ok(())
+}
+
+/// `scry impact NAME` — composes callers + transitive subclasses
+/// into a single deduped impact set. The reported counts are what
+/// you'd need to review if you renamed/changed NAME's signature.
+///
+/// Output: a stdout summary (or JSON) listing
+///   - direct callers (RefRecord with kind=call)
+///   - subclasses at depth ≤ `subclass_depth`
+///   - the union of files those two sets touch
+///
+/// With `--reachable`, the callers list is build-graph-pruned (same
+/// semantics as `scry callers --reachable`). The subclass set is not
+/// reachability-filtered because inheritance edges don't respect
+/// module deps (a child class can live anywhere that imports the
+/// parent's header).
+fn cmd_impact(
+    name: String,
+    index: Option<PathBuf>,
+    in_: Option<String>,
+    subclass_depth: usize,
+    reachable: bool,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let t = Instant::now();
+    let r = open_index(index)?;
+
+    // Callers — lookup_refs_exact, filter by kind=call, optionally
+    // reachability-prune.
+    let mut callers: Vec<RefRecord> = r.lookup_refs_exact(&name)
+        .into_iter()
+        .filter(|rr| rr.kind == scry_store::RefKind::Call)
+        .filter(|rr| match in_.as_deref() {
+            None => true,
+            Some(p) => r.files.get(rr.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        })
+        .collect();
+    if reachable {
+        if let Some(mg) = r.module_graph.as_ref() {
+            let defs = r.lookup_exact(&name);
+            let callee_modules: std::collections::HashSet<u32> = defs.iter()
+                .filter_map(|s| mg.module_of_file(s.file_id)).collect();
+            if !callee_modules.is_empty() {
+                callers.retain(|rr| match mg.module_of_file(rr.file_id) {
+                    Some(cm) => callee_modules.iter().any(|m| mg.is_reachable(cm, *m)),
+                    None => true,
+                });
+            }
+        }
+    }
+
+    // Subclasses — transitive BFS, then path filter.
+    let subclasses: Vec<SymbolRecord> = r
+        .subclasses_transitive(&name, subclass_depth)
+        .into_iter()
+        .filter(|s| match in_.as_deref() {
+            None => true,
+            Some(p) => r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        })
+        .collect();
+
+    // Affected files: union of caller files + subclass files.
+    let mut files_touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for rr in &callers {
+        if let Some(fe) = r.files.get(rr.file_id as usize) {
+            files_touched.insert(fe.display_path(&r.roots));
+        }
+    }
+    for s in &subclasses {
+        if let Some(fe) = r.files.get(s.file_id as usize) {
+            files_touched.insert(fe.display_path(&r.roots));
+        }
+    }
+
+    if json {
+        let v = serde_json::json!({
+            "name": name,
+            "callers": callers.iter().take(limit).map(|rr| ref_to_json(&r, rr))
+                .collect::<Vec<_>>(),
+            "subclasses": subclasses.iter().take(limit).map(|s| symbol_to_json(&r, s))
+                .collect::<Vec<_>>(),
+            "files_touched": files_touched.iter().take(limit).collect::<Vec<_>>(),
+            "totals": {
+                "callers": callers.len(),
+                "subclasses": subclasses.len(),
+                "files_touched": files_touched.len(),
+            },
+        });
+        println!("{v}");
+    } else {
+        println!(
+            "impact of {name:?}: {} callers, {} subclasses (depth {}), {} files touched",
+            callers.len(), subclasses.len(), subclass_depth, files_touched.len(),
+        );
+        if !callers.is_empty() {
+            println!("\n== callers (showing {}) ==", callers.len().min(limit));
+            for rr in callers.iter().take(limit) {
+                let path = r.files.get(rr.file_id as usize)
+                    .map(|fe| fe.display_path(&r.roots))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                println!("  {path}:{}:{}  {}", rr.line, rr.col,
+                    rr.scope_path.last().map_or("", String::as_str));
+            }
+        }
+        if !subclasses.is_empty() {
+            println!("\n== subclasses (showing {}) ==", subclasses.len().min(limit));
+            for s in subclasses.iter().take(limit) {
+                let path = r.files.get(s.file_id as usize)
+                    .map(|fe| fe.display_path(&r.roots))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                println!("  {path}:{}:{}  {}", s.line, s.col, s.name);
+            }
+        }
+        eprintln!(
+            "[scry] cmd=impact q={:?} callers={} subclasses={} files={} elapsed={}ms",
+            name, callers.len(), subclasses.len(), files_touched.len(),
+            t.elapsed().as_millis(),
+        );
+    }
     Ok(())
 }
 
@@ -6236,6 +6385,24 @@ fn mcp_tools_list_result() -> serde_json::Value {
             })),
         ),
         tool(
+            "impact",
+            "\"What breaks if I change NAME?\" — composes callers + \
+             transitive subclasses into one deduped impact set. \
+             Returns counts (callers, subclasses, files_touched) plus \
+             the up-to-`limit` instances of each. Use this as a \
+             pre-flight check before refactors: small counts → safe \
+             rename; large counts → split the change.",
+            obj(&["name"], serde_json::json!({
+                "name":  {"type": "string"},
+                "in":    in_prop,
+                "limit": limit_prop,
+                "subclass_depth": {"type": "integer", "minimum": 0, "default": 2,
+                    "description": "BFS depth for the subclass leg of the impact set."},
+                "reachable": {"type": "boolean", "default": false,
+                    "description": "Build-graph reachability filter on callers leg only."},
+            })),
+        ),
+        tool(
             "prefix",
             "Symbols whose name starts with PREFIX (FST-backed \
              completion). Useful for 'what's everything starting \
@@ -6449,6 +6616,7 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "callers"  => &["name"],
         "subclasses"      => &["name"],
         "implementations" => &["name"],
+        "impact"          => &["name"],
         "prefix"   => &["prefix"],
         "fuzzy"    => &["substr"],
         "grep"     => &["pattern"],
@@ -7019,6 +7187,14 @@ fn serve_one_request<W: std::io::Write>(
                 .map(|n| n as usize).unwrap_or(0);
             serve_subclasses(reader, arg_str("name"), in_, depth, limit)
         }
+        "impact" => {
+            let depth = args.get("subclass_depth")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize).unwrap_or(2);
+            let reachable = args.get("reachable")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_impact(reader, arg_str("name"), in_, depth, reachable, limit)
+        }
         "grep"    => {
             let ci = args.get("case_insensitive")
                 .and_then(serde_json::Value::as_bool)
@@ -7343,6 +7519,66 @@ fn serve_ref(
         out.push(ref_to_json(r, &rr));
     }
     serde_json::Value::Array(out)
+}
+
+/// `impact` JSON-RPC handler — returns the composed callers +
+/// subclasses + files_touched summary. Same algorithm as
+/// [`cmd_impact`]; result shape mirrors the CLI's `--json` output
+/// so an LLM can consume either uniformly.
+fn serve_impact(
+    r: &StoreReader,
+    name: &str,
+    in_: Option<&str>,
+    subclass_depth: usize,
+    reachable: bool,
+    limit: usize,
+) -> serde_json::Value {
+    let prefix = in_.unwrap_or("");
+    let mut callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
+        .filter(|rr| rr.kind == scry_store::RefKind::Call)
+        .filter(|rr| prefix.is_empty() || file_in_prefix(r, rr.file_id, prefix))
+        .collect();
+    if reachable {
+        if let Some(mg) = r.module_graph.as_ref() {
+            let defs = r.lookup_exact(name);
+            let callee_modules: std::collections::HashSet<u32> = defs.iter()
+                .filter_map(|s| mg.module_of_file(s.file_id)).collect();
+            if !callee_modules.is_empty() {
+                callers.retain(|rr| match mg.module_of_file(rr.file_id) {
+                    Some(cm) => callee_modules.iter().any(|m| mg.is_reachable(cm, *m)),
+                    None => true,
+                });
+            }
+        }
+    }
+    let subclasses: Vec<SymbolRecord> = r.subclasses_transitive(name, subclass_depth)
+        .into_iter()
+        .filter(|s| prefix.is_empty() || file_in_prefix(r, s.file_id, prefix))
+        .collect();
+    let mut files_touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for rr in &callers {
+        if let Some(fe) = r.files.get(rr.file_id as usize) {
+            files_touched.insert(fe.display_path(&r.roots));
+        }
+    }
+    for s in &subclasses {
+        if let Some(fe) = r.files.get(s.file_id as usize) {
+            files_touched.insert(fe.display_path(&r.roots));
+        }
+    }
+    serde_json::json!({
+        "name": name,
+        "callers": callers.iter().take(limit).map(|rr| ref_to_json(r, rr))
+            .collect::<Vec<_>>(),
+        "subclasses": subclasses.iter().take(limit).map(|s| symbol_to_json(r, s))
+            .collect::<Vec<_>>(),
+        "files_touched": files_touched.iter().take(limit).collect::<Vec<_>>(),
+        "totals": {
+            "callers": callers.len(),
+            "subclasses": subclasses.len(),
+            "files_touched": files_touched.len(),
+        },
+    })
 }
 
 /// `subclasses` / `implementations` JSON-RPC handler. Direct (depth=0)

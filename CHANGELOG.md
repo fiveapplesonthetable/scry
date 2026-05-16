@@ -7,6 +7,43 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.18] — 2026-05-16
+
+`scry impact NAME` — "what breaks if I change NAME?" — composes
+callers + transitive subclasses into a single deduped impact set.
+LLM-shaped pre-flight check before refactors: small counts → safe
+rename; large counts → split the change.
+
+**CLI:**
+
+- `scry impact NAME [--in PREFIX] [--subclass-depth N]
+  [--reachable] [--limit N] [--json]`. Default depth = 2 (covers
+  most class-hierarchy refactors; raise for deep hierarchies).
+- Default output shows the three totals up top
+  (`callers / subclasses / files_touched`) then up to `--limit`
+  rows of each, grouped. `--json` returns the same payload as
+  the JSON-RPC handler.
+
+**JSON-RPC + MCP:**
+
+- New `impact` tool taking `name` (required), `in`, `limit`,
+  `subclass_depth`, `reachable`. Returns
+  `{ name, callers[], subclasses[], files_touched[], totals }`.
+  Same shape as the CLI `--json` output so an LLM can consume
+  either uniformly.
+
+**Composes with `--reachable`** on the callers leg — same
+build-graph semantics as `scry callers --reachable`. The subclass
+leg is not reachability-filtered because inheritance edges don't
+respect build deps (a child class can live anywhere that imports
+the parent's header).
+
+**E2E test** (`impact_e2e_via_cli_and_rpc`) builds a 4-class Java
+fixture (Animal → Dog → Puppy plus a Caller invoking `Animal.speak`)
+and validates that `impact Animal` returns the right subclasses,
+the caller, and the union of touched files via both CLI and
+JSON-RPC paths.
+
 ## [0.1.17] — 2026-05-16
 
 Real-producer validation for v0.1.16's SCIP importer + producer

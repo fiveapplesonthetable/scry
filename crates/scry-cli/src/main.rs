@@ -218,6 +218,25 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Subtree coverage: files / bytes / symbols broken down by FileKind
+    /// for any directory within an indexed root. Useful for "what
+    /// fraction of $repo did scry actually understand?" — point it at
+    /// an internal subtree and see whether the right languages got
+    /// picked up. Substring-matches the displayed file path, same as
+    /// the `--in` flag elsewhere.
+    Coverage {
+        /// Path SUBSTRING (full or root-relative); e.g.
+        /// `frameworks/base/services/`. Empty = whole index.
+        path: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Also break symbol counts down by kind within each language.
+        #[arg(long)]
+        by_kind: bool,
+        /// JSON output instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
     /// List every symbol defined in a single file (sorted by line).
     ///
     /// PATH is matched against the indexed file paths via suffix —
@@ -403,6 +422,7 @@ fn main() -> Result<()> {
             cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json)
         }
         Cmd::Stats { index } => cmd_stats(index),
+        Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
         Cmd::Outline { path, index, json, limit } => cmd_outline(path, index, json, limit),
         Cmd::Grep {
             pattern, index, regex, lang, in_, limit, json, workers,
@@ -1344,6 +1364,141 @@ fn cmd_stats(index: Option<PathBuf>) -> Result<()> {
     for (k, c) in kv {
         println!("  {:>10}  {}", c, k.short());
     }
+    Ok(())
+}
+
+/// Subtree coverage stats — files, bytes, symbols, broken down per
+/// FileKind (and optionally per SymbolKind within each language).
+///
+/// Performance: with the file_symbols sidecar present, per-file
+/// symbol counts come from a single O(1) lookup each, so this runs
+/// in O(N files matching PATH). Without the sidecar, falls back to
+/// a full symbol-vec scan once and groups in memory (still bounded
+/// by the corpus, not the subtree).
+fn cmd_coverage(
+    path: String,
+    index: Option<PathBuf>,
+    by_kind: bool,
+    json: bool,
+) -> Result<()> {
+    use std::collections::HashMap;
+    let t = Instant::now();
+    let r = open_index(index)?;
+    let prefix = path.trim();
+
+    // Pass 1: find matching files, group totals by FileKind.
+    struct LangBucket {
+        files: u64,
+        bytes: u64,
+        symbols: u64,
+        by_kind: HashMap<SymbolKind, u64>,
+    }
+    impl LangBucket {
+        fn new() -> Self { Self { files: 0, bytes: 0, symbols: 0, by_kind: HashMap::new() } }
+    }
+    let mut by_lang: HashMap<FileKind, LangBucket> = HashMap::new();
+    let matching_ids: Vec<(u32, FileKind, u64)> = r.files.iter()
+        .filter(|fe| {
+            if prefix.is_empty() { true }
+            else { fe.display_path(&r.roots).contains(prefix) }
+        })
+        .map(|fe| (fe.id, fe.kind, fe.size))
+        .collect();
+    for (_id, kind, size) in &matching_ids {
+        let b = by_lang.entry(*kind).or_insert_with(LangBucket::new);
+        b.files += 1;
+        b.bytes += *size;
+    }
+
+    // Pass 2: symbol counts. Fast path uses file_symbols sidecar.
+    let has_sidecar = r.symbols_for_file(0).is_some()
+        || matching_ids.first().map(|(id, _, _)| r.symbols_for_file(*id).is_some()).unwrap_or(false);
+    if has_sidecar && (!by_kind || matching_ids.len() <= 50_000) {
+        // O(N matching files) lookups. When by_kind is true we have to
+        // decode every symbol anyway, which gets expensive on huge
+        // subtrees — fall through to the linear scan in that case.
+        for (id, kind, _) in &matching_ids {
+            let idxs = r.symbols_for_file(*id).unwrap_or_default();
+            if !by_kind {
+                if let Some(b) = by_lang.get_mut(kind) {
+                    b.symbols += idxs.len() as u64;
+                }
+            } else {
+                for i in &idxs {
+                    if let Some(s) = r.get_symbol(*i) {
+                        let b = by_lang.entry(s.lang).or_insert_with(LangBucket::new);
+                        b.symbols += 1;
+                        *b.by_kind.entry(s.kind).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        // Slow path: linear scan of every symbol, filter by matching file_id set.
+        let matching_set: std::collections::HashSet<u32> =
+            matching_ids.iter().map(|(id, _, _)| *id).collect();
+        for s in r.iter_symbols() {
+            if !matching_set.contains(&s.file_id) { continue; }
+            let b = by_lang.entry(s.lang).or_insert_with(LangBucket::new);
+            b.symbols += 1;
+            if by_kind {
+                *b.by_kind.entry(s.kind).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let total_files: u64 = by_lang.values().map(|b| b.files).sum();
+    let total_bytes: u64 = by_lang.values().map(|b| b.bytes).sum();
+    let total_symbols: u64 = by_lang.values().map(|b| b.symbols).sum();
+
+    if json {
+        let by_lang_json: serde_json::Map<String, serde_json::Value> = by_lang.iter()
+            .map(|(k, b)| {
+                let mut o = serde_json::json!({
+                    "files": b.files,
+                    "bytes": b.bytes,
+                    "symbols": b.symbols,
+                });
+                if by_kind {
+                    let kinds: serde_json::Map<String, serde_json::Value> = b.by_kind.iter()
+                        .map(|(sk, c)| (sk.short().to_string(), serde_json::json!(c)))
+                        .collect();
+                    o["by_kind"] = serde_json::Value::Object(kinds);
+                }
+                (k.as_str().to_string(), o)
+            })
+            .collect();
+        let out = serde_json::json!({
+            "path": prefix,
+            "files_total": total_files,
+            "bytes_total": total_bytes,
+            "symbols_total": total_symbols,
+            "by_lang": by_lang_json,
+        });
+        println!("{}", out);
+    } else {
+        println!("subtree:      {}", if prefix.is_empty() { "<entire index>" } else { prefix });
+        println!("files-total:  {}", total_files);
+        println!("bytes-total:  {}", human_bytes(total_bytes));
+        println!("symbols:      {}", total_symbols);
+        println!();
+        println!("{:>10}  {:>14}  {:>12}  lang", "files", "bytes", "symbols");
+        println!("{:>10}  {:>14}  {:>12}  ----", "-----", "-----", "-------");
+        let mut sorted: Vec<(&FileKind, &LangBucket)> = by_lang.iter().collect();
+        sorted.sort_by_key(|(_, b)| std::cmp::Reverse(b.files));
+        for (lang, b) in sorted {
+            println!("{:>10}  {:>14}  {:>12}  {}",
+                     b.files, human_bytes(b.bytes), b.symbols, lang.as_str());
+            if by_kind && !b.by_kind.is_empty() {
+                let mut kinds: Vec<(&SymbolKind, &u64)> = b.by_kind.iter().collect();
+                kinds.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+                for (sk, c) in kinds.iter().take(10) {
+                    println!("{:>10}  {:>14}  {:>12}    └─ {}", "", "", c, sk.short());
+                }
+            }
+        }
+    }
+    log_query(&r, "coverage", prefix, total_files as usize, total_files as usize, t);
     Ok(())
 }
 
@@ -2599,6 +2754,8 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
             "callers" => serve_ref(&reader, arg_str("name"), lang, Some("call"), in_, limit),
             "grep"    => serve_grep(&reader, arg_str("pattern"), lang, in_, limit),
             "outline" => serve_outline(&reader, arg_str("path"), limit),
+            "coverage" => serve_coverage(&reader, arg_str("path"),
+                args.get("by_kind").and_then(|v| v.as_bool()).unwrap_or(false)),
             "stats"   => serve_stats(&reader),
             other     => serde_json::json!({"error": format!("unknown cmd: {other}")}),
         };
@@ -2806,6 +2963,85 @@ fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value
         "symbols_total": found.len(),
         "symbols_shown": take,
         "symbols": arr,
+    })
+}
+
+/// JSON-RPC coverage: subtree stats. Same shape as the CLI's
+/// `scry coverage --json`. by_kind=true includes per-symbol-kind
+/// counts inside each language; default false to keep responses
+/// compact (typical agent use case is "what's in this dir" not
+/// "how many ctors").
+fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Value {
+    use std::collections::HashMap;
+    let matching: Vec<(u32, FileKind, u64)> = r.files.iter()
+        .filter(|fe| path.is_empty() || fe.display_path(&r.roots).contains(path))
+        .map(|fe| (fe.id, fe.kind, fe.size))
+        .collect();
+    struct LangBucket {
+        files: u64, bytes: u64, symbols: u64,
+        by_kind: HashMap<SymbolKind, u64>,
+    }
+    let mut by_lang: HashMap<FileKind, LangBucket> = HashMap::new();
+    for (_id, kind, size) in &matching {
+        let b = by_lang.entry(*kind).or_insert_with(|| LangBucket {
+            files: 0, bytes: 0, symbols: 0, by_kind: HashMap::new(),
+        });
+        b.files += 1;
+        b.bytes += *size;
+    }
+    // Symbol counts via the file_symbols sidecar fast path when present.
+    let has_sidecar = matching.first()
+        .map(|(id, _, _)| r.symbols_for_file(*id).is_some())
+        .unwrap_or(false);
+    if has_sidecar && (!by_kind || matching.len() <= 50_000) {
+        for (id, kind, _) in &matching {
+            let idxs = r.symbols_for_file(*id).unwrap_or_default();
+            if !by_kind {
+                if let Some(b) = by_lang.get_mut(kind) { b.symbols += idxs.len() as u64; }
+            } else {
+                for i in &idxs {
+                    if let Some(s) = r.get_symbol(*i) {
+                        let b = by_lang.entry(s.lang).or_insert_with(|| LangBucket {
+                            files: 0, bytes: 0, symbols: 0, by_kind: HashMap::new(),
+                        });
+                        b.symbols += 1;
+                        *b.by_kind.entry(s.kind).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        let matching_set: std::collections::HashSet<u32> =
+            matching.iter().map(|(id, _, _)| *id).collect();
+        for s in r.iter_symbols() {
+            if !matching_set.contains(&s.file_id) { continue; }
+            let b = by_lang.entry(s.lang).or_insert_with(|| LangBucket {
+                files: 0, bytes: 0, symbols: 0, by_kind: HashMap::new(),
+            });
+            b.symbols += 1;
+            if by_kind { *b.by_kind.entry(s.kind).or_insert(0) += 1; }
+        }
+    }
+    let by_lang_json: serde_json::Map<String, serde_json::Value> = by_lang.iter()
+        .map(|(k, b)| {
+            let mut o = serde_json::json!({
+                "files": b.files, "bytes": b.bytes, "symbols": b.symbols,
+            });
+            if by_kind {
+                let kinds: serde_json::Map<String, serde_json::Value> = b.by_kind.iter()
+                    .map(|(sk, c)| (sk.short().to_string(), serde_json::json!(c)))
+                    .collect();
+                o["by_kind"] = serde_json::Value::Object(kinds);
+            }
+            (k.as_str().to_string(), o)
+        })
+        .collect();
+    serde_json::json!({
+        "path": path,
+        "files_total": by_lang.values().map(|b| b.files).sum::<u64>(),
+        "bytes_total": by_lang.values().map(|b| b.bytes).sum::<u64>(),
+        "symbols_total": by_lang.values().map(|b| b.symbols).sum::<u64>(),
+        "by_lang": by_lang_json,
     })
 }
 

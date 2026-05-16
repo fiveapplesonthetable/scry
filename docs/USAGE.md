@@ -217,6 +217,86 @@ pick the shortest match.
 
 ---
 
+## Subtree coverage: `scry coverage`
+
+Files / bytes / symbols broken down per language for any directory
+within the index. Useful for "what fraction of $repo did scry
+actually understand?" — point it at an internal subtree to verify
+the right languages got picked up.
+
+```sh
+$ scry coverage frameworks/base/services
+subtree:      frameworks/base/services
+files-total:  6036
+bytes-total:  94.5 MB
+symbols:      191484
+
+     files           bytes       symbols  lang
+     -----           -----       -------  ----
+      4717         89.9 MB        178868  Java
+       348         43.9 KB           607  Owners
+       289        400.1 KB             0  XmlOther
+       237          2.0 MB          7342  Kotlin
+       154        305.5 KB           814  Soong
+       101          1.4 MB          2439  Cpp
+        75        135.2 KB           427  Manifest
+        51        206.9 KB           497  Header
+        37         59.5 KB           268  Aconfig
+        ...
+[scry] cmd=coverage q="frameworks/base/services" hits=6036 elapsed=782ms
+```
+
+Add `--by-kind` to also break each language down by SymbolKind:
+
+```sh
+$ scry coverage frameworks/base/services --by-kind
+...
+      4717         89.9 MB        178868  Java
+                                  105962    └─ method
+                                   58047    └─ field
+                                    7984    └─ class
+                                    5659    └─ ctor
+                                     820    └─ iface
+                                     317    └─ annot
+                                      79    └─ enum
+       237          2.0 MB          7342  Kotlin
+                                    4435    └─ field
+                                    2439    └─ fn
+                                     280    └─ class
+       ...
+```
+
+Empty PATH = whole index (same totals as `scry stats`, but grouped
+by lang inline):
+
+```sh
+$ scry coverage ""
+subtree:      <entire index>
+files-total:  1009166
+bytes-total:  12.0 GB
+symbols:      22790955
+
+     files           bytes       symbols  lang
+     -----           -----       -------  ----
+    204814          2.2 GB       5608803  Java
+    168881          2.1 GB       7603425  Header
+    164204          2.3 GB       2590567  Cpp
+    118627          1.6 GB       4208190  C
+     38702        411.5 MB        596043  Python
+     26424        139.6 MB        468619  Kotlin
+     20336        368.9 MB           727  Assembly
+     20230        236.7 MB        687370  Rust
+     17452         34.1 MB         45951  Aidl
+     14231        202.0 MB        408677  HeaderCpp
+     13716         52.5 MB         73240  Soong
+     ...
+```
+
+`--json` for machine consumption; the same shape goes through
+`scry serve` as `{"cmd":"coverage","args":{"path":"…","by_kind":true}}`.
+
+---
+
 ## Index metadata: `scry stats`
 
 ```sh

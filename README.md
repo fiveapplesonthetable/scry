@@ -133,6 +133,7 @@ snake-case, all optional except where noted):
 | `fuzzy`     | `substr`     | `in`, `limit`                       | `[symbol, …]`          |
 | `grep`      | `pattern`    | `lang`, `in`, `limit`               | `[hit, …]` (literal)   |
 | `outline`   | `path`       | `limit`                             | `{path, lang, symbols_total, symbols_shown, symbols: […]}` |
+| `coverage`  | `path`       | `by_kind`                           | `{path, files_total, bytes_total, symbols_total, by_lang: {…}}` |
 | `stats`     | —            | —                                   | metadata object        |
 
 All search commands accept `"in"` (root-relative subdir prefix); same

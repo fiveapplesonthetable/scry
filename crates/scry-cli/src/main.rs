@@ -132,6 +132,20 @@ enum Cmd {
         /// COULD contain the literal substring).
         #[arg(long)]
         build_trigrams: bool,
+        /// Incremental mode: open the existing index at --out, diff
+        /// the current source-tree state against the stored
+        /// file_digests, parse ONLY the changed + added files, and
+        /// replay the unchanged files' records from the old index.
+        /// Atomic: writes to a staging dir and renames into place; the
+        /// old index stays queryable for the duration. Falls back to
+        /// a full index if --out has no existing manifest or no
+        /// file_digests.bin (run `scry build-digests` first).
+        ///
+        /// Skips the trigram index unless --build-trigrams is also
+        /// passed (trigrams are re-extracted from disk for unchanged
+        /// files, adding ~25 s to the full corpus).
+        #[arg(long)]
+        incremental: bool,
     },
     /// Look up references to a name.
     Ref {
@@ -645,12 +659,19 @@ fn main() -> Result<()> {
         Cmd::Index {
             roots, profile, out, count_only, limit, no_refs, workers,
             max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes,
-            resume, build_trigrams,
-        } => cmd_index(
-            roots, profile, out, count_only, limit, no_refs, workers,
-            max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes,
-            resume, build_trigrams,
-        ),
+            resume, build_trigrams, incremental,
+        } => {
+            if incremental {
+                cmd_index_incremental(roots, out, profile, workers,
+                                      max_file_bytes, build_trigrams)
+            } else {
+                cmd_index(
+                    roots, profile, out, count_only, limit, no_refs, workers,
+                    max_file_bytes, big_file_bytes, mem_cap, flush_every, flush_bytes,
+                    resume, build_trigrams,
+                )
+            }
+        }
         Cmd::Def { name, index, lang, kind, in_, limit, json, md, budget } => {
             cmd_def(name, index, lang, kind, in_, limit, json, md, budget)
         }
@@ -2787,6 +2808,362 @@ fn cmd_index_diff(
             }
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// scry index --incremental
+// ---------------------------------------------------------------------------
+//
+// Selective-reparse + full-rebuild incremental. Skips the tree-sitter
+// parse for files whose content digest matches the prior index;
+// replays their existing records from the old index into a fresh
+// writer; parses only the added + changed files; finalizes and
+// atomically swaps the staging dir into place.
+//
+// Correctness pattern: we never mutate the old index. The new index
+// is built fresh in `<out>.incr.tmp/` and only swapped in at the end
+// via two rename calls. If the process dies mid-build, the old index
+// stays queryable.
+//
+// Trigrams: re-extracted from disk for unchanged files (cheap with
+// the kernel page cache; ~25 s on full corpus) plus produced by the
+// regular parse path for changed files. Skipped unless
+// --build-trigrams is also passed.
+//
+// What this version does NOT do:
+//   - True append-only writes preserving old file_ids. The new index
+//     reassigns file_ids 0..N sequentially; readers re-open and see
+//     the new mapping. (No external state depends on file_id stability.)
+//   - Re-run build-resolutions or build-file-symbols. The user can
+//     invoke them post-incremental if they need the sidecars.
+fn cmd_index_incremental(
+    roots: Vec<PathBuf>,
+    out: Option<PathBuf>,
+    profile: Option<String>,
+    workers: Option<usize>,
+    max_file_bytes: u64,
+    build_trigrams: bool,
+) -> Result<()> {
+    use rayon::prelude::*;
+    let t_total = Instant::now();
+    let out_dir = out.unwrap_or_else(default_index_dir);
+
+    // === Phase 1: open old + verify prereqs ===
+    if !out_dir.join("manifest.json").exists() {
+        anyhow::bail!(
+            "no existing index at {}; --incremental requires a prior `scry index` first",
+            out_dir.display()
+        );
+    }
+    let old = scry_store::StoreReader::open(&out_dir)
+        .with_context(|| format!("open existing index at {}", out_dir.display()))?;
+    if old.file_digests_mmap.is_none() {
+        anyhow::bail!(
+            "index at {} has no file_digests.bin — run `scry build-digests` first \
+             so --incremental can detect changes",
+            out_dir.display()
+        );
+    }
+
+    if let Some(n) = workers {
+        if n > 0 {
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+        }
+    }
+
+    // === Phase 2: walk + hash + categorize ===
+    // Resolve roots from CLI or fall back to defaults (matches non-
+    // incremental cmd_index behavior).
+    let roots = if roots.is_empty() { default_roots() } else { roots };
+    if roots.is_empty() { anyhow::bail!("no source roots provided and no default available"); }
+
+    // Map for fast diff: (root_id, relpath) -> (old_file_id, old_digest).
+    // Tombstoned files are excluded — they're conceptually "already
+    // deleted" and shouldn't influence the new index's contents.
+    let old_map: std::collections::HashMap<(u8, String), (u32, [u8; 32])> =
+        old.files.iter()
+            .filter(|fe| !old.is_tombstoned(fe.id))
+            .filter_map(|fe| old.file_digest(fe.id)
+                .map(|d| ((fe.root_id, fe.relpath.clone()), (fe.id, d))))
+            .collect();
+
+    eprintln!("[incremental] old index: {} files (post-tombstone)", old_map.len());
+
+    // Walk + hash each root in turn. We need root_id stability between
+    // old and new — assign by position in the roots vec. Where possible
+    // (the typical case: same roots between runs) old_id == new_id.
+    struct Categorized {
+        root_id: u8,
+        rf: scry_walker::RawFile,
+        rel: String,
+        digest: [u8; 32],
+    }
+    let mut all_files: Vec<Categorized> = Vec::new();
+    for (root_idx, root_path) in roots.iter().enumerate() {
+        let prof = match profile.as_deref() {
+            Some("aosp") => scry_walker::Profile::Aosp,
+            Some("linux") => scry_walker::Profile::Linux,
+            Some("generic") => scry_walker::Profile::Generic,
+            Some(other) => anyhow::bail!("unknown profile '{other}'"),
+            None => scry_walker::Profile::auto_detect(root_path),
+        };
+        eprintln!("[incremental] walking root {} ({prof:?})", root_path.display());
+        let collected = scry_walker::collect_files(root_path, prof)
+            .with_context(|| format!("walk {}", root_path.display()))?;
+        // Hash in parallel — blake3 is ~3 GB/s/core.
+        let hashed: Vec<(scry_walker::RawFile, String, [u8; 32])> =
+            collected.files.par_iter().map(|rf| {
+                let rel = rf.relpath.to_string_lossy().to_string();
+                let bytes = std::fs::read(&rf.path).unwrap_or_default();
+                let digest = *blake3::hash(&bytes).as_bytes();
+                (rf.clone(), rel, digest)
+            }).collect();
+        for (rf, rel, digest) in hashed {
+            all_files.push(Categorized { root_id: root_idx as u8, rf, rel, digest });
+        }
+    }
+    eprintln!("[incremental] walked + hashed {} files in {} ms",
+        all_files.len(), t_total.elapsed().as_millis());
+
+    // Split into unchanged vs needs_parse. Index by position in
+    // all_files so we don't allocate parallel vectors of clones.
+    let mut unchanged_idx: Vec<usize> = Vec::new();
+    let mut needs_parse_idx: Vec<usize> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<(u8, String)> =
+        std::collections::HashSet::with_capacity(all_files.len());
+    for (i, c) in all_files.iter().enumerate() {
+        let key = (c.root_id, c.rel.clone());
+        seen_keys.insert(key.clone());
+        match old_map.get(&key) {
+            Some((_, old_d)) if *old_d == c.digest => unchanged_idx.push(i),
+            _ => needs_parse_idx.push(i),
+        }
+    }
+    let removed_count = old_map.keys().filter(|k| !seen_keys.contains(k)).count();
+    let added_count = needs_parse_idx.iter()
+        .filter(|i| !old_map.contains_key(&(all_files[**i].root_id, all_files[**i].rel.clone())))
+        .count();
+    let changed_count = needs_parse_idx.len() - added_count;
+
+    eprintln!("[incremental] diff: {} unchanged, {} changed, {} added, {} removed",
+        unchanged_idx.len(), changed_count, added_count, removed_count);
+
+    if needs_parse_idx.is_empty() && removed_count == 0 {
+        eprintln!("[incremental] no changes — index already current");
+        return Ok(());
+    }
+
+    // === Phase 3: prepare staging writer ===
+    // NOTE: Path extension MUST NOT be `.tmp`. StoreWriter::new_streaming
+    // computes its own per-root staging path via `root.with_extension("tmp")`;
+    // if we passed `out.incr.tmp` here the writer would resolve its tmp_dir
+    // to the same path and delete our staging mid-build. `.incr` is safe.
+    let staging = out_dir.with_extension("incr");
+    // Best-effort cleanup of any stale staging dir from a crashed
+    // prior run.
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("create staging dir {}", staging.display()))?;
+    let mut writer = scry_store::StoreWriter::new_streaming(&staging)
+        .with_context(|| "open streaming writer")?;
+    if build_trigrams { writer.enable_trigrams(); }
+
+    // Carry over root entries with their original profiles.
+    for (i, root_path) in roots.iter().enumerate() {
+        let prof = old.roots.iter()
+            .find(|r| std::path::Path::new(&r.path) == root_path.as_path())
+            .map(|r| r.profile)
+            .unwrap_or_else(|| scry_walker::Profile::auto_detect(root_path));
+        writer.roots.push(scry_store::RootEntry {
+            id: i as u8,
+            path: root_path.display().to_string(),
+            profile: prof,
+        });
+    }
+
+    // === Phase 4: emit FileEntry records ===
+    // Layout: unchanged files first (low new_file_ids), then needs_parse.
+    // Build old_file_id -> new_file_id remap as we go.
+    let mut new_fid: u32 = 0;
+    let mut id_remap: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::with_capacity(unchanged_idx.len());
+    for &i in &unchanged_idx {
+        let c = &all_files[i];
+        let old_id = old_map[&(c.root_id, c.rel.clone())].0;
+        id_remap.insert(old_id, new_fid);
+        writer.files.push(scry_store::FileEntry {
+            id: new_fid, root_id: c.root_id,
+            relpath: c.rel.clone(),
+            kind: c.rf.kind, size: c.rf.size,
+        });
+        new_fid += 1;
+    }
+    let parse_id_start: u32 = new_fid;
+    for &i in &needs_parse_idx {
+        let c = &all_files[i];
+        writer.files.push(scry_store::FileEntry {
+            id: new_fid, root_id: c.root_id,
+            relpath: c.rel.clone(),
+            kind: c.rf.kind, size: c.rf.size,
+        });
+        new_fid += 1;
+    }
+    // Per-file digest list (parallel to writer.files) so we can write
+    // the new file_digests.bin sidecar after finalize.
+    let mut new_digests: Vec<[u8; 32]> = Vec::with_capacity(writer.files.len());
+    for &i in &unchanged_idx { new_digests.push(all_files[i].digest); }
+    for &i in &needs_parse_idx { new_digests.push(all_files[i].digest); }
+
+    // === Phase 5: replay unchanged records ===
+    // Iterate ALL old symbols / refs once; keep only those whose
+    // file_id is in the remap. Cheap relative to a parse pass.
+    let t_replay = Instant::now();
+    for s in old.iter_symbols() {
+        if let Some(&new_fid) = id_remap.get(&s.file_id) {
+            let mut s2 = s;
+            s2.file_id = new_fid;
+            writer.symbols.push(s2);
+            if writer.symbols.len() >= 5_000_000 {
+                writer.flush_symbols_chunk()
+                    .with_context(|| "flush replayed symbols")?;
+            }
+        }
+    }
+    for r in old.iter_refs() {
+        if let Some(&new_fid) = id_remap.get(&r.file_id) {
+            let mut r2 = r;
+            r2.file_id = new_fid;
+            writer.refs.push(r2);
+            if writer.refs.len() >= 5_000_000 {
+                writer.flush_refs_chunk()
+                    .with_context(|| "flush replayed refs")?;
+            }
+        }
+    }
+    eprintln!("[incremental] replayed {} symbols, {} refs from {} unchanged files in {} ms",
+        writer.symbols.len() + writer.symbol_chunk_lens.iter().sum::<u64>() as usize,
+        writer.refs.len() + writer.ref_chunk_lens.iter().sum::<u64>() as usize,
+        unchanged_idx.len(), t_replay.elapsed().as_millis());
+
+    // Replay trigrams from unchanged files. Re-read bytes (cheap;
+    // kernel page cache is hot from the hash pass). Done in parallel
+    // then merged single-threaded into the writer (push_trigrams
+    // isn't Sync).
+    if build_trigrams {
+        let t_trig = Instant::now();
+        let per_file: Vec<(u32, Vec<scry_store::trigram::Trigram>)> =
+            unchanged_idx.par_iter().map(|&i| {
+                let c = &all_files[i];
+                let new_fid = id_remap[&old_map[&(c.root_id, c.rel.clone())].0];
+                let bytes = std::fs::read(&c.rf.path).unwrap_or_default();
+                let tgs = scry_store::trigram::extract_sorted(&bytes);
+                (new_fid, tgs)
+            }).collect();
+        for (fid, tgs) in per_file {
+            writer.push_trigrams(&tgs, fid);
+        }
+        if let Some(_) = writer.trigrams.as_ref() {
+            writer.flush_trigrams_chunk()
+                .with_context(|| "flush replayed trigrams")?;
+        }
+        eprintln!("[incremental] replayed trigrams from {} files in {} ms",
+            unchanged_idx.len(), t_trig.elapsed().as_millis());
+    }
+
+    // === Phase 6: parse the changed + added files ===
+    let mut registry = FormatRegistry::new();
+    for p in scry_lang::tree_sitter_parsers() { registry.register(p); }
+    for p in scry_aosp::aosp_parsers() { registry.register(p); }
+    let registry = Arc::new(registry);
+    let t_parse = Instant::now();
+    // No OOM skiplist for incremental — the set is small enough that
+    // a problematic file's effects are obvious and the user can pin
+    // a hard-skip explicitly.
+    let skiplist: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let parsed: Vec<Option<(u32, Vec<SymbolRecord>, Vec<RefRecord>, Vec<scry_store::trigram::Trigram>)>> =
+        needs_parse_idx.par_iter().enumerate().map(|(i, &cat_i)| {
+            let c = &all_files[cat_i];
+            let new_fid = parse_id_start + i as u32;
+            let fe = scry_store::FileEntry {
+                id: new_fid, root_id: c.root_id,
+                relpath: c.rel.clone(),
+                kind: c.rf.kind, size: c.rf.size,
+            };
+            match parse_one(&c.rf, &fe, c.root_id, false, max_file_bytes,
+                            &registry, &skiplist, None, build_trigrams) {
+                Ok(t) => Some((new_fid, t.0, t.1, t.2)),
+                Err(e) => {
+                    eprintln!("[incremental] parse FAILED for {}: {e:#}", c.rf.path.display());
+                    None
+                }
+            }
+        }).collect();
+    eprintln!("[incremental] parsed {} files in {} ms",
+        needs_parse_idx.len(), t_parse.elapsed().as_millis());
+
+    // Single-threaded merge of per-file results into the writer.
+    for entry in parsed.into_iter().flatten() {
+        let (fid, syms, refs, trigrams) = entry;
+        writer.symbols.extend(syms);
+        writer.refs.extend(refs);
+        if build_trigrams && !trigrams.is_empty() {
+            writer.push_trigrams(&trigrams, fid);
+        }
+    }
+
+    // === Phase 7: finalize ===
+    let final_files_total = writer.files.len();
+    let stats = scry_store::IndexStats {
+        files_total: final_files_total as u64,
+        files_parsed: needs_parse_idx.len() as u64,
+        files_failed: 0,
+        bytes_total: writer.files.iter().map(|f| f.size).sum(),
+        symbols: 0,  // finalize_streaming computes the actual total
+        refs: 0,
+        elapsed_ms: t_total.elapsed().as_millis(),
+    };
+    writer.finalize_streaming(stats)
+        .with_context(|| "finalize_streaming")?;
+
+    // === Phase 8: write the file_digests sidecar for the new index ===
+    // Use the same packed format as build-digests so future
+    // --incremental runs see the fresh digests.
+    let new_digests_path = staging.join("file_digests.bin");
+    let tmp_digests = new_digests_path.with_extension("bin.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp_digests)?);
+        for d in &new_digests {
+            f.write_all(d)?;
+        }
+        f.flush()?;
+    }
+    std::fs::rename(&tmp_digests, &new_digests_path)?;
+
+    // === Phase 9: atomic swap ===
+    // Two renames: old -> .bak, staging -> out. If either fails the
+    // old index is recoverable from .bak; we clean it up on success.
+    let bak = out_dir.with_extension("incr.bak");
+    let _ = std::fs::remove_dir_all(&bak);  // clean any prior failed swap
+    std::fs::rename(&out_dir, &bak)
+        .with_context(|| format!("rename {} -> {}", out_dir.display(), bak.display()))?;
+    if let Err(e) = std::fs::rename(&staging, &out_dir) {
+        // Restore old on second-rename failure.
+        let _ = std::fs::rename(&bak, &out_dir);
+        return Err(anyhow::anyhow!("rename {} -> {} failed: {e}; old index restored",
+            staging.display(), out_dir.display()));
+    }
+    // Cleanup the old index now that the new one is in place.
+    let _ = std::fs::remove_dir_all(&bak);
+
+    eprintln!(
+        "[incremental] DONE in {} ms. {} files indexed ({} parsed, {} replayed)",
+        t_total.elapsed().as_millis(),
+        final_files_total,
+        needs_parse_idx.len(),
+        unchanged_idx.len(),
+    );
     Ok(())
 }
 

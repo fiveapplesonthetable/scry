@@ -503,6 +503,72 @@ fn synthetic_tree_roundtrip() {
     assert_eq!(r["error"]["code"].as_i64(), Some(-32601),
                "unknown method must return JSON-RPC -32601; got {r}");
 
+    // 8c. scry index --incremental round-trip. Reindex from the
+    // current state, build digests, modify one file + add a new
+    // one, incremental-rebuild, assert: unchanged file's symbols
+    // survive; changed file's new symbol is queryable; new file's
+    // symbols are queryable.
+    let inc_src = base.join("inc-src");
+    let inc_idx = base.join("inc-idx");
+    std::fs::create_dir_all(inc_src.join("a")).unwrap();
+    std::fs::create_dir_all(inc_src.join("b")).unwrap();
+    std::fs::write(inc_src.join("a/Alpha.java"),
+        "package z;\npublic class Alpha {\n    public void aMethod() {}\n}\n").unwrap();
+    std::fs::write(inc_src.join("b/Bravo.java"),
+        "package z;\npublic class Bravo {\n    public void bMethod() {}\n}\n").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&inc_src).arg("-o").arg(&inc_idx)
+        .args(["--workers", "2"])
+        .output().expect("initial index");
+    assert!(out.status.success(),
+            "initial index failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["build-digests", "--index"]).arg(&inc_idx)
+        .output().expect("build-digests");
+    assert!(out.status.success());
+
+    // No-change run is a no-op.
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&inc_src).arg("-o").arg(&inc_idx)
+        .arg("--incremental").args(["--workers", "2"])
+        .output().expect("incremental no-change");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no changes"),
+            "no-change incremental should say so; got: {stderr}");
+
+    // Modify Alpha + add Charlie.
+    std::fs::write(inc_src.join("a/Alpha.java"),
+        "package z;\npublic class Alpha {\n    public void aMethod() {}\n    public void newAlpha() {}\n}\n").unwrap();
+    std::fs::write(inc_src.join("a/Charlie.java"),
+        "package z;\npublic class Charlie {}\n").unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&inc_src).arg("-o").arg(&inc_idx)
+        .arg("--incremental").args(["--workers", "2"])
+        .output().expect("incremental rebuild");
+    assert!(out.status.success(),
+            "incremental failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("1 unchanged") || stderr.contains("1 unchanged,"),
+            "diff line should mention unchanged count: {stderr}");
+    assert!(stderr.contains("1 changed") || stderr.contains(" 1 changed,"),
+            "diff line should mention changed count: {stderr}");
+    assert!(stderr.contains("1 added") || stderr.contains(" 1 added,"),
+            "diff line should mention added count: {stderr}");
+
+    // Query the new state. Use the JSON query helper.
+    let new_sym = query_def(&inc_idx, "newAlpha");
+    let arr = new_sym.as_array().expect("def returns array");
+    assert!(!arr.is_empty(), "newAlpha should be found after incremental: {new_sym}");
+    let charlie = query_def(&inc_idx, "Charlie");
+    let arr = charlie.as_array().unwrap();
+    assert!(!arr.is_empty(), "Charlie (added) should be found: {charlie}");
+    let bravo = query_def(&inc_idx, "Bravo");
+    let arr = bravo.as_array().unwrap();
+    assert!(!arr.is_empty(),
+            "Bravo (unchanged, replayed) must survive incremental: {bravo}");
+
     // 8b. `scry health` against the synthetic index must report
     // OVERALL: healthy and exit 0. JSON form is parsed and pinned.
     let out = Command::new(scry_bin())

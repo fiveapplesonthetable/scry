@@ -1822,21 +1822,20 @@ fn cmd_build_trigrams(
     Ok(())
 }
 
-/// Extract the literal substrings from a regex pattern that are worth
-/// trigram-indexing. Returns None if the pattern has no extractable
-/// literals or extraction produced a result that would over-broaden
-/// (too many alternatives, or any literal shorter than 3 bytes).
-///
-/// Caller treats None as "fall back to full scan" — over-broad pre-
-/// filters are worse than no pre-filter because they pay both costs.
-fn regex_literals_for_trigram(pattern: &str) -> Option<Vec<Vec<u8>>> {
-    use regex_syntax::hir::literal::{Extractor, ExtractKind};
+/// Extract literal substrings from a regex for trigram pre-filtering,
+/// using the given extraction direction (Prefix or Suffix). Returns
+/// None when the result would over-broaden — empty Seq, > 64-wide
+/// alternation, or any literal shorter than 3 bytes (too short to
+/// trigram).
+fn regex_literals_kind(
+    pattern: &str,
+    kind: regex_syntax::hir::literal::ExtractKind,
+) -> Option<Vec<Vec<u8>>> {
+    use regex_syntax::hir::literal::Extractor;
     let hir = regex_syntax::parse(pattern).ok()?;
-    let seq = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
+    let seq = Extractor::new().kind(kind).extract(&hir);
     let lits = seq.literals()?;
     if lits.is_empty() { return None; }
-    // Cap: too many alternatives means the union is going to be most of
-    // the corpus anyway. 64 is generous; livegrep uses similar bounds.
     if lits.len() > 64 { return None; }
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(lits.len());
     for lit in lits {
@@ -1847,25 +1846,61 @@ fn regex_literals_for_trigram(pattern: &str) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
-/// For a regex pattern, return the trigram candidate set if any can be
-/// extracted. Returns None ⇒ caller should fall back to a full scan.
-///
-/// Algorithm: parse → extract prefix literals via HIR analysis → for
-/// each ≥3-byte literal, intersect its per-trigram posting lists, then
-/// UNION across alternatives (the regex matches if ANY alternative
-/// matches). Russ Cox / livegrep style.
-fn grep_candidates_for_regex(
+/// Backwards-compatible prefix-only literal extraction. Kept because
+/// the regex_lit_* unit tests assert this shape directly.
+fn regex_literals_for_trigram(pattern: &str) -> Option<Vec<Vec<u8>>> {
+    regex_literals_kind(pattern, regex_syntax::hir::literal::ExtractKind::Prefix)
+}
+
+/// Compute the candidate file set for ONE direction (prefix OR suffix).
+/// UNIONs across the alternatives in that direction (the regex matches
+/// if ANY alternative matches).
+fn candidates_for_literals(
     r: &StoreReader,
-    pattern: &str,
+    lits: &[Vec<u8>],
 ) -> Option<std::collections::HashSet<u32>> {
-    let lits = regex_literals_for_trigram(pattern)?;
     let mut union: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for lit in lits {
-        let part = r.grep_candidates(&lit)?;
+        let part = r.grep_candidates(lit)?;
         if part.is_empty() { continue; }
         union.extend(part);
     }
     Some(union)
+}
+
+/// For a regex pattern, return the trigram candidate set if any can be
+/// extracted. Returns None ⇒ caller should fall back to a full scan.
+///
+/// Russ Cox 2012 / livegrep extract MULTIPLE literals from a regex and
+/// AND-intersect: any matching file must contain a prefix literal AND
+/// (when extractable) a suffix literal too. For a regex like
+/// `r"foo.*bar"` that means the file must contain both "foo" and
+/// "bar" — a far tighter filter than the prefix-only "contains foo".
+///
+/// The extractor often gives different shapes from each direction:
+/// `r"(a|b|c)(x|y|z)[A-Z]+foo"` yields inexact 2-byte prefix
+/// alternatives (BAIL on <3 bytes) but a clean "foo" suffix —
+/// pre-2026-05-16 we'd fall back to full scan; now suffix narrowing
+/// kicks in.
+fn grep_candidates_for_regex(
+    r: &StoreReader,
+    pattern: &str,
+) -> Option<std::collections::HashSet<u32>> {
+    use regex_syntax::hir::literal::ExtractKind;
+    let prefix_cands = regex_literals_kind(pattern, ExtractKind::Prefix)
+        .and_then(|lits| candidates_for_literals(r, &lits));
+    let suffix_cands = regex_literals_kind(pattern, ExtractKind::Suffix)
+        .and_then(|lits| candidates_for_literals(r, &lits));
+    match (prefix_cands, suffix_cands) {
+        (Some(p), Some(s)) => {
+            // AND-intersect smaller-into-larger to minimize hash lookups.
+            let (mut keep, drop_) = if p.len() <= s.len() { (p, s) } else { (s, p) };
+            keep.retain(|f| drop_.contains(f));
+            Some(keep)
+        }
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
 }
 
 fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {
@@ -2254,5 +2289,55 @@ mod tests {
             .collect();
         let pat = alts.join("|");
         assert!(regex_literals_for_trigram(&pat).is_none(), "should bail at 65 alternatives");
+    }
+
+    /// Suffix extraction picks up trailing literals that prefix extraction
+    /// can't reach — the canonical case is a pattern starting with a too-
+    /// broad construct ("[A-Z]+") but ending in a fixed string. Pre-2026-
+    /// 05-16 we'd have bailed on prefix and skipped pre-filtering entirely;
+    /// the suffix path keeps narrowing.
+    #[test]
+    fn regex_lit_suffix_finds_trailing_literal() {
+        use regex_syntax::hir::literal::ExtractKind;
+        // [A-Z]+ prefix is unbounded but "ZygoteInit" is a clean suffix.
+        let suf = regex_literals_kind(r"[A-Z]+ZygoteInit", ExtractKind::Suffix).unwrap();
+        assert_eq!(suf.len(), 1);
+        assert!(suf[0].ends_with(b"ZygoteInit"), "got {:?}", suf[0]);
+        // Prefix should bail (literals would be "[A-Z]+" expansion).
+        // The exact prefix output depends on regex-syntax internals; we
+        // just assert the SUFFIX path finds something usable when prefix
+        // does not.
+    }
+
+    /// Pure literal: prefix and suffix both extract the same thing.
+    /// We don't assert equality (the extractor's internal encoding may
+    /// differ) — we only assert both directions produce ≥1 literal so
+    /// the AND-intersection in grep_candidates_for_regex still has both
+    /// sides to constrain on.
+    #[test]
+    fn regex_lit_pure_literal_both_directions() {
+        use regex_syntax::hir::literal::ExtractKind;
+        let p = regex_literals_kind("ZygoteInit", ExtractKind::Prefix).unwrap();
+        let s = regex_literals_kind("ZygoteInit", ExtractKind::Suffix).unwrap();
+        assert!(!p.is_empty());
+        assert!(!s.is_empty());
+    }
+
+    /// Prefix.*Suffix: both directions extract a useful literal. This is
+    /// the case the AND-intersect was added for — file must contain
+    /// BOTH "frameworks" AND "ActivityManager" to match, far tighter
+    /// than either alone.
+    #[test]
+    fn regex_lit_prefix_dotstar_suffix_separates() {
+        use regex_syntax::hir::literal::ExtractKind;
+        let p = regex_literals_kind(r"frameworks.*ActivityManager", ExtractKind::Prefix).unwrap();
+        let s = regex_literals_kind(r"frameworks.*ActivityManager", ExtractKind::Suffix).unwrap();
+        // Prefix literal should contain "frameworks"; suffix should
+        // contain "ActivityManager". The extractor may add trailing
+        // bytes for inexactness, so we use contains, not equality.
+        assert!(p.iter().any(|l| l.windows(10).any(|w| w == b"frameworks")),
+                "prefix should mention 'frameworks', got {:?}", p);
+        assert!(s.iter().any(|l| l.windows(15).any(|w| w == b"ActivityManager")),
+                "suffix should mention 'ActivityManager', got {:?}", s);
     }
 }

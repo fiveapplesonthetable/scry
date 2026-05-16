@@ -276,6 +276,8 @@ impl StorePaths {
     pub fn refs(&self) -> PathBuf { self.root.join("refs.bin") }
     pub fn ref_names_fst(&self) -> PathBuf { self.root.join("ref_names.fst") }
     pub fn ref_postings(&self) -> PathBuf { self.root.join("ref_postings.bin") }
+    pub fn trigram_fst(&self) -> PathBuf { self.root.join("trigrams.fst") }
+    pub fn trigram_postings(&self) -> PathBuf { self.root.join("trigram_postings.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +303,11 @@ pub struct StoreWriter {
     /// re-reading the chunks first.
     pub symbol_chunk_lens: Vec<u64>,
     pub ref_chunk_lens: Vec<u64>,
+    /// Per-batch staging of trigram tuples (trigram, file_id). Flushed to
+    /// disk by flush_trigrams_chunk. When None, trigram indexing is
+    /// disabled (writer was created without the build_trigrams option).
+    pub trigrams: Option<Vec<(trigram::Trigram, u32)>>,
+    pub trigram_chunk_count: u32,
 }
 
 impl StoreWriter {
@@ -316,6 +323,18 @@ impl StoreWriter {
             ref_chunk_count: 0,
             symbol_chunk_lens: Vec::new(),
             ref_chunk_lens: Vec::new(),
+            trigrams: None,
+            trigram_chunk_count: 0,
+        }
+    }
+
+    /// Turn on trigram index building. Subsequent push_trigrams calls will
+    /// accumulate trigrams that get flushed alongside symbol/ref chunks.
+    /// Must be called BEFORE the indexing pipeline starts (we don't backfill
+    /// trigrams for already-parsed files).
+    pub fn enable_trigrams(&mut self) {
+        if self.trigrams.is_none() {
+            self.trigrams = Some(Vec::with_capacity(16 * 1024 * 1024));
         }
     }
 
@@ -340,6 +359,8 @@ impl StoreWriter {
             ref_chunk_count: 0,
             symbol_chunk_lens: Vec::new(),
             ref_chunk_lens: Vec::new(),
+            trigrams: None,
+            trigram_chunk_count: 0,
         })
     }
 
@@ -376,9 +397,16 @@ impl StoreWriter {
         };
         let (sym_chunks, sym_lens) = count_chunks("symbols")?;
         let (ref_chunks, ref_lens) = count_chunks("refs")?;
+        // Also count existing trigram chunks if any (resume case).
+        let mut tg_chunks: u32 = 0;
+        loop {
+            let p = tmp.join(format!("trigrams.chunk.{:06}.bin", tg_chunks));
+            if !p.exists() { break; }
+            tg_chunks += 1;
+        }
         eprintln!(
-            "[resume] reopening {} (existing chunks: {} symbol, {} ref)",
-            tmp.display(), sym_chunks, ref_chunks,
+            "[resume] reopening {} (existing chunks: {} symbol, {} ref, {} trigram)",
+            tmp.display(), sym_chunks, ref_chunks, tg_chunks,
         );
         Ok(Self {
             paths: StorePaths::new(root),
@@ -391,6 +419,8 @@ impl StoreWriter {
             ref_chunk_count: ref_chunks,
             symbol_chunk_lens: sym_lens,
             ref_chunk_lens: ref_lens,
+            trigrams: None,
+            trigram_chunk_count: tg_chunks,
         })
     }
 
@@ -427,6 +457,45 @@ impl StoreWriter {
         write_bincode(&p, &take)?;
         self.symbol_chunk_count = n + 1;
         self.symbol_chunk_lens.push(count);
+        Ok(count)
+    }
+
+    /// Append a single file's trigrams to the writer's pending buffer.
+    /// No-op if trigram building is disabled. Caller is responsible for
+    /// passing the already-deduplicated sorted trigrams for `file_id`
+    /// (typically from `trigram::extract_sorted`).
+    pub fn push_trigrams(&mut self, trigrams: &[trigram::Trigram], file_id: u32) {
+        if let Some(buf) = self.trigrams.as_mut() {
+            buf.reserve(trigrams.len());
+            for t in trigrams {
+                buf.push((*t, file_id));
+            }
+        }
+    }
+
+    /// Drain pending trigrams to a chunk file. Sorted by (trigram, file_id)
+    /// so the finalize k-way merge can stream them in order.
+    /// Tuple layout on disk: 3-byte trigram, 4-byte file_id LE = 7 bytes.
+    pub fn flush_trigrams_chunk(&mut self) -> Result<u64> {
+        let tmp = match self.tmp_dir.clone() {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+        let buf = match self.trigrams.as_mut() {
+            Some(b) if !b.is_empty() => b,
+            _ => return Ok(0),
+        };
+        let n = self.trigram_chunk_count;
+        let p = tmp.join(format!("trigrams.chunk.{:06}.bin", n));
+        buf.sort_unstable();
+        let count = buf.len() as u64;
+        let mut w = BufWriter::with_capacity(1 << 20, File::create(&p)?);
+        for (t, f) in buf.drain(..) {
+            w.write_all(&t)?;
+            w.write_all(&f.to_le_bytes())?;
+        }
+        w.flush()?;
+        self.trigram_chunk_count = n + 1;
         Ok(count)
     }
 
@@ -498,6 +567,7 @@ impl StoreWriter {
         // Flush any remaining in-RAM records.
         let _ = self.flush_symbols_chunk()?;
         let _ = self.flush_refs_chunk()?;
+        let _ = self.flush_trigrams_chunk()?;
 
         let final_dir = self.paths.root.clone();
         let tmp = self
@@ -567,6 +637,19 @@ impl StoreWriter {
             )?;
         }
 
+        // -- trigrams.fst + trigram_postings.bin (delta+varint posting lists)
+        //    Only built when the writer was created with --build-trigrams.
+        if self.trigram_chunk_count > 0 {
+            let chunk_paths: Vec<PathBuf> = (0..self.trigram_chunk_count)
+                .map(|n| tmp.join(format!("trigrams.chunk.{:06}.bin", n)))
+                .collect();
+            kway_merge_trigrams_to_fst(
+                &chunk_paths,
+                &tmp_paths.trigram_fst(),
+                &tmp_paths.trigram_postings(),
+            )?;
+        }
+
         let manifest = Manifest {
             version: 1,
             scry_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -591,6 +674,9 @@ impl StoreWriter {
         }
         let _ = std::fs::remove_file(tmp.join("progress.json"));
         let _ = std::fs::remove_file(tmp.join("progress.json.tmp"));
+        for n in 0..self.trigram_chunk_count {
+            let _ = std::fs::remove_file(tmp.join(format!("trigrams.chunk.{:06}.bin", n)));
+        }
 
         if final_dir.exists() {
             let old = final_dir.with_extension("old");
@@ -821,6 +907,139 @@ impl PartialOrd for HeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 
+// ---------------------------------------------------------------------------
+// Trigram-chunk reader + k-way merge (mirrors the names-chunk machinery).
+// ---------------------------------------------------------------------------
+struct TrigramChunkReader {
+    file: BufReader<File>,
+    next: Option<(trigram::Trigram, u32)>,
+}
+impl TrigramChunkReader {
+    fn open(path: &Path) -> Result<Self> {
+        let mut r = Self {
+            file: BufReader::new(
+                File::open(path).with_context(|| format!("open {}", path.display()))?,
+            ),
+            next: None,
+        };
+        r.advance()?;
+        Ok(r)
+    }
+    fn advance(&mut self) -> Result<()> {
+        use std::io::Read;
+        let mut t = [0u8; 3];
+        if self.file.read_exact(&mut t).is_err() { self.next = None; return Ok(()); }
+        let mut f = [0u8; 4];
+        self.file.read_exact(&mut f)?;
+        self.next = Some((t, u32::from_le_bytes(f)));
+        Ok(())
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct TrigramHeapItem {
+    trigram: trigram::Trigram,
+    file_id: u32,
+    reader_id: usize,
+}
+impl Ord for TrigramHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.trigram.cmp(&self.trigram)
+            .then(other.reader_id.cmp(&self.reader_id))
+            .then(other.file_id.cmp(&self.file_id))
+    }
+}
+impl PartialOrd for TrigramHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+/// K-way merge per-chunk sorted (trigram, file_id) tuples into:
+///   - trigrams.fst:        FST mapping the 3-byte trigram → u64 offset
+///   - trigram_postings.bin: per-trigram delta-coded varint file_id list
+///
+/// Posting layout per trigram:
+///   u32 LE count, then `count` × varint(delta_from_previous).
+/// Delta+varint is the same compression Code Search / livegrep use; gives
+/// ~3-5× shrink vs. raw u32 for typical posting lists in source-code
+/// corpora where file_ids are densely packed.
+fn kway_merge_trigrams_to_fst(
+    chunk_paths: &[PathBuf],
+    fst_path: &Path,
+    postings_path: &Path,
+) -> Result<()> {
+    use std::collections::BinaryHeap;
+    let mut readers: Vec<TrigramChunkReader> = chunk_paths.iter()
+        .map(|p| TrigramChunkReader::open(p))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap: BinaryHeap<TrigramHeapItem> = BinaryHeap::with_capacity(readers.len());
+    for (i, r) in readers.iter().enumerate() {
+        if let Some((t, f)) = r.next {
+            heap.push(TrigramHeapItem { trigram: t, file_id: f, reader_id: i });
+        }
+    }
+    let mut postings = BufWriter::with_capacity(1 << 20, File::create(postings_path)?);
+    let fst_file = BufWriter::with_capacity(1 << 20, File::create(fst_path)?);
+    let mut fst_builder = fst::MapBuilder::new(fst_file)?;
+    let mut current_trigram: Option<trigram::Trigram> = None;
+    let mut current_offset: u64 = 0;
+    let mut current_fids: Vec<u32> = Vec::new();
+    let mut pos: u64 = 0;
+
+    fn write_varint(w: &mut BufWriter<File>, mut v: u32) -> std::io::Result<u64> {
+        let mut n: u64 = 0;
+        while v >= 0x80 { w.write_all(&[(v as u8 & 0x7f) | 0x80])?; v >>= 7; n += 1; }
+        w.write_all(&[v as u8])?;
+        Ok(n + 1)
+    }
+
+    let flush_group = |postings: &mut BufWriter<File>,
+                       fst_builder: &mut fst::MapBuilder<BufWriter<File>>,
+                       trigram: &trigram::Trigram,
+                       fids: &mut Vec<u32>,
+                       offset: u64,
+                       pos: &mut u64|
+     -> Result<()> {
+        if fids.is_empty() { return Ok(()); }
+        fids.sort_unstable();
+        fids.dedup();
+        postings.write_all(&(fids.len() as u32).to_le_bytes())?;
+        *pos += 4;
+        let mut prev: u32 = 0;
+        for &f in fids.iter() {
+            let delta = f.wrapping_sub(prev);
+            *pos += write_varint(postings, delta)?;
+            prev = f;
+        }
+        fst_builder.insert(trigram, offset)
+            .with_context(|| format!("trigram fst insert {:?}", trigram))?;
+        Ok(())
+    };
+
+    while let Some(TrigramHeapItem { trigram, file_id, reader_id }) = heap.pop() {
+        let same = current_trigram.as_ref() == Some(&trigram);
+        if !same {
+            if let Some(t) = current_trigram.take() {
+                flush_group(&mut postings, &mut fst_builder, &t, &mut current_fids, current_offset, &mut pos)?;
+                current_fids.clear();
+            }
+            current_trigram = Some(trigram);
+            current_offset = pos;
+        }
+        current_fids.push(file_id);
+        readers[reader_id].advance()?;
+        if let Some((t, f)) = readers[reader_id].next {
+            heap.push(TrigramHeapItem { trigram: t, file_id: f, reader_id });
+        }
+    }
+    if let Some(t) = current_trigram.take() {
+        flush_group(&mut postings, &mut fst_builder, &t, &mut current_fids, current_offset, &mut pos)?;
+    }
+    if pos == 0 { postings.write_all(&[0u8])?; }
+    postings.flush()?;
+    fst_builder.finish()?;
+    Ok(())
+}
+
 fn kway_merge_names_to_fst(
     chunk_paths: &[PathBuf],
     fst_path: &Path,
@@ -926,6 +1145,11 @@ pub struct StoreReader {
     pub postings_mmap: memmap2::Mmap,
     pub ref_fst: fst::Map<memmap2::Mmap>,
     pub ref_postings_mmap: memmap2::Mmap,
+    /// Trigram index for fast literal grep. Only present when the index
+    /// was built with --build-trigrams. When absent, grep falls back to
+    /// the full-scan path. None for old indexes — they still work.
+    pub trigram_fst: Option<fst::Map<memmap2::Mmap>>,
+    pub trigram_postings_mmap: Option<memmap2::Mmap>,
 }
 
 impl StoreReader {
@@ -958,10 +1182,56 @@ impl StoreReader {
         let ref_fst = fst::Map::new(ref_fst_mmap)?;
         let pf = File::open(paths.ref_postings())?;
         let ref_postings_mmap = unsafe { memmap2::Mmap::map(&pf)? };
+        // Trigram index is optional — old indexes don't have it. Try to open,
+        // and silently fall through if missing.
+        let (trigram_fst, trigram_postings_mmap) = match (File::open(paths.trigram_fst()), File::open(paths.trigram_postings())) {
+            (Ok(tf), Ok(tp)) => {
+                let tf_mmap = unsafe { memmap2::Mmap::map(&tf)? };
+                let tp_mmap = unsafe { memmap2::Mmap::map(&tp)? };
+                let tfst = fst::Map::new(tf_mmap)?;
+                (Some(tfst), Some(tp_mmap))
+            }
+            _ => (None, None),
+        };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
+            trigram_fst, trigram_postings_mmap,
         })
+    }
+
+    /// Trigram pre-filter for literal grep. Returns Some(set of candidate
+    /// file_ids) when the trigram index is available AND the needle has at
+    /// least one trigram. Returns None when grep should fall back to the
+    /// full-scan path (no index, or needle too short to trigrammify).
+    ///
+    /// Correctness: any file containing the literal `needle` MUST contain
+    /// every trigram in `needle`. So the candidate set = intersection of
+    /// posting lists, which is a superset of the actual-match set.
+    /// Caller still scans candidates with memchr to find true positions.
+    pub fn grep_candidates(&self, needle: &[u8]) -> Option<std::collections::HashSet<u32>> {
+        let fst = self.trigram_fst.as_ref()?;
+        let postings = self.trigram_postings_mmap.as_ref()?;
+        let qts = trigram::trigrams_of_query(needle);
+        if qts.is_empty() { return None; }
+        // For each trigram: lookup offset, decode posting list. Skip missing
+        // (means zero files contain it = empty intersection = early exit).
+        let mut lists: Vec<std::collections::HashSet<u32>> = Vec::with_capacity(qts.len());
+        for t in &qts {
+            let off = match fst.get(t.as_slice()) {
+                Some(v) => v,
+                None => return Some(std::collections::HashSet::new()),
+            };
+            lists.push(read_trigram_posting(postings, off));
+        }
+        // Intersect smallest-first to minimize work.
+        lists.sort_by_key(|s| s.len());
+        let mut result = lists.swap_remove(0);
+        for s in lists {
+            result.retain(|f| s.contains(f));
+            if result.is_empty() { break; }
+        }
+        Some(result)
     }
 
     pub fn lookup_refs_exact(&self, name: &str) -> Vec<&RefRecord> {
@@ -1029,6 +1299,37 @@ impl StoreReader {
     fn read_posting(&self, off: u64) -> Vec<u32> {
         read_posting(&self.postings_mmap, off)
     }
+}
+
+/// Decode a trigram posting list at the given byte offset. Layout matches
+/// what kway_merge_trigrams_to_fst wrote: u32 LE count, then `count` ×
+/// varint(delta_from_previous), reconstructing the original sorted u32 list.
+fn read_trigram_posting(buf: &[u8], off: u64) -> std::collections::HashSet<u32> {
+    let start = off as usize;
+    let mut out = std::collections::HashSet::new();
+    if start + 4 > buf.len() { return out; }
+    let count = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
+    out.reserve(count);
+    let mut p = start + 4;
+    let mut prev: u32 = 0;
+    for _ in 0..count {
+        // varint decode (LE128, MSB continuation)
+        let mut delta: u32 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            if p >= buf.len() { return out; }
+            let b = buf[p];
+            p += 1;
+            delta |= ((b & 0x7f) as u32) << shift;
+            if b & 0x80 == 0 { break; }
+            shift += 7;
+            if shift >= 32 { return out; } // malformed
+        }
+        let f = prev.wrapping_add(delta);
+        out.insert(f);
+        prev = f;
+    }
+    out
 }
 
 fn read_posting(buf: &[u8], off: u64) -> Vec<u32> {

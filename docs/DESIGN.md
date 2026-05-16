@@ -1,7 +1,15 @@
 # scry — design
 
-Status: draft, pre-implementation. Comments and pushback welcome before code
-lands.
+**Status: implemented + in production.** This document is the as-designed
+spec; everything below is shipped against `~/dev/aosp` + `/mnt/agent/dev/linux`
+unless explicitly marked "(deferred)". For the as-built operator view see
+`OPERATIONS.md`; for the fast-path (trigram + lazy mmap) details see
+`FAST_PATH.md`. Both fast-path optimizations shipped on 2026-05-16
+(commits `1041f2b`, `e96a4ee`, `d1e507a`). The deprecated
+`set_timeout_micros` per-file budget was replaced by
+`parse_with_options` + progress callback on 2026-05-16 (`c2e32fa`)
+after several real AOSP Java files were observed running > 1 h with
+the old mechanism silently failing to abort.
 
 ---
 

@@ -283,6 +283,47 @@ enum Cmd {
         #[arg(long)]
         budget: Option<usize>,
     },
+    /// One-shot post-finalize pipeline: rebuilds every sidecar
+    /// scry's query path knows how to use, in one command.
+    /// Equivalent to running `build-offsets`, `build-file-symbols`,
+    /// `build-trigrams`, `build-resolutions` (always), plus
+    /// `build-modgraph` for each `--build-<kind> ROOT` flag passed,
+    /// plus `scip-import` for each `--scip FILE` flag passed.
+    /// Reports per-stage timings.
+    Finalize {
+        #[arg(long, value_name = "DIR")]
+        index: Option<PathBuf>,
+        /// Soong project root → write `module_graph.json`.
+        #[arg(long, value_name = "PATH")]
+        build_soong: Option<PathBuf>,
+        /// Linux kernel project root → write `module_graph.json`
+        /// (overrides build_soong if both are set; only one
+        /// module_graph fits per index).
+        #[arg(long, value_name = "PATH")]
+        build_kernel: Option<PathBuf>,
+        /// GN project root.
+        #[arg(long, value_name = "PATH")]
+        build_gn: Option<PathBuf>,
+        /// Bazel project root.
+        #[arg(long, value_name = "PATH")]
+        build_bazel: Option<PathBuf>,
+        /// Cargo workspace root.
+        #[arg(long, value_name = "PATH")]
+        build_cargo: Option<PathBuf>,
+        /// SCIP index file to import.
+        #[arg(long, value_name = "PATH")]
+        scip: Option<PathBuf>,
+        /// `scry clang-index` input: compile_commands.json. Set
+        /// alongside this you can pass `--clang-root` to filter.
+        #[arg(long, value_name = "PATH")]
+        clang_compile_commands: Option<PathBuf>,
+        /// Optional `--root` to pass to scry clang-index.
+        #[arg(long, value_name = "PATH")]
+        clang_root: Option<PathBuf>,
+        /// Workers passed through to the sub-commands.
+        #[arg(long, default_value_t = 16)]
+        workers: usize,
+    },
     /// Recursive callers tree for NAME. Walks the call graph
     /// upwards: for each caller, find ITS callers, up to `--depth`
     /// levels. Cycle-safe (visited-set). Outputs an indented tree
@@ -1087,6 +1128,13 @@ fn main() -> Result<()> {
             cmd_impact(name, index, in_, subclass_depth, reachable, limit, json),
         Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, json } =>
             cmd_callgraph(name, index, in_, depth, max_nodes, reachable, json),
+        Cmd::Finalize {
+            index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
+            scip, clang_compile_commands, clang_root, workers,
+        } => cmd_finalize(
+            index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
+            scip, clang_compile_commands, clang_root, workers,
+        ),
         Cmd::Subclasses { name, index, in_, depth, limit, json } =>
             cmd_subclasses(name, index, in_, depth, limit, json),
         Cmd::Implementations { name, index, in_, depth, limit, json } =>
@@ -2256,6 +2304,84 @@ fn cmd_def(
         print_results(&r, &filtered, limit, json);
     }
     log_query(&r, "def", &name, filtered.len(), filtered.len().min(limit), t);
+    Ok(())
+}
+
+/// `scry finalize` — one-shot post-index sidecar pipeline.
+///
+/// Composition of existing build-* commands; the value here is
+/// discoverability + one-stop CI hook. Each stage reports its
+/// own timing and exits non-zero on failure so the caller can
+/// fail-fast.
+#[allow(clippy::too_many_arguments)]
+fn cmd_finalize(
+    index: Option<PathBuf>,
+    build_soong: Option<PathBuf>,
+    build_kernel: Option<PathBuf>,
+    build_gn: Option<PathBuf>,
+    build_bazel: Option<PathBuf>,
+    build_cargo: Option<PathBuf>,
+    scip: Option<PathBuf>,
+    clang_compile_commands: Option<PathBuf>,
+    clang_root: Option<PathBuf>,
+    workers: usize,
+) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    let t_total = Instant::now();
+    eprintln!("[finalize] index: {}", dir.display());
+
+    fn stage<R, F: FnOnce() -> Result<R>>(name: &str, f: F) -> Result<R> {
+        let t = Instant::now();
+        eprintln!("[finalize] === {name} ===");
+        let r = f().with_context(|| format!("finalize stage {name}"))?;
+        eprintln!("[finalize] {name} done in {} ms", t.elapsed().as_millis());
+        Ok(r)
+    }
+
+    stage("build-offsets", || cmd_build_offsets(Some(dir.clone())))?;
+    stage("build-file-symbols", || cmd_build_file_symbols(Some(dir.clone())))?;
+    stage("build-trigrams", || cmd_build_trigrams(Some(dir.clone()), Some(workers), 5 * 1024 * 1024))?;
+    stage("build-resolutions", || cmd_build_resolutions(Some(dir.clone())))?;
+
+    // Module-graph. Pick one source — first non-None wins, with a
+    // clear log line stating the choice. Multiple precision sidecars
+    // for the same index don't compose: a single module_graph.json
+    // lives in the dir.
+    let mg_out = dir.join("module_graph.json");
+    let mg_source = build_soong.as_ref().map(|r| ("soong", r))
+        .or_else(|| build_kernel.as_ref().map(|r| ("kernel", r)))
+        .or_else(|| build_gn.as_ref().map(|r| ("gn", r)))
+        .or_else(|| build_bazel.as_ref().map(|r| ("bazel", r)))
+        .or_else(|| build_cargo.as_ref().map(|r| ("cargo", r)));
+    if let Some((kind, root)) = mg_source {
+        let kind_str = kind.to_string();
+        let root = root.clone();
+        let out = mg_out.clone();
+        stage(&format!("build-modgraph {kind_str}"),
+              || cmd_build_modgraph(&kind_str, &root, &out))?;
+    } else {
+        eprintln!("[finalize] (no --build-<kind> flag — skipping module_graph)");
+    }
+
+    if let Some(scip_path) = scip {
+        let dir2 = dir.clone();
+        stage("scip-import", || scry_scip::import_scip(&scip_path, &dir2, None))?;
+    }
+
+    if let Some(cc_path) = clang_compile_commands {
+        let dir2 = dir.clone();
+        let root = clang_root.clone();
+        let workers_for_clang = workers;
+        stage("clang-index", || scry_clang::build_clang_usrs(
+            &cc_path, &dir2, root.as_deref(), workers_for_clang, 4 * 1024 * 1024,
+        ))?;
+    }
+
+    eprintln!(
+        "[finalize] ALL STAGES OK in {} sec — run `scry health --index {}` \
+         to verify sidecar shapes.",
+        t_total.elapsed().as_secs(), dir.display(),
+    );
     Ok(())
 }
 

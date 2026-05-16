@@ -7,6 +7,40 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.21] — 2026-05-16
+
+\`scry finalize\` — one-shot post-index sidecar pipeline. Rebuilds
+every sidecar scry's query path knows how to use, in one
+command, with per-stage timings. Discoverable from \`--help\` so
+new users don't have to learn the build-* command zoo.
+
+\`\`\`bash
+# After scry index finishes:
+scry finalize --index /path/to/idx \\
+  --build-soong /path/to/aosp \\
+  --scip /path/to/index.scip \\
+  --clang-compile-commands /path/to/compile_commands.json
+\`\`\`
+
+Stages run in order, fail-fast on any error:
+1. \`build-offsets\`        — random-access readers.
+2. \`build-file-symbols\`   — outline + enclosing_function fast path.
+3. \`build-trigrams\`       — literal grep 100×.
+4. \`build-resolutions\`    — Layer 2 ref → def overrides.
+5. \`build-modgraph KIND\`  — module_graph.json (one of soong /
+   kernel / gn / bazel / cargo; first non-None wins, since only
+   one module_graph fits per index).
+6. \`scip-import FILE\`     — Path C cross-language precision.
+7. \`clang-index FILE\`     — Path B C/C++/ObjC precision.
+
+Each stage is opt-in via its \`--build-<kind>\` / \`--scip\` /
+\`--clang-compile-commands\` flag. The first four always run; the
+later ones only when their input flag is provided.
+
+This makes the AOSP rebuild ritual a single command instead of
+chaining six. The post-finalize script (\`scripts/post_finalize.sh\`)
+will start using it in a follow-up.
+
 ## [0.1.20] — 2026-05-16
 
 `scry callgraph NAME` — recursive callers tree. LLM-shaped

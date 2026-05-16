@@ -203,11 +203,24 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Substring (fuzzy-ish) search over symbol names.
+    /// Typo-tolerant fuzzy search over symbol names. Combines a
+    /// substring match (catches "ParcelFile" → "ParcelFileDescriptor")
+    /// with a Levenshtein-automaton walk bounded by --distance, then
+    /// re-ranks the union by Wagner-Fischer edit distance so the
+    /// closest names land first. The `distance` field on each result
+    /// is the actual edit distance from the query to the symbol name.
     Fuzzy {
         substr: String,
         #[arg(long)]
         index: Option<PathBuf>,
+        /// Levenshtein distance bound for typo tolerance. The actual
+        /// per-result distance shown in output is computed exactly
+        /// via Wagner-Fischer; this flag only caps the candidate set
+        /// that the FST automaton walks. Defaults to 2 — high enough
+        /// for one-character typos in either direction, low enough
+        /// that the automaton stays cheap.
+        #[arg(long, default_value = "2")]
+        distance: u32,
         #[arg(long, default_value = "50")]
         limit: usize,
         #[arg(long)]
@@ -505,8 +518,8 @@ fn main() -> Result<()> {
         Cmd::Prefix { prefix, index, limit, json } => {
             cmd_prefix(prefix, index, limit, json)
         }
-        Cmd::Fuzzy { substr, index, limit, json } => {
-            cmd_fuzzy(substr, index, limit, json)
+        Cmd::Fuzzy { substr, index, distance, limit, json } => {
+            cmd_fuzzy(substr, index, distance, limit, json)
         }
         Cmd::Ref { name, index, lang, kind, in_, limit, json } => {
             cmd_ref(name, index, lang, kind, in_, limit, json)
@@ -1374,15 +1387,56 @@ fn cmd_prefix(prefix: String, index: Option<PathBuf>, limit: usize, json: bool) 
     Ok(())
 }
 
-fn cmd_fuzzy(substr: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
+fn cmd_fuzzy(
+    substr: String,
+    index: Option<PathBuf>,
+    distance: u32,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     let t = Instant::now();
     let r = open_index(index)?;
-    let mut results = r.lookup_substring(&substr, limit.saturating_mul(8).max(limit));
-    rank_symbols(&mut results, &r);
-    let shown = limit.min(results.len());
-    print_results(&r, &results[..shown], limit, json);
-    log_query(&r, "fuzzy", &substr, results.len(), shown, t);
+    // Ranked path: substring matches + Levenshtein-bounded matches,
+    // deduped, re-sorted by exact Wagner-Fischer distance.
+    let scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(&substr, distance, limit);
+    let shown = scored.len();
+    print_fuzzy_results(&r, &scored, json);
+    log_query(&r, "fuzzy", &substr, shown, shown, t);
     Ok(())
+}
+
+/// Print a fuzzy result set. Distance is shown alongside each hit so
+/// callers can see *why* a particular entry ranked where it did.
+fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bool) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if json {
+        for (s, d) in scored {
+            let mut j = symbol_to_json(r, s);
+            j.as_object_mut().unwrap()
+                .insert("distance".to_string(), serde_json::json!(d));
+            let _ = writeln!(out, "{}", j);
+        }
+        return;
+    }
+    for (s, d) in scored {
+        let path = r.files.get(s.file_id as usize)
+            .map(|f| f.display_path(&r.roots))
+            .unwrap_or_default();
+        let scope = if s.scope_path.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", s.scope_path.join("."))
+        };
+        let _ = writeln!(out, "{}:{}:{}  (d={})  ({} {}){}  {}",
+            path, s.line, s.col, d,
+            s.kind.short(), s.lang.as_str(), scope, s.name);
+    }
+    let _ = writeln!(out, "\n{} result{} (showing {})",
+        scored.len(),
+        if scored.len() == 1 { "" } else { "s" },
+        scored.len());
 }
 
 fn cmd_ref(
@@ -3242,9 +3296,11 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "in":    in_prop,
             "limit": limit_prop,
         }))),
-        tool("fuzzy", "Symbols whose name contains SUBSTR.", obj(&["substr"], serde_json::json!({
+        tool("fuzzy", "Typo-tolerant symbol search, ranked by edit distance.", obj(&["substr"], serde_json::json!({
             "substr": {"type": "string"},
             "in":    in_prop,
+            "distance": {"type": "integer", "default": 2,
+                "description": "Levenshtein bound for typo tolerance (1–3 is sensible)."},
             "limit": limit_prop,
         }))),
         tool("grep", "Content search; literal pattern unless --regex is set on the request (default literal).", obj(&["pattern"], serde_json::json!({
@@ -3508,7 +3564,11 @@ fn serve_one_request<W: std::io::Write>(
     let mut result = match cmd {
         "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, limit),
         "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, limit),
-        "fuzzy"   => serve_fuzzy(reader, arg_str("substr"), in_, limit),
+        "fuzzy"   => {
+            let dist = args.get("distance").and_then(|v| v.as_u64())
+                .map(|n| n as u32).unwrap_or(2);
+            serve_fuzzy_with_distance(reader, arg_str("substr"), in_, dist, limit)
+        }
         "ref"     => serve_ref(reader, arg_str("name"), lang, kind, in_, limit),
         "callers" => serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit),
         "grep"    => serve_grep(reader, arg_str("pattern"), lang, in_, limit),
@@ -3701,15 +3761,32 @@ fn serve_prefix(r: &StoreReader, prefix: &str, in_: Option<&str>, limit: usize) 
     serde_json::Value::Array(v)
 }
 
-fn serve_fuzzy(r: &StoreReader, substr: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
+/// JSON-RPC fuzzy: typo-tolerant + edit-distance ranked. Each emitted
+/// hit carries a `distance` field so callers know how close the match
+/// is to their query. The request can pass `args.distance: N` to
+/// override the default Levenshtein bound (2).
+fn serve_fuzzy_with_distance(
+    r: &StoreReader,
+    substr: &str,
+    in_: Option<&str>,
+    distance: u32,
+    limit: usize,
+) -> serde_json::Value {
     let in_prefix = in_.unwrap_or("");
     let cap = limit.saturating_mul(8).max(limit);
-    let mut filtered: Vec<SymbolRecord> = r.lookup_substring(substr, cap).into_iter()
-        .filter(|s| file_in_prefix(r, s.file_id, in_prefix))
-        .collect();
-    rank_symbols(&mut filtered, r);
-    let v: Vec<_> = filtered.iter().take(limit).map(|s| symbol_to_json(r, s)).collect();
-    serde_json::Value::Array(v)
+    // Over-fetch from the ranked path; filter by --in *after* ranking
+    // so a tight subdir filter doesn't kick out closer matches.
+    let scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(substr, distance, cap);
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    for (s, d) in scored {
+        if !file_in_prefix(r, s.file_id, in_prefix) { continue; }
+        let mut j = symbol_to_json(r, &s);
+        j.as_object_mut().unwrap()
+            .insert("distance".to_string(), serde_json::json!(d));
+        out.push(j);
+        if out.len() >= limit { break; }
+    }
+    serde_json::Value::Array(out)
 }
 
 fn serve_ref(

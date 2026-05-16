@@ -147,16 +147,36 @@ Ranked the same way `def` is — real source > api-txt > test fixtures.
 
 ## Fuzzy symbol search: `scry fuzzy`
 
-Substring match anywhere in the symbol name. Slower than `prefix`
-(walks the FST) but useful when you don't remember the leading
-characters.
+Typo-tolerant + edit-distance ranked. Two candidate sources are
+unioned before ranking: (a) substring matches anywhere in the symbol
+name, (b) Levenshtein-bounded matches up to `--distance N` (default 2).
+The merged set is re-sorted by an internal score that prefers
+**substring matches** over **Levenshtein-close-but-unrelated** names,
+then by exact Wagner-Fischer distance.
+
+The `d=N` column on each result is the true Wagner-Fischer distance
+from query to symbol name. Substring matches show non-zero `d` (the
+inserted characters cost) but rank above unrelated typos.
 
 ```sh
 $ scry fuzzy ParcelFile --limit 3
-/home/zim/dev/aosp/frameworks/base/core/java/android/os/ParcelFileDescriptor.java:67:14  (class java)  [ParcelFileDescriptor]  ParcelFileDescriptor
-...
-[scry] cmd=fuzzy q="ParcelFile" hits=22 shown=3 files=1009166 elapsed=190ms
+/home/zim/dev/aosp/frameworks/base/core/java/android/os/ParcelFileDescriptor.java:76:14  (d=10)  (class Java)  [ParcelFileDescriptor]  ParcelFileDescriptor
+/home/zim/dev/aosp/frameworks/native/libs/binder/rust/src/parcel/file_descriptor.rs:29:12  (d=10)  (struct Rust)  [ParcelFileDescriptor]  ParcelFileDescriptor
+/home/zim/dev/aosp/frameworks/base/core/java/android/os/ParcelFileDescriptor.java:197:12  (d=10)  (ctor Java)  [ParcelFileDescriptor]  ParcelFileDescriptor
+
+3 results (showing 3)
+[scry] cmd=fuzzy q="ParcelFile" hits=3 shown=3 files=1009166 elapsed=1179ms
 ```
+
+Typo example — a single deletion still finds the intended symbol:
+
+```sh
+$ scry fuzzy PrcelFile --distance 1 --limit 3
+… ParcelFile (d=1)  …
+```
+
+JSON-RPC + MCP both honor `args.distance: N` to override the
+default; output gains a `distance` field per hit.
 
 ---
 

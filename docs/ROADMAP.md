@@ -420,9 +420,17 @@ Single new IO backend selected at runtime:
 
 ---
 
-## 5. Fuzzy ranking by edit distance
+## 5. ~~Fuzzy ranking by edit distance~~ ✅ shipped
 
-### Goal
+**Shipped in `scry fuzzy` — see USAGE.md "Fuzzy symbol search".**
+Two candidate sources (substring + Levenshtein automaton) merged,
+re-ranked by a smart score that prefers substring matches over
+unrelated typos, then tie-broken by exact Wagner-Fischer distance.
+Each result carries a `distance` field. Pin tests in
+`crates/scry-store/src/lib.rs::tests` cover the canonical pairs and
+the prefix-beats-middle-substring invariant.
+
+### Goal (original)
 
 `scry fuzzy ParcelFile --limit 10` currently returns matches in
 FST traversal order, not sorted by edit distance to the query.

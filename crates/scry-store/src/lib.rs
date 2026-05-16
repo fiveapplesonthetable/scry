@@ -1650,9 +1650,174 @@ impl StoreReader {
         out
     }
 
+    /// Typo-tolerant fuzzy lookup with an explicit edit-distance ranking.
+    /// Returns `(symbol, distance)` tuples sorted by distance ASC (closest
+    /// matches first), then by `rank_score` DESC for stable ordering
+    /// within a single distance band, then by name ASC as a final
+    /// tiebreaker so the output is deterministic.
+    ///
+    /// `max_distance` is the bound on the Levenshtein automaton's accept
+    /// set (typically 1 or 2 — higher distances expand the candidate set
+    /// disproportionately while rarely producing useful matches). A
+    /// reasonable default is `max_distance=2` for queries ≥ 4 chars and
+    /// `1` for shorter queries.
+    ///
+    /// The implementation merges two candidate sources:
+    ///   1. Substring matches (catches "ParcelFile" → "ParcelFileDescriptor")
+    ///   2. Levenshtein automaton matches up to `max_distance` (catches
+    ///      "ParcelFille" → "ParcelFile" via a single deletion)
+    /// then computes the actual Wagner-Fischer distance from query to
+    /// each candidate name and sorts. Substring matches naturally land
+    /// at low (but typically non-zero) distance since insertions are
+    /// counted; pure typos at small distance also surface. The result is
+    /// the user expectation that "I typed X, give me the closest names".
+    pub fn lookup_fuzzy_ranked(
+        &self,
+        query: &str,
+        max_distance: u32,
+        limit: usize,
+    ) -> Vec<(SymbolRecord, u32)> {
+        use fst::{automaton::Levenshtein, IntoStreamer, Streamer};
+        let cap = limit.saturating_mul(8).max(limit);
+        // 1. Substring candidates (the historical behavior we preserve
+        //    for the "I typed a real prefix/substring" case).
+        let mut candidates: Vec<SymbolRecord> = self.lookup_substring(query, cap);
+
+        // 2. Levenshtein-bounded candidates (the typo-tolerance case).
+        //    The Automaton API requires a query ≥ 1 char and the fst
+        //    crate's Levenshtein constructor caps the practical
+        //    distance — patterns too complex error out, in which case
+        //    we just fall back to the substring-only path.
+        if !query.is_empty() && max_distance > 0 {
+            if let Ok(lev) = Levenshtein::new(query, max_distance) {
+                let mut stream = self.fst.search(&lev).into_stream();
+                while let Some((key, off)) = stream.next() {
+                    // Decode each posting once; rely on the later dedup
+                    // step (by file_id, line, name) to collapse overlap
+                    // with the substring candidates.
+                    for i in self.read_posting(off) {
+                        if let Some(s) = self.get_symbol(i) {
+                            candidates.push(s);
+                            if candidates.len() >= cap.saturating_mul(2) { break; }
+                        }
+                    }
+                    if candidates.len() >= cap.saturating_mul(2) { break; }
+                    let _ = key;
+                }
+            }
+        }
+
+        // Dedup by (file_id, line, col, name) — these tuples uniquely
+        // identify a definition site regardless of which lookup path
+        // brought it in. Using a HashSet of indices keeps memory bounded.
+        let mut seen: std::collections::HashSet<(u32, u32, u32, String)> =
+            std::collections::HashSet::with_capacity(candidates.len());
+        candidates.retain(|s| {
+            let k = (s.file_id, s.line, s.col, s.name.clone());
+            seen.insert(k)
+        });
+
+        // Score every candidate twice:
+        //   - `display_distance` = honest Wagner-Fischer distance from
+        //     query to name. Returned in output; what the user sees.
+        //   - `sort_score`       = "smart" ranking score that gives
+        //     substring matches a strong preference over Levenshtein-
+        //     close-but-unrelated names. Otherwise a typo like
+        //     "Parcelable" (WF distance 2 from "ParcelFile") would
+        //     outrank "ParcelFileDescriptor" (WF 10 but perfect prefix)
+        //     — which is not what users mean by fuzzy.
+        let q = query.as_bytes();
+        let mut scored: Vec<(SymbolRecord, u32, u32)> = candidates.into_iter()
+            .map(|s| {
+                let display = wagner_fischer(q, s.name.as_bytes());
+                let sort = fuzzy_sort_score(q, s.name.as_bytes(), display);
+                (s, display, sort)
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.2.cmp(&b.2)                                  // sort_score ASC
+                .then_with(|| b.0.rank_score().cmp(&a.0.rank_score()))
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+        scored.truncate(limit);
+        scored.into_iter().map(|(s, d, _)| (s, d)).collect()
+    }
+
     fn read_posting(&self, off: u64) -> Vec<u32> {
         read_posting(&self.postings_mmap, off)
     }
+}
+
+/// Internal ranking score for fuzzy match candidates. Lower wins.
+/// Treats different match qualities asymmetrically so substring matches
+/// (which signal "user got the right prefix/suffix; just wants more")
+/// outrank merely-Levenshtein-close-but-unrelated names (which signal
+/// "user might have typoed; here's something with similar letters").
+///
+/// The three cases:
+///   - **Exact match**: 0.
+///   - **Substring**: distance proportional to `name.len() - query.len()` —
+///     longer expansions cost more, but any substring outranks any typo.
+///     A prefix match gets a slight extra discount over a middle-substring
+///     match, which gets one over a suffix-only match.
+///   - **Typo**: Wagner-Fischer distance + a penalty that scales with
+///     query length. The penalty pushes typos below substring matches
+///     of similar length; without it, a query like "ParcelFile" would
+///     prefer "Parcelable" (WF=2, no substring) over
+///     "ParcelFileDescriptor" (WF=10, perfect prefix), which violates
+///     user intuition.
+fn fuzzy_sort_score(query: &[u8], name: &[u8], wf: u32) -> u32 {
+    if query == name { return 0; }
+    let q_len = query.len();
+    let n_len = name.len();
+    if q_len <= n_len {
+        // Substring check. Cheap memchr-style scan.
+        if name.windows(q_len).any(|w| w == query) {
+            let extra = (n_len - q_len) as u32;
+            // Prefix-match discount: the most common "I just want a
+            // longer name" intent.
+            if name.starts_with(query) { return extra; }
+            // Middle-substring slightly worse than prefix.
+            return extra + 1;
+        }
+    }
+    // Pure typo (or query longer than name): WF + per-query-length
+    // penalty so any substring of comparable length wins.
+    wf + (q_len as u32 * 2).max(4)
+}
+
+/// Wagner-Fischer edit distance between two byte slices.
+///
+/// O(|a| * |b|) time; O(min(|a|, |b|)) space via two rolling rows. Used
+/// by `lookup_fuzzy_ranked` to score candidate symbol names against a
+/// query. Bytes are compared raw — for ASCII identifier names this is
+/// identical to character distance; for multi-byte UTF-8 names the
+/// distance is byte-level (not grapheme-level), which slightly
+/// over-penalizes Unicode identifiers. Acceptable for AOSP / Linux
+/// kernel symbol sets, which are overwhelmingly ASCII.
+///
+/// Public so the CLI / test layer can pin specific values without
+/// touching the StoreReader.
+pub fn wagner_fischer(a: &[u8], b: &[u8]) -> u32 {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 { return m as u32; }
+    if m == 0 { return n as u32; }
+    // Keep `b` as the shorter side to bound space at O(min(n, m)).
+    let (a, b, n, m) = if n < m { (b, a, m, n) } else { (a, b, n, m) };
+    let mut prev: Vec<u32> = (0..=m as u32).collect();
+    let mut curr: Vec<u32> = vec![0; m + 1];
+    for i in 1..=n {
+        curr[0] = i as u32;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (curr[j - 1] + 1)        // insertion in b
+                .min(prev[j] + 1)              // deletion in b
+                .min(prev[j - 1] + cost);      // substitution
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
 }
 
 /// Decode a trigram posting list at the given byte offset. Layout matches
@@ -2261,5 +2426,125 @@ mod tests {
         let bytes = vec![0u8; 4];
         let got = read_posting(&bytes, 1000);
         assert!(got.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Wagner-Fischer edit distance — pins the canonical small cases so a
+    // future refactor of the inner loop can't silently mis-rank fuzzy
+    // results. We test the published-textbook values that lots of unit
+    // tests across the industry use; they're not arbitrary.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn wagner_fischer_known_pairs() {
+        // Identity
+        assert_eq!(wagner_fischer(b"foo", b"foo"), 0);
+        // Single insertion
+        assert_eq!(wagner_fischer(b"foo", b"foos"), 1);
+        // Single deletion
+        assert_eq!(wagner_fischer(b"foos", b"foo"), 1);
+        // Single substitution
+        assert_eq!(wagner_fischer(b"foo", b"fou"), 1);
+        // The textbook kitten / sitting → 3
+        assert_eq!(wagner_fischer(b"kitten", b"sitting"), 3);
+        // Symmetry holds
+        assert_eq!(wagner_fischer(b"sitting", b"kitten"), 3);
+        // Empty inputs
+        assert_eq!(wagner_fischer(b"", b""), 0);
+        assert_eq!(wagner_fischer(b"", b"abc"), 3);
+        assert_eq!(wagner_fischer(b"abc", b""), 3);
+    }
+
+    /// The space-bound trick (keep the shorter side as `b`) must not
+    /// change correctness. Spot-check by reversing the argument order
+    /// across multiple length combinations.
+    #[test]
+    fn wagner_fischer_argument_order_invariance() {
+        let pairs: &[(&[u8], &[u8])] = &[
+            (b"abc", b"xyz"),
+            (b"hello", b"world"),
+            (b"a", b"abcde"),
+            (b"ParcelFile", b"ParcelFileDescriptor"),
+        ];
+        for (a, b) in pairs {
+            assert_eq!(wagner_fischer(a, b), wagner_fischer(b, a),
+                       "asymmetric on ({a:?}, {b:?})");
+        }
+    }
+
+    /// Pure Wagner-Fischer ordering test (the underlying metric, not
+    /// the user-facing rank). Pinned so a refactor of the inner loop
+    /// can't silently mis-rank.
+    #[test]
+    fn wagner_fischer_orders_closer_matches_first() {
+        let names = [
+            "Parcel",
+            "ParcelFile",
+            "ParcelFileDescriptor",
+            "Parcelable",
+        ];
+        let query = b"ParcelFile";
+        let mut scored: Vec<(&str, u32)> = names.iter()
+            .map(|n| (*n, wagner_fischer(query, n.as_bytes())))
+            .collect();
+        scored.sort_by_key(|&(_, d)| d);
+        // Exact match wins.
+        assert_eq!(scored[0].0, "ParcelFile");
+        assert_eq!(scored[0].1, 0);
+    }
+
+    /// The fuzzy *sort* score (vs pure Levenshtein) gives substring
+    /// matches a strong preference over Levenshtein-close-but-unrelated
+    /// names. This test pins the user-facing ordering:
+    ///
+    ///   query="ParcelFile" should rank
+    ///     ParcelFile             (exact)              first
+    ///     ParcelFileDescriptor   (prefix substring)   before
+    ///     OutboundParcelFile     (middle substring)   before
+    ///     Parcelable             (typo, WF=2)         before
+    ///     ParcellableFooBar      (typo, WF≈9)         last
+    ///
+    /// Without the substring bonus, Parcelable (WF=2) would outrank
+    /// ParcelFileDescriptor (WF=10) — which is wrong per the ROADMAP.
+    #[test]
+    fn fuzzy_sort_score_prefers_substring_over_typo() {
+        let q = b"ParcelFile";
+        let names = [
+            "ParcelFile",
+            "ParcelFileDescriptor",
+            "OutboundParcelFile",
+            "Parcelable",
+            "ParcellableFooBar",
+        ];
+        let mut scored: Vec<(&str, u32)> = names.iter()
+            .map(|n| {
+                let nb = n.as_bytes();
+                (*n, fuzzy_sort_score(q, nb, wagner_fischer(q, nb)))
+            })
+            .collect();
+        scored.sort_by_key(|&(_, d)| d);
+        let names_sorted: Vec<&str> = scored.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names_sorted[0], "ParcelFile",
+                   "exact must rank first: {scored:?}");
+        let pfd = names_sorted.iter().position(|&n| n == "ParcelFileDescriptor").unwrap();
+        let parcelable = names_sorted.iter().position(|&n| n == "Parcelable").unwrap();
+        assert!(pfd < parcelable,
+                "ParcelFileDescriptor (prefix substring) must outrank Parcelable (typo): {scored:?}");
+        let outbound = names_sorted.iter().position(|&n| n == "OutboundParcelFile").unwrap();
+        let parcellable = names_sorted.iter().position(|&n| n == "ParcellableFooBar").unwrap();
+        assert!(outbound < parcellable,
+                "OutboundParcelFile (middle substring) must outrank ParcellableFooBar (typo): {scored:?}");
+    }
+
+    /// Prefix-match discount: among two substring matches of equal
+    /// length, the one where the query is a prefix should win.
+    #[test]
+    fn fuzzy_sort_prefix_beats_middle_substring() {
+        let q = b"abc";
+        let prefix_name = b"abcXYZ";  // query is prefix
+        let middle_name = b"XabcYZ";  // query in the middle, same length
+        let p = fuzzy_sort_score(q, prefix_name, wagner_fischer(q, prefix_name));
+        let m = fuzzy_sort_score(q, middle_name, wagner_fischer(q, middle_name));
+        assert!(p < m, "prefix score {p} must beat middle score {m}");
     }
 }

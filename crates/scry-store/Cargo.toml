@@ -14,7 +14,7 @@ parking_lot = { workspace = true }
 scry-walker = { path = "../scry-walker" }
 
 bincode = "1.3"
-fst = "0.4"
+fst = { version = "0.4", features = ["levenshtein"] }
 blake3 = "1"
 memmap2 = "0.9"
 memchr = { workspace = true }

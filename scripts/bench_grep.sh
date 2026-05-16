@@ -36,8 +36,11 @@ bench() {
   eval "$cmd" >/dev/null 2>&1 || true
   local best=999999
   for _ in 1 2 3; do
-    local t=$({ /usr/bin/time -f "%e" bash -c "$cmd >/dev/null 2>&1" ; } 2>&1)
-    if awk -v a="$t" -v b="$best" 'BEGIN { exit !(a < b) }' ; then
+    # /usr/bin/time prepends "Command exited with non-zero status N" when
+    # the child exits non-zero (rg does this on no-match). Take the LAST
+    # line so we always get the bare "%e" elapsed value, not the diagnostic.
+    local t=$({ /usr/bin/time -f "%e" bash -c "$cmd >/dev/null 2>&1" ; } 2>&1 | tail -1)
+    if awk -v a="$t" -v b="$best" 'BEGIN { exit !(a + 0 < b + 0) }' ; then
       best=$t
     fi
   done

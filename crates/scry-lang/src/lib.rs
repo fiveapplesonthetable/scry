@@ -75,6 +75,68 @@ fn parse_timeout_micros() -> u64 {
     })
 }
 
+enum ParseOutcome {
+    Tree(tree_sitter::Tree),
+    TimedOut,
+    Failed,
+}
+
+/// Parse `source` with a wall-clock budget enforced via a progress
+/// callback. Returns the tree (or a failure reason) plus elapsed millis.
+///
+/// We use `parse_with_options` + `progress_callback` rather than the
+/// deprecated `set_timeout_micros`. The latter relies on tree-sitter
+/// internally checking the clock at certain decision points; for some
+/// adversarial inputs it never does, and the parse runs forever (we
+/// observed >1h stalls on real AOSP Java files). The progress callback
+/// is invoked at every parser step, so the abort is guaranteed to be
+/// observed within microseconds of the deadline.
+fn parse_with_timeout(parser: &mut Parser, source: &[u8]) -> (ParseOutcome, u128) {
+    parse_with_explicit_timeout(parser, source, parse_timeout_micros())
+}
+
+fn parse_with_explicit_timeout(
+    parser: &mut Parser,
+    source: &[u8],
+    timeout_micros: u64,
+) -> (ParseOutcome, u128) {
+    let start = std::time::Instant::now();
+    let len = source.len();
+    let mut read = |i: usize, _: tree_sitter::Point| -> &[u8] {
+        if i < len { &source[i..] } else { &[] }
+    };
+
+    if timeout_micros == 0 {
+        let tree = parser.parse_with_options(&mut read, None, None);
+        let elapsed = start.elapsed().as_millis();
+        return match tree {
+            Some(t) => (ParseOutcome::Tree(t), elapsed),
+            None => (ParseOutcome::Failed, elapsed),
+        };
+    }
+
+    let timeout = std::time::Duration::from_micros(timeout_micros);
+    let mut timed_out = false;
+    let tree = {
+        let mut cb = |_: &tree_sitter::ParseState| -> bool {
+            if start.elapsed() > timeout {
+                timed_out = true;
+                true
+            } else {
+                false
+            }
+        };
+        let opts = tree_sitter::ParseOptions::new().progress_callback(&mut cb);
+        parser.parse_with_options(&mut read, None, Some(opts))
+    };
+    let elapsed = start.elapsed().as_millis();
+    match (tree, timed_out) {
+        (Some(t), _) => (ParseOutcome::Tree(t), elapsed),
+        (None, true) => (ParseOutcome::TimedOut, elapsed),
+        (None, false) => (ParseOutcome::Failed, elapsed),
+    }
+}
+
 pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
     use FileKind::*;
     let spec = match kind {
@@ -119,24 +181,19 @@ fn extract_refs_with(
     PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
         parser.set_language(lang.language)?;
-        let t = parse_timeout_micros();
-        if t > 0 { parser.set_timeout_micros(t); }
-        let t_parse = std::time::Instant::now();
-        let tree = match parser.parse(source, None) {
-            Some(t) => t,
-            None => {
-                // Loud, file-named log so the operator can investigate the
-                // specific input that defeated tree-sitter. We don't silently
-                // skip; we record + report.
-                let elapsed_ms = t_parse.elapsed().as_millis();
-                let reason = if t > 0 && (elapsed_ms as u128) >= ((t as u128) / 1000).saturating_sub(50) {
-                    "TIMEOUT"
-                } else {
-                    "ABORT"
-                };
+        let tree = match parse_with_timeout(&mut parser, source) {
+            (ParseOutcome::Tree(t), _) => t,
+            (ParseOutcome::TimedOut, elapsed_ms) => {
                 eprintln!(
-                    "[ts-{}] {} ({} bytes) — tree-sitter parse returned None after {} ms (refs query)",
-                    reason, current_file_name(), source.len(), elapsed_ms,
+                    "[ts-TIMEOUT] {} ({} bytes) — progress callback aborted after {} ms (refs query)",
+                    current_file_name(), source.len(), elapsed_ms,
+                );
+                return Ok(Vec::new());
+            },
+            (ParseOutcome::Failed, elapsed_ms) => {
+                eprintln!(
+                    "[ts-ABORT] {} ({} bytes) — tree-sitter parse returned None after {} ms (refs query)",
+                    current_file_name(), source.len(), elapsed_ms,
                 );
                 return Ok(Vec::new());
             },
@@ -189,21 +246,19 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
     PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
         parser.set_language(spec.language)?;
-        let t = parse_timeout_micros();
-        if t > 0 { parser.set_timeout_micros(t); }
-        let t_parse = std::time::Instant::now();
-        let tree = match parser.parse(source, None) {
-            Some(t) => t,
-            None => {
-                let elapsed_ms = t_parse.elapsed().as_millis();
-                let reason = if t > 0 && (elapsed_ms as u128) >= ((t as u128) / 1000).saturating_sub(50) {
-                    "TIMEOUT"
-                } else {
-                    "ABORT"
-                };
+        let tree = match parse_with_timeout(&mut parser, source) {
+            (ParseOutcome::Tree(t), _) => t,
+            (ParseOutcome::TimedOut, elapsed_ms) => {
                 eprintln!(
-                    "[ts-{}] {} ({} bytes) — tree-sitter parse returned None after {} ms (symbols query)",
-                    reason, current_file_name(), source.len(), elapsed_ms,
+                    "[ts-TIMEOUT] {} ({} bytes) — progress callback aborted after {} ms (symbols query)",
+                    current_file_name(), source.len(), elapsed_ms,
+                );
+                return Ok(Vec::new());
+            },
+            (ParseOutcome::Failed, elapsed_ms) => {
+                eprintln!(
+                    "[ts-ABORT] {} ({} bytes) — tree-sitter parse returned None after {} ms (symbols query)",
+                    current_file_name(), source.len(), elapsed_ms,
                 );
                 return Ok(Vec::new());
             },
@@ -960,5 +1015,63 @@ mod tests {
         assert!(names.contains(&"baz"));
         assert!(names.contains(&"quux"));
         assert!(names.contains(&"foo"));
+    }
+
+    /// The progress callback path must actually abort runaway parses.
+    /// We feed the cpp grammar a synthetic input large enough to take
+    /// far more than 1 microsecond and assert it returns TimedOut well
+    /// before the (artificial) timeout's natural duration.
+    ///
+    /// Why this test exists: the previous implementation used
+    /// set_timeout_micros, which silently failed to abort some real
+    /// AOSP Java files in production (parses ran >1h with a 60s
+    /// budget). The migration to parse_with_options must keep that
+    /// regression from recurring.
+    #[test]
+    fn progress_callback_aborts_runaway_parse() {
+        // Generate a large C++-ish source the grammar will plow through.
+        let mut src = String::with_capacity(2_000_000);
+        for i in 0..50_000 {
+            src.push_str(&format!(
+                "template <class T{0}> struct S{0} {{ T{0} a, b, c, d, e; }};\n",
+                i
+            ));
+        }
+        let bytes = src.as_bytes();
+
+        // A 1-micro budget: any non-trivial parse will exceed it on the
+        // very first progress callback invocation.
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(cpp_spec().language).unwrap();
+            let start = std::time::Instant::now();
+            let (outcome, elapsed) = parse_with_explicit_timeout(&mut parser, bytes, 1);
+            let wall = start.elapsed().as_millis();
+            assert!(
+                matches!(outcome, ParseOutcome::TimedOut),
+                "expected TimedOut, got something else after {} ms wall / {} ms reported",
+                wall, elapsed,
+            );
+            // Sanity: abort should happen quickly. A 1-micro budget on a
+            // 2MB synthetic input that the unbounded grammar would parse
+            // in ~hundreds of ms must abort well under that.
+            assert!(
+                wall < 100,
+                "abort took {} ms wall — progress callback is not firing fast enough",
+                wall,
+            );
+        });
+    }
+
+    /// Sanity: with timeout=0 we get unbounded parsing and a real tree.
+    #[test]
+    fn unbounded_parse_returns_tree() {
+        let src = b"int main() { return 0; }";
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(cpp_spec().language).unwrap();
+            let (outcome, _) = parse_with_explicit_timeout(&mut parser, src, 0);
+            assert!(matches!(outcome, ParseOutcome::Tree(_)));
+        });
     }
 }

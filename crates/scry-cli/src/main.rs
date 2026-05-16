@@ -1,5 +1,12 @@
 //! scry: semantic code search and cross-reference engine for AOSP and Linux.
 
+// jemalloc returns freed memory to the OS aggressively. Default glibc malloc
+// keeps a high-water-mark — fine for short jobs, disastrous for our pattern
+// of "allocate millions of Strings per batch, drop them, repeat". Switching
+// the global allocator dropped index RSS by 10×+ in practice on AOSP.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -13,6 +20,29 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// jemalloc runtime stats — we read `stats.allocated` periodically to log
+// what the allocator is actually holding, separate from our application-
+// level estimated_bytes(). This is the ground truth.
+use tikv_jemalloc_ctl::{epoch, stats};
+
+// Shared between the heartbeat thread (writes) and every parser worker
+// (reads, for backpressure). Updated every 100 ms from jemalloc's
+// `stats.allocated`. Workers wait if above BACKPRESSURE_CEILING.
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static BACKPRESSURE_CEILING: AtomicU64 = AtomicU64::new(0); // 0 = disabled
+
+/// Block until the allocator reports we're below the soft ceiling.
+/// Returns immediately if no ceiling is configured. Polls at ~5 ms.
+fn await_memory_headroom() {
+    let ceiling = BACKPRESSURE_CEILING.load(Ordering::Relaxed);
+    if ceiling == 0 { return; }
+    loop {
+        let cur = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        if cur < ceiling { return; }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "scry", version, about = "Semantic code search for AOSP and Linux")]
@@ -46,17 +76,20 @@ enum Cmd {
         /// shared / memory-constrained hosts.
         #[arg(long)]
         workers: Option<usize>,
-        /// Skip individual source files larger than this many bytes. Default
-        /// 5 MiB. Most AOSP files over this size are auto-generated or
-        /// binary-ish and slow the parser disproportionately.
-        #[arg(long, default_value_t = 5 * 1024 * 1024)]
+        /// Hard refuse-to-touch ceiling (default 100 MiB). Files this large
+        /// are binary blobs (.git packs, prebuilt jars). Every byte under
+        /// this is parsed. Concurrency is bounded by --mem-cap via memory
+        /// backpressure, not by file size.
+        #[arg(long, default_value_t = 100 * 1024 * 1024)]
         max_file_bytes: u64,
-        /// Soft RSS cap in GiB. When the indexer's RSS climbs within 85% of
-        /// this value a watchdog signals workers to flush in-memory records
-        /// to on-disk chunk files. 0 = unlimited. When non-zero, indexing
-        /// runs in streaming mode (per-batch chunk flushes + streaming
-        /// finalize). Required to safely index the full AOSP+Linux corpus
-        /// on a shared host.
+        /// Soft memory ceiling in GiB. When jemalloc-reported allocated
+        /// memory climbs above 80% of this value, parser workers WAIT
+        /// (don't pick up new files) until the heap drains via batch
+        /// flushes. This is the memory backpressure mechanism that lets
+        /// scry safely index pathological data-dump files (a single 2.1 MB
+        /// generated BLAS test_data.cpp transiently allocates ~9 GB in
+        /// tree-sitter's AST). Naturally serializes such files without any
+        /// size-based heuristic. 0 = no backpressure.
         #[arg(long, default_value_t = 0)]
         mem_cap: u32,
         /// Batch size (files) between unconditional flushes when streaming.
@@ -326,6 +359,53 @@ fn cmd_index(
     );
 
     let t_total = Instant::now();
+
+    // -- Memory backpressure: a background thread polls jemalloc's
+    // `stats.allocated` every 100 ms and publishes it into ALLOCATED_BYTES.
+    // Parser workers consult that counter before picking up a file: if we're
+    // above 80% of the mem-cap, they sleep briefly and retry. This degrades
+    // parallelism gracefully under memory pressure (naturally serializes the
+    // pathological data-dump files) without any per-file size heuristics.
+    //
+    // We also log a one-line heartbeat every 5 s so the operator can SEE
+    // where the allocator is sitting separate from our application counters.
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let ceiling_bytes = (mem_cap as u64) * 1024 * 1024 * 1024;
+    let soft_ceiling = (ceiling_bytes as f64 * 0.80) as u64;
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    BACKPRESSURE_CEILING.store(soft_ceiling, Ordering::Relaxed);
+    let stop_clone = heartbeat_stop.clone();
+    let _heartbeat = std::thread::spawn(move || {
+        let e = epoch::mib().ok();
+        let allocated = stats::allocated::mib().ok();
+        let resident = stats::resident::mib().ok();
+        let active = stats::active::mib().ok();
+        let mut tick = 0u32;
+        while !stop_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+            if let (Some(e), Some(a)) = (&e, &allocated) {
+                if e.advance().is_ok() {
+                    let alloc_b = a.read().unwrap_or(0) as u64;
+                    ALLOCATED_BYTES.store(alloc_b, Ordering::Relaxed);
+                    // 5 s heartbeat (50 × 100 ms)
+                    if tick % 50 == 0 {
+                        let res_b = resident.as_ref().and_then(|m| m.read().ok()).unwrap_or(0) as u64;
+                        let act_b = active.as_ref().and_then(|m| m.read().ok()).unwrap_or(0) as u64;
+                        let backpressured = if soft_ceiling > 0 && alloc_b >= soft_ceiling {
+                            " BACKPRESSURE"
+                        } else { "" };
+                        eprintln!(
+                            "[jemalloc] allocated={} active={} resident={}{}",
+                            human_bytes(alloc_b), human_bytes(act_b), human_bytes(res_b),
+                            backpressured,
+                        );
+                    }
+                    tick = tick.wrapping_add(1);
+                }
+            }
+        }
+    });
+
     let mut writer = if streaming && !count_only {
         StoreWriter::new_streaming(&out_dir)?
     } else {
@@ -408,15 +488,41 @@ fn cmd_index(
             let refs_sink = parking_lot::Mutex::new(std::mem::take(&mut writer.refs));
 
             let batch_start = Instant::now();
+            // Counter for in-batch progress logging (every 1000 files).
+            let progress_step: u64 = 1000;
+            // Outlier thresholds — log per-file diagnostic if exceeded.
+            let outlier_ms: u128 = 250;
+            let outlier_records: usize = 5_000;
             batch_files_slice
                 .par_iter()
                 .zip(batch_entries_slice.par_iter())
                 .for_each(|(rf, fe)| {
+                    // Memory-backpressure: if jemalloc says we're above the
+                    // soft ceiling, wait. This makes pathological files
+                    // (BLAS test_data.cpp etc) parse serially while small
+                    // files keep parallelism — no size-based hack required.
+                    await_memory_headroom();
+                    let t_file = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
                     }));
+                    let elapsed_file_ms = t_file.elapsed().as_millis();
                     match result {
                         Ok(Ok((s, r))) => {
+                            let total_recs = s.len() + r.len();
+                            // Outlier diagnostic: any file that took unusually
+                            // long OR produced unusually many records gets
+                            // logged with its full context, so we can see
+                            // exactly what shapes blow up.
+                            if elapsed_file_ms > outlier_ms || total_recs > outlier_records {
+                                eprintln!(
+                                    "[slow]  {} kind={:?} size={} records={} ({}+{}) elapsed={}ms",
+                                    rf.path.display(), rf.kind,
+                                    human_bytes(rf.size),
+                                    total_recs, s.len(), r.len(),
+                                    elapsed_file_ms,
+                                );
+                            }
                             parsed.fetch_add(1, Ordering::Relaxed);
                             symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
                             refs_total.fetch_add(r.len() as u64, Ordering::Relaxed);
@@ -427,6 +533,18 @@ fn cmd_index(
                             est_bytes.fetch_add(batch_inc, Ordering::Relaxed);
                             if !s.is_empty() { syms_sink.lock().extend(s); }
                             if !r.is_empty() { refs_sink.lock().extend(r); }
+                            // Per-1000-files in-batch heartbeat with running
+                            // in-RAM bytes — so we can see growth slope live.
+                            let p = parsed.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
+                            if p % progress_step == 0 {
+                                eprintln!(
+                                    "[batch{}] {} files done, {} syms, {} refs, ~{} in-RAM",
+                                    batch_no, p,
+                                    symbols_total.load(Ordering::Relaxed),
+                                    refs_total.load(Ordering::Relaxed),
+                                    human_bytes(est_bytes.load(Ordering::Relaxed)),
+                                );
+                            }
                         }
                         _ => { failed.fetch_add(1, Ordering::Relaxed); }
                     }
@@ -514,6 +632,7 @@ fn cmd_index(
         total_files_total, grand_syms, grand_refs, elapsed_ms,
         total_files_total as f64 / (elapsed_ms.max(1) as f64 / 1000.0),
     );
+    heartbeat_stop.store(true, Ordering::Relaxed);
     Ok(())
 }
 

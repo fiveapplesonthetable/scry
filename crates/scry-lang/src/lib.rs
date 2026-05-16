@@ -94,11 +94,6 @@ fn extract_refs_with(
                         Ok(s) if !s.is_empty() => s.to_string(),
                         _ => continue,
                     };
-                    // Skip ultra-common noise names that appear millions of times
-                    // and would explode the index for no value.
-                    if is_noise_name(&name) {
-                        continue;
-                    }
                     let pos = node.start_position();
                     out.push(RawRef {
                         name,
@@ -121,18 +116,6 @@ fn extract_refs_with(
     })
 }
 
-/// Drop refs whose name is a generic keyword or builtin. Keeps the ref table
-/// down to call-site-grade signal.
-fn is_noise_name(s: &str) -> bool {
-    matches!(
-        s,
-        "self" | "this" | "super" | "true" | "false" | "null" | "None" | "nil" |
-        "Box" | "Option" | "Result" | "Vec" | "String" | "str" | "bool" | "int" |
-        "void" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" |
-        "f32" | "f64" | "char" | "uint" | "size_t" | "ssize_t" |
-        "T" | "K" | "V" | "E" | "_" | "" | "size" | "length" | "len" | "count"
-    )
-}
 
 struct LangSpec {
     language: &'static Language,

@@ -200,6 +200,13 @@ enum Cmd {
         /// have been run first. No-op without the sidecar.
         #[arg(long)]
         clang_precise: bool,
+        /// Filter refs by SCIP symbol identity (Path C). Same shape
+        /// as --clang-precise but reads symbols from the
+        /// `scip_index.bin` sidecar built by `scry scip-import` —
+        /// works for any language with a SCIP indexer (Java/Kotlin/
+        /// Go/Rust/TypeScript/Python/...). No-op without the sidecar.
+        #[arg(long)]
+        scip_precise: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -240,6 +247,10 @@ enum Cmd {
         /// --clang-precise`). Requires `clang_usrs.bin` sidecar.
         #[arg(long)]
         clang_precise: bool,
+        /// Filter callers by SCIP symbol identity (see `scry ref
+        /// --scip-precise`). Requires `scip_index.bin` sidecar.
+        #[arg(long)]
+        scip_precise: bool,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -619,6 +630,41 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Import a SCIP index (https://github.com/sourcegraph/scip)
+    /// produced by scip-java / scip-kotlin / gopls / rust-analyzer /
+    /// scip-typescript / etc., into the scry sidecar
+    /// `<index>/scip_index.bin`. Powers `--scip-precise` queries.
+    ScipImport {
+        /// Path to the SCIP index file (protobuf, typically named
+        /// `index.scip` or `*.scip`).
+        #[arg(long, value_name = "PATH")]
+        scip: PathBuf,
+        /// Existing scry index dir; sidecar lands here.
+        #[arg(long, value_name = "DIR")]
+        index: Option<PathBuf>,
+        /// Override the SCIP index's `project_root` for path
+        /// resolution. Use when the SCIP file was generated under
+        /// a different working tree (CI vs local).
+        #[arg(long, value_name = "PATH")]
+        root: Option<PathBuf>,
+    },
+    /// Report stats from the optional SCIP sidecar at
+    /// `<index>/scip_index.bin` (produced by `scry scip-import`).
+    ScipStats {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
+    /// Look up the SCIP symbol ID for a (path, byte_offset) pair
+    /// against the sidecar. Empty stdout when no record covers
+    /// the site.
+    ScipLookup {
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        offset: u32,
+    },
     /// Look up the clang USR for a (path, byte_offset) pair against
     /// the sidecar. Returns the empty string if no record covers
     /// that exact site.
@@ -945,10 +991,10 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, distance, limit, json } => {
             cmd_fuzzy(substr, index, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable, clang_precise } => {
-            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise)
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise } => {
+            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, reachable, clang_precise, format } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, reachable, clang_precise, scip_precise, format } => {
             if precise {
                 // clangd path returns precise callers; reachable filter
                 // is composed on top there too (TODO: thread through —
@@ -957,7 +1003,7 @@ fn main() -> Result<()> {
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
             // Fall through to the heuristic path with reachable filter.
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise)
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -979,6 +1025,9 @@ fn main() -> Result<()> {
             cmd_clang_index(compile_commands, index, root, workers, max_file_bytes),
         Cmd::ClangStats { index } => cmd_clang_stats(index),
         Cmd::ClangLookup { index, path, offset } => cmd_clang_lookup(index, &path, offset),
+        Cmd::ScipImport { scip, index, root } => cmd_scip_import(scip, index, root),
+        Cmd::ScipStats { index } => cmd_scip_stats(index),
+        Cmd::ScipLookup { index, path, offset } => cmd_scip_lookup(index, &path, offset),
         Cmd::Subclasses { name, index, in_, depth, limit, json } =>
             cmd_subclasses(name, index, in_, depth, limit, json),
         Cmd::Implementations { name, index, in_, depth, limit, json } =>
@@ -2266,6 +2315,7 @@ fn cmd_ref(
     format: Option<String>,
     reachable: bool,
     clang_precise: bool,
+    scip_precise: bool,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2411,6 +2461,63 @@ fn cmd_ref(
                         "[scry] --clang-precise: {} → {} refs after USR identity \
                          filter ({} def USRs)",
                         before, kept.len(), def_usrs.len(),
+                    );
+                    kept
+                }
+            }
+        }
+    } else {
+        filtered
+    };
+    // --scip-precise: same shape as --clang-precise but reads SCIP
+    // symbol IDs from `scip_index.bin`. Composes after the clang
+    // filter so both can stack on a mixed-language index.
+    let filtered = if scip_precise {
+        let sidecar_path = r.paths.scip_index();
+        match scry_store::scip_index::ScipIndex::open(&sidecar_path)? {
+            None => {
+                eprintln!(
+                    "[scry] --scip-precise: this index has no scip_index.bin \
+                     sidecar; run `scry scip-import --scip FILE.scip \
+                     --index DIR` first. Returning unfiltered.",
+                );
+                filtered
+            }
+            Some(sidx) => {
+                const WINDOW: u32 = 64;
+                let defs = r.lookup_exact(&name);
+                let def_syms: std::collections::HashSet<String> = defs
+                    .iter()
+                    .filter_map(|s| {
+                        let p = r.files.get(s.file_id as usize)?
+                            .display_path(&r.roots);
+                        sidx.symbol_for_window(&p, s.byte_start, WINDOW)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                if def_syms.is_empty() {
+                    eprintln!(
+                        "[scry] --scip-precise: no SCIP symbol found for any def of \
+                         {name:?} (def site outside the imported SCIP index?). \
+                         Returning unfiltered.",
+                    );
+                    filtered
+                } else {
+                    let before = filtered.len();
+                    let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
+                        let p = match r.files.get(rr.file_id as usize) {
+                            Some(fe) => fe.display_path(&r.roots),
+                            None => return true,
+                        };
+                        match sidx.symbol_for_window(&p, rr.byte_start, WINDOW) {
+                            Some(s) => def_syms.contains(s),
+                            None => true,
+                        }
+                    }).collect();
+                    eprintln!(
+                        "[scry] --scip-precise: {} → {} refs after SCIP symbol \
+                         identity filter ({} def symbols)",
+                        before, kept.len(), def_syms.len(),
                     );
                     kept
                 }
@@ -6077,6 +6184,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar."},
                 "clang_precise": {"type": "boolean", "default": false,
                     "description": "Filter refs by clang USR identity (C/C++/ObjC name-collision pruning). No-op without the clang_usrs.bin sidecar (`scry clang-index ...`)."},
+                "scip_precise": {"type": "boolean", "default": false,
+                    "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer). No-op without the scip_index.bin sidecar (`scry scip-import ...`)."},
             })),
         ),
         tool(
@@ -6097,6 +6206,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present."},
                 "clang_precise": {"type": "boolean", "default": false,
                     "description": "Same as on `ref` — clang USR identity filter; no-op without clang_usrs.bin."},
+                "scip_precise": {"type": "boolean", "default": false,
+                    "description": "Same as on `ref` — SCIP symbol identity filter; no-op without scip_index.bin."},
             })),
         ),
         tool(
@@ -6497,6 +6608,60 @@ fn cmd_clang_lookup(index: Option<PathBuf>, path: &str, offset: u32) -> Result<(
     Ok(())
 }
 
+/// `scry scip-import` — ingest an external SCIP index into the
+/// scry sidecar so `--scip-precise` queries can filter by symbol
+/// identity.
+fn cmd_scip_import(
+    scip: PathBuf,
+    index: Option<PathBuf>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    scry_scip::import_scip(&scip, &dir, root.as_deref())
+}
+
+fn cmd_scip_stats(index: Option<PathBuf>) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    let sidecar_path = scry_store::StorePaths::new(dir.clone()).scip_index();
+    match scry_store::scip_index::ScipIndex::open(&sidecar_path)? {
+        None => {
+            println!(
+                "no scip_index.bin found at {}. Run `scry scip-import \
+                 --scip FILE.scip --index {}` to generate it.",
+                sidecar_path.display(),
+                dir.display(),
+            );
+        }
+        Some(idx) => {
+            println!(
+                "scip_index.bin: version 1, {} unique symbols, {} occurrences \
+                 ({} bytes file)",
+                idx.symbol_count(),
+                idx.len(),
+                std::fs::metadata(&sidecar_path).map(|m| m.len()).unwrap_or(0),
+            );
+            for s in idx.sidecar.symbol_table.iter().take(3) {
+                println!("  sample: {s}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_scip_lookup(index: Option<PathBuf>, path: &str, offset: u32) -> Result<()> {
+    let dir = index.unwrap_or_else(default_index_dir);
+    let sidecar_path = scry_store::StorePaths::new(dir).scip_index();
+    let idx = scry_store::scip_index::ScipIndex::open(&sidecar_path)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "no scip_index.bin at {} — run scry scip-import first",
+            sidecar_path.display(),
+        ))?;
+    if let Some(s) = idx.symbol_for(path, offset) {
+        println!("{s}");
+    }
+    Ok(())
+}
+
 /// Run the warm pass and print a one-line summary. Standalone
 /// `scry warm --index DIR` entrypoint; the daemon paths call
 /// `warm_index_dir` directly without the summary print.
@@ -6835,14 +7000,18 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let clang_precise = args.get("clang_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise)
+            let scip_precise = args.get("scip_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise)
         }
         "callers" => {
             let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let clang_precise = args.get("clang_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise)
+            let scip_precise = args.get("scip_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise)
         }
         "subclasses" | "implementations" => {
             let depth = args.get("depth")
@@ -7084,6 +7253,7 @@ fn serve_ref(
     limit: usize,
     reachable: bool,
     clang_precise: bool,
+    scip_precise: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     // Precompute the callee module set ONCE if --reachable + sidecar.
@@ -7102,7 +7272,7 @@ fn serve_ref(
     };
     // Open the clang USR sidecar once (lazy: only if --clang-precise).
     // Same alignment-window as the CLI path.
-    const CLANG_WINDOW: u32 = 64;
+    const PRECISE_WINDOW: u32 = 64;
     let cusr: Option<scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
         scry_store::clang_usrs::ClangUsrIndex::open(&r.paths.clang_usrs()).ok().flatten()
     } else {
@@ -7111,7 +7281,18 @@ fn serve_ref(
     let def_usrs: Option<std::collections::HashSet<String>> = cusr.as_ref().map(|c| {
         r.lookup_exact(name).iter().filter_map(|s| {
             let p = r.files.get(s.file_id as usize)?.display_path(&r.roots);
-            c.usr_for_window(&p, s.byte_start, CLANG_WINDOW).map(str::to_string)
+            c.usr_for_window(&p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
+        }).collect()
+    });
+    let sidx: Option<scry_store::scip_index::ScipIndex> = if scip_precise {
+        scry_store::scip_index::ScipIndex::open(&r.paths.scip_index()).ok().flatten()
+    } else {
+        None
+    };
+    let def_scip: Option<std::collections::HashSet<String>> = sidx.as_ref().map(|c| {
+        r.lookup_exact(name).iter().filter_map(|s| {
+            let p = r.files.get(s.file_id as usize)?.display_path(&r.roots);
+            c.symbol_for_window(&p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
         }).collect()
     });
     let mut out = Vec::new();
@@ -7142,8 +7323,19 @@ fn serve_ref(
             if !usrs.is_empty() {
                 if let Some(fe) = r.files.get(rr.file_id as usize) {
                     let p = fe.display_path(&r.roots);
-                    if let Some(u) = c.usr_for_window(&p, rr.byte_start, CLANG_WINDOW) {
+                    if let Some(u) = c.usr_for_window(&p, rr.byte_start, PRECISE_WINDOW) {
                         if !usrs.contains(u) { continue; }
+                    }
+                }
+            }
+        }
+        // SCIP symbol identity filter (Path C).
+        if let (Some(c), Some(syms)) = (sidx.as_ref(), def_scip.as_ref()) {
+            if !syms.is_empty() {
+                if let Some(fe) = r.files.get(rr.file_id as usize) {
+                    let p = fe.display_path(&r.roots);
+                    if let Some(s) = c.symbol_for_window(&p, rr.byte_start, PRECISE_WINDOW) {
+                        if !syms.contains(s) { continue; }
                     }
                 }
             }

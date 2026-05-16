@@ -7,6 +7,59 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.16] — 2026-05-16
+
+SCIP importer + `--scip-precise` filter — Path C. Brings symbol-
+identity precision to every language with a SCIP indexer (Java,
+Kotlin, Go, Rust, TypeScript, Python, …) without us writing per-
+language parsers. Reuses the same alignment-window + filter
+composition that already powers `--clang-precise`.
+
+**Three new subcommands on the main `scry` binary:**
+
+- `scry scip-import --scip FILE.scip --index DIR` — read a SCIP
+  protobuf (emitted by `scip-java`, `scip-kotlin`,
+  `rust-analyzer --output-scip`, `gopls scip`, `scip-typescript`,
+  `scip-python`, `lsif-clang`, …), translate each occurrence's
+  `(line, col)` to a `byte_offset` against the source on disk,
+  intern symbols, write `scip_index.bin`. Use `--root PATH` to
+  override the SCIP file's `project_root` (CI vs local checkout).
+- `scry scip-stats --index DIR` — sidecar shape with sample
+  symbols; helpful "run scip-import first" message if absent.
+- `scry scip-lookup --index DIR --path P --offset N` — scriptable
+  symbol-at-location lookup. Empty stdout when no record covers.
+
+**`--scip-precise` filter (CLI + JSON-RPC + MCP):**
+
+- `scry ref NAME --scip-precise`, `scry callers NAME --scip-precise`.
+- Composes after `--clang-precise` and `--reachable`. All three
+  stack: build-graph reachability → clang USR → SCIP symbol, then
+  the result is what you see.
+- MCP tools `ref` and `callers` advertise `scip_precise: boolean`.
+- Sites without a SCIP record pass through unchanged — the filter
+  only removes false-positive name collisions, never blocks
+  lookups for code outside the SCIP coverage.
+
+**Internals:**
+
+- New crate `scry-scip` holds the protobuf-decoding logic + line→
+  byte offset translation. Depends on Sourcegraph's official
+  `scip` crate (0.7) + `protobuf` (3.x) for `Index::parse_from_bytes`.
+- New `scry-store::scip_index::ScipIndex` reader — same shape as
+  `ClangUsrIndex`: `(abs_path, byte_offset)` exact map + per-path
+  sorted offset list for `symbol_for_window`. 4 unit tests cover
+  exact + window + missing + bad-version.
+- End-to-end test in `scry-scip` builds a synthetic 1-document
+  `Index` in memory, writes it as protobuf, re-imports via
+  `import_scip`, and validates the sidecar round-trip including
+  line/col → byte_offset math.
+- Sidecar schema v1 locked:
+  `ScipSidecar { version, symbol_table: Vec<String>,
+  records: [{ abs_path, byte_offset, symbol_id, role (u8) }] }`.
+- `role` keeps the low 8 bits of SCIP's `symbol_roles` bitmap
+  verbatim — `0x01` Definition / `0x02` Import / `0x04` WriteAccess /
+  `0x08` ReadAccess / etc. — so future filters can read them.
+
 ## [0.1.15] — 2026-05-16
 
 Type-hierarchy queries: `scry subclasses NAME` and `scry implementations

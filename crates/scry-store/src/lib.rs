@@ -40,6 +40,7 @@ pub mod trigram;
 pub mod embed;
 pub mod modgraph;
 pub mod clang_usrs;
+pub mod scip_index;
 
 /// Tell the kernel we plan to read every byte of `path` soon, so it
 /// can start pulling pages into the page cache while we do other
@@ -549,6 +550,10 @@ impl StorePaths {
     /// `scry-clang-index`. Present when the user has run the helper
     /// against a compile_commands.json. v0.1.13+.
     pub fn clang_usrs(&self) -> PathBuf { self.root.join("clang_usrs.bin") }
+    /// Optional Path C sidecar: per-occurrence SCIP symbol IDs
+    /// imported from external SCIP tools (scip-java, gopls,
+    /// rust-analyzer, …) via `scry scip-import`. v0.1.16+.
+    pub fn scip_index(&self) -> PathBuf { self.root.join("scip_index.bin") }
     /// file_id → list of symbol indices. Packed: per file_id (in order),
     /// a u32 count followed by `count` u32 indices into symbols.bin.
     pub fn file_symbols(&self) -> PathBuf { self.root.join("file_symbols.bin") }

@@ -14,6 +14,51 @@ use std::path::{Path, PathBuf};
 
 pub mod trigram;
 
+/// On-disk bincode'd `Vec<T>` backed by an mmap + a u64-LE offsets sidecar.
+/// Random-access decode of a single record is a u64 read + a bincode deserialize
+/// over a borrowed slice — no allocation of the full Vec at open time.
+///
+/// The whole point: a finalized AOSP+Linux index has ~10 GB of bincode'd
+/// records. Eagerly loading into Vec at open() costs ~5-10 s of bincode
+/// deserialize + 10 GB RSS. With this, open() is ~10 ms (two mmap calls)
+/// and per-query memory is whatever the lookup decodes (usually a few KB).
+pub struct LazyVec<T: for<'de> serde::Deserialize<'de>> {
+    data_mmap: memmap2::Mmap,
+    offsets_mmap: memmap2::Mmap,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: for<'de> serde::Deserialize<'de>> LazyVec<T> {
+    pub fn open(data_path: &Path, offsets_path: &Path) -> Result<Self> {
+        let df = File::open(data_path)
+            .with_context(|| format!("open {}", data_path.display()))?;
+        let of = File::open(offsets_path)
+            .with_context(|| format!("open {}", offsets_path.display()))?;
+        let data_mmap = unsafe { memmap2::Mmap::map(&df)? };
+        let offsets_mmap = unsafe { memmap2::Mmap::map(&of)? };
+        Ok(Self { data_mmap, offsets_mmap, _phantom: std::marker::PhantomData })
+    }
+
+    pub fn len(&self) -> usize { self.offsets_mmap.len() / 8 }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Decode and return one record by index. Returns None on out-of-bounds
+    /// or a corrupt index/data file.
+    pub fn get(&self, idx: usize) -> Option<T> {
+        if idx >= self.len() { return None; }
+        let o = idx * 8;
+        let off = u64::from_le_bytes(self.offsets_mmap[o..o + 8].try_into().ok()?) as usize;
+        if off >= self.data_mmap.len() { return None; }
+        bincode::deserialize::<T>(&self.data_mmap[off..]).ok()
+    }
+
+    /// Streaming iterator over decoded records. Allocates one record at a
+    /// time, NOT the whole Vec — safe to call on multi-GB indexes.
+    pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        (0..self.len()).filter_map(move |i| self.get(i))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -1169,6 +1214,7 @@ pub struct StoreReader {
     pub manifest: Manifest,
     pub roots: Vec<RootEntry>,
     pub files: Vec<FileEntry>,
+    /// Eager-loaded records. Empty in lazy mode (use lazy_symbols instead).
     pub symbols: Vec<SymbolRecord>,
     pub refs: Vec<RefRecord>,
     pub fst: fst::Map<memmap2::Mmap>,
@@ -1180,6 +1226,12 @@ pub struct StoreReader {
     /// the full-scan path. None for old indexes — they still work.
     pub trigram_fst: Option<fst::Map<memmap2::Mmap>>,
     pub trigram_postings_mmap: Option<memmap2::Mmap>,
+    /// Lazy/mmap-backed record stores. When Some, the public lookup APIs
+    /// decode on-demand instead of relying on the eager `symbols`/`refs`
+    /// Vecs. Present iff the index has _offsets.bin sidecars (new indexes,
+    /// or old indexes retrofitted via `scry build-offsets`).
+    pub lazy_symbols: Option<LazyVec<SymbolRecord>>,
+    pub lazy_refs: Option<LazyVec<RefRecord>>,
 }
 
 impl StoreReader {
@@ -1191,9 +1243,25 @@ impl StoreReader {
         ))?;
         let roots: Vec<RootEntry> = read_bincode(&paths.roots())?;
         let files: Vec<FileEntry> = read_bincode(&paths.files())?;
-        let symbols: Vec<SymbolRecord> = read_bincode(&paths.symbols())?;
-        // refs.bin may be absent for old indexes
-        let refs: Vec<RefRecord> = if paths.refs().exists() {
+        // Lazy-mode shortcut: if BOTH a record file and its offsets sidecar
+        // exist, mmap them and skip the eager bincode-into-Vec load. The
+        // eager symbols/refs fields stay empty; readers go through the
+        // get_symbol/get_ref helpers which prefer lazy when available.
+        let lazy_symbols = if paths.symbols().exists() && paths.symbol_offsets().exists() {
+            Some(LazyVec::<SymbolRecord>::open(&paths.symbols(), &paths.symbol_offsets())?)
+        } else { None };
+        let lazy_refs = if paths.refs().exists() && paths.ref_offsets().exists() {
+            Some(LazyVec::<RefRecord>::open(&paths.refs(), &paths.ref_offsets())?)
+        } else { None };
+        let symbols: Vec<SymbolRecord> = if lazy_symbols.is_some() {
+            Vec::new()  // lazy mode — don't eagerly load 10 GB into RAM
+        } else {
+            read_bincode(&paths.symbols())?
+        };
+        // refs.bin may be absent for very old indexes
+        let refs: Vec<RefRecord> = if lazy_refs.is_some() {
+            Vec::new()
+        } else if paths.refs().exists() {
             read_bincode(&paths.refs())?
         } else {
             Vec::new()
@@ -1227,7 +1295,33 @@ impl StoreReader {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
             trigram_fst, trigram_postings_mmap,
+            lazy_symbols, lazy_refs,
         })
+    }
+
+    /// Total number of symbol records, regardless of lazy/eager backing.
+    pub fn n_symbols(&self) -> usize {
+        self.lazy_symbols.as_ref().map(|l| l.len()).unwrap_or(self.symbols.len())
+    }
+    /// Total number of ref records, regardless of lazy/eager backing.
+    pub fn n_refs(&self) -> usize {
+        self.lazy_refs.as_ref().map(|l| l.len()).unwrap_or(self.refs.len())
+    }
+    /// Get one symbol record by its global index. Owned because lazy mode
+    /// decodes on-demand. Eager mode clones (cheap; ~50 bytes typically).
+    pub fn get_symbol(&self, idx: u32) -> Option<SymbolRecord> {
+        if let Some(l) = self.lazy_symbols.as_ref() {
+            l.get(idx as usize)
+        } else {
+            self.symbols.get(idx as usize).cloned()
+        }
+    }
+    pub fn get_ref(&self, idx: u32) -> Option<RefRecord> {
+        if let Some(l) = self.lazy_refs.as_ref() {
+            l.get(idx as usize)
+        } else {
+            self.refs.get(idx as usize).cloned()
+        }
     }
 
     /// Trigram pre-filter for literal grep. Returns Some(set of candidate
@@ -1264,38 +1358,38 @@ impl StoreReader {
         Some(result)
     }
 
-    pub fn lookup_refs_exact(&self, name: &str) -> Vec<&RefRecord> {
+    pub fn lookup_refs_exact(&self, name: &str) -> Vec<RefRecord> {
         let off = match self.ref_fst.get(name.as_bytes()) {
             Some(v) => v,
             None => return Vec::new(),
         };
         read_posting(&self.ref_postings_mmap, off)
             .into_iter()
-            .filter_map(|i| self.refs.get(i as usize))
+            .filter_map(|i| self.get_ref(i))
             .collect()
     }
 
-    pub fn lookup_exact(&self, name: &str) -> Vec<&SymbolRecord> {
+    pub fn lookup_exact(&self, name: &str) -> Vec<SymbolRecord> {
         let off = match self.fst.get(name.as_bytes()) {
             Some(v) => v,
             None => return Vec::new(),
         };
         self.read_posting(off).into_iter()
-            .filter_map(|i| self.symbols.get(i as usize))
+            .filter_map(|i| self.get_symbol(i))
             .collect()
     }
 
-    pub fn lookup_prefix(&self, prefix: &str, limit: usize) -> Vec<&SymbolRecord> {
+    pub fn lookup_prefix(&self, prefix: &str, limit: usize) -> Vec<SymbolRecord> {
         use fst::IntoStreamer;
         use fst::Streamer;
-        let mut out: Vec<&SymbolRecord> = Vec::new();
+        let mut out: Vec<SymbolRecord> = Vec::new();
         let mut stream = self.fst.range().ge(prefix.as_bytes()).into_stream();
         while let Some((key, off)) = stream.next() {
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
             for i in self.read_posting(off) {
-                if let Some(s) = self.symbols.get(i as usize) {
+                if let Some(s) = self.get_symbol(i) {
                     out.push(s);
                     if out.len() >= limit {
                         return out;
@@ -1306,15 +1400,15 @@ impl StoreReader {
         out
     }
 
-    pub fn lookup_substring(&self, substr: &str, limit: usize) -> Vec<&SymbolRecord> {
+    pub fn lookup_substring(&self, substr: &str, limit: usize) -> Vec<SymbolRecord> {
         use fst::Streamer;
-        let mut out: Vec<&SymbolRecord> = Vec::new();
+        let mut out: Vec<SymbolRecord> = Vec::new();
         let needle = substr.as_bytes();
         let mut stream = self.fst.stream();
         while let Some((key, off)) = stream.next() {
             if memchr::memmem::find(key, needle).is_some() {
                 for i in self.read_posting(off) {
-                    if let Some(s) = self.symbols.get(i as usize) {
+                    if let Some(s) = self.get_symbol(i) {
                         out.push(s);
                         if out.len() >= limit {
                             return out;

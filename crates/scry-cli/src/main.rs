@@ -657,6 +657,11 @@ fn human_bytes(b: u64) -> String {
 }
 
 fn main() -> Result<()> {
+    // CLI tools must die quietly when their stdout pipe closes
+    // (e.g. `scry grep PATTERN | head`); the helper lives in
+    // scry-store because that's the only crate that allows unsafe.
+    scry_store::restore_default_sigpipe();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

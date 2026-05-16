@@ -45,6 +45,30 @@ pub mod embed;
 /// less for the caller — a path we can't open just won't get
 /// prefetched. Used by `cmd_grep` after the trigram pre-filter to
 /// overlap candidate-file IO with the per-file scan loop.
+/// Restore SIGPIPE to its default disposition (kill the process)
+/// so a partial write to a closed pipe terminates cleanly instead
+/// of panicking with a `BrokenPipe` error mid-flush.
+///
+/// Rust's runtime installs `SIG_IGN` for SIGPIPE so the I/O syscall
+/// returns EPIPE rather than killing the process — fine for daemons,
+/// wrong for CLI tools that pipe stdout to `head`/`less`/etc. Without
+/// this, `scry grep PATTERN | head` panics loudly the moment `head`
+/// closes its end of the pipe.
+///
+/// Single-call function; safe to invoke multiple times. No-op on
+/// non-Unix platforms.
+pub fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: setting a signal's disposition to the default has no
+    // memory or thread-safety implications. This is the standard
+    // CLI-tool boilerplate Rust intentionally omits from its
+    // runtime. The cast through `_` lets the call work on every
+    // libc::sighandler_t target ABI.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 pub fn prefault_path(path: &Path) {
     use std::os::unix::io::AsRawFd;
     if let Ok(f) = File::open(path) {

@@ -1295,3 +1295,38 @@ fn parse_timeout_skips_pathological_file() {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+// ===========================================================================
+// SIGPIPE regression: piping a long-output subcommand to `head` must
+// exit cleanly (Unix: killed by SIGPIPE → status code 141 or 0
+// depending on shell semantics) and not panic with `BrokenPipe`.
+// Without the runtime fix in main.rs, `scry completions bash | head`
+// panics mid-write inside clap_complete.
+// ===========================================================================
+
+#[cfg(unix)]
+#[test]
+fn sigpipe_does_not_panic_on_truncated_stdout() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    // Spawn `scry completions bash` and read only the first 200 bytes
+    // of its stdout, then drop the read end. The child should observe
+    // SIGPIPE on its next write and exit silently — NOT print a Rust
+    // panic backtrace to stderr.
+    let mut child = Command::new(scry_bin())
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn().expect("spawn scry completions bash");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut buf = [0u8; 200];
+    let _ = stdout.read(&mut buf);
+    drop(stdout);
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"),
+            "scry must not panic on broken pipe; stderr was:\n{stderr}");
+    assert!(!stderr.contains("BrokenPipe"),
+            "scry must not surface BrokenPipe to stderr; stderr was:\n{stderr}");
+}

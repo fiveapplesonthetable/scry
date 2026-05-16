@@ -286,12 +286,33 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             };
-            let scope_path = compute_scope(
+            let mut scope_path = compute_scope(
                 name_node,
                 source,
                 spec.scope_node_kinds,
                 spec.package_node_kind,
             );
+            // Receiver-typed declaration (Kotlin extension fn / property):
+            // - extension function name's parent IS function_declaration
+            // - extension property name's parent is variable_declaration,
+            //   grandparent is property_declaration. The receiver
+            //   user_type lives on the property_declaration directly.
+            // Prepend its identifier to scope_path so `def shouted` shows
+            // scope "String", and outline groups extensions by receiver.
+            let decl_node = if let Some(parent) = name_node.parent() {
+                match parent.kind() {
+                    "function_declaration" => Some((parent, name_node)),
+                    "variable_declaration" => parent.parent()
+                        .filter(|gp| gp.kind() == "property_declaration")
+                        .map(|gp| (gp, parent)),
+                    _ => None,
+                }
+            } else { None };
+            if let Some((decl, boundary)) = decl_node {
+                if let Some(recv) = kotlin_receiver_for_decl(decl, boundary, source) {
+                    scope_path.insert(0, recv);
+                }
+            }
             let start = name_node.start_position();
             out.push(RawSymbol {
                 name,
@@ -307,6 +328,45 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
     })
 }
 
+/// Kotlin extension function / property receiver lookup.
+///
+/// For a function or property declaration that defines an extension
+/// (`fun String.shouted()` or `val String.firstChar`), the AST has a
+/// `user_type` node positioned BEFORE the identifier-name field. Return
+/// the receiver identifier text if present, or None when this is a
+/// plain function/property.
+///
+/// We can't express "any user_type before the name field" in
+/// tree-sitter query syntax cleanly (return-type user_type would also
+/// match), so this runs as a post-process on each function_decl /
+/// property_decl match.
+fn kotlin_receiver_for_decl(
+    decl: tree_sitter::Node,
+    name_node: tree_sitter::Node,
+    src: &[u8],
+) -> Option<String> {
+    let mut cursor = decl.walk();
+    let name_start = name_node.start_byte();
+    let mut found_receiver: Option<String> = None;
+    for child in decl.named_children(&mut cursor) {
+        if child.start_byte() >= name_start { break; }
+        if child.kind() == "user_type" {
+            // Pull the first identifier text inside the receiver's user_type.
+            let mut cw = child.walk();
+            for grand in child.named_children(&mut cw) {
+                if grand.kind() == "identifier" {
+                    if let Ok(s) = grand.utf8_text(src) {
+                        found_receiver = Some(s.to_string());
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    found_receiver
+}
+
 fn compute_scope(
     node: tree_sitter::Node,
     src: &[u8],
@@ -319,8 +379,14 @@ fn compute_scope(
         let k = p.kind();
         if scope_kinds.contains(&k) || Some(k) == package_kind {
             if let Some(n) = p.child_by_field_name("name") {
-                if let Ok(s) = n.utf8_text(src) {
-                    scope.push(s.to_string());
+                // Don't push our own name as our own scope step — for a
+                // function/class declaration where the captured @name IS
+                // p's "name" field, the symbol belongs INSIDE p but
+                // p doesn't enclose it scope-wise.
+                if n.id() != node.id() {
+                    if let Ok(s) = n.utf8_text(src) {
+                        scope.push(s.to_string());
+                    }
                 }
             }
         }
@@ -1072,6 +1138,72 @@ mod tests {
             parser.set_language(cpp_spec().language).unwrap();
             let (outcome, _) = parse_with_explicit_timeout(&mut parser, src, 0);
             assert!(matches!(outcome, ParseOutcome::Tree(_)));
+        });
+    }
+
+    /// Kotlin extension function gets its receiver type prepended to the
+    /// scope_path so `def shouted` shows scope ["String"], and outline of
+    /// a file groups extensions by their receiver. Plain Kotlin functions
+    /// keep their normal scope (empty here).
+    #[test]
+    fn kotlin_extension_receiver_scoping() {
+        let src = br#"
+            package x
+            fun String.shouted(): String = uppercase() + "!"
+            val String.firstChar: Char get() = this[0]
+            fun plain() {}
+            class Holder {
+                fun method() {}
+            }
+        "#;
+        let syms = extract(FileKind::Kotlin, src).unwrap();
+        let by_name: std::collections::HashMap<_, _> = syms.iter()
+            .map(|s| (s.name.clone(), s.scope_path.clone()))
+            .collect();
+        // Extension function -> scope[0] = "String"
+        assert_eq!(by_name.get("shouted"), Some(&vec!["String".to_string()]),
+                   "shouted should be scoped to String, got {:?}", by_name.get("shouted"));
+        // Extension property -> scope[0] = "String"
+        assert_eq!(by_name.get("firstChar"), Some(&vec!["String".to_string()]),
+                   "firstChar should be scoped to String, got {:?}", by_name.get("firstChar"));
+        // Plain function -> empty scope
+        assert_eq!(by_name.get("plain"), Some(&vec![]),
+                   "plain should have empty scope, got {:?}", by_name.get("plain"));
+        // Method on a class -> scope = ["Holder"] (normal class scope, not receiver)
+        assert_eq!(by_name.get("method"), Some(&vec!["Holder".to_string()]),
+                   "Holder.method scope, got {:?}", by_name.get("method"));
+    }
+
+    #[test]
+    #[ignore = "exploratory; run with -- --ignored --nocapture to see Kotlin AST"]
+    fn dump_kotlin_ext_ast() {
+        let src = b"package x\nfun String.shouted(): String = uppercase() + \"!\"\nval String.firstChar: Char get() = this[0]\n";
+        PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(kotlin_spec().language).unwrap();
+            let tree = parser.parse(src.as_ref(), None).unwrap();
+            fn walk(n: tree_sitter::Node, src: &[u8], depth: usize) {
+                let text = n.utf8_text(src).unwrap_or("?");
+                let snippet = if text.len() < 40 { text.replace('\n', "\\n") } else { format!("<{}b>", text.len()) };
+                let field = n.parent()
+                    .and_then(|p| {
+                        let mut w = p.walk();
+                        let mut field_name = None;
+                        for (i, c) in p.named_children(&mut w).enumerate() {
+                            if c.id() == n.id() {
+                                field_name = p.field_name_for_named_child(i as u32).map(String::from);
+                                break;
+                            }
+                        }
+                        field_name
+                    })
+                    .map(|s| format!(" [field={s}]"))
+                    .unwrap_or_default();
+                println!("{:indent$}{}{} = {:?}", "", n.kind(), field, snippet, indent = depth*2);
+                let mut w = n.walk();
+                for c in n.named_children(&mut w) { walk(c, src, depth + 1); }
+            }
+            walk(tree.root_node(), src.as_ref(), 0);
         });
     }
 }

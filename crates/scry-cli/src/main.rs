@@ -331,6 +331,31 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         workers: usize,
     },
+    /// Outgoing edges from NAME's body: what does NAME call /
+    /// reference? Symmetric counterpart to `scry callers NAME`.
+    /// Resolves NAME to one or more SymbolRecords, computes each
+    /// body's byte range via the enclosing_function heuristic, then
+    /// returns every ref whose byte_start falls in that range.
+    /// Requires the file_refs sidecar (`scry build-file-refs`) for
+    /// O(refs-in-file) lookup; falls back to a full scan if missing.
+    Uses {
+        name: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Disambiguate which def of NAME to introspect when the
+        /// name has multiple definitions: keep only defs whose
+        /// path contains this substring.
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
+        /// Filter outgoing refs by kind (call, type, field, …).
+        /// Default: all kinds.
+        #[arg(long, short = 'k')]
+        kind: Option<String>,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Recursive callers tree for NAME. Walks the call graph
     /// upwards: for each caller, find ITS callers, up to `--depth`
     /// levels. Cycle-safe (visited-set). Outputs an indented tree
@@ -841,6 +866,16 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Build the file→ref-ids sidecar (file_refs.bin +
+    /// file_refs_offsets.bin). Symmetric to file_symbols but indexes
+    /// refs.bin. Powers `scry uses`: outgoing edges from a function
+    /// body are found by intersecting "refs in NAME's file" with
+    /// "byte range of NAME's body". Without this sidecar, `uses`
+    /// must linearly scan all 63M refs.
+    BuildFileRefs {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
     /// Layer 2 ref-to-def resolution: per-ref override sidecar produced
     /// by walking the index ONCE post-finalize. For each unresolved or
     /// ambiguous ref, narrow candidates using language-specific context
@@ -1147,6 +1182,8 @@ fn main() -> Result<()> {
             cmd_impact(name, index, in_, subclass_depth, reachable, limit, json),
         Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, json } =>
             cmd_callgraph(name, index, in_, depth, max_nodes, reachable, json),
+        Cmd::Uses { name, index, in_, kind, limit, json } =>
+            cmd_uses(name, index, in_, kind, limit, json),
         Cmd::Finalize {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, workers,
@@ -1171,6 +1208,7 @@ fn main() -> Result<()> {
         }
         Cmd::BuildOffsets { index } => cmd_build_offsets(index),
         Cmd::BuildFileSymbols { index } => cmd_build_file_symbols(index),
+        Cmd::BuildFileRefs { index } => cmd_build_file_refs(index),
         Cmd::BuildResolutions { index } => cmd_build_resolutions(index),
         Cmd::BuildDigests { index, workers } => cmd_build_digests(index, workers),
         Cmd::Compact { index } => cmd_compact(index),
@@ -2285,6 +2323,13 @@ fn warn_if_index_stale(r: &StoreReader) {
     if built_with.is_empty() || built_with == running {
         return;
     }
+    // Patch-level mismatches (0.1.17 vs 0.1.24, etc.) are mostly
+    // bugfix releases that DON'T require an index rebuild. Don't
+    // warn for those — only flag major.minor drift where the
+    // on-disk format or query semantics actually shifted.
+    let bw_mm = major_minor(built_with);
+    let rn_mm = major_minor(running);
+    if bw_mm == rn_mm { return; }
     eprintln!(
         "[scry] WARNING: this index was built with scry {built_with}; \
          running {running}. Older builds may have stale records (e.g. the \
@@ -2293,6 +2338,20 @@ fn warn_if_index_stale(r: &StoreReader) {
          Suppress this warning with SCRY_QUIET=1.",
         r.paths.root.display(), r.paths.root.display(),
     );
+}
+
+/// `"0.1.17"` → `Some("0.1")`. Returns the input unchanged if it
+/// can't be split (preserves the conservative-warning shape for
+/// non-semver tags).
+fn major_minor(v: &str) -> &str {
+    let mut dots = 0;
+    for (i, c) in v.char_indices() {
+        if c == '.' {
+            dots += 1;
+            if dots == 2 { return &v[..i]; }
+        }
+    }
+    v
 }
 
 fn cmd_def(
@@ -2359,6 +2418,7 @@ fn cmd_finalize(
 
     stage("build-offsets", || cmd_build_offsets(Some(dir.clone())))?;
     stage("build-file-symbols", || cmd_build_file_symbols(Some(dir.clone())))?;
+    stage("build-file-refs", || cmd_build_file_refs(Some(dir.clone())))?;
     stage("build-trigrams", || cmd_build_trigrams(Some(dir.clone()), Some(workers), 5 * 1024 * 1024))?;
     stage("build-resolutions", || cmd_build_resolutions(Some(dir.clone())))?;
 
@@ -4415,6 +4475,179 @@ fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
         human_bytes(std::fs::metadata(paths.file_symbols_offsets()).map(|m| m.len()).unwrap_or(0)),
     );
     Ok(())
+}
+
+/// `scry build-file-refs` — symmetric to `scry build-file-symbols`
+/// but groups refs.bin entries by file_id. Powers `scry uses`.
+/// Walks the lazy ref vec once; ~140MB sidecar on AOSP+Linux
+/// (63M refs × 4 bytes per id + offsets).
+fn cmd_build_file_refs(index: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    eprintln!("[frefs] target index: {}", index_dir.display());
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+
+    let r = StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+    let n_files = r.files.len();
+    eprintln!("[frefs] {} files, {} refs — building reverse map", n_files, r.n_refs());
+
+    let t = Instant::now();
+    let mut by_file: Vec<Vec<u32>> = vec![Vec::new(); n_files];
+    let mut ref_idx: u32 = 0;
+    for rr in r.iter_refs() {
+        let fid = rr.file_id as usize;
+        if fid < by_file.len() {
+            by_file[fid].push(ref_idx);
+        }
+        ref_idx += 1;
+        if ref_idx % 5_000_000 == 0 {
+            eprintln!("[frefs] grouped {} M refs ({} ms)",
+                ref_idx / 1_000_000, t.elapsed().as_millis());
+        }
+    }
+    eprintln!("[frefs] grouping done in {} ms; writing sidecars",
+        t.elapsed().as_millis());
+
+    let data_tmp = paths.file_refs().with_extension("bin.tmp");
+    let off_tmp = paths.file_refs_offsets().with_extension("bin.tmp");
+    {
+        let mut w = BufWriter::with_capacity(8 << 20, std::fs::File::create(&data_tmp)?);
+        let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&off_tmp)?);
+        let mut byte_pos: u64 = 0;
+        for ids in &by_file {
+            ow.write_all(&byte_pos.to_le_bytes())?;
+            let count = ids.len() as u32;
+            w.write_all(&count.to_le_bytes())?;
+            for id in ids {
+                w.write_all(&id.to_le_bytes())?;
+            }
+            byte_pos += 4 + 4 * (ids.len() as u64);
+        }
+        w.flush()?;
+        ow.flush()?;
+    }
+    std::fs::rename(&data_tmp, paths.file_refs())?;
+    std::fs::rename(&off_tmp, paths.file_refs_offsets())?;
+
+    eprintln!("[frefs] DONE in {} ms. file_refs={} offsets={}",
+        t.elapsed().as_millis(),
+        human_bytes(std::fs::metadata(paths.file_refs()).map(|m| m.len()).unwrap_or(0)),
+        human_bytes(std::fs::metadata(paths.file_refs_offsets()).map(|m| m.len()).unwrap_or(0)),
+    );
+    Ok(())
+}
+
+/// `scry uses NAME` — outgoing edges from NAME's body. For each
+/// def of NAME, computes the body byte range (via the
+/// enclosing_function heuristic from v0.1.20: byte_start of NAME
+/// up to the next function's byte_start in the same file), then
+/// returns every ref inside that range. With the `file_refs`
+/// sidecar this is O(refs_in_file × log F); without it we'd
+/// linearly scan all refs (much slower at AOSP scale, hence the
+/// stern stderr nudge).
+fn cmd_uses(
+    name: String,
+    index: Option<PathBuf>,
+    in_: Option<String>,
+    kind: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let t = Instant::now();
+    let r = open_index(index)?;
+    let defs: Vec<SymbolRecord> = r.lookup_exact(&name).into_iter()
+        .filter(|s| match in_.as_deref() {
+            None => true,
+            Some(p) => r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        })
+        .collect();
+    if defs.is_empty() {
+        eprintln!("[scry] uses: no def of {name:?} found{}",
+            in_.as_deref().map(|p| format!(" matching --in {p:?}")).unwrap_or_default());
+        return Ok(());
+    }
+
+    // For each def, determine its body byte range. Use the same
+    // partition-point logic as enclosing_function: body ends where
+    // the next function-like symbol in the same file begins.
+    let mut out_refs: Vec<RefRecord> = Vec::new();
+    let mut seen_idx: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let kind_filter = kind.as_deref();
+    for def in &defs {
+        let body_end = next_function_byte_start(&r, def.file_id, def.byte_start)
+            .unwrap_or(u32::MAX);
+        let refs_in_file: Vec<u32> = match r.refs_for_file(def.file_id) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "[scry] uses: file_refs sidecar missing; run \
+                     `scry build-file-refs --index DIR` for fast lookup. \
+                     Falling back to a per-file linear scan (slow).",
+                );
+                r.iter_refs().enumerate()
+                    .filter_map(|(i, rr)| (rr.file_id == def.file_id).then_some(i as u32))
+                    .collect()
+            }
+        };
+        for ref_idx in refs_in_file {
+            let Some(rr) = r.get_ref(ref_idx) else { continue };
+            if rr.byte_start < def.byte_start || rr.byte_start >= body_end { continue; }
+            if let Some(k) = kind_filter {
+                if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
+            }
+            // Dedupe by (file_id, byte_start, name) — same ref site
+            // appearing across multiple defs (overloads) collapses.
+            let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
+            if seen_idx.insert(key) {
+                out_refs.push(rr);
+            }
+        }
+    }
+
+    if json {
+        for rr in out_refs.iter().take(limit) {
+            println!("{}", ref_to_json(&r, rr));
+        }
+    } else {
+        let shown = out_refs.len().min(limit);
+        for rr in out_refs.iter().take(shown) {
+            let path = r.files.get(rr.file_id as usize)
+                .map(|fe| fe.display_path(&r.roots))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            println!("{path}:{}:{}  ({} {})  {}",
+                rr.line, rr.col, rr.kind.short(), rr.lang.as_str(), rr.name);
+        }
+        println!("\n{} use{} (showing {})",
+            out_refs.len(),
+            if out_refs.len() == 1 { "" } else { "s" },
+            shown);
+        eprintln!("[scry] cmd=uses q={:?} defs={} hits={} elapsed={}ms",
+            name, defs.len(), out_refs.len(), t.elapsed().as_millis());
+    }
+    Ok(())
+}
+
+/// Body-end heuristic: in `file_id`, find the next function-like
+/// symbol whose byte_start is > `def_start`. Returns its
+/// byte_start. None if there's no such symbol (def is the last
+/// function in the file → body runs to EOF).
+fn next_function_byte_start(
+    r: &StoreReader,
+    file_id: u32,
+    def_start: u32,
+) -> Option<u32> {
+    let idxs = r.symbols_for_file(file_id)?;
+    let mut starts: Vec<u32> = idxs.into_iter()
+        .filter_map(|i| r.get_symbol(i))
+        .filter(|s| matches!(s.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor))
+        .map(|s| s.byte_start)
+        .filter(|bs| *bs > def_start)
+        .collect();
+    starts.sort_unstable();
+    starts.first().copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -6803,6 +7036,22 @@ fn mcp_tools_list_result() -> serde_json::Value {
             })),
         ),
         tool(
+            "uses",
+            "Outgoing edges from NAME's body — what does NAME call \
+             or reference? Symmetric to `callers`. Returns up to \
+             `limit` refs inside NAME's function body. Use \
+             `kind: \"call\"` to restrict to call sites. Requires \
+             the file_refs sidecar (`scry build-file-refs`) for \
+             O(1) per-file lookup.",
+            obj(&["name"], serde_json::json!({
+                "name":  {"type": "string"},
+                "in":    in_prop,
+                "kind":  {"type": "string",
+                    "description": "Filter by ref kind: call, type, field, import, inherit, using-ns. Default: all."},
+                "limit": limit_prop,
+            })),
+        ),
+        tool(
             "callgraph",
             "Recursive callers tree for NAME — \"how does control \
              flow reach this function?\". Walks call refs upward N \
@@ -7052,6 +7301,7 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "implementations" => &["name"],
         "impact"          => &["name"],
         "callgraph"       => &["name"],
+        "uses"            => &["name"],
         "prefix"   => &["prefix"],
         "fuzzy"    => &["substr"],
         "grep"     => &["pattern"],
@@ -7651,6 +7901,9 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_callgraph(reader, arg_str("name"), in_, depth, max_nodes, reachable)
         }
+        "uses" => {
+            serve_uses(reader, arg_str("name"), in_, kind, limit)
+        }
         "grep"    => {
             let ci = args.get("case_insensitive")
                 .and_then(serde_json::Value::as_bool)
@@ -7978,6 +8231,50 @@ fn serve_ref(
             }
         }
         out.push(ref_to_json(r, &rr));
+    }
+    serde_json::Value::Array(out)
+}
+
+/// `uses` JSON-RPC handler — outgoing edges. Same algorithm as
+/// [`cmd_uses`]: locate def(s) of NAME, compute body byte range
+/// via next-function heuristic, intersect with refs in that file.
+fn serve_uses(
+    r: &StoreReader,
+    name: &str,
+    in_: Option<&str>,
+    kind: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
+    let in_prefix = in_.unwrap_or("");
+    let defs: Vec<SymbolRecord> = r.lookup_exact(name).into_iter()
+        .filter(|s| in_prefix.is_empty() || file_in_prefix(r, s.file_id, in_prefix))
+        .collect();
+    if defs.is_empty() {
+        return serde_json::json!([]);
+    }
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for def in &defs {
+        let body_end = next_function_byte_start(r, def.file_id, def.byte_start)
+            .unwrap_or(u32::MAX);
+        let refs_in_file = match r.refs_for_file(def.file_id) {
+            Some(v) => v,
+            // Daemon path stays quiet; no stderr spam.
+            None => continue,
+        };
+        for ref_idx in refs_in_file {
+            if out.len() >= limit { break; }
+            let Some(rr) = r.get_ref(ref_idx) else { continue };
+            if rr.byte_start < def.byte_start || rr.byte_start >= body_end { continue; }
+            if let Some(k) = kind {
+                if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
+            }
+            let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
+            if seen.insert(key) {
+                out.push(ref_to_json(r, &rr));
+            }
+        }
+        if out.len() >= limit { break; }
     }
     serde_json::Value::Array(out)
 }

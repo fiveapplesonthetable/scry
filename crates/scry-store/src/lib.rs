@@ -566,6 +566,14 @@ impl StorePaths {
     /// file's entry begins in file_symbols.bin. Allows random access
     /// without scanning the whole packed file.
     pub fn file_symbols_offsets(&self) -> PathBuf { self.root.join("file_symbols_offsets.bin") }
+    /// file_id → list of ref indices (v0.1.25+). Same packed shape as
+    /// `file_symbols`: per file_id (in order), a u32 count followed
+    /// by `count` u32 indices into refs.bin. Powers `scry uses`
+    /// (outgoing edges: which symbols does NAME's body reference?)
+    /// by letting us narrow refs to a single file in O(1) instead
+    /// of scanning all 63M.
+    pub fn file_refs(&self) -> PathBuf { self.root.join("file_refs.bin") }
+    pub fn file_refs_offsets(&self) -> PathBuf { self.root.join("file_refs_offsets.bin") }
     /// Per-ref resolution overrides: packed u64-LE per ref_idx; 0 = unresolved,
     /// other values are the resolved definition's id (matches SymbolRecord.id).
     /// Produced by `scry build-resolutions`; reader honors it on get_ref().
@@ -1665,6 +1673,13 @@ pub struct StoreReader {
     /// to the linear scan path then. Retrofit via build-file-symbols.
     pub file_symbols_mmap: Option<memmap2::Mmap>,
     pub file_symbols_offsets_mmap: Option<memmap2::Mmap>,
+    /// file_id → list of ref_idx (v0.1.25+). Identical packed
+    /// layout to file_symbols_mmap; reused via the same decoder
+    /// helper. Powers `scry uses` (outgoing edges) by letting it
+    /// narrow refs to a single file's body in O(1) instead of
+    /// scanning all 63M refs.
+    pub file_refs_mmap: Option<memmap2::Mmap>,
+    pub file_refs_offsets_mmap: Option<memmap2::Mmap>,
     /// Per-ref resolved-def-id overrides. Indexed by ref_idx; 0 ⇒
     /// unresolved (use the RefRecord's own resolved_to, which may also
     /// be None). Built post-finalize via `scry build-resolutions`.
@@ -1790,6 +1805,15 @@ impl StoreReader {
         } else {
             (None, None)
         };
+        // file_refs sidecar — same packed shape as file_symbols, but
+        // indexed at refs.bin instead. Powers `scry uses`.
+        let (file_refs_mmap, file_refs_offsets_mmap) = if
+            paths.file_refs().exists() && paths.file_refs_offsets().exists()
+        {
+            (Some(safe_mmap(&paths.file_refs())?), Some(safe_mmap(&paths.file_refs_offsets())?))
+        } else {
+            (None, None)
+        };
         // Per-ref resolution overrides (Layer 2 sidecar). Optional.
         let ref_resolutions_mmap = if paths.ref_resolutions().exists() {
             Some(safe_mmap(&paths.ref_resolutions())?)
@@ -1837,6 +1861,7 @@ impl StoreReader {
             unique_names_mmap, unique_name_offsets_mmap,
             lazy_symbols, lazy_refs,
             file_symbols_mmap, file_symbols_offsets_mmap,
+            file_refs_mmap, file_refs_offsets_mmap,
             ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
             chunks, embeddings_mmap, embedding_dim, embedding_count,
@@ -2035,6 +2060,17 @@ impl StoreReader {
     pub fn symbols_for_file(&self, file_id: u32) -> Option<Vec<u32>> {
         let data = self.file_symbols_mmap.as_ref()?;
         let offs = self.file_symbols_offsets_mmap.as_ref()?;
+        Some(read_file_symbols_entry(data, offs, file_id))
+    }
+
+    /// O(1) lookup of all ref indices recorded in the given file.
+    /// Mirrors [`symbols_for_file`] but indexes the refs.bin packed
+    /// data. Built by `scry build-file-refs`. Returns None when the
+    /// sidecar isn't present; `scry uses` falls back to scanning
+    /// every ref in that case (much slower at AOSP scale).
+    pub fn refs_for_file(&self, file_id: u32) -> Option<Vec<u32>> {
+        let data = self.file_refs_mmap.as_ref()?;
+        let offs = self.file_refs_offsets_mmap.as_ref()?;
         Some(read_file_symbols_entry(data, offs, file_id))
     }
 

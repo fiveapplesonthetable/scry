@@ -7,6 +7,48 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.25] — 2026-05-17
+
+`scry uses NAME` — outgoing edges from NAME's body. Symmetric
+counterpart to `scry callers NAME`: for each def of NAME, walks
+refs whose `byte_start` falls in NAME's body byte range
+(computed via the next-function heuristic from v0.1.20) and
+returns them. Plus a quieter version warning.
+
+**`scry uses`:**
+
+- CLI: `scry uses NAME [--in PREFIX] [--kind call] [--limit N] [--json]`.
+- JSON-RPC + MCP: `{"cmd":"uses","args":{"name":"...","kind":"call"}}`.
+- New file_refs sidecar (`<index>/file_refs.bin` +
+  `file_refs_offsets.bin`) makes per-file ref lookup O(1)
+  instead of scanning 63M refs. ~245MB on AOSP+Linux. Built by
+  `scry build-file-refs` or auto via `scry finalize`.
+- Without the sidecar, `uses` falls back to a linear scan with
+  an actionable stderr warning suggesting the build command.
+- Live AOSP measurement (`uses bindServiceLocked`):
+  - without file_refs: 12.6 s (linear scan)
+  - with file_refs: **306 ms** (~41×)
+- E2E test (`uses_e2e_outgoing_edges`) builds a 4-method Java
+  fixture and asserts `uses run` returns ONLY the calls inside
+  `run()`'s body, not `main()`'s call to the same method.
+
+**Quieter version warning:**
+
+- The "index built with scry X.Y.Z; running A.B.C" stderr line
+  used to fire on any version mismatch, including patch-level
+  drift (0.1.17 → 0.1.24). Patch releases are bugfix-only and
+  don't invalidate indexes, so the warning was alarmist noise.
+- Now only fires when major.minor differs (0.1.x → 0.2.x), so
+  the user only sees it when an actual rebuild is worth doing.
+
+**Plumbing:**
+
+- `scry finalize` adds `build-file-refs` to its always-run
+  stages so freshly-built indexes get `uses` precision for
+  free.
+- `StoreReader::refs_for_file(file_id)` mirrors the existing
+  `symbols_for_file` shape, reusing the same packed decoder.
+
 ## [0.1.24] — 2026-05-17
 
 `--reachable` cold latency 22s → 4.7s (~5×) via an on-disk

@@ -2007,3 +2007,63 @@ public class Tree {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn uses_e2e_outgoing_edges() {
+    // Fixture: a class with three methods where one calls the other two.
+    // `uses run` should return calls to a() and b() inside run() — and
+    // NOT return calls outside run()'s body (e.g. inside main()).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-uses-e2e-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("zoo")).unwrap();
+    std::fs::write(src.join("zoo/Tree.java"), r#"package zoo;
+public class Tree {
+  public void a() {}
+  public void b() {}
+  public void main() { a(); }
+  public void run() {
+    a();
+    b();
+  }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    // Build the file_refs sidecar so `uses` takes the fast path.
+    let out = Command::new(scry_bin())
+        .args(["build-file-refs", "--index"]).arg(&idx)
+        .output().expect("spawn scry build-file-refs");
+    assert!(out.status.success(),
+            "build-file-refs failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // uses run --json --kind call: should include "a" and "b"
+    // (the two calls inside run's body), NOT include "a" from
+    // main's body — that's a different enclosing function.
+    let out = Command::new(scry_bin())
+        .args(["uses", "run", "--index"]).arg(&idx)
+        .args(["--kind", "call", "--json", "--limit", "20"])
+        .output().expect("spawn scry uses");
+    assert!(out.status.success(),
+            "uses run failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let names: Vec<&str> = lines.iter().filter_map(|v| v["name"].as_str()).collect();
+    assert!(names.contains(&"a"),
+            "uses run should include a() call; got {names:?}");
+    assert!(names.contains(&"b"),
+            "uses run should include b() call; got {names:?}");
+    assert_eq!(names.len(), 2,
+            "uses run should ONLY return calls inside run()'s body \
+             (a and b), not main's call to a; got {names:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

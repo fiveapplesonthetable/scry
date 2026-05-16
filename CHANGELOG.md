@@ -7,6 +7,29 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.19] — 2026-05-16
+
+`scry health` now reports the three precision sidecars
+(`module_graph.json`, `clang_usrs.bin`, `scip_index.bin`) at
+both the raw-file-presence level and as structured per-sidecar
+checks (version + record counts + actionable "run X to
+generate" hints when absent).
+
+Output excerpt:
+
+\`\`\`
+  [ OK] module_graph.json     OK (256477806 bytes)
+  [ OK] clang_usrs.bin        OK (49560901 bytes)
+  [ OK] scip_index.bin        absent (optional)
+  [ OK] module_graph          v1, 91347 modules, 552496 dep edges, 1397276 file attributions
+  [ OK] clang_usrs            v1, 17822 USRs, 541626 records
+  [ OK] scip_index            absent (run \`scry scip-import\`)
+\`\`\`
+
+A corrupt sidecar (wrong version, bad protobuf, malformed JSON)
+surfaces as a soft warning with the parse error inline so you
+can diagnose without re-running every precision command.
+
 ## [0.1.18] — 2026-05-16
 
 `scry impact NAME` — "what breaks if I change NAME?" — composes

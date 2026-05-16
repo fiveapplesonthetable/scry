@@ -5581,6 +5581,11 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         ("tombstones.bin",       paths.tombstones()),
         ("chunks.bin",           paths.chunks()),
         ("embeddings.bin",       paths.embeddings()),
+        // Precision sidecars (v0.1.12+). Each has its own structured
+        // status line below; this just reports raw file presence.
+        ("module_graph.json",    paths.module_graph_json()),
+        ("clang_usrs.bin",       paths.clang_usrs()),
+        ("scip_index.bin",       paths.scip_index()),
     ];
     for (name, path) in optional_files {
         let (ok, status) = match std::fs::metadata(path) {
@@ -5624,6 +5629,45 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         name: "open + spot-decode", status: reader_status,
         required: true, ok: reader_ok,
     });
+
+    // Precision-sidecar checks: open each precision sidecar that's
+    // present and report version + record counts. Drift here (e.g. a
+    // v0 sidecar against this scry) gets surfaced as a soft warn so
+    // the user knows --reachable / --clang-precise / --scip-precise
+    // won't behave as expected.
+    // module_graph: read the JSON shape directly (cheap) instead of
+    // building the full reachability bitmap, which needs the file
+    // table StoreReader::open already produced. We report what the
+    // sidecar *says* it has; the live `open + spot-decode` check
+    // above already exercised the wiring on the full StoreReader.
+    let mg_status = match std::fs::read(paths.module_graph_json()) {
+        Err(_) => "absent (run `scry build-modgraph`)".to_string(),
+        Ok(raw) => match serde_json::from_slice::<scry_store::modgraph::ModuleGraphJsonV1>(&raw) {
+            Ok(v) if v.version == 1 => format!(
+                "v1, {} modules, {} dep edges, {} file attributions",
+                v.modules.len(), v.deps.len(), v.files.len(),
+            ),
+            Ok(v) => format!("present but unsupported version {}", v.version),
+            Err(e) => format!("present but FAILED to parse: {e:#}"),
+        },
+    };
+    checks.push(Check { name: "module_graph", status: mg_status, required: false, ok: true });
+    let cu_status = match scry_store::clang_usrs::ClangUsrIndex::open(&paths.clang_usrs()) {
+        Ok(None) => "absent (run `scry clang-index`)".to_string(),
+        Ok(Some(c)) => format!(
+            "v1, {} USRs, {} records", c.usr_count(), c.len(),
+        ),
+        Err(e) => format!("present but FAILED to open: {e:#}"),
+    };
+    checks.push(Check { name: "clang_usrs", status: cu_status, required: false, ok: true });
+    let si_status = match scry_store::scip_index::ScipIndex::open(&paths.scip_index()) {
+        Ok(None) => "absent (run `scry scip-import`)".to_string(),
+        Ok(Some(s)) => format!(
+            "v1, {} symbols, {} records", s.symbol_count(), s.len(),
+        ),
+        Err(e) => format!("present but FAILED to open: {e:#}"),
+    };
+    checks.push(Check { name: "scip_index", status: si_status, required: false, ok: true });
 
     // Version-skew check. Surface the scry_version that built the
     // index alongside the running binary's version. A mismatch is

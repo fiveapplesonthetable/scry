@@ -537,6 +537,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "regex",
+ "regex-syntax",
  "scry-aosp",
  "scry-lang",
  "scry-store",

@@ -914,6 +914,16 @@ fn parse_one(
         return Ok((Vec::new(), Vec::new()));
     }
     if rf.size > max_file_bytes {
+        // Loud skip so the operator can audit which files we never opened.
+        // These are almost always data-blobs masquerading as source —
+        // sqlite3.c amalgamation, crypto test vectors, audio sample headers,
+        // generated math constant tables. Tree-sitter ASTs over multi-MB
+        // text data routinely OOM workers, so we refuse to even read them.
+        eprintln!(
+            "[skip-large] {} kind={:?} size={} > max-file-bytes={}",
+            rf.path.display(), rf.kind,
+            human_bytes(rf.size), human_bytes(max_file_bytes),
+        );
         return Ok((Vec::new(), Vec::new()));
     }
     let bytes = std::fs::read(&rf.path)

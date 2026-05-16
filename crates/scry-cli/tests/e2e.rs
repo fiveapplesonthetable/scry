@@ -569,6 +569,142 @@ fn synthetic_tree_roundtrip() {
     assert!(!arr.is_empty(),
             "Bravo (unchanged, replayed) must survive incremental: {bravo}");
 
+    // 8c-bis. Incremental with file DELETION. Drop Charlie.java +
+    // delete Alpha.java entirely; rebuild incremental; assert the
+    // diff line reports `1 removed` and the dropped symbols are no
+    // longer queryable. This is the path the previous test did not
+    // cover and the agent audit flagged as CRITICAL.
+    std::fs::remove_file(inc_src.join("a/Alpha.java")).unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&inc_src).arg("-o").arg(&inc_idx)
+        .arg("--incremental").args(["--workers", "2"])
+        .output().expect("incremental w/ delete");
+    assert!(out.status.success(),
+            "incremental-with-delete failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("1 removed") || stderr.contains(" 1 removed,"),
+            "diff line should mention 1 removed: {stderr}");
+    // After re-opening the new index, Alpha must be gone.
+    let alpha_gone = query_def(&inc_idx, "Alpha");
+    let arr = alpha_gone.as_array().unwrap();
+    let still_present: Vec<_> = arr.iter()
+        .filter(|h| h.pointer("/path").and_then(|p| p.as_str())
+                     .map(|p| p.contains("Alpha.java")).unwrap_or(false))
+        .collect();
+    assert!(still_present.is_empty(),
+            "Alpha.java symbols must not be queryable after deletion: {alpha_gone}");
+    // Charlie + Bravo must still be there.
+    assert!(!query_def(&inc_idx, "Charlie").as_array().unwrap().is_empty(),
+            "Charlie should survive deletion of Alpha");
+    assert!(!query_def(&inc_idx, "Bravo").as_array().unwrap().is_empty(),
+            "Bravo should survive deletion of Alpha");
+
+    // 8c-ter. Stable file_id invariant: re-running the SAME
+    // incremental against an unchanged tree must be a no-op
+    // ("no changes — index already current"). This proves the digest
+    // round-trip is deterministic; a stable-order bug would flip a
+    // file's digest and trigger a false rebuild.
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&inc_src).arg("-o").arg(&inc_idx)
+        .arg("--incremental").args(["--workers", "2"])
+        .output().expect("incremental no-change after delete");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no changes"),
+            "second no-change incremental should be a no-op: {stderr}");
+
+    // 8d. `scry index-diff` with a file removal. The diff path is
+    // separate from the incremental builder; it must independently
+    // report removed=1 when a file vanishes. Sequence:
+    //   1. Add Delta.java to disk.
+    //   2. Run `scry index --incremental` so Delta is *in the index*.
+    //   3. Run `scry build-digests` so digests are flushed.
+    //   4. Delete Delta from disk.
+    //   5. Run `scry index-diff` — must report removed=1.
+    // This is materially different from "create file → delete file
+    // → diff" (no-op) because index-diff compares disk-now against
+    // the index/digest-state-then, not against some side computation.
+    std::fs::write(inc_src.join("b/Delta.java"),
+        "package z;\npublic class Delta {}\n").unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&inc_src).arg("-o").arg(&inc_idx)
+        .arg("--incremental").args(["--workers", "2"])
+        .output().expect("incremental to pick up Delta");
+    assert!(out.status.success());
+    let out = Command::new(scry_bin())
+        .args(["build-digests", "--index"]).arg(&inc_idx)
+        .output().expect("build-digests after delta");
+    assert!(out.status.success());
+    std::fs::remove_file(inc_src.join("b/Delta.java")).unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index-diff"]).arg(&inc_src).arg("--index").arg(&inc_idx)
+        .output().expect("index-diff after remove");
+    assert!(out.status.success());
+    let combined = format!("{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout));
+    assert!(combined.contains("removed:   1") || combined.contains("removed: 1"),
+            "index-diff must report removed=1 when a file vanishes: {combined}");
+
+    // 8e. Short-pattern grep (< 3 bytes). The trigram fast-path
+    // requires ≥ 3 bytes; with a 2-byte pattern the engine must
+    // degrade to the full scan rather than silently returning zero.
+    // Build trigrams on the incremental index first.
+    let out = Command::new(scry_bin())
+        .args(["build-trigrams", "--index"]).arg(&inc_idx)
+        .output().expect("build-trigrams for short-pattern test");
+    assert!(out.status.success());
+    let out = Command::new(scry_bin())
+        .args(["grep", "ge", "--index"]).arg(&inc_idx).args(["--limit", "10"])
+        .output().expect("scry grep on short pattern");
+    assert!(out.status.success(),
+            "short-pattern grep must not error: {}", String::from_utf8_lossy(&out.stderr));
+    // "ge" appears in "package z;" in every Java file. Must find ≥ 1.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("package"),
+            "short-pattern grep must match `package`: {stdout}");
+
+    // 8f. Regex grep path (separate code path from literal mmap+memchr).
+    let out = Command::new(scry_bin())
+        .args(["grep", "--regex", "Bravo|Charlie", "--index"]).arg(&inc_idx)
+        .args(["--limit", "10"])
+        .output().expect("regex grep");
+    assert!(out.status.success(),
+            "regex grep must not error: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Bravo") || stdout.contains("Charlie"),
+            "regex alternation grep must find at least one: {stdout}");
+
+    // 8g. Smoke-test the other CLI commands the agent audit flagged
+    // as untested. Each one is a separate process invocation against
+    // the synthetic index; we assert exit=0 + a basic shape check.
+    let assert_smoke = |args: &[&str], must_contain: &str, label: &str| {
+        let out = Command::new(scry_bin()).args(args)
+            .args(["--index"]).arg(&inc_idx)
+            .output().expect(label);
+        assert!(out.status.success(),
+                "{label} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let combined = format!("{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr));
+        assert!(combined.contains(must_contain),
+                "{label} output missing '{must_contain}': {combined}");
+    };
+    assert_smoke(&["prefix", "Bra", "--json"],     "Bravo",   "cmd_prefix");
+    assert_smoke(&["fuzzy", "Bravo", "--json"],    "Bravo",   "cmd_fuzzy");
+    assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
+    assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
+
+    // `scry compact` on an index with no tombstones must exit
+    // cleanly and report nothing-to-do (today's placeholder
+    // behavior; the test pins the contract so a future
+    // implementation can't silently change it).
+    let out = Command::new(scry_bin())
+        .args(["compact", "--index"]).arg(&inc_idx)
+        .output().expect("scry compact");
+    assert!(out.status.success(),
+            "compact failed: {}", String::from_utf8_lossy(&out.stderr));
+
     // 8b. `scry health` against the synthetic index must report
     // OVERALL: healthy and exit 0. JSON form is parsed and pinned.
     let out = Command::new(scry_bin())

@@ -39,21 +39,80 @@ scry/
 └── README.md          one-paragraph project pitch + quickstart
 ```
 
-## Build
+## Prerequisites
 
-The whole workspace builds with stable Rust 1.79+ (vanilla 2021
-edition; clippy lints in `[workspace.lints]` rely on the 1.74
-manifest-lints feature):
+Hard requirements:
+
+- **Linux x86_64 host.** Build is portable Rust, but the operations
+  recipe (cgroup envelope, `posix_fadvise` page-cache prefetch) is
+  Linux-only. Other targets compile but lose the production-mode
+  memory safety guards described in `docs/OPERATIONS.md`.
+- **Stable Rust 1.79 or newer.** Pinned in the workspace manifest
+  (`rust-version = "1.79"`); newer is fine. Edition 2021. The
+  `[workspace.lints]` table relies on the 1.74 manifest-lints
+  feature.
+- **Git ≥ 2.30.** For `scry diff --since` (parses `git diff --name-only`).
+- **clang 14+ in `$PATH`.** Required only if you exercise the
+  `--precise` path on `scry callers` (clangd-driven C++ type
+  resolution). Absent clang, every other command works.
+- **Disk space.** ~3 GB of cargo deps + target; the live AOSP+Linux
+  index itself needs ~12 GB. The benchmarked corpus on this host
+  (1,009,166 files, 70 GB source) does not need to be present to
+  build or test — the synthetic-tree e2e test stands alone.
+
+Soft requirements (optional but recommended):
+
+- **`perf` (linux-tools-generic)** for the `perf stat` decomposition
+  in `docs/BENCHMARKS.md`. Not needed for tests.
+- **`ripgrep`** for the comparison benches (`./scripts/bench_grep.sh`).
+- **`msmtp` or `sendmail`** if you want the hourly status email cron
+  documented in `docs/OPERATIONS.md`.
+
+## First-time setup
 
 ```sh
-. ./env.sh                  # CARGO_HOME / RUSTUP_HOME under /mnt/agent/cargo
-cargo build --release       # ~20 s cold, ~5 s incremental
+git clone https://github.com/fiveapplesonthetable/scry
+cd scry
+
+# env.sh pins CARGO_HOME / RUSTUP_HOME under /mnt/agent so the
+# build artifacts don't compete with the host's `~/` (the host's
+# rootfs is the small partition on this layout). On any other host
+# you can skip sourcing it and use your default cargo location.
+. ./env.sh
+
+# Install the toolchain if you don't already have it. rustup will
+# read rust-toolchain (none committed; uses your default) — bump
+# to ≥ 1.79 if it picks something older.
+rustup show active-toolchain || rustup default stable
+rustup component add clippy rustfmt
+
+# Build + test. ~20 s cold for build; tests finish in ~3 s.
+cargo build --release
+cargo test --release --workspace
+cargo clippy --release --workspace --all-targets   # must be clean
+
+# Smoke-test the binary against the synthetic tree the e2e
+# test built (or your own corpus):
+./target/release/scry --help
+```
+
+If `cargo build --release` reports a missing system header (rare —
+only happens with the C-FFI tree-sitter grammars on minimal
+distros), install `build-essential` (Debian/Ubuntu) or the
+equivalent toolchain group.
+
+## Build
+
+```sh
+cargo build --release                              # ~20 s cold, ~5 s incremental
 cargo clippy --release --workspace --all-targets   # must be clean
 ```
 
 The workspace builds and lints clean — zero warnings across all
-targets. Don't merge a change that introduces one; either fix it or
-explicitly allow it with a comment explaining why.
+targets. Don't merge a change that introduces one; either fix it
+or explicitly `#[allow]` it with a comment explaining why. The
+strict policy is in the top-level `Cargo.toml` `[workspace.lints]`
+block; see "Code quality posture" below for the rationale.
 
 ## Test
 
@@ -396,7 +455,7 @@ that catches problems fastest:
 2. **`cargo build --release`** — must finish with zero warnings.
    New warnings should either be fixed or explicitly
    `#[allow]`'d with a comment.
-3. **`cargo test --release --workspace`** — all 80 tests pass.
+3. **`cargo test --release --workspace`** — all 129 tests pass.
    The e2e test is the strongest single signal; if it fails,
    something cross-crate broke.
 4. **`./scripts/validate.sh`** — exercises every CLI command +

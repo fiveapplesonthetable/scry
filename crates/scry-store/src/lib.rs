@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 pub mod trigram;
 pub mod embed;
+pub mod modgraph;
 
 /// Tell the kernel we plan to read every byte of `path` soon, so it
 /// can start pulling pages into the page cache while we do other
@@ -537,6 +538,12 @@ impl StorePaths {
     pub fn unique_name_offsets(&self) -> PathBuf { self.root.join("unique_name_offsets.bin") }
     pub fn symbol_offsets(&self) -> PathBuf { self.root.join("symbols_offsets.bin") }
     pub fn ref_offsets(&self) -> PathBuf { self.root.join("refs_offsets.bin") }
+    /// Build-system module graph + file→module attribution + precomputed
+    /// reachability bitmap. Optional sidecar — present when the index
+    /// was built with `--build soong` / `gn` / `kernel` (v0.1.12+).
+    /// Powers `--precise` queries that filter results by build-graph
+    /// reachability instead of name-match alone.
+    pub fn module_graph_json(&self) -> PathBuf { self.root.join("module_graph.json") }
     /// file_id → list of symbol indices. Packed: per file_id (in order),
     /// a u32 count followed by `count` u32 indices into symbols.bin.
     pub fn file_symbols(&self) -> PathBuf { self.root.join("file_symbols.bin") }
@@ -1672,6 +1679,13 @@ pub struct StoreReader {
     /// Number of chunks in the embedding sidecar. Matches chunks.len()
     /// when both are present.
     pub embedding_count: u32,
+    /// Build-system module graph + reachability bitmap. Present iff
+    /// the index has a `module_graph.json` sidecar (v0.1.12+
+    /// `--build soong/gn/kernel`). Loaded eagerly because (a) it's
+    /// small (a few MB even for AOSP-scale), (b) every `--precise`
+    /// query touches it, and (c) the reachability bitmap is the
+    /// hot path. None on legacy / non-build-aware indexes.
+    pub module_graph: Option<modgraph::ModuleGraph>,
 }
 
 impl StoreReader {
@@ -1787,6 +1801,40 @@ impl StoreReader {
         } else {
             (None, None, 0u32, 0u32)
         };
+        // Build-system module graph sidecar (v0.1.12+). Read as JSON
+        // (small, parsed once at open) and compacted into a packed
+        // reachability bitmap by ModuleGraph::from_json_v1. The
+        // file→path-to-file_id resolver walks `files` once to build
+        // a HashMap; thereafter the lookup is O(1). Skip silently if
+        // missing — indexes built by v0.1.11 and earlier have no
+        // such sidecar and queries should work exactly as before.
+        let module_graph = if paths.module_graph_json().exists() {
+            let raw = std::fs::read(paths.module_graph_json())
+                .with_context(|| format!("read {}", paths.module_graph_json().display()))?;
+            let v: modgraph::ModuleGraphJsonV1 = serde_json::from_slice(&raw)
+                .with_context(|| format!("parse {}", paths.module_graph_json().display()))?;
+            if v.version != 1 {
+                anyhow::bail!(
+                    "{}: unsupported version {} (this binary understands v1)",
+                    paths.module_graph_json().display(), v.version,
+                );
+            }
+            // Build a path → file_id lookup once. Use the FileEntry's
+            // display_path so the adapter's path format (which can be
+            // absolute or root-relative depending on the build system)
+            // matches what scry indexed.
+            let path_to_id: HashMap<String, u32> = files
+                .iter()
+                .map(|fe| (fe.display_path(&roots), fe.id))
+                .collect();
+            let total_files = files.len();
+            let mg = modgraph::ModuleGraph::from_json_v1(v, total_files, |p| {
+                path_to_id.get(p).copied()
+            });
+            Some(mg)
+        } else {
+            None
+        };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
@@ -1798,6 +1846,7 @@ impl StoreReader {
             ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
             chunks, embeddings_mmap, embedding_dim, embedding_count,
+            module_graph,
         })
     }
 

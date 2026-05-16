@@ -16,7 +16,7 @@ use scry_store::{
     SymbolKind, SymbolRecord,
 };
 use scry_walker::{collect_files, FileKind, Profile, RawFile};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,10 +78,18 @@ enum Cmd {
         workers: Option<usize>,
         /// Hard refuse-to-touch ceiling (default 100 MiB). Files this large
         /// are binary blobs (.git packs, prebuilt jars). Every byte under
-        /// this is parsed. Concurrency is bounded by --mem-cap via memory
-        /// backpressure, not by file size.
+        /// this is parsed.
         #[arg(long, default_value_t = 100 * 1024 * 1024)]
         max_file_bytes: u64,
+        /// Files larger than this are routed to a single-worker serial
+        /// queue instead of the parallel pool. Tree-sitter can transiently
+        /// allocate GB-scale memory on pathological inputs; running such
+        /// files concurrently can OOM the host between memory-stats polls.
+        /// Serializing them bounds peak RAM to one big parse at a time.
+        /// Default 64 KiB — keeps the parallel hot path on small files
+        /// while ensuring no Vec-init-list explosion goes parallel.
+        #[arg(long, default_value_t = 64 * 1024)]
+        big_file_bytes: u64,
         /// Soft memory ceiling in GiB. When jemalloc-reported allocated
         /// memory climbs above 80% of this value, parser workers WAIT
         /// (don't pick up new files) until the heap drains via batch
@@ -96,6 +104,13 @@ enum Cmd {
         /// Bounds steady-state RAM regardless of corpus size.
         #[arg(long, default_value_t = 50_000)]
         flush_every: usize,
+        /// Resume from a previous run's checkpoint. If `<index>.tmp/`
+        /// contains `batch.NNNNNN.done` markers, skip those batches' files
+        /// and continue from the next one. Pairs with systemd
+        /// `Restart=on-failure`: the cgroup hard-kills on OOM, systemd
+        /// respawns, this flag lets us pick up where we left off.
+        #[arg(long)]
+        resume: bool,
     },
     /// Look up references to a name.
     Ref {
@@ -270,10 +285,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index {
             roots, profile, out, count_only, limit, no_refs, workers,
-            max_file_bytes, mem_cap, flush_every,
+            max_file_bytes, big_file_bytes, mem_cap, flush_every, resume,
         } => cmd_index(
             roots, profile, out, count_only, limit, no_refs, workers,
-            max_file_bytes, mem_cap, flush_every,
+            max_file_bytes, big_file_bytes, mem_cap, flush_every, resume,
         ),
         Cmd::Def { name, index, lang, kind, limit, json, md, budget } => {
             cmd_def(name, index, lang, kind, limit, json, md, budget)
@@ -319,8 +334,10 @@ fn cmd_index(
     no_refs: bool,
     workers: Option<usize>,
     max_file_bytes: u64,
+    big_file_bytes: u64,
     mem_cap: u32,
     flush_every: usize,
+    resume: bool,
 ) -> Result<()> {
     if let Some(n) = workers {
         if n > 0 {
@@ -407,10 +424,29 @@ fn cmd_index(
     });
 
     let mut writer = if streaming && !count_only {
-        StoreWriter::new_streaming(&out_dir)?
+        if resume {
+            StoreWriter::resume_streaming(&out_dir)?
+        } else {
+            StoreWriter::new_streaming(&out_dir)?
+        }
     } else {
         StoreWriter::new(&out_dir)
     };
+
+    // -- Walk + sort + assign file_ids for every root up front --
+    // Stable per-relpath ordering is what makes --resume safe: a second run
+    // with the same args (same source tree state) assigns the exact same
+    // file_ids, so chunks already on disk reference indices in the about-to-be-
+    // rebuilt writer.files. The walker is parallel and emits in non-
+    // deterministic order — without this sort, file_id 12345 might mean two
+    // different files across runs and the index would be corrupt.
+    struct PreparedRoot {
+        root_id: u8,
+        root_path: PathBuf,
+        files: Vec<RawFile>,
+        file_entries: Vec<FileEntry>,
+    }
+    let mut prepared: Vec<PreparedRoot> = Vec::with_capacity(roots.len());
     let mut next_file_id: u32 = 0;
     let mut total_files_total: u64 = 0;
     let mut total_files_parsed: u64 = 0;
@@ -431,6 +467,8 @@ fn cmd_index(
         eprintln!("[walk]  {} (profile: {:?})", root.display(), prof);
         let mut collected = collect_files(root, prof)?;
         if let Some(n) = limit { collected.files.truncate(n); }
+        // Deterministic order is required for --resume correctness.
+        collected.files.sort_unstable_by(|a, b| a.relpath.cmp(&b.relpath));
         eprintln!(
             "[walk]  {} files / {} / {} ms",
             collected.files.len(),
@@ -460,23 +498,136 @@ fn cmd_index(
             })
             .collect();
         next_file_id += collected.files.len() as u32;
+        // File entries are deterministic from the sorted walk — push them now
+        // so writer.files is complete even for batches we skip on resume.
+        writer.files.extend(file_entries.iter().cloned());
+        prepared.push(PreparedRoot {
+            root_id,
+            root_path: collected.root,
+            files: collected.files,
+            file_entries,
+        });
+    }
 
-        if count_only {
-            writer.files.extend(file_entries);
-            continue;
+    // -- Resume watermark + orphan-chunk cleanup --
+    // Watermark = number of file_ids that are fully done. file_ids [0, watermark)
+    // are flushed to chunk files on disk. progress.json is written atomically
+    // (via rename) AFTER each batch's chunks are flushed. If we crash between
+    // chunk flush and progress write, the on-disk chunk_count exceeds the
+    // progress.json record — those are orphans and we discard them before
+    // resuming, so we don't double-count any file's records in the final index.
+    let progress_path = writer.tmp_dir.as_ref().map(|t| t.join("progress.json"));
+    let mut watermark: u32 = 0;
+    if resume {
+        if let Some(p) = progress_path.as_ref() {
+            if p.exists() {
+                let s = std::fs::read_to_string(p)
+                    .with_context(|| format!("read {}", p.display()))?;
+                let v: serde_json::Value = serde_json::from_str(&s)
+                    .with_context(|| format!("parse {}", p.display()))?;
+                watermark = v.get("completed_files").and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                let saved_sym = v.get("symbol_chunks").and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                let saved_ref = v.get("ref_chunks").and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                // Verify the roots signature matches: if the user reindexes
+                // with different roots or the source tree changed size, file_ids
+                // would be reassigned and chunks on disk would be misaligned.
+                // Fail loudly rather than silently producing a corrupt index.
+                let want = v.get("roots").and_then(|x| x.as_array()).cloned()
+                    .unwrap_or_default();
+                if want.len() != prepared.len() {
+                    anyhow::bail!(
+                        "resume: root count mismatch ({} in {} vs {} now); \
+                         remove {} and re-index without --resume",
+                        want.len(), p.display(), prepared.len(),
+                        writer.tmp_dir.as_ref().unwrap().display(),
+                    );
+                }
+                for (i, rj) in want.iter().enumerate() {
+                    let want_path = rj.get("path").and_then(|x| x.as_str()).unwrap_or("");
+                    let want_n = rj.get("n_files").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let cur = &prepared[i];
+                    let cur_path = cur.root_path.display().to_string();
+                    if cur_path != want_path {
+                        anyhow::bail!(
+                            "resume: root[{}] path mismatch (now {} vs progress {}); \
+                             re-index without --resume", i, cur_path, want_path,
+                        );
+                    }
+                    if cur.files.len() as u64 != want_n {
+                        anyhow::bail!(
+                            "resume: root[{}] file count changed ({} now vs {} in progress); \
+                             source tree shifted — re-index without --resume",
+                            i, cur.files.len(), want_n,
+                        );
+                    }
+                }
+                // Discard any orphan chunks past what progress.json knows about.
+                let tmp = writer.tmp_dir.as_ref().unwrap().clone();
+                let drop_orphans = |kind: &str, keep: u32, on_disk: &mut u32, lens: &mut Vec<u64>| {
+                    while *on_disk > keep {
+                        let n = *on_disk - 1;
+                        let p = tmp.join(format!("{kind}.chunk.{:06}.bin", n));
+                        let np = tmp.join(format!("{}_names.chunk.{:06}.bin",
+                            kind.trim_end_matches('s'), n));
+                        let _ = std::fs::remove_file(&p);
+                        let _ = std::fs::remove_file(&np);
+                        if let Some(_) = lens.pop() { /* drop */ }
+                        *on_disk = n;
+                    }
+                };
+                if writer.symbol_chunk_count > saved_sym {
+                    eprintln!("[resume] discarding {} orphan symbol chunk(s) past progress",
+                        writer.symbol_chunk_count - saved_sym);
+                    drop_orphans("symbols", saved_sym,
+                        &mut writer.symbol_chunk_count, &mut writer.symbol_chunk_lens);
+                }
+                if writer.ref_chunk_count > saved_ref {
+                    eprintln!("[resume] discarding {} orphan ref chunk(s) past progress",
+                        writer.ref_chunk_count - saved_ref);
+                    drop_orphans("refs", saved_ref,
+                        &mut writer.ref_chunk_count, &mut writer.ref_chunk_lens);
+                }
+                eprintln!("[resume] watermark = {} files done (sym chunks {}, ref chunks {})",
+                    watermark, writer.symbol_chunk_count, writer.ref_chunk_count);
+                // Seed cumulative tallies so the final manifest reflects the
+                // whole index, not just THIS run's delta. Symbols/refs counts
+                // come from the chunk headers we already read. We assume files
+                // below the watermark all parsed successfully (the resume
+                // marker is only written after a batch flush succeeded).
+                total_files_parsed = watermark as u64;
+                grand_syms = writer.symbol_chunk_lens.iter().sum();
+                grand_refs = writer.ref_chunk_lens.iter().sum();
+            } else {
+                eprintln!("[resume] no progress.json under {} — starting fresh",
+                    writer.tmp_dir.as_ref().unwrap().display());
+            }
         }
+    }
 
-        // ----- batched parse: bound RAM by chunking the file list -----
-        let n_files = collected.files.len();
+    // ----- per-root batched parse -----
+    for pr in &prepared {
+        let root_id = pr.root_id;
+        let files: &[RawFile] = &pr.files;
+        let file_entries: &[FileEntry] = &pr.file_entries;
+        if count_only { continue; }
+        let n_files = files.len();
         let total_batches = (n_files + batch_files - 1) / batch_files.max(1);
         let mut batch_no = 0usize;
         let mut start = 0usize;
         let parse_total = Instant::now();
         while start < n_files {
             let end = (start + batch_files).min(n_files);
-            let batch_files_slice = &collected.files[start..end];
+            let batch_files_slice = &files[start..end];
             let batch_entries_slice = &file_entries[start..end];
             batch_no += 1;
+            let batch_end_id = batch_entries_slice.last().unwrap().id;
+            if resume && batch_end_id < watermark {
+                start = end;
+                continue;
+            }
 
             let parsed = Arc::new(AtomicU64::new(0));
             let failed = Arc::new(AtomicU64::new(0));
@@ -493,62 +644,80 @@ fn cmd_index(
             // Outlier thresholds — log per-file diagnostic if exceeded.
             let outlier_ms: u128 = 250;
             let outlier_records: usize = 5_000;
-            batch_files_slice
-                .par_iter()
-                .zip(batch_entries_slice.par_iter())
-                .for_each(|(rf, fe)| {
-                    // Memory-backpressure: if jemalloc says we're above the
-                    // soft ceiling, wait. This makes pathological files
-                    // (BLAS test_data.cpp etc) parse serially while small
-                    // files keep parallelism — no size-based hack required.
-                    await_memory_headroom();
-                    let t_file = Instant::now();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
-                    }));
-                    let elapsed_file_ms = t_file.elapsed().as_millis();
-                    match result {
-                        Ok(Ok((s, r))) => {
-                            let total_recs = s.len() + r.len();
-                            // Outlier diagnostic: any file that took unusually
-                            // long OR produced unusually many records gets
-                            // logged with its full context, so we can see
-                            // exactly what shapes blow up.
-                            if elapsed_file_ms > outlier_ms || total_recs > outlier_records {
-                                eprintln!(
-                                    "[slow]  {} kind={:?} size={} records={} ({}+{}) elapsed={}ms",
-                                    rf.path.display(), rf.kind,
-                                    human_bytes(rf.size),
-                                    total_recs, s.len(), r.len(),
-                                    elapsed_file_ms,
-                                );
-                            }
-                            parsed.fetch_add(1, Ordering::Relaxed);
-                            symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
-                            refs_total.fetch_add(r.len() as u64, Ordering::Relaxed);
-                            // Internal byte accounting — no /proc polling.
-                            let mut batch_inc: u64 = 0;
-                            for x in &s { batch_inc += x.estimated_bytes() as u64; }
-                            for x in &r { batch_inc += x.estimated_bytes() as u64; }
-                            est_bytes.fetch_add(batch_inc, Ordering::Relaxed);
-                            if !s.is_empty() { syms_sink.lock().extend(s); }
-                            if !r.is_empty() { refs_sink.lock().extend(r); }
-                            // Per-1000-files in-batch heartbeat with running
-                            // in-RAM bytes — so we can see growth slope live.
-                            let p = parsed.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-                            if p % progress_step == 0 {
-                                eprintln!(
-                                    "[batch{}] {} files done, {} syms, {} refs, ~{} in-RAM",
-                                    batch_no, p,
-                                    symbols_total.load(Ordering::Relaxed),
-                                    refs_total.load(Ordering::Relaxed),
-                                    human_bytes(est_bytes.load(Ordering::Relaxed)),
-                                );
-                            }
+
+            // SIZE-ROUTED SCHEDULING: pre-split this batch into "small"
+            // (parallel-safe) and "big" (must serialize) buckets BEFORE
+            // opening any files — we already know rf.size from the walker.
+            // Big-bucket files run one-at-a-time so a single pathological
+            // tree-sitter parse can't compound across workers.
+            let (small_items, big_items): (Vec<_>, Vec<_>) = batch_files_slice
+                .iter()
+                .zip(batch_entries_slice.iter())
+                .partition(|(rf, _)| rf.size <= big_file_bytes);
+            if !big_items.is_empty() {
+                eprintln!(
+                    "[route] batch {}: {} small (parallel), {} big (serial, > {})",
+                    batch_no, small_items.len(), big_items.len(),
+                    human_bytes(big_file_bytes),
+                );
+            }
+
+            // Helper closure — inlined parse + sink push + diagnostics.
+            // Called from both the parallel small pass and the serial big pass.
+            let process_one = |rf: &RawFile, fe: &FileEntry| {
+                await_memory_headroom();
+                let t_file = Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parse_one(rf, fe, root_id, no_refs, max_file_bytes, &registry)
+                }));
+                let elapsed_file_ms = t_file.elapsed().as_millis();
+                match result {
+                    Ok(Ok((s, r))) => {
+                        let total_recs = s.len() + r.len();
+                        if elapsed_file_ms > outlier_ms || total_recs > outlier_records {
+                            eprintln!(
+                                "[slow]  {} kind={:?} size={} records={} ({}+{}) elapsed={}ms",
+                                rf.path.display(), rf.kind,
+                                human_bytes(rf.size),
+                                total_recs, s.len(), r.len(),
+                                elapsed_file_ms,
+                            );
                         }
-                        _ => { failed.fetch_add(1, Ordering::Relaxed); }
+                        parsed.fetch_add(1, Ordering::Relaxed);
+                        symbols_total.fetch_add(s.len() as u64, Ordering::Relaxed);
+                        refs_total.fetch_add(r.len() as u64, Ordering::Relaxed);
+                        let mut batch_inc: u64 = 0;
+                        for x in &s { batch_inc += x.estimated_bytes() as u64; }
+                        for x in &r { batch_inc += x.estimated_bytes() as u64; }
+                        est_bytes.fetch_add(batch_inc, Ordering::Relaxed);
+                        if !s.is_empty() { syms_sink.lock().extend(s); }
+                        if !r.is_empty() { refs_sink.lock().extend(r); }
+                        let p = parsed.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
+                        if p % progress_step == 0 {
+                            eprintln!(
+                                "[batch{}] {} files done, {} syms, {} refs, ~{} in-RAM",
+                                batch_no, p,
+                                symbols_total.load(Ordering::Relaxed),
+                                refs_total.load(Ordering::Relaxed),
+                                human_bytes(est_bytes.load(Ordering::Relaxed)),
+                            );
+                        }
                     }
-                });
+                    _ => { failed.fetch_add(1, Ordering::Relaxed); }
+                }
+            };
+
+            // 1. Parallel pass over small files (the bulk of the corpus).
+            small_items.par_iter().for_each(|(rf, fe)| process_one(rf, fe));
+
+            // 2. Serial pass over big files — guarantees ONE big tree-sitter
+            //    parse in flight at a time. Peak transient RAM ≈ one big
+            //    file's pathological allocation (bounded to a few GB) rather
+            //    than N × that. This is the actual fix for the 100ms-burst
+            //    OOM that polling-backpressure can't catch.
+            for (rf, fe) in &big_items {
+                process_one(rf, fe);
+            }
 
             writer.symbols = syms_sink.into_inner();
             writer.refs = refs_sink.into_inner();
@@ -568,6 +737,21 @@ fn cmd_index(
                 let sf = writer.flush_symbols_chunk()?;
                 let rf_ = writer.flush_refs_chunk()?;
                 let _ = (sf, rf_);
+                // Atomically record progress AFTER chunks land on disk. If we
+                // crash here, the next --resume reads the previous (or no)
+                // marker, finds extra chunks past saved_chunks, and drops
+                // them as orphans before reprocessing this batch.
+                if let Some(pp) = progress_path.as_ref() {
+                    let new_completed = batch_end_id + 1;
+                    write_progress_atomic(
+                        pp,
+                        new_completed,
+                        writer.symbol_chunk_count,
+                        writer.ref_chunk_count,
+                        &prepared.iter().map(|p| (p.root_path.display().to_string(),
+                            p.files.len() as u64)).collect::<Vec<_>>(),
+                    )?;
+                }
             }
 
             eprintln!(
@@ -587,8 +771,6 @@ fn cmd_index(
             start = end;
         }
         eprintln!("[parse] root done in {} ms", parse_total.elapsed().as_millis());
-
-        writer.files.extend(file_entries);
     }
 
     // In streaming mode we skip in-memory resolve (would require all records).
@@ -633,6 +815,34 @@ fn cmd_index(
         total_files_total as f64 / (elapsed_ms.max(1) as f64 / 1000.0),
     );
     heartbeat_stop.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Write `progress.json` via tmp-then-rename so the file either reflects the
+/// previous batch or the new one — never a half-written mix. Called after
+/// every successful chunk flush so a cgroup OOM-kill always lands somewhere
+/// recoverable.
+fn write_progress_atomic(
+    path: &Path,
+    completed_files: u32,
+    symbol_chunks: u32,
+    ref_chunks: u32,
+    roots: &[(String, u64)],
+) -> Result<()> {
+    let v = serde_json::json!({
+        "version": 1,
+        "completed_files": completed_files,
+        "symbol_chunks": symbol_chunks,
+        "ref_chunks": ref_chunks,
+        "roots": roots.iter().map(|(p, n)| serde_json::json!({"path": p, "n_files": n}))
+            .collect::<Vec<_>>(),
+    });
+    let s = serde_json::to_string(&v)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, s.as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

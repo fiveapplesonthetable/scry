@@ -341,6 +341,57 @@ impl StoreWriter {
         })
     }
 
+    /// Open an existing streaming staging dir for RESUME, or fall back to
+    /// new_streaming if none exists. Counts existing chunk files on disk so
+    /// the chunk_count + chunk_lens are consistent with what's already
+    /// written. Used after a cgroup OOM-kill + systemd restart so we don't
+    /// reparse files already-flushed in previous runs.
+    pub fn resume_streaming<P: Into<PathBuf>>(root: P) -> Result<Self> {
+        use std::io::Read;
+        let root: PathBuf = root.into();
+        let tmp = root.with_extension("tmp");
+        if !tmp.exists() {
+            return Self::new_streaming(root);
+        }
+        let count_chunks = |kind: &str| -> Result<(u32, Vec<u64>)> {
+            let mut n: u32 = 0;
+            let mut lens: Vec<u64> = Vec::new();
+            loop {
+                let p = Self::chunk_path(&tmp, kind, n);
+                if !p.exists() { break; }
+                // bincode 1.3 default config serializes Vec<T> as `u64 LE length`
+                // followed by encoded elements. We read just the header to get
+                // the chunk's record count without deserializing the records.
+                let mut f = std::fs::File::open(&p)
+                    .with_context(|| format!("open chunk {}", p.display()))?;
+                let mut hdr = [0u8; 8];
+                f.read_exact(&mut hdr)
+                    .with_context(|| format!("read header of {}", p.display()))?;
+                lens.push(u64::from_le_bytes(hdr));
+                n += 1;
+            }
+            Ok((n, lens))
+        };
+        let (sym_chunks, sym_lens) = count_chunks("symbols")?;
+        let (ref_chunks, ref_lens) = count_chunks("refs")?;
+        eprintln!(
+            "[resume] reopening {} (existing chunks: {} symbol, {} ref)",
+            tmp.display(), sym_chunks, ref_chunks,
+        );
+        Ok(Self {
+            paths: StorePaths::new(root),
+            roots: Vec::new(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            refs: Vec::new(),
+            tmp_dir: Some(tmp),
+            symbol_chunk_count: sym_chunks,
+            ref_chunk_count: ref_chunks,
+            symbol_chunk_lens: sym_lens,
+            ref_chunk_lens: ref_lens,
+        })
+    }
+
     fn chunk_path(tmp: &Path, kind: &str, n: u32) -> PathBuf {
         tmp.join(format!("{kind}.chunk.{:06}.bin", n))
     }
@@ -525,8 +576,9 @@ impl StoreWriter {
         serde_json::to_writer_pretty(&mut mf, &manifest)?;
         mf.flush()?;
 
-        // Drop chunk files now that the final bin files are written. Keeps
-        // disk usage roughly to the size of the final index.
+        // Drop chunk files + progress marker now that the final bin files are
+        // written. Without this the resume checkpoint would leak into the
+        // published index dir alongside the .bin files.
         for n in 0..self.symbol_chunk_count {
             let _ = std::fs::remove_file(Self::chunk_path(&tmp, "symbols", n));
             let _ = std::fs::remove_file(Self::chunk_path(&tmp, "symbol_names", n));
@@ -535,6 +587,8 @@ impl StoreWriter {
             let _ = std::fs::remove_file(Self::chunk_path(&tmp, "refs", n));
             let _ = std::fs::remove_file(Self::chunk_path(&tmp, "ref_names", n));
         }
+        let _ = std::fs::remove_file(tmp.join("progress.json"));
+        let _ = std::fs::remove_file(tmp.join("progress.json.tmp"));
 
         if final_dir.exists() {
             let old = final_dir.with_extension("old");

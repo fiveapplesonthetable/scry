@@ -634,14 +634,15 @@ Why:
   bothered because the difference doesn't show up in our
   profile.
 
-#### `crossbeam`
+#### `crossbeam` (declared in workspace deps, not yet imported)
 
-[`crossbeam`][crossbeam] is referenced in the workspace `Cargo.toml`
-for the channel and atomic primitives, though our actual usage is
-light (most cross-thread coordination is via rayon and atomics).
-It's there for future use; specifically, the OOM heartbeat thread
-could move from a polled atomic to a crossbeam channel if we
-needed back-pressure signaling.
+[`crossbeam`][crossbeam] is pinned at the workspace level so that
+any crate that needs richer cross-thread primitives (channels with
+backpressure, atomic cells, deque) gets one stable version. No
+crate currently pulls it in — rayon and `std::sync::atomic` cover
+the cases that exist today. If the OOM heartbeat thread needs to
+move from a polled atomic to a channel-based protocol, that's the
+crate.
 
 [crossbeam]: https://docs.rs/crossbeam/
 

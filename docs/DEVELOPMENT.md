@@ -18,10 +18,12 @@ scry/
 │   └── scry-cli/      the `scry` binary: CLI + JSON-RPC + build-* utilities
 ├── docs/
 │   ├── DESIGN.md      as-built design (cgroup envelope, format, ranking)
+│   ├── THEORY.md      from-scratch course on the CS behind scry (Rust → FST → EM model)
 │   ├── OPERATIONS.md  knobs + recipe for production indexing
 │   ├── USAGE.md       exhaustive command examples with real output
 │   ├── BENCHMARKS.md  matrix numbers + perf decomposition
 │   ├── FAST_PATH.md   trigram + lazy-reader optimization design
+│   ├── AGENT_NOTES.md LLM-agent perspective: token economy, accuracy, small-model setup
 │   └── DEVELOPMENT.md (you are here)
 ├── scripts/
 │   ├── run_index.sh          production indexer wrapper (cgroup + resume)
@@ -317,11 +319,6 @@ exist but aren't critical-path:
 - **MCP server wrapper.** `scry serve` is stdin/stdout JSON-RPC; an
   MCP wrapper would expose the same surface to any MCP-aware client.
   Mechanical port; nothing in the core needs to change.
-- **`posix_fadvise(WILLNEED)` on grep candidate lists.** The perf
-  decomposition in `BENCHMARKS.md` shows the dominant cost is
-  page-faulting cold mmap'd file contents (1.37 s sys vs 0.6 s user
-  on the 680 ms test query). Pre-faulting could shave another
-  30-50% off the cold-cache case. Single syscall per file.
 - **Subprocess-per-parse isolation.** A single rogue tree-sitter
   parse can't OOM the host (parse_with_options + cgroup MemoryMax
   catch it), but it can still chew CPU for the budgeted 60 s. A
@@ -335,6 +332,162 @@ exist but aren't critical-path:
 None of these are blocking real LLM-agent use today; the next item
 to actually start is "whichever delivers the most leverage for an
 agent task you currently run scry for."
+
+## Experiments and unexplored directions
+
+The items above are concrete follow-ups with clear shape. The list
+below is more speculative — wild ideas, research-shaped questions,
+or technique grafts from other systems. Each entry names the idea,
+the expected win, the cost, and the reason it hasn't been tried.
+
+### Algorithmic / index format
+
+- **Bigram + trigram hybrid index.** Lin & Yan (2016) show that
+  storing bigrams alongside trigrams cuts intersection cost on
+  5+ byte patterns by ~30% at ~30% extra storage. Worth measuring
+  on our query mix; the win is likely <2× since we're already
+  selective, but the bigram dictionary stays small (65k keys).
+- **Position info per trigram posting.** Today a posting says "file
+  42 contains trigram `Zyg`"; with positions we'd skip the `memchr`
+  scan entirely for the candidate set. Cost: ~10× larger trigram
+  payload (positions are u32 per occurrence). Probably not worth it
+  given the candidate scan is already ~470 ms / 1.4 GB read.
+- **Field-aware n-grams** (separate trigram indexes for identifiers
+  vs comments vs strings). Lets `--in-identifiers` or
+  `--exclude-comments` filters work without false matches on prose
+  trigrams. Zoekt supports this; we don't. Storage roughly doubles.
+- **Bloom-filter-style lossy FST.** Belazzougui et al. (2011)
+  construct probabilistic FSTs with one-sided error for set
+  membership. Our 280 MB FST could shrink to ~80 MB at <0.1% false
+  positive rate. The exact path (lookup → load record → verify) is
+  unchanged; only the prefix walk would need a "yes, but verify"
+  semantics. Worth a half-day spike to measure.
+- **Suffix array fallback for arbitrary patterns.** Modern compact
+  suffix arrays (FM-index, CSA) on the concatenated corpus would
+  support *any* substring query, including those scry's literal
+  extractor falls back on. The build is ~hours and the index is
+  ~5× the size of the source; the win is closing the
+  full-scan-fallback gap.
+- **Online FST construction.** Daciuk (1998) describes incremental
+  minimization. Would let us add new symbols without a full
+  rebuild. The pre-existing FST stays read-only; new symbols
+  accumulate in a small overlay FST that's merged at finalize.
+  Complex but unblocks per-commit incrementalism.
+
+### IO / memory
+
+- **`io_uring` migration.** Replacing the `mmap + read` pattern in
+  the grep candidate scan with `io_uring`-batched reads is a
+  measurable 1.5-2× on random-IO workloads (Axboe 2019 numbers).
+  We don't see the bottleneck today on NVMe; the win is larger on
+  rotational or networked storage.
+- **`MAP_HUGETLB` for the trigram FST.** Mapping the ~280 MB FST
+  with huge pages (2 MiB) cuts TLB misses on the prefix walk.
+  Likely single-digit-% win on warm queries; needs hugepages
+  configured at boot. Cheap to try.
+- **Adaptive worker count based on jemalloc.** Today `--workers
+  16` is static. A controller that scales workers based on
+  observed RSS slope would keep us closer to the memory ceiling
+  on hosts with more RAM. Risk: oscillation under load.
+- **Per-query page-cache warmup.** After a query, the next likely
+  follow-up (e.g., after `def Foo`, the user often runs `callers
+  Foo`) can be pre-faulted speculatively. Real win for interactive
+  human use; less so for LLM agents that don't follow predictable
+  patterns.
+- **DAX / persistent-memory layout.** byte-addressable pmem skips
+  the page cache entirely. scry would work unchanged but read at
+  near-DRAM latency. Hardware unavailable to us currently; design
+  is forward-compatible.
+
+### Resolution / precision
+
+- **SCIP ingestion for precision uplift.** Already in DESIGN §5 as
+  a phase-5 opt-in; not blocking, but the integration is well-
+  understood and would close the 10-20% accuracy gap on
+  C++/Java overload resolution. Half-day per language to wire up.
+- **Stack Graphs (GitHub, 2023) for Kotlin/Python.** Scope
+  resolution from declarative rules, like tree-sitter queries but
+  for resolution. Would replace our heuristic Layer 1 for
+  hard-to-resolve languages. Active research project at GitHub;
+  Rust bindings unclear.
+- **Cross-language JNI binding inference.** Java `native` methods
+  and C++ `Java_pkg_Class_method` exports follow naming rules
+  scry could resolve automatically. Today the link is invisible.
+  ~200 LOC + a per-language naming convention table.
+- **AIDL-generated symbol shadow links.** Today `scry def IFoo`
+  finds the AIDL source; finding the Java `IFoo.Stub` or C++
+  `BpIFoo` requires a separate query. Generating these as
+  synthetic symbols (linked to the AIDL definition) would unify
+  the lookup. Moderate; depends on tracking the AIDL generator
+  conventions across HIDL/NDK/Rust outputs.
+
+### Coverage
+
+- **bash + assembly via tree-sitter.** Both grammars exist; we
+  haven't wired them. Bash is high-value for AOSP build scripts
+  (lunch / mm / mmm); assembly is lower-value but a frequent
+  question for kernel code.
+- **Swift / Dart / Haskell / OCaml.** Grammars exist; the
+  question is whether anyone's AOSP work touches them. The
+  generic-profile walker would pick these up automatically.
+- **Kotlin companion objects, sealed-class hierarchies, inline
+  reified fns.** Listed under "Known coverage gaps"; adding each
+  is a tree-sitter query addition + scope adjustment.
+- **Per-language Layer 2 narrowing** beyond Java. Already in
+  "What's left"; the framework is in place.
+- **OWNERS chain traversal.** Today `scry owner PATH` returns the
+  nearest OWNERS file's owners. The Gerrit semantics walk up the
+  chain accumulating; we should match. ~100 LOC.
+
+### Agent / LLM interface
+
+- **MCP server wrapper.** Already in "What's left".
+- **`outline_with_snippets` combined call.** Saves one round-trip
+  per file the agent wants to understand. AGENT_NOTES recommends
+  it.
+- **Streaming JSON-RPC responses.** Today `scry serve` writes one
+  JSON line per response. For large result sets (`callers
+  transact` with no limit), streaming each hit individually would
+  let an agent cut off early. tokio + framed codec is the easy
+  path.
+- **Query plan / `--explain`.** For a query that's slow, print the
+  trigrams + posting sizes + intersection size + scan cost so the
+  caller can see why. Useful for both humans and LLMs that need
+  to debug.
+- **Embedding-based semantic retrieval as a sibling tool.** A
+  separate `scry semantic-search "how do I parse TOML"` that
+  drops into a vector index over chunks. Complementary to the
+  lexical/identifier search scry does today. Big lift; depends on
+  an embedding model + Faiss/HNSW index.
+- **PR-diff scoped queries.** `scry callers Foo --since-commit
+  HEAD~10` for "show me callers added in the last 10 commits".
+  Requires git history awareness; AOSP's repo-managed history
+  makes the implementation interesting.
+- **Heuristic auto-narrowing.** If `scry def String --limit 10`
+  returns 200 ranked-equal hits, the tool should suggest a
+  filter (`add --in frameworks/base/`) rather than just
+  truncating. Both interactive and agent-friendly.
+
+### Operational
+
+- **Cron-driven nightly rebuild.** Today the indexer runs on
+  demand via systemd-run. A `OnCalendar=*-*-* 03:00:00` timer
+  would keep the index fresh without manual intervention.
+- **Web UI** wrapping `scry serve`. Single static page; HTML
+  results table; live filter. Not strictly necessary for the
+  LLM-agent or terminal use case, but useful for casual browsing.
+- **Pre-built index distribution.** A nightly snapshot of the
+  ~9.5 GB index published as a tarball would let downstream
+  users skip the 13-min rebuild on their first install. Storage
+  cost is the binding constraint.
+
+The pattern across this list: each idea has a clear hypothesis
+about the win and a clear notion of the cost. Items move from
+this section to "What's left" when the hypothesis becomes
+concrete enough to commit to a milestone, and from there to the
+codebase when the milestone closes. Anything still in this list
+after a year either failed the hypothesis quietly or fell out
+of priority.
 
 ## Contributing
 

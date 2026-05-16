@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod build_adapter;
 mod clangd;
 
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
@@ -518,6 +519,31 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         max_conns: u32,
     },
+    /// Build the canonical scry v1 `module_graph.json` from a project's
+    /// native build metadata. Once written into the index dir, queries
+    /// with `--reachable` get build-graph-aware filtering — refs in
+    /// modules that can't actually reach the queried name are dropped.
+    ///
+    /// Supported KINDs:
+    ///   cargo  — Rust workspaces. Reads `Cargo.toml` at ROOT, recurses
+    ///            into workspace members, builds the module + intra-
+    ///            workspace dep graph from each member's `dependencies`.
+    ///   soong  — AOSP. Reads `ROOT/out/soong/module-graph.json` (must
+    ///            be generated first via `m json-module-graph`). Skeleton
+    ///            implementation; validate against your AOSP output.
+    ///   kernel — Linux Kbuild. Not yet implemented (queued v0.1.12).
+    ///   gn     — GN/ninja (perfetto / Chromium). Not yet implemented.
+    BuildModgraph {
+        /// Build system to read from.
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// Project root containing the build metadata.
+        #[arg(long, value_name = "PATH")]
+        root: PathBuf,
+        /// Where to write module_graph.json (typically <index_dir>/module_graph.json).
+        #[arg(long, short = 'o', value_name = "PATH")]
+        output: PathBuf,
+    },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
     /// hundreds of ms). Sequential parallel read of every file in
@@ -860,6 +886,7 @@ fn main() -> Result<()> {
         Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
+        Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -6133,6 +6160,34 @@ fn cmd_serve(index: Option<PathBuf>, listen: Option<String>, max_conns: u32) -> 
         None => serve_stdio(&reader),
         Some(spec) => serve_listener(&reader, spec, max_conns),
     }
+}
+
+/// `scry build-modgraph` entrypoint. Reads native build metadata
+/// (Cargo.toml workspace, Soong module-graph.json output, etc.),
+/// emits scry's canonical v1 module_graph.json at `output`. After
+/// this, `scry callers X --reachable` honors the build-graph
+/// reachability filter automatically.
+fn cmd_build_modgraph(kind: &str, root: &Path, output: &Path) -> Result<()> {
+    let t = Instant::now();
+    let g = build_adapter::build_modgraph(kind, root)?;
+    let json = serde_json::to_string_pretty(&g)
+        .context("serialize module-graph as JSON")?;
+    // Write to <output>.tmp then rename so a partial write doesn't
+    // leave a broken sidecar in the index dir.
+    let tmp = output.with_extension("json.tmp");
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&tmp, &json)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, output)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), output.display()))?;
+    eprintln!(
+        "[modgraph] {}: {} modules, {} dep edges, {} files attributed; wrote {} ({} bytes) in {} ms",
+        kind, g.modules.len(), g.deps.len(), g.files.len(),
+        output.display(), json.len(), t.elapsed().as_millis(),
+    );
+    Ok(())
 }
 
 /// Run the warm pass and print a one-line summary. Standalone

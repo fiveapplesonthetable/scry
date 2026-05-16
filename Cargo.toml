@@ -27,6 +27,7 @@ memchr = "2"
 regex = "1"
 fnv = "1"
 bincode = "1.3"
+toml = "0.8"
 
 [profile.release]
 lto = "thin"

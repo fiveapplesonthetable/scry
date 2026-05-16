@@ -751,7 +751,7 @@ fn cmd_index(
                             kind.trim_end_matches('s'), n));
                         let _ = std::fs::remove_file(&p);
                         let _ = std::fs::remove_file(&np);
-                        if let Some(_) = lens.pop() { /* drop */ }
+                        lens.pop();
                         *on_disk = n;
                     }
                 };
@@ -816,7 +816,7 @@ fn cmd_index(
             // Estimate remaining batches just for the log line; not used for
             // anything load-bearing.
             let remaining = n_files.saturating_sub(end);
-            let total_batches = batch_no + (remaining + batch_files - 1) / batch_files.max(1);
+            let total_batches = batch_no + remaining.div_ceil(batch_files.max(1));
             if resume && batch_end_id < watermark {
                 start = end;
                 continue;

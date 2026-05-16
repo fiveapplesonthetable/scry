@@ -898,41 +898,6 @@ impl StoreWriter {
     }
 }
 
-/// Like `build_name_fst` but takes a pre-built (already-sorted via BTreeMap)
-/// name -> indices map. Used by the streaming finalize so we don't have to
-/// hold the raw records in RAM while emitting postings.
-fn write_postings_and_fst(
-    by_name: &BTreeMap<String, Vec<u32>>,
-    fst_path: &Path,
-    postings_path: &Path,
-) -> Result<()> {
-    let mut postings = BufWriter::new(File::create(postings_path)?);
-    let mut pos: u64 = 0;
-    let mut offsets: Vec<(&str, u64)> = Vec::with_capacity(by_name.len());
-    for (name, idxs) in by_name.iter() {
-        offsets.push((name.as_str(), pos));
-        postings.write_all(&(idxs.len() as u32).to_le_bytes())?;
-        pos += 4;
-        for i in idxs {
-            postings.write_all(&i.to_le_bytes())?;
-            pos += 4;
-        }
-    }
-    if pos == 0 {
-        postings.write_all(&[0u8])?;
-    }
-    postings.flush()?;
-    let fst_file = BufWriter::new(File::create(fst_path)?);
-    let mut builder = fst::MapBuilder::new(fst_file)?;
-    for (name, off) in offsets {
-        builder
-            .insert(name.as_bytes(), off)
-            .with_context(|| format!("fst insert {name}"))?;
-    }
-    builder.finish()?;
-    Ok(())
-}
-
 /// Build a FST + posting list for a stream of (name, idx) tuples.
 /// The FST stores `name -> u64 offset` into the postings file.
 /// Each posting is `u32 count + count * u32 idx` (little-endian).

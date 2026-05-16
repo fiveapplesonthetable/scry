@@ -142,7 +142,32 @@ the same way as elsewhere.
 
 ---
 
-## 2. Incremental indexing
+## 2. Incremental indexing — ⏳ foundation shipped, append-write rebuild pending
+
+**Foundation shipped:**
+  - `file_digests.bin` sidecar (per-file blake3) — `scry build-digests`
+  - `tombstones.bin` bitmap — `scry tombstone PATH`
+  - Tombstone filter on every read path (get_symbol, get_ref,
+    grep_candidates)
+  - `scry index-diff` — preview which files would be re-parsed,
+    tombstoned, or added without modifying the index
+  - `scry compact` — placeholder reporting tombstone counts; in-place
+    rewrite still TODO
+
+**What's still pending**: `scry index --incremental` that actually
+*re-parses only the changed files* and *appends to the existing
+index* (preserving file_ids; rebuilding only the affected portions
+of the FSTs and trigram postings). This needs a meaningful refactor
+of the writer pipeline to support open-for-append + merge-with-
+existing-chunks at finalize. ~5 more days of focused work.
+
+Today's usable flow:
+  1. `scry build-digests` (one-time setup or after a full rebuild).
+  2. `scry index-diff` to see what changed.
+  3. `scry tombstone <path>` for files you deleted and need
+     immediate query freshness for.
+  4. Periodic full `scry index <roots>` rebuild when the churn
+     justifies the 13-min cost.
 
 ### Goal
 

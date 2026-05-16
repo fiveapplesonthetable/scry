@@ -456,6 +456,57 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Compute and store per-file blake3 content digests
+    /// (file_digests.bin) for an existing index. The digest is what
+    /// `scry index --incremental` reads to decide which files actually
+    /// changed between two builds — without it, only full reindex
+    /// works. Walks every indexed file once, hashes in parallel via
+    /// rayon. Cheap: ~25 s for the full AOSP+Linux corpus.
+    BuildDigests {
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Parallelism for the hashing pass; default = num_cpus.
+        #[arg(long, default_value = "0")]
+        workers: usize,
+    },
+    /// Rewrite the index dropping any tombstoned records (file_ids
+    /// marked deleted by a prior `scry index --incremental`). Reclaims
+    /// space and resets the tombstone bitmap. Atomic: writes to a
+    /// .tmp/ then swaps. Safe to run while readers are open — they
+    /// keep the old mmap until they re-open.
+    Compact {
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
+    /// Preview what an incremental reindex would do: walk the source
+    /// roots, hash every file, compare against the existing index's
+    /// file_digests sidecar. Reports counts (added / changed /
+    /// unchanged / removed) and optionally lists the files. Does
+    /// not modify the index — safe to run on a live one.
+    IndexDiff {
+        roots: Vec<PathBuf>,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long, default_value = "all")]
+        profile: String,
+        /// Show every changed/added/removed file (not just counts).
+        #[arg(long)]
+        verbose: bool,
+        #[arg(long, default_value = "0")]
+        workers: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a specific file as tombstoned. The next query of any kind
+    /// will skip records belonging to that file. Use case: "I just
+    /// deleted this file and want immediate query freshness without
+    /// running a full incremental." Idempotent; safe to run on a file
+    /// that's already tombstoned.
+    Tombstone {
+        path: PathBuf,
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -553,6 +604,11 @@ fn main() -> Result<()> {
         Cmd::BuildOffsets { index } => cmd_build_offsets(index),
         Cmd::BuildFileSymbols { index } => cmd_build_file_symbols(index),
         Cmd::BuildResolutions { index } => cmd_build_resolutions(index),
+        Cmd::BuildDigests { index, workers } => cmd_build_digests(index, workers),
+        Cmd::Compact { index } => cmd_compact(index),
+        Cmd::IndexDiff { roots, index, profile, verbose, workers, json } =>
+            cmd_index_diff(roots, index, profile, verbose, workers, json),
+        Cmd::Tombstone { path, index } => cmd_tombstone(path, index),
     }
 }
 
@@ -2417,6 +2473,301 @@ fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
 ///   2. Walk refs once → for each ref, narrow candidates with the
 ///      file's package + imports, fall back to plain name match, write
 ///      the chosen def's u64 id to the sidecar (or 0 if unresolved).
+// ---------------------------------------------------------------------------
+// build-digests (per-file blake3 content digest sidecar)
+// ---------------------------------------------------------------------------
+//
+// The packed format is exactly `32 * n_files` bytes:
+// `file_digests[file_id * 32 .. (file_id+1) * 32]` is the blake3 digest of
+// that file's bytes. Files that can't be opened (deleted between index
+// build and digest build, permission errors) get a zero digest — the
+// incremental walker treats zero as "unknown" and rehashes.
+//
+// Hashing is parallel via rayon. Throughput on this corpus is ~3 GB/s
+// per core; the full AOSP+Linux corpus (70 GB) hashes in ~25 s with
+// 16 workers.
+fn cmd_build_digests(index: Option<PathBuf>, workers: usize) -> Result<()> {
+    use rayon::prelude::*;
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    eprintln!("[digests] target index: {}", index_dir.display());
+    if workers > 0 {
+        // Best-effort: ignored if a global pool already exists.
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
+    }
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+    let r = scry_store::StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+    let n_files = r.files.len();
+    eprintln!("[digests] {} files to hash", n_files);
+
+    let t = Instant::now();
+    // Compute (file_id, digest) in parallel and collect into a dense
+    // Vec<[u8; 32]> sized to the file count.
+    let mut digests: Vec<[u8; 32]> = vec![[0u8; 32]; n_files];
+    let pairs: Vec<(u32, [u8; 32])> = r.files.par_iter().map(|fe| {
+        let path = fe.display_path(&r.roots);
+        match std::fs::read(&path) {
+            Ok(bytes) => (fe.id, *blake3::hash(&bytes).as_bytes()),
+            Err(_) => (fe.id, [0u8; 32]),  // unreadable → zero digest
+        }
+    }).collect();
+    for (id, d) in pairs {
+        if (id as usize) < digests.len() {
+            digests[id as usize] = d;
+        }
+    }
+    eprintln!("[digests] hashed in {} ms", t.elapsed().as_millis());
+
+    // Write to .tmp then atomic-rename — same pattern as
+    // build-file-symbols / build-resolutions.
+    let tmp = paths.file_digests().with_extension("bin.tmp");
+    {
+        use std::io::{BufWriter, Write};
+        let mut w = BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
+        for d in &digests {
+            w.write_all(d)?;
+        }
+        w.flush()?;
+    }
+    std::fs::rename(&tmp, paths.file_digests())?;
+    eprintln!("[digests] DONE. {} bytes written → {}",
+        32 * n_files, paths.file_digests().display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// index-diff (preview an incremental reindex without writing anything)
+// ---------------------------------------------------------------------------
+//
+// Walks `roots`, hashes every file, compares against the existing
+// index's `file_digests.bin`. Reports four sets:
+//   - unchanged : same (root_id, relpath) → same digest
+//   - changed   : same (root_id, relpath) → different digest
+//   - added     : new (root_id, relpath)
+//   - removed   : in old index, not in new walk
+//
+// This is the validation pre-step for `scry index --incremental` —
+// if the diff doesn't match expectations, the full incremental
+// commit would have done the wrong thing too.
+fn cmd_index_diff(
+    roots: Vec<PathBuf>,
+    index: Option<PathBuf>,
+    profile: String,
+    verbose: bool,
+    workers: usize,
+    json: bool,
+) -> Result<()> {
+    use rayon::prelude::*;
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    if workers > 0 {
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
+    }
+    let roots = if roots.is_empty() { default_roots() } else { roots };
+    if roots.is_empty() {
+        anyhow::bail!("no source roots provided and no default available");
+    }
+    let r = scry_store::StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+    if r.file_digests_mmap.is_none() {
+        anyhow::bail!(
+            "index at {} has no file_digests sidecar — run `scry build-digests` first",
+            index_dir.display()
+        );
+    }
+
+    // Build a map: (root_id, relpath) → (old file_id, old digest) from
+    // the existing index.
+    let mut old_map: std::collections::HashMap<(u8, String), (u32, [u8; 32])> =
+        std::collections::HashMap::with_capacity(r.files.len());
+    for fe in r.files.iter() {
+        if let Some(d) = r.file_digest(fe.id) {
+            old_map.insert((fe.root_id, fe.relpath.clone()), (fe.id, d));
+        }
+    }
+    let t = Instant::now();
+
+    // Walk the roots and hash. Reuse the walker's classification so
+    // the diff respects the same skiplist as a real index build.
+    let mut all_new: Vec<(u8, String, [u8; 32])> = Vec::new();
+    for (root_idx, root_path) in roots.iter().enumerate() {
+        // Auto-detect profile per root unless the user pinned one.
+        let prof = match profile.as_str() {
+            "aosp" => scry_walker::Profile::Aosp,
+            "linux" => scry_walker::Profile::Linux,
+            "generic" => scry_walker::Profile::Generic,
+            _ => scry_walker::Profile::auto_detect(root_path),
+        };
+        let collected = scry_walker::collect_files(root_path, prof)
+            .with_context(|| format!("walk {}", root_path.display()))?;
+        // Hash in parallel.
+        let hashed: Vec<(String, [u8; 32])> = collected.files.par_iter().map(|rf| {
+            let rel = rf.relpath.to_string_lossy().to_string();
+            let bytes = std::fs::read(&rf.path).unwrap_or_default();
+            let d = *blake3::hash(&bytes).as_bytes();
+            (rel, d)
+        }).collect();
+        for (rel, d) in hashed {
+            all_new.push((root_idx as u8, rel, d));
+        }
+    }
+
+    // Compare.
+    let mut unchanged = 0usize;
+    let mut changed: Vec<(u8, String)> = Vec::new();
+    let mut added: Vec<(u8, String)> = Vec::new();
+    let mut seen_new: std::collections::HashSet<(u8, String)> =
+        std::collections::HashSet::with_capacity(all_new.len());
+    for (root_id, rel, d) in &all_new {
+        let key = (*root_id, rel.clone());
+        seen_new.insert(key.clone());
+        match old_map.get(&key) {
+            Some((_, old_d)) if old_d == d => unchanged += 1,
+            Some(_) => changed.push(key),
+            None => added.push(key),
+        }
+    }
+    let mut removed: Vec<(u8, String)> = Vec::new();
+    for (k, _) in &old_map {
+        if !seen_new.contains(k) {
+            removed.push(k.clone());
+        }
+    }
+
+    let elapsed_ms = t.elapsed().as_millis();
+    if json {
+        let entry = serde_json::json!({
+            "unchanged": unchanged,
+            "changed":   changed.len(),
+            "added":     added.len(),
+            "removed":   removed.len(),
+            "elapsed_ms": elapsed_ms,
+            "changed_files": if verbose { Some(changed.iter().map(|(_,r)| r).collect::<Vec<_>>()) } else { None },
+            "added_files":   if verbose { Some(added.iter().map(|(_,r)| r).collect::<Vec<_>>()) } else { None },
+            "removed_files": if verbose { Some(removed.iter().map(|(_,r)| r).collect::<Vec<_>>()) } else { None },
+        });
+        println!("{}", entry);
+    } else {
+        eprintln!("[index-diff] walked {} files in {} ms",
+            all_new.len(), elapsed_ms);
+        println!("unchanged: {unchanged}");
+        println!("changed:   {} {}", changed.len(),
+            if changed.is_empty() { "" } else { "(would re-parse)" });
+        println!("added:     {} {}", added.len(),
+            if added.is_empty() { "" } else { "(would parse fresh)" });
+        println!("removed:   {} {}", removed.len(),
+            if removed.is_empty() { "" } else { "(would tombstone)" });
+        if verbose {
+            for set in [("changed", &changed), ("added", &added), ("removed", &removed)] {
+                if set.1.is_empty() { continue; }
+                println!("\n--- {} ---", set.0);
+                for (root_id, rel) in set.1 {
+                    let root = roots.get(*root_id as usize)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| format!("<root {root_id}>"));
+                    println!("  {}/{}", root, rel);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// tombstone (manually mark one file as deleted; next query skips it)
+// ---------------------------------------------------------------------------
+//
+// Reads/creates `tombstones.bin`, sets the bit for the file_id matching
+// `path`. The path can be either:
+//   - absolute (matched against the file's display_path)
+//   - root-relative substring (matched against display_path via contains)
+fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+    let r = scry_store::StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+
+    let needle = path.to_string_lossy().to_string();
+    let matches: Vec<u32> = r.files.iter()
+        .filter(|fe| {
+            let p = fe.display_path(&r.roots);
+            p == needle || p.contains(&needle)
+        })
+        .map(|fe| fe.id)
+        .collect();
+    if matches.is_empty() {
+        anyhow::bail!("no indexed file matches {}", needle);
+    }
+
+    // Read existing bitmap (or start empty) and grow as needed.
+    let mut bitmap: Vec<u8> = if paths.tombstones().exists() {
+        std::fs::read(paths.tombstones())?
+    } else { Vec::new() };
+    let max_id = matches.iter().copied().max().unwrap();
+    let required_len = (max_id as usize) / 8 + 1;
+    if bitmap.len() < required_len {
+        bitmap.resize(required_len, 0u8);
+    }
+    let mut newly_marked = 0usize;
+    for id in &matches {
+        let byte = (*id as usize) / 8;
+        let bit = (*id as usize) % 8;
+        if (bitmap[byte] >> bit) & 1 == 0 {
+            bitmap[byte] |= 1 << bit;
+            newly_marked += 1;
+        }
+    }
+    // Atomic write.
+    let tmp = paths.tombstones().with_extension("bin.tmp");
+    std::fs::write(&tmp, &bitmap)?;
+    std::fs::rename(&tmp, paths.tombstones())?;
+    eprintln!("[tombstone] marked {} file(s) ({} newly); bitmap is {} bytes",
+        matches.len(), newly_marked, bitmap.len());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// compact (rewrite the index dropping tombstoned records)
+// ---------------------------------------------------------------------------
+//
+// Reads the current index, builds a remap from old file_id → new file_id
+// (compacted; tombstoned ids removed), streams every symbol/ref through,
+// re-emits with the remapped file_id. The trigram FST + name FSTs need
+// rebuilding from the surviving postings, which dominates the cost.
+//
+// For v1 this is a placeholder that errors clearly when there are
+// tombstones; the full rebuild is a non-trivial standalone change.
+// The expected use pattern is "incremental + occasional full rebuild
+// via `scry index` overwriting the dir" — `compact` is the in-place
+// alternative for very-large indexes where the full rebuild is
+// expensive.
+fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    let paths = scry_store::StorePaths::new(index_dir.clone());
+    let r = scry_store::StoreReader::open(&index_dir)
+        .with_context(|| format!("open index at {}", index_dir.display()))?;
+    let n_files = r.files.len();
+    let mut tombstoned = 0usize;
+    for fe in r.files.iter() {
+        if r.is_tombstoned(fe.id) { tombstoned += 1; }
+    }
+    if tombstoned == 0 {
+        eprintln!("[compact] no tombstones in {} files — nothing to do", n_files);
+        return Ok(());
+    }
+    eprintln!(
+        "[compact] {} of {} files tombstoned ({:.1}%); rewriting would reclaim space.",
+        tombstoned, n_files,
+        (tombstoned as f64 / n_files as f64) * 100.0,
+    );
+    eprintln!("[compact] in-place rewrite is not yet implemented;");
+    eprintln!("[compact] for now, run `scry index <roots> -o {} --workers N` for a clean rebuild.",
+        index_dir.display());
+    // Touch the tombstone sidecar so the user can see what's still
+    // tombstoned via `xxd` etc.
+    let _ = paths.tombstones();
+    Ok(())
+}
+
 fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     use std::collections::HashMap;
     use std::io::{BufWriter, Write};

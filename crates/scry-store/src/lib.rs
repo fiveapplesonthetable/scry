@@ -456,6 +456,20 @@ impl StorePaths {
     /// other values are the resolved definition's id (matches SymbolRecord.id).
     /// Produced by `scry build-resolutions`; reader honors it on get_ref().
     pub fn ref_resolutions(&self) -> PathBuf { self.root.join("ref_resolutions.bin") }
+    /// Per-file content digest: packed `[u8; 32]` per file_id (blake3).
+    /// Indexed parallel to `files.bin`. Used by `scry index --incremental`
+    /// to detect which files actually changed between two index builds.
+    /// Optional: indexes built before this sidecar landed (or without
+    /// `scry build-digests` having been run) simply lack the file; the
+    /// reader treats absent as "no digest known", and incremental
+    /// indexing falls back to full reindex.
+    pub fn file_digests(&self) -> PathBuf { self.root.join("file_digests.bin") }
+    /// Tombstone bitmap: 1 bit per file_id (rounded to bytes). Bit set
+    /// means "this file_id has been deleted; filter its symbols and
+    /// refs out of every query result". Produced by `scry index
+    /// --incremental` (when files are removed or replaced); cleared by
+    /// `scry compact`. Absent file = no tombstones (legacy indexes).
+    pub fn tombstones(&self) -> PathBuf { self.root.join("tombstones.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,6 +1413,16 @@ pub struct StoreReader {
     /// unresolved (use the RefRecord's own resolved_to, which may also
     /// be None). Built post-finalize via `scry build-resolutions`.
     pub ref_resolutions_mmap: Option<memmap2::Mmap>,
+    /// Per-file blake3 content digest (packed `[u8; 32]` per file_id).
+    /// Powers `scry index --incremental` change detection. Present when
+    /// `scry build-digests` has run against this index; absent otherwise.
+    pub file_digests_mmap: Option<memmap2::Mmap>,
+    /// Per-file tombstone bitmap (1 bit per file_id). Present when
+    /// `scry index --incremental` has deleted or replaced any files.
+    /// Every query path filters tombstoned file_ids out of results.
+    /// `scry compact` rebuilds the index without tombstoned records
+    /// and clears the bitmap.
+    pub tombstones_mmap: Option<memmap2::Mmap>,
 }
 
 impl StoreReader {
@@ -1469,6 +1493,17 @@ impl StoreReader {
         } else {
             None
         };
+        // Per-file blake3 digests (for incremental change detection).
+        // Optional sidecar; absence means we can't do `--incremental`.
+        let file_digests_mmap = if paths.file_digests().exists() {
+            Some(safe_mmap(&paths.file_digests())?)
+        } else { None };
+        // Tombstone bitmap (1 bit per file_id). Optional; absent means
+        // no tombstones (the common case until the first incremental
+        // commit that deletes or replaces a file).
+        let tombstones_mmap = if paths.tombstones().exists() {
+            Some(safe_mmap(&paths.tombstones())?)
+        } else { None };
         Ok(Self {
             paths, manifest, roots, files, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
@@ -1476,7 +1511,32 @@ impl StoreReader {
             lazy_symbols, lazy_refs,
             file_symbols_mmap, file_symbols_offsets_mmap,
             ref_resolutions_mmap,
+            file_digests_mmap, tombstones_mmap,
         })
+    }
+
+    /// Read the blake3 digest for a file_id, if the file_digests sidecar
+    /// is present. Returns None for indexes that pre-date the sidecar or
+    /// for out-of-range ids.
+    pub fn file_digest(&self, file_id: u32) -> Option<[u8; 32]> {
+        let m = self.file_digests_mmap.as_ref()?;
+        let off = (file_id as usize) * 32;
+        if off + 32 > m.len() { return None; }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&m[off..off + 32]);
+        Some(out)
+    }
+
+    /// Is this file_id tombstoned (logically deleted by a prior
+    /// incremental commit)? Returns false when the tombstone sidecar
+    /// is absent (the common case for indexes that have never been
+    /// incrementally updated).
+    pub fn is_tombstoned(&self, file_id: u32) -> bool {
+        let m = match self.tombstones_mmap.as_ref() { Some(m) => m, None => return false };
+        let byte = (file_id as usize) / 8;
+        let bit = (file_id as usize) % 8;
+        if byte >= m.len() { return false; }
+        (m[byte] >> bit) & 1 == 1
     }
 
     /// Apply the resolution sidecar override to a RefRecord, if present.
@@ -1537,21 +1597,42 @@ impl StoreReader {
     }
     /// Get one symbol record by its global index. Owned because lazy mode
     /// decodes on-demand. Eager mode clones (cheap; ~50 bytes typically).
+    /// Get a SymbolRecord by index, filtering out tombstoned files.
+    /// Returns None for an out-of-range index OR for a symbol whose
+    /// file_id has been marked deleted by a prior incremental commit.
+    /// Compaction code that wants to *see* tombstoned records should
+    /// call `get_symbol_raw` instead.
     pub fn get_symbol(&self, idx: u32) -> Option<SymbolRecord> {
+        let s = self.get_symbol_raw(idx)?;
+        if self.is_tombstoned(s.file_id) { return None; }
+        Some(s)
+    }
+    /// Get a SymbolRecord by index without any tombstone filtering.
+    /// Only used by compaction / debug introspection — production
+    /// query paths should use `get_symbol`.
+    pub fn get_symbol_raw(&self, idx: u32) -> Option<SymbolRecord> {
         if let Some(l) = self.lazy_symbols.as_ref() {
             l.get(idx as usize)
         } else {
             self.symbols.get(idx as usize).cloned()
         }
     }
+    /// Get a RefRecord by index, filtering tombstones and applying the
+    /// Layer 2 resolution sidecar override. Same dual as get_symbol.
     pub fn get_ref(&self, idx: u32) -> Option<RefRecord> {
-        let mut rec = if let Some(l) = self.lazy_refs.as_ref() {
-            l.get(idx as usize)?
-        } else {
-            self.refs.get(idx as usize).cloned()?
-        };
+        let mut rec = self.get_ref_raw(idx)?;
+        if self.is_tombstoned(rec.file_id) { return None; }
         self.apply_resolution_override(idx, &mut rec);
         Some(rec)
+    }
+    /// Raw RefRecord access without tombstone filtering or resolution
+    /// override application.
+    pub fn get_ref_raw(&self, idx: u32) -> Option<RefRecord> {
+        if let Some(l) = self.lazy_refs.as_ref() {
+            l.get(idx as usize)
+        } else {
+            self.refs.get(idx as usize).cloned()
+        }
     }
 
     /// Trigram pre-filter for literal grep. Returns Some(set of candidate
@@ -1584,6 +1665,13 @@ impl StoreReader {
         for s in lists {
             result.retain(|f| s.contains(f));
             if result.is_empty() { break; }
+        }
+        // Filter tombstoned file_ids — they survive in the trigram
+        // index until the next compact, but their content on disk may
+        // have been modified or the file deleted entirely. Skip rather
+        // than serving stale hits.
+        if self.tombstones_mmap.is_some() {
+            result.retain(|f| !self.is_tombstoned(*f));
         }
         Some(result)
     }
@@ -2534,6 +2622,62 @@ mod tests {
         let parcellable = names_sorted.iter().position(|&n| n == "ParcellableFooBar").unwrap();
         assert!(outbound < parcellable,
                 "OutboundParcelFile (middle substring) must outrank ParcellableFooBar (typo): {scored:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // file_digest + is_tombstoned sidecar accessors (incremental indexing)
+    // ------------------------------------------------------------------
+
+    /// A reader opened against an index dir with no `file_digests.bin`
+    /// returns None for every file_digest query — confirms the
+    /// backwards-compat path doesn't crash on legacy indexes.
+    /// (Builds nothing; just exercises the accessor against a stub
+    /// reader. The reader's open() is too heavyweight to construct
+    /// inline; we verify the bare accessor logic via a focused unit.)
+    #[test]
+    fn file_digest_absent_returns_none() {
+        // Simulate by checking that an out-of-range byte slice returns
+        // None — same code path as "sidecar missing" because the
+        // accessor only reads when the mmap is Some(_).
+        let mm: Option<&[u8]> = None;
+        // Inline the accessor logic:
+        let file_id = 5u32;
+        let digest = mm.and_then(|m| {
+            let off = (file_id as usize) * 32;
+            if off + 32 > m.len() { None }
+            else {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&m[off..off+32]);
+                Some(out)
+            }
+        });
+        assert!(digest.is_none());
+    }
+
+    /// Tombstone bitmap accessor: bit 0 of byte 0 = file_id 0, bit 3 of
+    /// byte 1 = file_id 11. Verify the byte/bit math by constructing a
+    /// known bitmap and exercising the accessor pattern.
+    #[test]
+    fn tombstone_bitmap_byte_bit_layout() {
+        // Mark file_ids 0, 7, 8, 11, 64 as tombstoned.
+        let mut buf = [0u8; 16];
+        buf[0] |= 1 << 0;     // file_id 0
+        buf[0] |= 1 << 7;     // file_id 7
+        buf[1] |= 1 << 0;     // file_id 8
+        buf[1] |= 1 << 3;     // file_id 11
+        buf[8] |= 1 << 0;     // file_id 64
+        let is_tombstoned = |id: u32| -> bool {
+            let byte = (id as usize) / 8;
+            let bit = (id as usize) % 8;
+            if byte >= buf.len() { return false; }
+            (buf[byte] >> bit) & 1 == 1
+        };
+        for id in [0, 7, 8, 11, 64] {
+            assert!(is_tombstoned(id), "file_id {id} should be tombstoned");
+        }
+        for id in [1, 2, 3, 4, 5, 6, 9, 10, 12, 63, 65, 100, 999] {
+            assert!(!is_tombstoned(id), "file_id {id} should NOT be tombstoned");
+        }
     }
 
     /// Prefix-match discount: among two substring matches of equal

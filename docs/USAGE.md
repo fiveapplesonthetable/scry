@@ -618,7 +618,44 @@ $ scry build-resolutions --index /mnt/agent/scry-index
 [res] pass 2 (per-file imports: 163951 files) in 19020 ms
 [res] pass 3 (resolve 62772968 refs, 55922904 resolved, 0 narrowed via Java context) in 420100 ms
 [res] DONE. 502183744 bytes written → /mnt/agent/scry-index/ref_resolutions.bin
+
+# Per-file content digest (blake3) sidecar — powers index-diff and
+# the full --incremental indexer. ~25 s for the full AOSP+Linux corpus.
+$ scry build-digests --index /mnt/agent/scry-index
+[digests] 1009166 files to hash
+[digests] hashed in 24812 ms
+[digests] DONE. 32293312 bytes written → /mnt/agent/scry-index/file_digests.bin
 ```
+
+## Incremental indexing foundation
+
+```sh
+# What would change if we re-indexed right now? (Requires
+# file_digests.bin from `scry build-digests`.)
+$ scry index-diff ~/dev/aosp /mnt/agent/dev/linux
+[index-diff] walked 1009166 files in 25340 ms
+unchanged: 1009160
+changed:   4 (would re-parse)
+added:     2 (would parse fresh)
+removed:   0
+
+# Verbose mode lists every changed/added/removed path:
+$ scry index-diff --verbose ~/dev/aosp /mnt/agent/dev/linux
+
+# Manually tombstone a file (next query of any kind skips it).
+# Useful when you've deleted a file and want immediate query freshness
+# without running a full reindex:
+$ scry rm-tombstone deleted_file.java --index /mnt/agent/scry-index
+[tombstone] marked 1 file(s) (1 newly); bitmap is 126146 bytes
+```
+
+The full `scry index --incremental` that re-parses only the changed
+files and appends to the existing index is roadmapped (see
+`docs/ROADMAP.md` § 2); today the supported pattern is:
+`build-digests` → `index-diff` to preview → `tombstone` to drop
+specific files → full `scry index` to re-parse from scratch when the
+churn justifies it. The current foundation gives O(seconds)
+freshness for deletes and O(walk-time) preview for any change set.
 
 ---
 

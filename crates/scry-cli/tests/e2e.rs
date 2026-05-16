@@ -491,6 +491,95 @@ public class Activity {
         eprintln!("git not on PATH — skipping diff e2e");
     }
 
+    // 10. Incremental-indexing foundation: build-digests + tombstone
+    // + index-diff + verify query path filters tombstoned files.
+    //
+    // Re-index from scratch so we have a clean baseline (the git step
+    // above already left us with one, but this is defensive in case
+    // we got skipped).
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src)
+        .arg("-o").arg(&idx)
+        .args(["--workers", "2"])
+        .output().expect("re-index for digest tests");
+    assert!(out.status.success(),
+            "re-index failed: {}", String::from_utf8_lossy(&out.stderr));
+    // 10a. build-digests should write file_digests.bin
+    let out = Command::new(scry_bin())
+        .args(["build-digests", "--index"]).arg(&idx)
+        .output().expect("scry build-digests");
+    assert!(out.status.success(),
+            "build-digests failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(idx.join("file_digests.bin").exists(),
+            "file_digests.bin must exist after build-digests");
+
+    // 10b. index-diff against the same tree should report all unchanged.
+    let out = Command::new(scry_bin())
+        .args(["index-diff"]).arg(&src)
+        .args(["--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("scry index-diff");
+    assert!(out.status.success(),
+            "index-diff failed: {}", String::from_utf8_lossy(&out.stderr));
+    let diff_line = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().find(|l| !l.is_empty()).expect("index-diff prints JSON");
+    let diff: serde_json::Value = serde_json::from_str(diff_line).expect("diff is JSON");
+    assert_eq!(diff["changed"], 0, "diff against same tree must show 0 changed: {diff}");
+    assert_eq!(diff["added"], 0, "0 added: {diff}");
+    assert_eq!(diff["removed"], 0, "0 removed: {diff}");
+    assert!(diff["unchanged"].as_u64().unwrap() > 0,
+            "must have ≥1 unchanged file: {diff}");
+
+    // 10c. Modify a file and re-run index-diff; should show 1 changed.
+    std::fs::write(
+        src.join("frameworks/base/core/java/android/app/Binder.java"),
+        r#"package android.app;
+public class Binder {
+    public void transact() { /* modified */ }
+    public void newMethod() {}
+}
+"#,
+    ).unwrap();
+    let out = Command::new(scry_bin())
+        .args(["index-diff"]).arg(&src)
+        .args(["--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("scry index-diff post-edit");
+    assert!(out.status.success(),
+            "index-diff failed: {}", String::from_utf8_lossy(&out.stderr));
+    let diff: serde_json::Value = serde_json::from_str(
+        std::str::from_utf8(&out.stdout).unwrap().lines()
+            .find(|l| !l.is_empty()).unwrap()
+    ).unwrap();
+    assert_eq!(diff["changed"], 1, "expected 1 changed file: {diff}");
+
+    // 10d. Tombstone Binder.java and assert that `scry def Binder`
+    // no longer returns it. This validates the tombstone filter on
+    // every read path through get_symbol.
+    let out = Command::new(scry_bin())
+        .args(["tombstone"]).arg("Binder.java")
+        .args(["--index"]).arg(&idx)
+        .output().expect("scry tombstone");
+    assert!(out.status.success(),
+            "tombstone failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(idx.join("tombstones.bin").exists(),
+            "tombstones.bin must exist after tombstone");
+
+    let out = Command::new(scry_bin())
+        .args(["def", "Binder", "--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("scry def post-tombstone");
+    assert!(out.status.success());
+    let hits: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    // Every remaining hit must not be in Binder.java
+    let any_binder = hits.iter().any(|h| h["path"].as_str().unwrap_or("")
+        .ends_with("Binder.java"));
+    assert!(!any_binder,
+            "tombstoned Binder.java symbols must not appear in def results: {hits:?}");
+
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();

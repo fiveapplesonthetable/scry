@@ -34,6 +34,26 @@ thread_local! {
     static PARSER: RefCell<Parser> = RefCell::new(Parser::new());
 }
 
+/// Per-file tree-sitter parse timeout (microseconds). Set via env var
+/// SCRY_PARSE_TIMEOUT_MS at process start; 0 = unlimited. Read once and
+/// cached so the per-parse setup is a single load.
+///
+/// Why this exists: tree-sitter grammars can transiently allocate gigabytes
+/// on adversarial inputs (e.g. the ctags Kotlin parser test fixtures). A
+/// timeout lets us cap that — when it fires, parse() returns None and we
+/// record a parse failure for that file instead of OOM-killing the whole
+/// indexer.
+fn parse_timeout_micros() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SCRY_PARSE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|ms| ms.saturating_mul(1000))
+            .unwrap_or(0)
+    })
+}
+
 pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
     use FileKind::*;
     let spec = match kind {
@@ -78,6 +98,8 @@ fn extract_refs_with(
     PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
         parser.set_language(lang.language)?;
+        let t = parse_timeout_micros();
+        if t > 0 { parser.set_timeout_micros(t); }
         let tree = match parser.parse(source, None) {
             Some(t) => t,
             None => return Ok(Vec::new()),
@@ -130,6 +152,8 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
     PARSER.with(|cell| {
         let mut parser = cell.borrow_mut();
         parser.set_language(spec.language)?;
+        let t = parse_timeout_micros();
+        if t > 0 { parser.set_timeout_micros(t); }
         let tree = match parser.parse(source, None) {
             Some(t) => t,
             None => return Ok(Vec::new()),

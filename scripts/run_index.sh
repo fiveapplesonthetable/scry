@@ -9,6 +9,13 @@ set -euo pipefail
 # jemalloc: aggressive return-to-OS so RSS tracks workload instead of
 # accumulating a high-water mark across batches.
 export MALLOC_CONF="dirty_decay_ms:100,muzzy_decay_ms:100,narenas:1"
+# tree-sitter parse timeout per file. Adversarial inputs (ctags' own
+# kotlin/python grammar fixtures, generated 250 KB Java tests) can
+# transiently allocate gigabytes. Capping the parse time bounds the damage
+# — files that time out are recorded as parse failures, not OOM kills.
+# 2000 ms is comfortably above any legitimate parse (real Kotlin files
+# clock in at <50 ms; the largest real Cpp files are ~500 ms).
+export SCRY_PARSE_TIMEOUT_MS=2000
 
 ROOTS=(
   /home/zim/dev/aosp
@@ -32,9 +39,9 @@ fi
 exec /mnt/agent/scry/target/release/scry index \
   "${USE_ROOTS[@]}" \
   --resume \
-  --workers 24 \
+  --workers 8 \
   --flush-bytes 1024 \
   --flush-every 1000 \
-  --mem-cap 60 \
+  --mem-cap 40 \
   --big-file-bytes 8192 \
   -o /mnt/agent/scry-index

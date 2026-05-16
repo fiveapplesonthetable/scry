@@ -1222,6 +1222,7 @@ fn cmd_def(
     md: bool,
     budget: Option<usize>,
 ) -> Result<()> {
+    let t = Instant::now();
     let r = open_index(index)?;
     let results = r.lookup_exact(&name);
     let mut filtered: Vec<SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
@@ -1237,25 +1238,32 @@ fn cmd_def(
     } else {
         print_results(&r, &filtered, limit, json);
     }
+    log_query(&r, "def", &name, filtered.len(), filtered.len().min(limit), t);
     Ok(())
 }
 
 fn cmd_prefix(prefix: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
+    let t = Instant::now();
     let r = open_index(index)?;
     // Over-fetch then rank; the FST gives unordered hits and the limit
     // should land on the BEST matches, not just the first ones the FST
     // happens to encounter.
     let mut results = r.lookup_prefix(&prefix, limit.saturating_mul(8).max(limit));
     rank_symbols(&mut results, &r);
-    print_results(&r, &results[..limit.min(results.len())], limit, json);
+    let shown = limit.min(results.len());
+    print_results(&r, &results[..shown], limit, json);
+    log_query(&r, "prefix", &prefix, results.len(), shown, t);
     Ok(())
 }
 
 fn cmd_fuzzy(substr: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
+    let t = Instant::now();
     let r = open_index(index)?;
     let mut results = r.lookup_substring(&substr, limit.saturating_mul(8).max(limit));
     rank_symbols(&mut results, &r);
-    print_results(&r, &results[..limit.min(results.len())], limit, json);
+    let shown = limit.min(results.len());
+    print_results(&r, &results[..shown], limit, json);
+    log_query(&r, "fuzzy", &substr, results.len(), shown, t);
     Ok(())
 }
 
@@ -1268,6 +1276,7 @@ fn cmd_ref(
     limit: usize,
     json: bool,
 ) -> Result<()> {
+    let t = Instant::now();
     let r = open_index(index)?;
     let results = r.lookup_refs_exact(&name);
     let filtered: Vec<RefRecord> = results
@@ -1295,6 +1304,8 @@ fn cmd_ref(
         })
         .collect();
     print_refs(&r, &filtered, limit, json);
+    let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
+    log_query(&r, label, &name, filtered.len(), filtered.len().min(limit), t);
     Ok(())
 }
 
@@ -1374,6 +1385,7 @@ fn resolve_file_id(r: &StoreReader, arg: &str) -> Option<u32> {
 }
 
 fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -> Result<()> {
+    let t = Instant::now();
     let r = open_index(index)?;
     let file_id = match resolve_file_id(&r, &path) {
         Some(id) => id,
@@ -1428,6 +1440,7 @@ fn cmd_outline(path: String, index: Option<PathBuf>, json: bool, limit: usize) -
             println!("... ({} more — pass --limit 0 to see all)", found.len() - take);
         }
     }
+    log_query(&r, "outline", &path, found.len(), take, t);
     Ok(())
 }
 
@@ -1559,6 +1572,86 @@ fn print_results_md(
 }
 
 /// Read a snippet of `total_lines` centered roughly on `line`.
+/// Default path for the per-query ops log. Honors $SCRY_LOG, otherwise
+/// $HOME/.scry/queries.log. Returns None on a non-Unicode or missing
+/// HOME (no log = best-effort skip, not an error).
+fn query_log_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SCRY_LOG") {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".scry").join("queries.log"))
+}
+
+/// Print a one-line stats footer to stderr AND append a JSON line to
+/// the ops log (~/.scry/queries.log by default). Both are best-effort
+/// — a log-write failure never affects the query's exit status.
+///
+/// `total_files` defaults to the index's `files_total` (every search
+/// looks at every file conceptually); commands that genuinely narrow
+/// (grep with trigram pre-filter) should call log_query_with_files
+/// to surface the candidate count.
+fn log_query(
+    r: &StoreReader,
+    cmd: &str,
+    query: &str,
+    hits: usize,
+    shown: usize,
+    t_start: Instant,
+) {
+    log_query_with_files(r, cmd, query, hits, shown, t_start, None);
+}
+
+fn log_query_with_files(
+    r: &StoreReader,
+    cmd: &str,
+    query: &str,
+    hits: usize,
+    shown: usize,
+    t_start: Instant,
+    candidate_files: Option<usize>,
+) {
+    let elapsed_ms = t_start.elapsed().as_millis();
+    let total_files = r.manifest.stats.files_total;
+    let cands = candidate_files
+        .map(|c| format!(" cands={c}"))
+        .unwrap_or_default();
+    eprintln!(
+        "[scry] cmd={cmd} q={query:?} hits={hits} shown={shown} files={total_files}{cands} elapsed={elapsed_ms}ms",
+    );
+
+    // Best-effort JSON append. Errors are swallowed — we never want a
+    // log-write failure to corrupt a query's exit code or stdout.
+    if let Some(path) = query_log_path() {
+        let _ = (|| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .create(true).append(true).open(&path)?;
+            let line = serde_json::json!({
+                "ts": now_unix_secs(),
+                "cmd": cmd,
+                "query": query,
+                "hits": hits,
+                "shown": shown,
+                "files_total": total_files,
+                "candidate_files": candidate_files,
+                "elapsed_ms": elapsed_ms,
+                "index": r.paths.root.display().to_string(),
+            });
+            use std::io::Write;
+            writeln!(f, "{}", line)?;
+            Ok(())
+        })();
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0)
+}
+
 fn read_snippet(path: &str, line: u32, total_lines: u32) -> String {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -1566,10 +1659,16 @@ fn read_snippet(path: &str, line: u32, total_lines: u32) -> String {
     };
     let src = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = src.lines().collect();
+    // Defensive: an empty file produces lines.len() == 0, so the prior
+    // `lines[start..=end]` would index an empty Vec and panic. Caller
+    // is from the Markdown formatter which iterates ranking results
+    // and reads each file independently — one empty file shouldn't
+    // sink the whole query.
+    if lines.is_empty() { return String::new(); }
     let target = line.saturating_sub(1) as usize;
     let half = (total_lines / 2) as usize;
     let start = target.saturating_sub(half);
-    let end = (target + half).min(lines.len().saturating_sub(1));
+    let end = (target + half).min(lines.len() - 1);
     lines[start..=end].join("\n")
 }
 
@@ -1678,6 +1777,7 @@ fn cmd_grep(
     max_file_bytes: u64,
     mem_cap: u32,
 ) -> Result<()> {
+    let t = Instant::now();
     if let Some(n) = workers {
         if n > 0 {
             if let Err(e) = rayon::ThreadPoolBuilder::new()
@@ -1843,6 +1943,8 @@ fn cmd_grep(
         }
         eprintln!("\n{} hits across {} files", hits.len(), total_files);
     }
+    let label = if is_regex { "grep-regex" } else { "grep" };
+    log_query_with_files(&r, label, &pattern, hits.len(), hits.len(), t, Some(total_files));
     Ok(())
 }
 

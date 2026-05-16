@@ -1543,8 +1543,12 @@ fn cmd_grep(
                 }
             }
             if !prefix.is_empty() {
+                // Same semantics as cmd_def/cmd_ref: --in is a substring
+                // of the absolute path so the caller can pass either a
+                // root-relative subdir ("frameworks/base/") or an absolute
+                // one and have both work.
                 let full = fe.display_path(&r.roots);
-                if !full.starts_with(prefix) {
+                if !full.contains(prefix) {
                     return false;
                 }
             }
@@ -1969,13 +1973,17 @@ fn cmd_serve(index: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Does the symbol/ref live under the given subdir prefix? Matched against
-/// the displayed path (root-relative), so callers pass repo-root-relative
-/// prefixes like "frameworks/base/services/".
+/// Does the symbol/ref live under the given subdir prefix?
+///
+/// `display_path` returns the full absolute path (root.path + relpath),
+/// so a caller-supplied filter like "frameworks/base/" — a repo-root-
+/// relative substring — must match via `contains`, not `starts_with`
+/// (the path always starts with the root, never with the subdir).
+/// This matches the semantics of CLI cmd_def/cmd_ref (lines 1178/1220).
 fn file_in_prefix(r: &StoreReader, file_id: u32, prefix: &str) -> bool {
     if prefix.is_empty() { return true; }
     match r.files.get(file_id as usize) {
-        Some(fe) => fe.display_path(&r.roots).starts_with(prefix),
+        Some(fe) => fe.display_path(&r.roots).contains(prefix),
         None => false,
     }
 }
@@ -2082,8 +2090,11 @@ fn serve_grep(
             if !format!("{:?}", fe.kind).eq_ignore_ascii_case(l) { continue; }
         }
         if !prefix.is_empty() {
+            // Substring match — same semantics as file_in_prefix and
+            // CLI cmd_grep; absolute paths never start with a root-
+            // relative subdir.
             let p = fe.display_path(&r.roots);
-            if !p.starts_with(prefix) { continue; }
+            if !p.contains(prefix) { continue; }
         }
         scanned += 1;
         let path = fe.display_path(&r.roots);

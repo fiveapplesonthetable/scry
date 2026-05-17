@@ -2676,7 +2676,8 @@ public class A {
         let mut cmd = Command::new(scry_bin());
         cmd.arg(subcmd).arg("bindServce").arg("--index").arg(&idx);
         for a in &extra_args { cmd.arg(a); }
-        let out = cmd.output().expect(&format!("spawn {subcmd} typo"));
+        let out = cmd.output()
+            .unwrap_or_else(|_| panic!("spawn {subcmd} typo"));
         assert!(out.status.success(),
             "{subcmd} typo failed: {}", String::from_utf8_lossy(&out.stderr));
         let stderr = String::from_utf8_lossy(&out.stderr);

@@ -61,7 +61,7 @@ fn health_status(index_dir: &Path, artifact: &str) -> String {
         .expect("health --json parses");
     v["checks"].as_array().expect("checks array").iter()
         .find(|c| c["artifact"] == artifact)
-        .and_then(|c| c["status"].as_str().map(std::string::ToString::to_string))
+        .and_then(|c| c["status"].as_str().map(ToString::to_string))
         .unwrap_or_else(|| format!("<no check named {artifact}>"))
 }
 

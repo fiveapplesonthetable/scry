@@ -480,6 +480,12 @@ enum Cmd {
         /// `scry ref --strict`.
         #[arg(long)]
         strict: bool,
+        /// Use lexical (tree-sitter) name match only. Default
+        /// auto-engages clang USR + SCIP symbol identity filters
+        /// when their sidecars are present (root level only —
+        /// deeper recursion stays lexical). See `scry ref --lexical`.
+        #[arg(long)]
+        lexical: bool,
         #[arg(long)]
         json: bool,
     },
@@ -518,6 +524,12 @@ enum Cmd {
         /// land on a specific def. See `scry ref --strict`.
         #[arg(long)]
         strict: bool,
+        /// Use lexical (tree-sitter) name match only. Default
+        /// auto-engages clang USR + SCIP symbol identity filters
+        /// on the callers leg when their sidecars are present.
+        /// See `scry ref --lexical`.
+        #[arg(long)]
+        lexical: bool,
         #[arg(long, default_value = "200")]
         limit: usize,
         #[arg(long)]
@@ -1317,10 +1329,10 @@ fn main() -> Result<()> {
         Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => precision_subcmds::cmd_scip_lookup(index, &path, offset),
-        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, limit, json } =>
-            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, limit, json),
-        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, json } =>
-            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, json),
+        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
+            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
+        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json } =>
+            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json),
         Cmd::Uses { name, index, in_, not_in, kind, strict, format, limit, json } =>
             cmd_uses(name, index, in_, not_in, kind, strict, format, limit, json),
         Cmd::Finalize {
@@ -2557,6 +2569,7 @@ fn cmd_def(
 /// dedups repeats; a global node cap (`--max-nodes`) plus the
 /// `--depth` cap bound the work on hub functions (e.g. `log()`,
 /// `assert`).
+#[allow(clippy::too_many_arguments)]
 fn cmd_callgraph(
     name: String,
     index: Option<PathBuf>,
@@ -2567,6 +2580,7 @@ fn cmd_callgraph(
     reachable: bool,
     def_in: Option<String>,
     strict: bool,
+    lexical: bool,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
@@ -2603,6 +2617,25 @@ fn cmd_callgraph(
             ids
         });
 
+    // Root-level precision filter (clang USR + SCIP symbol identity).
+    // Auto-engages when sidecars present unless --lexical was passed.
+    // Deeper recursion stays lexical because callee names at depth >0
+    // are caller-function names — those are def-style queries, not the
+    // same NAME the user asked about, and their precision answer would
+    // need a separate sidecar lookup per name (not free).
+    let (_reach_unused, clang_precise, scip_precise) =
+        resolve_precision(lexical, false, false, false);
+    let root_precise_sites: Option<std::collections::HashSet<(u32, u32)>> =
+        if !lexical && (clang_precise || scip_precise) {
+            let raw_root = r.lookup_refs_exact(&name);
+            let kept = apply_precision_filter(
+                &r, &name, raw_root, clang_precise, scip_precise,
+            )?;
+            Some(kept.into_iter().map(|rr| (rr.file_id, rr.byte_start)).collect())
+        } else {
+            None
+        };
+
     /// One node in the callers tree. Children are callers of this
     /// function (i.e. parents on the call stack).
     #[derive(Debug, Default, serde::Serialize)]
@@ -2627,6 +2660,11 @@ fn cmd_callgraph(
         // resolved_to ∈ set (with strict toggle). None ⇒ no filter
         // (also the case for all non-root recursive levels).
         root_def_target_ids: Option<&std::collections::HashSet<u64>>,
+        // Root-level precision filter: Some(set of (file_id, byte_start))
+        // ⇒ keep only refs whose site is in the set. None at deeper
+        // recursion levels (precision is not threaded down — see
+        // root_precise_sites computation in cmd_callgraph).
+        root_precise_sites: Option<&std::collections::HashSet<(u32, u32)>>,
         strict: bool,
         visited: &mut std::collections::HashSet<String>,
         budget: &mut usize,
@@ -2670,6 +2708,13 @@ fn cmd_callgraph(
             if root_def_target_ids.is_none() && strict && rr.resolved_to.is_none() {
                 continue;
             }
+            // Root-level precision filter (clang USR / SCIP symbol
+            // identity). Only Some at the topmost call.
+            if let Some(sites) = root_precise_sites {
+                if !sites.contains(&(rr.file_id, rr.byte_start)) {
+                    continue;
+                }
+            }
             // Prefer the byte-range enclosing function (more accurate
             // than scope_path.last() which reports the class on Java).
             // Fall back to scope_path when file_symbols is missing.
@@ -2689,12 +2734,13 @@ fn cmd_callgraph(
             if *budget == 0 { break; }
         }
         // Recurse into each caller, expanding their callers. Pass
-        // None for root_def_target_ids so the narrowing only fires
-        // at the topmost level (we don't have per-frame def context).
+        // None for root_def_target_ids / root_precise_sites so the
+        // narrowing only fires at the topmost level (we don't have
+        // per-frame def or per-name precision context).
         for (caller_name, node) in &mut out {
             node.callers = expand(
                 r, caller_name, depth_left - 1, in_prefix, not_in_prefix,
-                callee_modules, None, strict, visited, budget,
+                callee_modules, None, None, strict, visited, budget,
             );
         }
         visited.remove(callee);
@@ -2706,8 +2752,8 @@ fn cmd_callgraph(
     let prefix = in_.as_deref().unwrap_or("");
     let neg_prefix = not_in.as_deref().unwrap_or("");
     let tree = expand(&r, &name, depth, prefix, neg_prefix, callee_modules.as_ref(),
-                      root_def_target_ids.as_ref(), strict,
-                      &mut visited, &mut budget);
+                      root_def_target_ids.as_ref(), root_precise_sites.as_ref(),
+                      strict, &mut visited, &mut budget);
 
     if json {
         println!("{}", serde_json::json!({
@@ -2770,6 +2816,7 @@ fn cmd_callgraph(
 /// reachability-filtered because inheritance edges don't respect
 /// module deps (a child class can live anywhere that imports the
 /// parent's header).
+#[allow(clippy::too_many_arguments)]
 fn cmd_impact(
     name: String,
     index: Option<PathBuf>,
@@ -2779,17 +2826,26 @@ fn cmd_impact(
     reachable: bool,
     def_in: Option<String>,
     strict: bool,
+    lexical: bool,
     limit: usize,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
     let r = open_index(index)?;
 
-    // Callers — lookup_refs_exact, filter by kind=call, optionally
-    // reachability-prune.
-    let mut callers: Vec<RefRecord> = r.lookup_refs_exact(&name)
+    // Callers — lookup_refs_exact, filter by kind=call, then apply
+    // build-symbol precision (auto-on when sidecars are present —
+    // `lexical` opt-out skips it) and path filters.
+    let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(&name)
         .into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
+        .collect();
+    let (_reach, clang_precise, scip_precise) =
+        resolve_precision(lexical, false, false, false);
+    let callers_precise = apply_precision_filter(
+        &r, &name, raw_callers, clang_precise, scip_precise,
+    )?;
+    let mut callers: Vec<RefRecord> = callers_precise.into_iter()
         .filter(|rr| match r.files.get(rr.file_id as usize) {
             Some(fe) => path_matches(
                 &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
@@ -3116,6 +3172,146 @@ fn resolve_precision(
     (explicit_reachable, true, true)
 }
 
+/// Apply build-symbol precision filtering (clang USR + SCIP symbol
+/// identity) to a candidate set of refs. Both filters consult their
+/// own on-disk sidecar (`clang_usrs.bin` / `scip_index.bin`); when
+/// the sidecar is absent the filter no-ops with a one-line warning.
+///
+/// `name` is the symbol the caller queried — we look up its defs to
+/// gather the "ground truth" symbol IDs (USR / SCIP) that surviving
+/// refs must match. `lookup_exact` runs once for both filters so a
+/// query with both enabled isn't N=2 lookups.
+///
+/// Returns the surviving refs. Errors propagate from sidecar open
+/// (the underlying `ClangUsrIndex::open` / `ScipIndex::open` can
+/// fail on corrupted files — soft-fail on missing, hard-fail on
+/// corrupt).
+pub(crate) fn apply_precision_filter(
+    r: &StoreReader,
+    name: &str,
+    refs: Vec<RefRecord>,
+    clang_precise: bool,
+    scip_precise: bool,
+) -> Result<Vec<RefRecord>> {
+    // Window covers the offset drift between tree-sitter (identifier
+    // position) and clang (cursor position — sometimes at the keyword
+    // for class/struct/typedef). 64 bytes covers every real-world
+    // identifier without bridging adjacent decls.
+    const WINDOW: u32 = 64;
+    // Look up the defs once and share between both filters.
+    let defs_lazy = if clang_precise || scip_precise {
+        Some(r.lookup_exact(name))
+    } else {
+        None
+    };
+
+    let refs = if clang_precise {
+        let sidecar_path = r.paths.clang_usrs();
+        match scry_store::clang_usrs::ClangUsrIndex::open(&sidecar_path)? {
+            None => {
+                eprintln!(
+                    "[scry] --clang-precise: this index has no clang_usrs.bin \
+                     sidecar; run `scry clang-index --compile-commands FILE \
+                     --index DIR` first. Returning unfiltered.",
+                );
+                refs
+            }
+            Some(cusr) => {
+                let def_usrs: std::collections::HashSet<String> = defs_lazy
+                    .as_ref().unwrap().iter()
+                    .filter_map(|s| {
+                        let p = r.files.get(s.file_id as usize)?
+                            .display_path(&r.roots);
+                        cusr.usr_for_window(&p, s.byte_start, WINDOW)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                if def_usrs.is_empty() {
+                    eprintln!(
+                        "[scry] --clang-precise: no clang USR found for any def \
+                         of {name:?} (def site outside the indexed \
+                         compile_commands?). Returning unfiltered.",
+                    );
+                    refs
+                } else {
+                    let before = refs.len();
+                    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
+                        let p = match r.files.get(rr.file_id as usize) {
+                            Some(fe) => fe.display_path(&r.roots),
+                            None => return true,
+                        };
+                        match cusr.usr_for_window(&p, rr.byte_start, WINDOW) {
+                            Some(u) => def_usrs.contains(u),
+                            None => true, // uncovered TU / non-C++ → keep
+                        }
+                    }).collect();
+                    eprintln!(
+                        "[scry] --clang-precise: {} → {} refs after USR identity \
+                         filter ({} def USRs)",
+                        before, kept.len(), def_usrs.len(),
+                    );
+                    kept
+                }
+            }
+        }
+    } else {
+        refs
+    };
+    let refs = if scip_precise {
+        let sidecar_path = r.paths.scip_index();
+        match scry_store::scip_index::ScipIndex::open(&sidecar_path)? {
+            None => {
+                eprintln!(
+                    "[scry] --scip-precise: this index has no scip_index.bin \
+                     sidecar; run `scry scip-import --scip FILE.scip \
+                     --index DIR` first. Returning unfiltered.",
+                );
+                refs
+            }
+            Some(sidx) => {
+                let def_syms: std::collections::HashSet<String> = defs_lazy
+                    .as_ref().unwrap().iter()
+                    .filter_map(|s| {
+                        let p = r.files.get(s.file_id as usize)?
+                            .display_path(&r.roots);
+                        sidx.symbol_for_window(&p, s.byte_start, WINDOW)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                if def_syms.is_empty() {
+                    eprintln!(
+                        "[scry] --scip-precise: no SCIP symbol found for any def \
+                         of {name:?} (def site outside the imported SCIP \
+                         index?). Returning unfiltered.",
+                    );
+                    refs
+                } else {
+                    let before = refs.len();
+                    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
+                        let p = match r.files.get(rr.file_id as usize) {
+                            Some(fe) => fe.display_path(&r.roots),
+                            None => return true,
+                        };
+                        match sidx.symbol_for_window(&p, rr.byte_start, WINDOW) {
+                            Some(s) => def_syms.contains(s),
+                            None => true,
+                        }
+                    }).collect();
+                    eprintln!(
+                        "[scry] --scip-precise: {} → {} refs after SCIP symbol \
+                         identity filter ({} def symbols)",
+                        before, kept.len(), def_syms.len(),
+                    );
+                    kept
+                }
+            }
+        }
+    } else {
+        refs
+    };
+    Ok(refs)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_ref(
     name: String,
@@ -3323,128 +3519,9 @@ fn cmd_ref(
     } else {
         filtered
     };
-    // --clang-precise: drop refs whose (path, byte_start) doesn't
-    // map to the same USR as any def of the name. Requires the
-    // clang_usrs.bin sidecar produced by `scry clang-index`.
-    let filtered = if clang_precise {
-        let sidecar_path = r.paths.clang_usrs();
-        match scry_store::clang_usrs::ClangUsrIndex::open(&sidecar_path)? {
-            None => {
-                eprintln!(
-                    "[scry] --clang-precise: this index has no clang_usrs.bin \
-                     sidecar; run `scry clang-index --compile-commands FILE \
-                     --index DIR` first. Returning unfiltered.",
-                );
-                filtered
-            }
-            Some(cusr) => {
-                // Collect USR(s) for any def of `name`.
-                // Use a ±64-byte window for both def and ref lookups
-                // — clang's cursor location can sit at the keyword
-                // (struct/class/typedef) while scry's byte_start sits
-                // at the identifier. 64 covers all real-world widths
-                // without false positives across distinct decls.
-                const WINDOW: u32 = 64;
-                let defs = r.lookup_exact(&name);
-                let def_usrs: std::collections::HashSet<String> = defs
-                    .iter()
-                    .filter_map(|s| {
-                        let p = r.files.get(s.file_id as usize)?
-                            .display_path(&r.roots);
-                        cusr.usr_for_window(&p, s.byte_start, WINDOW)
-                            .map(str::to_string)
-                    })
-                    .collect();
-                if def_usrs.is_empty() {
-                    eprintln!(
-                        "[scry] --clang-precise: no clang USR found for any def of \
-                         {name:?} (def site outside the indexed compile_commands?). \
-                         Returning unfiltered.",
-                    );
-                    filtered
-                } else {
-                    let before = filtered.len();
-                    let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
-                        let p = match r.files.get(rr.file_id as usize) {
-                            Some(fe) => fe.display_path(&r.roots),
-                            None => return true, // can't disprove → keep
-                        };
-                        match cusr.usr_for_window(&p, rr.byte_start, WINDOW) {
-                            Some(u) => def_usrs.contains(u),
-                            // No clang record for this site → keep
-                            // (it's a non-C/C++ file or an uncovered TU).
-                            None => true,
-                        }
-                    }).collect();
-                    eprintln!(
-                        "[scry] --clang-precise: {} → {} refs after USR identity \
-                         filter ({} def USRs)",
-                        before, kept.len(), def_usrs.len(),
-                    );
-                    kept
-                }
-            }
-        }
-    } else {
-        filtered
-    };
-    // --scip-precise: same shape as --clang-precise but reads SCIP
-    // symbol IDs from `scip_index.bin`. Composes after the clang
-    // filter so both can stack on a mixed-language index.
-    let filtered = if scip_precise {
-        let sidecar_path = r.paths.scip_index();
-        match scry_store::scip_index::ScipIndex::open(&sidecar_path)? {
-            None => {
-                eprintln!(
-                    "[scry] --scip-precise: this index has no scip_index.bin \
-                     sidecar; run `scry scip-import --scip FILE.scip \
-                     --index DIR` first. Returning unfiltered.",
-                );
-                filtered
-            }
-            Some(sidx) => {
-                const WINDOW: u32 = 64;
-                let defs = r.lookup_exact(&name);
-                let def_syms: std::collections::HashSet<String> = defs
-                    .iter()
-                    .filter_map(|s| {
-                        let p = r.files.get(s.file_id as usize)?
-                            .display_path(&r.roots);
-                        sidx.symbol_for_window(&p, s.byte_start, WINDOW)
-                            .map(str::to_string)
-                    })
-                    .collect();
-                if def_syms.is_empty() {
-                    eprintln!(
-                        "[scry] --scip-precise: no SCIP symbol found for any def of \
-                         {name:?} (def site outside the imported SCIP index?). \
-                         Returning unfiltered.",
-                    );
-                    filtered
-                } else {
-                    let before = filtered.len();
-                    let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
-                        let p = match r.files.get(rr.file_id as usize) {
-                            Some(fe) => fe.display_path(&r.roots),
-                            None => return true,
-                        };
-                        match sidx.symbol_for_window(&p, rr.byte_start, WINDOW) {
-                            Some(s) => def_syms.contains(s),
-                            None => true,
-                        }
-                    }).collect();
-                    eprintln!(
-                        "[scry] --scip-precise: {} → {} refs after SCIP symbol \
-                         identity filter ({} def symbols)",
-                        before, kept.len(), def_syms.len(),
-                    );
-                    kept
-                }
-            }
-        }
-    } else {
-        filtered
-    };
+    let filtered = apply_precision_filter(
+        &r, &name, filtered, clang_precise, scip_precise,
+    )?;
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
     // --format count: just the totals, no per-hit rows. Pays off for
     // "how many callers does X have?" agent queries — one short line
@@ -3505,7 +3582,7 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
     let mut groups: Vec<(u64, usize)> = by_id.into_iter()
         .map(|(k, v)| (k.unwrap(), v))
         .collect();
-    groups.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.1));
     // Build a name→symbols map ONCE so we don't pay lookup_exact
     // per row. The ref's name is the same for the whole group.
     let candidates = reader.lookup_exact(name);
@@ -7787,7 +7864,11 @@ fn mcp_tools_list_result() -> serde_json::Value {
              levels via `enclosing_function` resolution (more \
              accurate than scope_path for Java/Kotlin where the \
              scope is the class). `--max-nodes` caps total expansion \
-             on hub functions (logger, assert, etc.).",
+             on hub functions (logger, assert, etc.). Root-level \
+             callers are auto-filtered by clang USR + SCIP symbol \
+             identity when those sidecars are present; pass \
+             `lexical: true` to opt out and see the raw name-match \
+             tree.",
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
@@ -7795,6 +7876,12 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "depth": {"type": "integer", "minimum": 1, "default": 3},
                 "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
                 "reachable": {"type": "boolean", "default": false},
+                "lexical": {"type": "boolean", "default": false,
+                    "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters on the ROOT level whenever the sidecars are present. Deeper recursion stays lexical (walker doesn't track per-name precision context)."},
+                "clang_precise": {"type": "boolean", "default": true,
+                    "description": "Filter root-level callers by clang USR identity (C/C++/ObjC). Auto-on when sidecar present; pass `lexical: true` to suppress."},
+                "scip_precise": {"type": "boolean", "default": true,
+                    "description": "Filter root-level callers by SCIP symbol identity. Auto-on when sidecar present; pass `lexical: true` to suppress."},
                 "def_in": {"type": "string",
                     "description": "Substring of the def-site file path for the ROOT callee. Same shape as `ref --def-in`. Narrows ONLY the topmost level — deeper recursive levels are not filtered because the walker doesn't track per-frame def context."},
                 "strict": {"type": "boolean", "default": false,
@@ -7808,7 +7895,11 @@ fn mcp_tools_list_result() -> serde_json::Value {
              Returns counts (callers, subclasses, files_touched) plus \
              the up-to-`limit` instances of each. Use this as a \
              pre-flight check before refactors: small counts → safe \
-             rename; large counts → split the change.",
+             rename; large counts → split the change. The callers \
+             leg auto-engages clang USR + SCIP symbol identity \
+             filters (sidecar-gated); pass `lexical: true` to opt \
+             out. Subclasses leg is identity-based already \
+             (type-hierarchy lookup).",
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
@@ -7818,6 +7909,12 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "BFS depth for the subclass leg of the impact set."},
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Build-graph reachability filter on callers leg only."},
+                "lexical": {"type": "boolean", "default": false,
+                    "description": "Use lexical (tree-sitter) name match only for the callers leg. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever the sidecars are present."},
+                "clang_precise": {"type": "boolean", "default": true,
+                    "description": "Filter callers by clang USR identity (C/C++/ObjC). Auto-on when sidecar present; pass `lexical: true` to suppress."},
+                "scip_precise": {"type": "boolean", "default": true,
+                    "description": "Filter callers by SCIP symbol identity. Auto-on when sidecar present; pass `lexical: true` to suppress."},
                 "def_in": {"type": "string",
                     "description": "Narrow the callers portion by def-site path (same as `ref --def-in`). Doesn't affect the subclass walk."},
                 "strict": {"type": "boolean", "default": false,
@@ -8513,11 +8610,20 @@ fn serve_one_request<W: std::io::Write>(
             let depth = args.get("subclass_depth")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(2);
-            let reachable = args.get("reachable")
+            let lexical = args.get("lexical")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let explicit_reachable = args.get("reachable")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let explicit_clang = args.get("clang_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let explicit_scip = args.get("scip_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let (reachable, clang_precise, scip_precise) =
+                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable, def_in, strict, limit)
+            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable,
+                         clang_precise, scip_precise, def_in, strict, limit)
         }
         "callgraph" => {
             let depth = args.get("depth")
@@ -8526,11 +8632,20 @@ fn serve_one_request<W: std::io::Write>(
             let max_nodes = args.get("max_nodes")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(200);
-            let reachable = args.get("reachable")
+            let lexical = args.get("lexical")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let explicit_reachable = args.get("reachable")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let explicit_clang = args.get("clang_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let explicit_scip = args.get("scip_precise")
+                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let (reachable, clang_precise, scip_precise) =
+                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes, reachable, def_in, strict)
+            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes,
+                            reachable, clang_precise, scip_precise, def_in, strict)
         }
         "uses" => {
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -8946,7 +9061,7 @@ fn serve_ref_by_def_histogram(
     let mut groups: Vec<(u64, usize)> = by_id.into_iter()
         .map(|(k, v)| (k.unwrap(), v))
         .collect();
-    groups.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.1));
     let candidates = reader.lookup_exact(name);
     let by_def_id: HashMap<u64, &SymbolRecord> = candidates.iter()
         .map(|s| (s.id, s)).collect();
@@ -9058,6 +9173,8 @@ fn serve_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
+    clang_precise: bool,
+    scip_precise: bool,
     def_in: Option<&str>,
     strict: bool,
 ) -> serde_json::Value {
@@ -9081,6 +9198,22 @@ fn serve_callgraph(
                 .collect()
         });
 
+    // Root-level precision filter — same shape as cmd_callgraph.
+    // Soft-fail on sidecar errors: a daemon shouldn't crash a single
+    // RPC because of a broken precision sidecar.
+    let root_precise_sites: Option<std::collections::HashSet<(u32, u32)>> =
+        if clang_precise || scip_precise {
+            let raw_root = r.lookup_refs_exact(name);
+            match apply_precision_filter(r, name, raw_root, clang_precise, scip_precise) {
+                Ok(kept) => Some(
+                    kept.into_iter().map(|rr| (rr.file_id, rr.byte_start)).collect()
+                ),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
     #[derive(Debug, Default, serde::Serialize)]
     struct Node {
         call_sites: usize,
@@ -9097,6 +9230,7 @@ fn serve_callgraph(
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
         root_def_target_ids: Option<&std::collections::HashSet<u64>>,
+        root_precise_sites: Option<&std::collections::HashSet<(u32, u32)>>,
         strict: bool,
         visited: &mut std::collections::HashSet<String>,
         budget: &mut usize,
@@ -9134,6 +9268,13 @@ fn serve_callgraph(
             if root_def_target_ids.is_none() && strict && rr.resolved_to.is_none() {
                 continue;
             }
+            // Root-level precision (clang USR / SCIP). Only Some at
+            // the topmost call; deeper recursion stays lexical.
+            if let Some(sites) = root_precise_sites {
+                if !sites.contains(&(rr.file_id, rr.byte_start)) {
+                    continue;
+                }
+            }
             let caller_name = r.enclosing_function(rr.file_id, rr.byte_start)
                 .map(|s| s.name)
                 .or_else(|| rr.scope_path.last().cloned());
@@ -9152,7 +9293,7 @@ fn serve_callgraph(
         // top level (same limitation as cmd_callgraph).
         for (caller_name, node) in &mut out {
             node.callers = expand(r, caller_name, depth_left - 1, in_prefix, not_in_prefix,
-                callee_modules, None, strict, visited, budget);
+                callee_modules, None, None, strict, visited, budget);
         }
         visited.remove(callee);
         out
@@ -9161,7 +9302,8 @@ fn serve_callgraph(
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let tree = expand(r, name, depth, prefix, neg_prefix, callee_modules.as_ref(),
-                      root_def_target_ids.as_ref(), strict, &mut visited, &mut budget);
+                      root_def_target_ids.as_ref(), root_precise_sites.as_ref(),
+                      strict, &mut visited, &mut budget);
     serde_json::json!({
         "callee": name,
         "depth": depth,
@@ -9182,12 +9324,27 @@ fn serve_impact(
     not_in: Option<&str>,
     subclass_depth: usize,
     reachable: bool,
+    clang_precise: bool,
+    scip_precise: bool,
     def_in: Option<&str>,
     strict: bool,
     limit: usize,
 ) -> serde_json::Value {
-    let mut callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
+    // Apply precision (clang USR + SCIP) on the callers leg only.
+    // Subclasses use type-hierarchy lookup; no symbol-identity index
+    // applies there. Soft-fail on sidecar errors so a broken sidecar
+    // doesn't take down the daemon RPC.
+    let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
+        .collect();
+    let callers_precise = if clang_precise || scip_precise {
+        apply_precision_filter(r, name, raw_callers, clang_precise, scip_precise)
+            .unwrap_or_else(|_| r.lookup_refs_exact(name).into_iter()
+                .filter(|rr| rr.kind == scry_store::RefKind::Call).collect())
+    } else {
+        raw_callers
+    };
+    let mut callers: Vec<RefRecord> = callers_precise.into_iter()
         .filter(|rr| file_path_matches(r, rr.file_id, in_, not_in))
         .collect();
     // v0.1.46 — same root-level narrowing as cmd_impact.

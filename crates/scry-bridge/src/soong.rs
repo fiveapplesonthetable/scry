@@ -741,7 +741,12 @@ enum JvmRuleKind {
 }
 
 fn classify_jvm_target(target: &str) -> Option<JvmRuleKind> {
-    if !target.ends_with(".jar") {
+    // Accept the canonical `<name>.jar` form AND Soong's sharded
+    // form `<name>.jarNN` (e.g. `framework.jar0`, `framework.jar59` —
+    // see `framework-minus-apex/android_common/javac/framework.jarN`).
+    // Without the sharded form we drop every multi-shard module
+    // (60 % of the source under `frameworks/base/` for AOSP).
+    if !ends_with_jar_or_sharded(target) {
         return None;
     }
     if target.contains("/javac/") && !target.contains("javac-header") {
@@ -753,6 +758,19 @@ fn classify_jvm_target(target: &str) -> Option<JvmRuleKind> {
         return Some(JvmRuleKind::Kotlinc);
     }
     None
+}
+
+/// True if `s` ends with `.jar` or `.jar` followed by ASCII digits.
+/// Soong shards a single javac compile across many output files
+/// named `<base>.jar0`, `<base>.jar1`, … `<base>.jarN`; each shard is
+/// its own javac rule with a sibling `<base>.jarN.rsp` sources file.
+fn ends_with_jar_or_sharded(s: &str) -> bool {
+    if s.ends_with(".jar") { return true; }
+    if let Some(idx) = s.rfind(".jar") {
+        let tail = &s[idx + ".jar".len()..];
+        return !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
 }
 
 /// Classify a build rule by its ninja rule name. Soong publishes many
@@ -1131,6 +1149,45 @@ mod tests {
         assert!(classify_jvm_target("x/kotlin-jar-snapshot/foo.jar").is_none());
         assert!(classify_jvm_target("x/turbine/foo.jar").is_none());
         assert!(classify_jvm_target("x/javac/foo.txt").is_none());
+    }
+
+    #[test]
+    fn classify_jvm_target_accepts_sharded_outputs() {
+        // Soong shards big javac compiles into `<base>.jarN` outputs
+        // (no .jar extension; the index suffix replaces it). The
+        // classifier must accept them or framework-minus-apex and
+        // friends fall off the bridge silently.
+        assert_eq!(
+            classify_jvm_target(
+                "out/.../frameworks/base/framework-minus-apex/\
+                 android_common/javac/framework.jar0",
+            ),
+            Some(JvmRuleKind::Javac),
+        );
+        assert_eq!(
+            classify_jvm_target(
+                "out/.../frameworks/base/framework-minus-apex/\
+                 android_common/javac/framework.jar59",
+            ),
+            Some(JvmRuleKind::Javac),
+        );
+        // Sanity: non-digit suffix must NOT be treated as a shard.
+        assert!(classify_jvm_target("x/javac/foo.jartmp").is_none());
+        assert!(classify_jvm_target("x/javac/foo.jar.rsp").is_none());
+    }
+
+    #[test]
+    fn ends_with_jar_or_sharded_matches_canonical_and_shards() {
+        assert!(ends_with_jar_or_sharded("foo.jar"));
+        assert!(ends_with_jar_or_sharded("foo.jar0"));
+        assert!(ends_with_jar_or_sharded("foo.jar59"));
+        assert!(ends_with_jar_or_sharded("path/to/foo.jar123"));
+        // Negatives.
+        assert!(!ends_with_jar_or_sharded("foo.txt"));
+        assert!(!ends_with_jar_or_sharded("foo.jartmp"));
+        assert!(!ends_with_jar_or_sharded("foo.jar.rsp"));
+        assert!(!ends_with_jar_or_sharded("foo.jar0/extra"));
+        assert!(!ends_with_jar_or_sharded(""));
     }
 
     #[test]

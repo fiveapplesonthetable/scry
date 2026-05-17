@@ -6,3 +6,8 @@
 .envrc.local
 *.profraw
 *.profdata
+# Build-system cruft that lands in the repo root when scry's javac
+# wrapper or a kernel kbuild stub writes to cwd (instead of /mnt/agent/tmp).
+/javac.*.args
+/..*.o.d
+/scripts/.*.o.d

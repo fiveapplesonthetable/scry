@@ -592,3 +592,129 @@ A change is mergeable when:
 - If the change touches CLI shape, `docs/USAGE.md` is updated to
   reflect the new flag / command with at least one real-output
   example.
+
+## Open work
+
+State as of the last commit. Each entry should land its own PR + a
+test pinning the new behaviour.
+
+### build-symbols: AOSP coverage ceiling without a full `m`
+
+Current AOSP pipeline ships every JVM-side fix that doesn't require
+re-running Soong's own codegen. Concretely (after commits
+`77062bf … aa3dd4c`):
+
+- ninja-variable expansion across all shards
+- `javacFlags` / `kotlincFlags` forwarders with surgical filtering
+- patched `semanticdb-kotlinc` (FirFileSymbol stderr noise)
+- `--patch-module=java.base=…` for libcore + ART
+- shell-aware quoted-blob handling for ErrorProne
+- AIDL / KAPT srcjar extraction, sibling `R.jar`/`aconfig` classpath
+- variant fallback (pick the variant whose `.rsp` files exist)
+
+The remaining failures are modules whose entire variant set is
+unbuilt on disk (no `.rsp`, no `classpath.rsp`, no `gen/aidl/*`).
+For these, the only path to "0 failures" is materialising the
+Soong intermediates. Two options for the operator:
+
+1. **Targeted**:
+   ```sh
+   cd ~/dev/aosp && source build/envsetup.sh
+   lunch aosp_arm64-trunk_staging-userdebug
+   m PhotopickerLib SystemUI-core Launcher3QuickStepLib \
+     HealthConnectLibrary PermissionController-lib \
+     PlatformComposeSceneTransitionLayout
+   ```
+   ~30 min, ~5 GB additional `out/soong/` cost. Plugs ~20 specific
+   modules currently in `no-output`.
+
+2. **Full**:
+   ```sh
+   m droid
+   ```
+   ~2–4 h incremental, ~50–150 GB `out/soong/` cost depending on
+   lunch combo. Materialises every reachable variant.
+
+Out of scope: implementing AAPT2 / AIDL / KAPT / KSP / protoc /
+aconfig codegen pipelines inside scry-bridge ("become Soong"). The
+practical sequence is `m` first, scry build-symbols second.
+
+### Per-language partial-success classifier
+
+`tolerate_javac_errors=true` and `tolerate_kotlinc_errors=true`
+currently dump every PartialOnError compilation's first stderr line
+to the log. The classifier should split partials into:
+
+- **classpath-gap partial**: stderr contains `unresolved reference`
+  / `cannot find symbol` / `package X does not exist`. Plot of
+  resolved jars suggests these are missing-jar issues, not
+  scry-bridge bugs. Aggregate into one summary line per run.
+- **codegen partial**: stderr contains `Exception while generating
+  code for` or kotlinc 2.x FIR/IR error. Real plugin / compiler
+  bugs.
+- **source-error partial**: stderr contains a `.java:N:M: error:`
+  with a real syntactic / type-system fault from the user's code.
+  Real source defects — should never be tolerated, but currently
+  are.
+
+Splitting the partial bucket lets operators tell "20 module's worth
+of missing-codegen Hilt stubs" apart from "one source file has a
+genuine compile error".
+
+### Kernel 634 parse failures
+
+`scry build-symbols --build-kbuild …` on the current Linux corpus
+produces 634 `CXError_ASTReadError` (code 4) failures, mostly in
+`drivers/gpu/drm/amd/`, `virt/kvm/`, and arch-specific subsystems.
+Probable causes (in order of likelihood):
+
+1. The compile-commands.json was generated for one defconfig but
+   the source files reference headers selected by a different
+   defconfig (e.g. AMD GPU code expects `CONFIG_DRM_AMDGPU=y`).
+2. Cross-arch include paths (the entry says
+   `-D__KERNEL__ -Iarch/x86/include` but the file lives in
+   `arch/arm64/`).
+3. libclang's resolution of kernel-specific macros
+   (`__builtin_va_list`, gcc-only intrinsics) — but the
+   `is_gcc_only_flag` filter already handles the common ones.
+
+Open: classify the 634 failures by directory + dump one
+representative CXDiagnostic per group to identify the root cause.
+
+### `usr_for_window` warm latency
+
+The strict-precision query hot path resolves USRs by scanning the
+clang sidecar's records inside a byte window around each ref.
+Current measurement on AOSP+kernel corpus (clang_usrs.bin: ~10 GB,
+~5 M USR records, ~100 M reference records):
+
+- Cold: ~30 s for 2.5 k refs
+- Warm (page cache hot): **17 s for 2.5 k refs** — far worse than
+  expected. The query should be O(log N) per ref via the existing
+  byte-offset index, not O(N).
+
+Likely cause: each `usr_for_window` call linear-scans the whole
+records vector instead of binary-searching `(file_id, byte_offset)`
+sorted entries. Fix: build a (file_id → sorted byte_offsets) side
+table at sidecar open time, then bisect within it.
+
+Located in `crates/scry-store/src/clang_usrs.rs`; the lookup is
+already used by `cmd_callgraph`, `cmd_uses`, and the strict filter
+in `cmd_impact`. A 10× speedup here lands in every precision query.
+
+### File split: scry-cli main.rs
+
+`crates/scry-cli/src/main.rs` is ~10,800 lines, well past the
+700-line cap we hold elsewhere. Split candidates (roughly
+self-contained):
+
+- `cmd_grep` + the literal/regex scan path
+- `cmd_callgraph` + traversal helpers
+- `cmd_impact` + `cmd_subclasses`
+- the `build-*` sidecar commands (trigrams, offsets, file_refs,
+  file_symbols, resolutions, digests, embeddings)
+- the `Index` command's mega-function (currently inline)
+
+Each split should land as its own commit with no behavioural
+change (pure code motion + `pub(crate)` adjustments). Easier to
+do incrementally than as one huge refactor.

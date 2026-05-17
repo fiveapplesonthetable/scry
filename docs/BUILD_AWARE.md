@@ -86,6 +86,42 @@ root, importing each `.scip` into the same sidecar.
 After it finishes, every query auto-engages the precision filter
 unless you pass `--lexical`.
 
+### Indexer binary configuration
+
+`scry build-symbols` looks up each per-language indexer binary by
+name. Resolution order, highest priority first:
+
+1. Explicit `--<name>` flag (`--javac /opt/jdk/bin/javac`,
+   `--scip-java /opt/sg/bin/scip-java`, `--kotlinc <path>`,
+   `--rust-analyzer <path>`, `--scip-go <path>`,
+   `--scip-typescript <path>`, `--scip-python <path>`,
+   `--semanticdb-javac-jar <path>`, `--semanticdb-kotlinc-jar <path>`,
+   `--gn-binary <path>`, `--cmake-binary <path>`).
+2. Per-binary env var `SCRY_INDEXER_<NAME>` (uppercased, dashes →
+   underscores). Examples:
+   - `SCRY_INDEXER_JAVAC=/path/to/javac`
+   - `SCRY_INDEXER_SCIP_JAVA=/path/to/scip-java`
+   - `SCRY_INDEXER_KOTLINC_EMBEDDABLE=/path/to/kotlinc-embeddable`
+   - `SCRY_INDEXER_RUST_ANALYZER=/path/to/rust-analyzer`
+   - `SCRY_INDEXER_SCIP_GO=/path/to/scip-go`
+   - `SCRY_INDEXER_SCIP_TYPESCRIPT=/path/to/scip-typescript`
+   - `SCRY_INDEXER_SCIP_PYTHON=/path/to/scip-python`
+3. First match on `$PATH`.
+
+If none of those resolves to a real file, the bare name is passed
+to `std::process::Command::new`, which surfaces the kernel's
+`No such file or directory` error so the operator sees which binary
+is missing.
+
+### Scratch dir
+
+Every per-compilation `.semanticdb` shard, extracted srcjar dir,
+per-target `.scip`, and per-shard classes/ dir lands under
+`$SCRY_TMP_DIR/scry-*`. The default is `/mnt/agent/tmp`, NOT
+`/tmp` — AOSP-scale runs emit 30+ GB of intermediates and `/tmp`
+is often a small tmpfs that would fill in seconds. Override with
+`SCRY_TMP_DIR=/some/large/volume` if your layout differs.
+
 ### Auto-discovery
 
 `scry finalize` auto-discovers two kinds of artifacts inside each

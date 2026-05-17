@@ -63,6 +63,20 @@ precision (clang USRs / SCIP symbols) auto-engages whenever the
 corresponding sidecar is present, so you get Kythe-class identity
 narrowing by default — no flags to remember.
 
+### One-line install of every indexer scry consumes
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/master/scripts/install_indexers.sh)
+```
+
+Installs libclang + JDK + Go + npm + the SCIP indexers for all
+seven languages (TypeScript, Python, Rust, Go, Java, Kotlin, C/C++).
+Idempotent. Drops binaries under `~/.local/bin` (override with
+`PREFIX=…`). Builds semanticdb-kotlinc from source via sbt because
+it's not on Maven Central. See [`scripts/install_indexers.sh`].
+
+[`scripts/install_indexers.sh`]: scripts/install_indexers.sh
+
 ```sh
 # 1. Index the source tree.
 scry index ~/dev/myproject -o ./idx

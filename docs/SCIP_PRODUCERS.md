@@ -6,6 +6,11 @@ filter work across every producer below; the table is here so you
 can copy-paste the command to generate the SCIP file for your
 language without hunting through eight tool repos.
 
+**Quick install:** every producer below is installed in one shot by
+`scripts/install_indexers.sh` (see [`BUILD_AWARE.md`](BUILD_AWARE.md)
+or the README). Run that once instead of cherry-picking commands
+from this table.
+
 If a producer is missing from this list, file an issue — the
 format is canonical, so adding one is just a docs change.
 

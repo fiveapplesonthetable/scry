@@ -14,6 +14,31 @@ see [`SCIP_PRODUCERS.md`](SCIP_PRODUCERS.md). This file focuses on
 
 ## Quick start
 
+### Install every indexer in one shot
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/master/scripts/install_indexers.sh)
+```
+
+What it does (idempotent):
+- Installs `libclang`, `JDK`, `Go`, `node`, `npm` via your distro
+  package manager (apt-get / dnf / brew).
+- Installs `scip-typescript`, `scip-python` via npm into
+  `$PREFIX/lib/node_modules/.bin` (default `$PREFIX=~/.local`).
+- Installs `rust-analyzer` via `rustup component add`.
+- Installs `scip-go` via `go install`.
+- Downloads `scip-java` launcher from the GitHub release.
+- Downloads `gradle 8.10.2` (needed by scip-java + scip-kotlin).
+- Downloads `sbt 1.10.5` and uses it to build `semanticdb-kotlinc`
+  from source, publishing to `~/.m2/repository` (scip-kotlin isn't
+  on Maven Central — sbt publishM2 is the only install path).
+
+After it finishes, every `scry finalize --build-out PATH` call
+auto-discovers `compile_commands.json` and `*.scip` produced by
+these tools without per-language flag plumbing.
+
+### Auto-discovery
+
 `scry finalize` auto-discovers two kinds of artifacts inside each
 indexed source root:
 

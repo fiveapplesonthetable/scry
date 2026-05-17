@@ -7,6 +7,31 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.53] — 2026-05-17
+
+Tighter "Did you mean: …" suggestions. v0.1.52's hint forwarded
+the store's substring-preferring fuzzy ranking — fine for explicit
+`scry fuzzy QUERY` (where users typing a real substring expect
+substring hits) but wrong for typo suggestions, where a longer
+name that happens to substring-contain the typo (`MainActivty`)
+crowded out the obvious closer match (`Activity`).
+
+```
+# Before (v0.1.52):
+$ scry def Activty
+[scry] Did you mean: MainActivty, Active, Activate? ...
+
+# After (v0.1.53):
+$ scry def Activty
+[scry] Did you mean: Activity, MainActivty? ...
+```
+
+Fix: re-sort fuzzy hits inside `suggest_similar` by pure
+Levenshtein distance ascending (then by name-length proximity
+to the query, then alphabetical) before picking top 3 distinct
+names. The store's `lookup_fuzzy_ranked` is unchanged — only
+the typo-hint path overrides the ranking.
+
 ## [0.1.52] — 2026-05-17
 
 `scry def` and `scry callers` / `scry ref` now emit a "Did you

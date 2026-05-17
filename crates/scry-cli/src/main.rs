@@ -4108,11 +4108,29 @@ fn path_matches(path: &str, in_: Option<&str>, not_in: Option<&str>) -> bool {
 /// (~ms on a 31M-symbol index) and catches the common typo case
 /// without users needing to know about `scry fuzzy`. Returns None
 /// for very short names (high false-positive rate) or no matches.
+///
+/// Re-sorts fuzzy hits by pure Levenshtein distance (then length
+/// closeness, then alphabetical) — the store's `lookup_fuzzy_ranked`
+/// favors substring matches, which is the right call for explicit
+/// `scry fuzzy QUERY` (where a user typing a real substring expects
+/// substring hits). For typo suggestions the user typed a misspelled
+/// identifier, so a closer Levenshtein match (`Activity` from
+/// `Activty`) is more useful than a longer name that happens to
+/// substring-contain the typo (`MainActivty`).
 fn suggest_similar(reader: &StoreReader, name: &str) -> Option<String> {
     if name.len() < 3 { return None; }
-    let hits = reader.lookup_fuzzy_ranked(name, 2, 8);
+    let mut hits = reader.lookup_fuzzy_ranked(name, 2, 16);
     if hits.is_empty() { return None; }
-    // Keep top-3 distinct names in the rank order fuzzy returned them.
+    // Closer Levenshtein first; tie-break by name-length proximity to
+    // the query (the typo and the real name usually differ by ≤ 2 chars),
+    // then alphabetical for determinism.
+    let q_len = name.len() as i32;
+    hits.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| (a.0.name.len() as i32 - q_len).abs()
+                          .cmp(&(b.0.name.len() as i32 - q_len).abs()))
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut names: Vec<String> = Vec::new();
     for (s, _d) in hits {

@@ -72,6 +72,19 @@ fn extract_v1_count(status: &str) -> usize {
         .and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Helper: run `scry ref NAME --scip-precise --index DIR` and capture
+/// stdout + stderr. Returns (stdout_string, stderr_string, exit_ok).
+fn run_scip_precise_ref(idx: &Path, name: &str) -> (String, String, bool) {
+    let r = Command::new(scry_bin())
+        .args(["ref", name, "--scip-precise", "--index"]).arg(idx)
+        .output().expect("spawn scry ref --scip-precise");
+    (
+        String::from_utf8_lossy(&r.stdout).into_owned(),
+        String::from_utf8_lossy(&r.stderr).into_owned(),
+        r.status.success(),
+    )
+}
+
 // ===========================================================================
 // TypeScript via scip-typescript
 // ===========================================================================
@@ -142,6 +155,20 @@ export function pet(a: Animal): string { return a.speak(); }
     // version drift.
     assert!(n_syms >= 5,
         "scip-typescript should produce >= 5 symbols from the fixture; got: {status}");
+
+    // Precision filter is engaged: --scip-precise narrows refs to
+    // those whose SCIP symbol matches a def's SCIP symbol. Even when
+    // the count doesn't change (single def, single ref), the filter
+    // log line proves the SCIP sidecar was consulted on every ref.
+    // This is the Kythe-level identity check: a ref's structured
+    // symbol must equal the def's structured symbol.
+    let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
+    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(stderr.contains("--scip-precise:"),
+        "--scip-precise should emit a diagnostic line proving the filter \
+         was engaged; got stderr:\n{stderr}");
+    assert!(stderr.contains("after SCIP symbol identity filter"),
+        "filter output should mention the identity filter step; got:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -307,6 +334,11 @@ pub fn pet<S: Speak>(s: &S) -> &'static str { s.speak() }
     assert!(extract_v1_count(&status) >= 3,
         "rust-analyzer should produce >= 3 symbols (Speak/Dog/pet); got: {status}");
 
+    let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
+    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(stderr.contains("--scip-precise:"),
+        "filter should be engaged; got stderr:\n{stderr}");
+
     std::fs::remove_dir_all(&base).ok();
 }
 
@@ -370,6 +402,11 @@ func Pet(a Animal) string { return a.Speak() }
     let status = health_status(&idx, "scip_index");
     assert!(status.starts_with("v1,"),
         "scip_index health should be 'v1, …'; got: {status}");
+
+    let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "Speak");
+    assert!(ok, "scry ref Speak --scip-precise failed: {stderr}");
+    assert!(stderr.contains("--scip-precise:"),
+        "filter should be engaged; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -442,6 +479,11 @@ def pet(a: Animal) -> str:
         "scip_index health should be 'v1, …'; got: {status}");
     assert!(extract_v1_count(&status) >= 3,
         "scip-python should produce >= 3 symbols (Animal/Dog/pet); got: {status}");
+
+    let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
+    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(stderr.contains("--scip-precise:"),
+        "filter should be engaged; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
 }

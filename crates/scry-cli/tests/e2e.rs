@@ -2653,5 +2653,25 @@ public class A {
     assert!(!stderr.contains("Did you mean"),
         "filtered 0-result must NOT trigger the typo hint; got: {stderr}");
 
+    // v0.1.54 — same hint extended to subclasses + callgraph + uses
+    // + impact. Each runs on the typo `bindServce` and must surface
+    // `bindService` in its stderr hint.
+    for (subcmd, extra_args) in [
+        ("subclasses", vec!["--limit", "3"]),
+        ("callgraph",  vec!["--depth", "1"]),
+        ("uses",       vec!["--limit", "3"]),
+        ("impact",     vec!["--limit", "3"]),
+    ] {
+        let mut cmd = Command::new(scry_bin());
+        cmd.arg(subcmd).arg("bindServce").arg("--index").arg(&idx);
+        for a in &extra_args { cmd.arg(a); }
+        let out = cmd.output().expect(&format!("spawn {subcmd} typo"));
+        assert!(out.status.success(),
+            "{subcmd} typo failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Did you mean") && stderr.contains("bindService"),
+            "{subcmd} stderr should suggest bindService; got: {stderr}");
+    }
+
     std::fs::remove_dir_all(&base).ok();
 }

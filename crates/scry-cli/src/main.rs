@@ -2760,6 +2760,13 @@ fn cmd_callgraph(
         }
         if tree.is_empty() {
             println!("  (no callers found)");
+            // v0.1.54 — typo hint when nothing matched. Gated on
+            // no narrowing flags (same logic as cmd_def / cmd_ref).
+            if in_.is_none() && not_in.is_none() && def_in.is_none() {
+                if let Some(hint) = suggest_similar(&r, &name) {
+                    eprintln!("[scry] {hint}");
+                }
+            }
         } else {
             render(&tree, 2);
         }
@@ -2905,6 +2912,16 @@ fn cmd_impact(
             "impact of {name:?}: {} callers, {} subclasses (depth {}), {} files touched",
             callers.len(), subclasses.len(), subclass_depth, files_touched.len(),
         );
+        // v0.1.54 — typo hint when impact yields nothing AND no filter
+        // narrowed the search. Helps users who typo the name (the no-op
+        // shape would otherwise be silently confusing).
+        if callers.is_empty() && subclasses.is_empty()
+            && in_.is_none() && not_in.is_none() && def_in.is_none()
+        {
+            if let Some(hint) = suggest_similar(&r, &name) {
+                eprintln!("[scry] {hint}");
+            }
+        }
         if !callers.is_empty() {
             println!("\n== callers (showing {}) ==", callers.len().min(limit));
             for rr in callers.iter().take(limit) {
@@ -2961,6 +2978,14 @@ fn cmd_subclasses(
         .collect();
     rank_symbols(&mut filtered, &r);
     print_results(&r, &filtered, limit, json);
+    // v0.1.54 — fuzzy "Did you mean" hint when no subclasses found.
+    // Gated on no filter narrowing the search: with --in set, an empty
+    // result means "no subclass in that subtree", not "name unknown".
+    if filtered.is_empty() && in_.is_none() {
+        if let Some(hint) = suggest_similar(&r, &name) {
+            eprintln!("[scry] {hint}");
+        }
+    }
     if !json {
         eprintln!(
             "[scry] cmd=subclasses q={:?} depth={} hits={} shown={} elapsed={}ms",
@@ -4119,7 +4144,15 @@ fn path_matches(path: &str, in_: Option<&str>, not_in: Option<&str>) -> bool {
 /// substring-contain the typo (`MainActivty`).
 fn suggest_similar(reader: &StoreReader, name: &str) -> Option<String> {
     if name.len() < 3 { return None; }
-    let mut hits = reader.lookup_fuzzy_ranked(name, 2, 16);
+    let mut hits = reader.lookup_fuzzy_ranked(name, 2, 32);
+    if hits.is_empty() { return None; }
+    // Drop pathologically long candidate names — the HTML/Javadoc
+    // indexer surfaces anchor IDs like `Z_handleUnknownTypeId-…` that
+    // can be 200+ chars; they're never what a user typed when
+    // hand-typing an identifier name. Cap at 4× query length, with a
+    // hard floor of 64 so short queries still see reasonable matches.
+    let max_len = (name.len() * 4).max(64);
+    hits.retain(|(s, _d)| s.name.len() <= max_len);
     if hits.is_empty() { return None; }
     // Closer Levenshtein first; tie-break by name-length proximity to
     // the query (the typo and the real name usually differ by ≤ 2 chars),
@@ -5104,6 +5137,12 @@ fn cmd_uses(
         if let Some(p) = in_.as_deref() { hint.push_str(&format!(" matching --in {p:?}")); }
         if let Some(p) = not_in.as_deref() { hint.push_str(&format!(" (excluding --not-in {p:?})")); }
         eprintln!("[scry] uses: no def of {name:?} found{hint}");
+        // v0.1.54 — typo hint when no path filter ruled defs out.
+        if in_.is_none() && not_in.is_none() {
+            if let Some(h) = suggest_similar(&r, &name) {
+                eprintln!("[scry] {h}");
+            }
+        }
         return Ok(());
     }
 

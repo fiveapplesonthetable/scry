@@ -7,6 +7,40 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.54] — 2026-05-17
+
+Extend the "Did you mean: …" hint (v0.1.52) to four more
+name-lookup commands: `subclasses`, `implementations`,
+`callgraph`, `uses`, `impact`. Each now surfaces the typo
+suggestion when its primary lookup yields nothing — same
+gating (no narrowing filter set) as the def/ref/callers path.
+
+```
+$ scry subclasses Activty
+0 results (showing 0)
+[scry] Did you mean: Activity, MainActivty? (run `scry fuzzy Activty` for the full list.)
+
+$ scry callgraph bindServce --depth 1
+callgraph (incoming, depth 1) of "bindServce":
+  (no callers found)
+[scry] Did you mean: bindService? (run `scry fuzzy bindServce` for the full list.)
+
+$ scry uses bindServce
+[scry] uses: no def of "bindServce" found
+[scry] Did you mean: bindService? (run `scry fuzzy bindServce` for the full list.)
+```
+
+Robustness fix in `suggest_similar`: drop pathologically long
+candidate names (cap at `4 × query.len()`, floor 64). The
+HTML/Javadoc indexer surfaces anchor IDs like
+`Z_handleUnknownTypeId-com.fasterxml.jackson.databind…` that
+can be 200+ chars; they're never what a user typed by hand.
+Without the cap, a typo on a short identifier could spam the
+terminal with paragraph-long suggestions.
+
+E2E test: `fuzzy_hint_on_zero_results` extended with a
+parameterized loop covering all four new subcommands.
+
 ## [0.1.53] — 2026-05-17
 
 Tighter "Did you mean: …" suggestions. v0.1.52's hint forwarded

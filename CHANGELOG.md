@@ -7,6 +7,72 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.27] — 2026-05-17
+
+Honest Java method-call resolution in `scry build-resolutions`.
+v0.1.26 shipped `--def-in PATH` to narrow xrefs by def-site
+location, but it returned 0 hits on the live index because the
+Layer 2 resolver was over-confidently pinning every ambiguous
+method call (e.g. all 65 503 `close()` calls on AOSP+Linux) to
+one arbitrary `pool[0]` candidate, hiding the real call graph.
+
+**Resolver changes (`resolve_one` in `cmd_build_resolutions`):**
+
+- **Same-file preference (all langs).** A call to `foo()` inside
+  file F that has a unique `foo` def in F now resolves there
+  first, before falling through to per-language narrowing.
+  Catches self-calls and inner-class refs without needing
+  receiver-type inference.
+- **Truthful unresolved for ambiguous method calls.** When a
+  `Call` / `Ctor` / `FieldAccess` ref remains ambiguous after
+  all narrowing rules, the resolver now returns 0 (unresolved)
+  instead of picking the misleading `pool[0]`. Without
+  receiver-type inference we cannot honestly pick between
+  many same-named methods, so the right behavior is to be
+  silent — and let `--def-in PATH`'s permissive branch include
+  the ref as "we don't know, keep it." Other ref kinds
+  (`TypeUse`, `Import`, `InheritFrom`, `UsingNamespace`) keep
+  the `pool[0]` fallback — types referenced unqualified are far
+  less ambiguous than methods.
+
+**Impact on `--def-in PerfettoTrace.java`:**
+
+- Before: 65 503 `close()` refs → 0 kept (all mis-resolved to
+  the same canonical close).
+- After (post-rebuild): same-file calls land on the right
+  PerfettoTrace.Session.close, cross-file ambiguous calls
+  pass through unresolved-but-kept. Users see the actual
+  call graph.
+
+**To take effect on an existing index:**
+- Run `scry build-resolutions --index DIR` to rewrite the
+  resolutions sidecar. No symbols/refs rebuild needed.
+- New tests: `resolve_one_java_call_ambiguous_returns_unresolved`,
+  `resolve_one_java_typeuse_ambiguous_keeps_pool0_fallback`,
+  `resolve_one_same_file_preference`.
+
+**Parallel `scry build-resolutions` (pass 3):**
+
+- Resolution is now parallelized via rayon: refs are batched
+  into 64K-record chunks, dispatched to a worker pool, and
+  written back in iteration order (the sidecar format requires
+  `byte_offset = ref_idx * 8`).
+- Live AOSP+Linux corpus (63.3 M refs) measurement:
+  - pass 3 before: ~11+ min (single-threaded, killed)
+  - pass 3 after: **61 s** (~11×+ on a 16-core box)
+- Atomic tmp+rename is unchanged; failed runs leave the
+  previous sidecar intact.
+
+**Live AOSP+Linux numbers after the rebuild:**
+
+- 25.6 M refs resolved (vs ~60 M previously — the drop is
+  expected and correct; we no longer claim false certainty
+  on ambiguous method calls).
+- 7.5 M refs narrowed via Java context (same-pkg / imports /
+  same-file preference / C++ namespace).
+- `scry callers close --def-in PerfettoTrace.java` now returns
+  57 890 over-included candidate callers (previously returned 0).
+
 ## [0.1.26] — 2026-05-17
 
 Two agent-critique fixes bundled together.

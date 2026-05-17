@@ -5745,22 +5745,52 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
               per_file_imports.len(), per_file_using_ns.len(), t2.elapsed().as_millis());
 
     // --- Pass 3: resolve every ref, write sidecar. ---
+    //
+    // Parallel resolution with rayon: collect refs into chunks of
+    // ~64K, resolve each chunk on a worker, then write chunks back
+    // out in iteration order. The sidecar format is byte_offset =
+    // ref_idx * 8, so ordering MUST be preserved — we collect chunks
+    // sequentially from `iter_refs`, dispatch resolution in parallel,
+    // and stream the results back in submission order.
+    //
+    // Memory: at peak we hold ~16 chunks × 64K refs × ~64B/ref ≈
+    // ~64 MiB of input + ~16 chunks × 64K × 8B = ~8 MiB output.
+    // Well within budget.
     let t3 = Instant::now();
     let tmp = paths.ref_resolutions().with_extension("bin.tmp");
     let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
-    let mut resolved_count: u64 = 0;
-    let mut narrowed_count: u64 = 0;
-    let mut resolve_ref = |rr: &RefRecord| -> Result<()> {
-        let chosen_id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
-                                     &per_file_using_ns, &mut narrowed_count);
-        if chosen_id != 0 { resolved_count += 1; }
-        ow.write_all(&chosen_id.to_le_bytes())?;
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let resolved_count = AtomicU64::new(0);
+    let narrowed_count = AtomicU64::new(0);
+    let mut chunk: Vec<RefRecord> = Vec::with_capacity(CHUNK_SIZE);
+    let process_chunk = |chunk: &mut Vec<RefRecord>, ow: &mut BufWriter<std::fs::File>| -> Result<()> {
+        if chunk.is_empty() { return Ok(()); }
+        let ids: Vec<u64> = chunk.par_iter().map(|rr| {
+            let mut local_narrowed = 0u64;
+            let id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
+                                 &per_file_using_ns, &mut local_narrowed);
+            if local_narrowed > 0 { narrowed_count.fetch_add(local_narrowed, Ordering::Relaxed); }
+            if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
+            id
+        }).collect();
+        for id in ids { ow.write_all(&id.to_le_bytes())?; }
+        chunk.clear();
         Ok(())
     };
-    for rr in r.iter_refs() { resolve_ref(&rr)?; }
+    for rr in r.iter_refs() {
+        chunk.push(rr);
+        if chunk.len() >= CHUNK_SIZE {
+            process_chunk(&mut chunk, &mut ow)?;
+        }
+    }
+    process_chunk(&mut chunk, &mut ow)?;
     ow.flush()?;
     drop(ow);
     std::fs::rename(&tmp, paths.ref_resolutions())?;
+    let resolved_count = resolved_count.into_inner();
+    let narrowed_count = narrowed_count.into_inner();
     eprintln!("[res] pass 3 (resolve {} refs, {} resolved, {} narrowed via Java context) in {} ms",
               n_refs, resolved_count, narrowed_count, t3.elapsed().as_millis());
     eprintln!("[res] DONE. {} bytes written → {}",
@@ -5791,6 +5821,19 @@ fn resolve_one(
         return cands[0].id;
     };
     if pool.len() == 1 { return pool[0].id; }
+
+    // Same-file preference (all langs). A call to `foo()` inside file F
+    // is much more likely to resolve to `foo` defined in F than to one
+    // of the many `foo`s elsewhere in the corpus. Catches self-calls
+    // and inner-class references without needing receiver inference.
+    {
+        let same_file: Vec<&&ResolveDef> = pool.iter()
+            .filter(|c| c.file_id == rr.file_id).collect();
+        if same_file.len() == 1 {
+            *narrowed += 1;
+            return same_file[0].id;
+        }
+    }
 
     // Java / Kotlin share the same package-narrowing shape: same package
     // → explicit import → wildcard import → implicit-import fallback.
@@ -5891,6 +5934,19 @@ fn resolve_one(
                 }
             }
         }
+    }
+
+    // Truthful unresolved for ambiguous method/ctor/field calls.
+    // Without receiver-type inference we cannot pick the right method
+    // from a sea of same-named candidates. Returning 0 here (rather
+    // than the misleading pool[0]) lets `--def-in PATH`'s permissive
+    // branch include the ref instead of incorrectly excluding it.
+    // Other ref kinds (type-use, import, inherit) keep the pool[0]
+    // fallback — they tend to refer to types, which are far less
+    // ambiguous than methods sharing a common name.
+    use scry_store::RefKind;
+    if matches!(rr.kind, RefKind::Call | RefKind::FieldAccess | RefKind::Ctor) {
+        return 0;
     }
 
     pool[0].id
@@ -9257,18 +9313,67 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    /// Ambiguous Java *method call* with no narrowing context →
+    /// unresolved (returns 0). v0.1.27 dropped the misleading
+    /// pool[0] fallback for Call / Ctor / FieldAccess refs: without
+    /// receiver-type inference we cannot pick the right method from
+    /// a sea of same-named candidates, so the resolver is honest
+    /// about ambiguity. `--def-in PATH`'s permissive branch then
+    /// includes these refs (over-include rather than mis-include).
     #[test]
-    fn resolve_one_java_no_narrowing_fallback() {
+    fn resolve_one_java_call_ambiguous_returns_unresolved() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("close".into(), vec![
+            mk_def(11, FileKind::Java, Some("com.other")),
+            mk_def(22, FileKind::Java, Some("com.third")),
+        ]);
+        let r = mk_ref("close", FileKind::Java, 5);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        assert_eq!(got, 0, "ambiguous Java method call should resolve to 0 (unresolved), not arbitrary pool[0]");
+        assert_eq!(n, 0);
+    }
+
+    /// Type-use refs (and other non-call kinds) DO keep the pool[0]
+    /// fallback — types referenced unqualified are far less ambiguous
+    /// than methods, and the resolver was already doing the right
+    /// thing for those.
+    #[test]
+    fn resolve_one_java_typeuse_ambiguous_keeps_pool0_fallback() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         by_name.insert("Foo".into(), vec![
             mk_def(11, FileKind::Java, Some("com.other")),
             mk_def(22, FileKind::Java, Some("com.third")),
         ]);
-        let r = mk_ref("Foo", FileKind::Java, 5);
+        let mut r = mk_ref("Foo", FileKind::Java, 5);
+        r.kind = RefKind::TypeUse;
         let mut n = 0u64;
         let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
         assert_eq!(got, 11);
         assert_eq!(n, 0);
+    }
+
+    /// Same-file preference: a call to `foo()` inside file F that
+    /// has a uniquely-named `foo` def in F wins, even when other
+    /// `foo` defs exist in the corpus. v0.1.27 narrowing rule.
+    #[test]
+    fn resolve_one_same_file_preference() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("close".into(), vec![
+            // Same-file (file_id=7) candidate — should win.
+            ResolveDef { id: 99, file_id: 7, lang: FileKind::Java,
+                         pkg: Some("com.foo".into()), scope_path: vec![] },
+            // Two other candidates elsewhere.
+            ResolveDef { id: 11, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("com.other".into()), scope_path: vec![] },
+            ResolveDef { id: 22, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("com.third".into()), scope_path: vec![] },
+        ]);
+        let r = mk_ref("close", FileKind::Java, 7);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        assert_eq!(got, 99, "same-file def should win over corpus-wide ambiguity");
+        assert_eq!(n, 1, "same-file pick counts as narrowed");
     }
 
     // ---- Kotlin Layer 2 ----

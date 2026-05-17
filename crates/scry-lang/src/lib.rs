@@ -1712,15 +1712,6 @@ fn cpp_refs_spec() -> &'static RefSpec {
                 (call_expression function: (field_expression field: (field_identifier) @ref.call))
                 (call_expression function: (qualified_identifier name: (identifier) @ref.call))
                 (call_expression function: (template_function name: (identifier) @ref.call))
-                ; v0.1.63 — scoped-call scope capture. For `Foo::bar()`
-                ; the scope identifier `Foo` is the static receiver —
-                ; emit as TypeUse so receiver-aware narrowing (v0.1.62)
-                ; can pin which `bar` is the target. The tree-sitter-cpp
-                ; grammar uses `namespace_identifier` for the scope
-                ; child, even when the actual entity is a class (the
-                ; grammar can't distinguish without semantic analysis).
-                (call_expression function: (qualified_identifier
-                    scope: (namespace_identifier) @ref.static_recv))
                 (new_expression type: (type_identifier) @ref.ctor)
                 (base_class_clause (type_identifier) @ref.inherit)
                 (preproc_include path: (string_literal) @ref.import)
@@ -1734,7 +1725,6 @@ fn cpp_refs_spec() -> &'static RefSpec {
             query: q,
             capture_kinds: &[
                 ("ref.call", RefKind::Call),
-                ("ref.static_recv", RefKind::TypeUse),
                 ("ref.ctor", RefKind::Ctor),
                 ("ref.inherit", RefKind::InheritFrom),
                 ("ref.import", RefKind::Import),
@@ -1756,18 +1746,6 @@ fn rust_refs_spec() -> &'static RefSpec {
                 r#"
                 (call_expression function: (identifier) @ref.call)
                 (call_expression function: (scoped_identifier name: (identifier) @ref.call))
-                ; v0.1.63 — Rust scoped-call scope. For `Foo::bar()` the
-                ; scope is the path's last identifier (the trait/type/
-                ; module name). Captured as TypeUse so receiver-aware
-                ; narrowing (v0.1.62) can pin which `bar` is the target.
-                ; PascalCase filter downstream catches the type-named
-                ; case (`Foo::bar`) and rejects lowercase module paths
-                ; (`std::fmt::write`) — modules would be too noisy and
-                ; the resolver's import-aware narrowing already covers
-                ; them. (Future: extend filter to whitelist known crate
-                ; roots like std/alloc/core.)
-                (call_expression function: (scoped_identifier
-                    path: (identifier) @ref.static_recv))
                 (call_expression function: (field_expression field: (field_identifier) @ref.call))
                 (macro_invocation macro: (identifier) @ref.call)
                 (use_declaration (scoped_identifier name: (identifier) @ref.import))
@@ -1780,7 +1758,6 @@ fn rust_refs_spec() -> &'static RefSpec {
             query: q,
             capture_kinds: &[
                 ("ref.call", RefKind::Call),
-                ("ref.static_recv", RefKind::TypeUse),
                 ("ref.inherit", RefKind::InheritFrom),
                 ("ref.import", RefKind::Import),
             ],

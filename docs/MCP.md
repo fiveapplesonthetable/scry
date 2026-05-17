@@ -52,23 +52,56 @@ Any other method gets a JSON-RPC `-32601` (method not found) error.
 
 ### Available tools
 
-| tool       | required args | optional args                          | what it returns                        |
-|------------|---------------|----------------------------------------|----------------------------------------|
-| `def`      | `name`        | `lang`, `kind`, `in`, `limit`          | symbol definition records              |
-| `ref`      | `name`        | `lang`, `kind`, `in`, `limit`          | reference records (any kind)           |
-| `callers`  | `name`        | `lang`, `in`, `limit`                  | references with `kind=call`            |
-| `prefix`   | `prefix`      | `in`, `limit`                          | symbols whose name starts with PREFIX  |
-| `fuzzy`    | `substr`      | `in`, `distance`, `limit`              | edit-distance-ranked symbol matches    |
-| `grep`     | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `limit`, `format` | content matches (literal substring; `regex: true` for regex; `case_insensitive: true` for case-folded match) |
-| `outline`  | `path`        | `limit`                                | every symbol in the file, by line      |
-| `coverage` | `path`        | `by_kind`                              | per-language file/byte/symbol counts   |
-| `stats`    | —             | —                                      | index metadata                         |
-| `ask`      | `query`       | `in`, `limit`                          | semantic-retrieval chunks (cosine-ranked) |
+| tool             | required args | optional args                                                                                            | what it returns                              |
+|------------------|---------------|----------------------------------------------------------------------------------------------------------|----------------------------------------------|
+| `def`            | `name`        | `lang`, `kind`, `in`, `limit`                                                                            | symbol definition records                    |
+| `ref`            | `name`        | `lang`, `kind`, `in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                        | reference records (any kind)                 |
+| `callers`        | `name`        | `lang`, `in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                                | references with `kind=call`                  |
+| `prefix`         | `prefix`      | `in`, `limit`                                                                                            | symbols whose name starts with PREFIX        |
+| `fuzzy`          | `substr`      | `in`, `distance`, `limit`                                                                                | edit-distance-ranked symbol matches          |
+| `grep`           | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `limit`, `format`                                             | content matches                              |
+| `outline`        | `path`        | `limit`                                                                                                  | every symbol in the file, by line            |
+| `coverage`       | `path`        | `by_kind`                                                                                                | per-language file/byte/symbol counts         |
+| `stats`          | —             | —                                                                                                        | index metadata (incl `refs_resolved` %)      |
+| `subclasses`     | `name`        | `in`, `limit`, `depth`                                                                                   | direct or transitive subtypes                |
+| `implementations`| `name`        | `in`, `limit`, `depth`                                                                                   | alias of `subclasses` (LSP shape)            |
+| `impact`         | `name`        | `in`, `limit`, `subclass_depth`, `reachable`, `def_in`, `strict`                                         | callers + subclasses + files_touched         |
+| `callgraph`      | `name`        | `in`, `depth`, `max_nodes`, `reachable`, `def_in`, `strict`                                              | recursive caller tree                        |
+| `uses`           | `name`        | `in`, `kind`, `limit`                                                                                    | outgoing edges from NAME's body              |
+| `ask`            | `query`       | `in`, `limit`                                                                                            | semantic-retrieval chunks (cosine-ranked)    |
 
 `limit` defaults to 20. `in` is a path-substring filter, same
 semantics as the CLI's `--in`. Tool `ask` requires the index to have
 been processed by `scry build-embeddings`; otherwise the tool returns
 a tool-level error (see "Error semantics" below).
+
+#### Resolver-aware flags (v0.1.26+)
+
+`def_in`, `strict`, and `format: "by-def"` are available on
+the `ref`, `callers`, `callgraph`, and `impact` tools (some
+also expose `scope`):
+
+- **`def_in: string`** — substring of the def-site file path.
+  Keeps only refs whose Layer 2 resolution (`resolved_to`)
+  lands at a def in a file containing this path. Permissive:
+  refs with `resolved_to=null` pass through (over-include
+  rather than silently drop). No-op without the
+  build-resolutions sidecar.
+- **`strict: bool`** — drop refs whose Layer 2 resolution
+  didn't land on a specific def. With `def_in`, also drops
+  the permissive over-include — only confident hits survive.
+- **`format: "by-def"`** (ref/callers only) — returns a
+  histogram array instead of per-ref records. Each entry:
+  `{count, def: {path, line, col, scope, kind, id}}`. The
+  unresolved bucket is last as `{count, def: null}`. Use this
+  to see WHICH def the refs actually target — invaluable for
+  polymorphic names like `close`, `onCreate`, `transact`.
+
+The `stats` tool's response now includes
+`refs_resolved: number | null` and
+`refs_resolved_pct: number | null` — `null` when the
+build-resolutions sidecar isn't present. Higher percentage
+means `def_in`/`strict` narrowing will be more effective.
 
 ---
 

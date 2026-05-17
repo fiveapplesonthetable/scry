@@ -5875,6 +5875,28 @@ fn resolve_one(
                     }
                 }
             }
+            // Import-aware class-narrowing for method-call refs (v0.1.28).
+            // Java imports are class-level, not method-level, so the rules
+            // above (which match `simple == &rr.name`) only catch the
+            // constructor case `new Foo()` where Foo is imported.
+            // Regular method calls like `session.close()` need a different
+            // angle: check whether any candidate's OWNING CLASS is imported
+            // in the calling file. If exactly one such candidate exists,
+            // prefer it — the file imports a single class with this method,
+            // strong signal the call targets it. Multiple imported
+            // candidates → still ambiguous (fall through to implicit_pkgs).
+            let imported_class_matches: Vec<&&ResolveDef> = pool.iter().filter(|c| {
+                let Some(c_pkg) = c.pkg.as_deref() else { return false };
+                let Some(outer) = c.scope_path.first() else { return false };
+                imps.iter().any(|(simple, ipkg)| {
+                    let ipkg = match ipkg { Some(p) => p.as_str(), None => return false };
+                    (simple == outer || simple == "*") && ipkg == c_pkg
+                })
+            }).collect();
+            if imported_class_matches.len() == 1 {
+                *narrowed += 1;
+                return imported_class_matches[0].id;
+            }
         }
         let implicit_pkgs: &[&str] = match rr.lang {
             FileKind::Java => &["java.lang"],
@@ -9380,6 +9402,85 @@ mod tests {
 
     /// Kotlin same-package narrowing mirrors Java: a file's package
     /// matches one candidate → that one wins.
+    /// Import-aware class narrowing (v0.1.28). Java file imports
+    /// `android.os.PerfettoTrace`; an ambiguous `close()` call there
+    /// should resolve to PerfettoTrace.Session.close because that's
+    /// the only candidate whose owning class is imported.
+    #[test]
+    fn resolve_one_java_method_call_via_class_import() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("close".into(), vec![
+            // PerfettoTrace.Session.close — outer class imported.
+            ResolveDef { id: 99, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("android.os".into()),
+                         scope_path: vec!["PerfettoTrace".into(), "Session".into()] },
+            // Closeable.close — not imported.
+            ResolveDef { id: 11, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("java.io".into()),
+                         scope_path: vec!["Closeable".into()] },
+        ]);
+        let mut imports = HashMap::new();
+        imports.insert(5u32, vec![
+            ("PerfettoTrace".to_string(), Some("android.os".to_string())),
+        ]);
+        let r = mk_ref("close", FileKind::Java, 5);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n);
+        assert_eq!(got, 99, "should resolve to the imported class's method");
+        assert_eq!(n, 1, "import-aware narrowing counts as narrowed");
+    }
+
+    /// Wildcard import variant: `import android.os.*` should also
+    /// trigger the class-import narrowing rule.
+    #[test]
+    fn resolve_one_java_method_call_via_wildcard_class_import() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("close".into(), vec![
+            ResolveDef { id: 99, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("android.os".into()),
+                         scope_path: vec!["PerfettoTrace".into(), "Session".into()] },
+            ResolveDef { id: 11, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("java.io".into()),
+                         scope_path: vec!["Closeable".into()] },
+        ]);
+        let mut imports = HashMap::new();
+        imports.insert(5u32, vec![
+            ("*".to_string(), Some("android.os".to_string())),
+        ]);
+        let r = mk_ref("close", FileKind::Java, 5);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n);
+        assert_eq!(got, 99);
+        assert_eq!(n, 1);
+    }
+
+    /// When multiple imported classes both define the method, the
+    /// import-aware rule must NOT pick one — fall through to the
+    /// truthful-unresolved branch for method calls.
+    #[test]
+    fn resolve_one_java_method_call_ambiguous_imports_stay_unresolved() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("close".into(), vec![
+            ResolveDef { id: 99, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("android.os".into()),
+                         scope_path: vec!["PerfettoTrace".into(), "Session".into()] },
+            ResolveDef { id: 88, file_id: 0, lang: FileKind::Java,
+                         pkg: Some("com.x".into()),
+                         scope_path: vec!["OtherClass".into()] },
+        ]);
+        let mut imports = HashMap::new();
+        // Both classes imported → ambiguous, must stay unresolved.
+        imports.insert(5u32, vec![
+            ("PerfettoTrace".to_string(), Some("android.os".to_string())),
+            ("OtherClass".to_string(), Some("com.x".to_string())),
+        ]);
+        let r = mk_ref("close", FileKind::Java, 5);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n);
+        assert_eq!(got, 0, "two viable imported candidates → unresolved (truthful)");
+        assert_eq!(n, 0);
+    }
+
     #[test]
     fn resolve_one_kotlin_same_package_narrowing() {
         let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();

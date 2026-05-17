@@ -2125,3 +2125,66 @@ public class Hit {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.28 — Java import refs must store the FULL qualified path,
+/// not just the trailing identifier. Without the package side,
+/// `cmd_build_resolutions`'s import-aware narrowing rule can never
+/// fire (it needs (pkg, simple) to match candidate FQNs).
+///
+/// Indexes one file with `import android.os.PerfettoTrace;` and
+/// asserts the Import ref's name is the full "android.os.PerfettoTrace".
+#[test]
+fn java_import_ref_captures_full_qualified_path() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-java-import-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("com/example")).unwrap();
+    std::fs::write(src.join("com/example/Caller.java"), r#"package com.example;
+import android.os.PerfettoTrace;
+public class Caller {
+    public void run(PerfettoTrace.Session s) {
+        s.close();
+    }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Look for the import ref by its FULL qualified name.
+    let out = Command::new(scry_bin())
+        .args(["ref", "android.os.PerfettoTrace", "--kind", "import",
+               "--index"]).arg(&idx).args(["--json"])
+        .output().expect("spawn scry ref");
+    assert!(out.status.success(),
+            "scry ref failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(!lines.is_empty(),
+            "should find import ref by full path 'android.os.PerfettoTrace'; \
+             got 0 hits — Java import query regressed to trailing-identifier only");
+
+    // The opposite: looking up by the bare class name should now miss
+    // (because the import ref's name is the full path, not "PerfettoTrace").
+    let out = Command::new(scry_bin())
+        .args(["ref", "PerfettoTrace", "--kind", "import", "--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("spawn scry ref");
+    assert!(out.status.success());
+    let bare_hits: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(bare_hits.is_empty(),
+            "import lookup by bare 'PerfettoTrace' should miss after the \
+             full-path fix; got {} hits", bare_hits.len());
+
+    std::fs::remove_dir_all(&base).ok();
+}

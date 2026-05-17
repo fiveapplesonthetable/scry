@@ -7,6 +7,58 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.28] — 2026-05-17
+
+Real fix for the "wrong `close()` callers in precise mode" complaint.
+v0.1.26 added `--def-in PATH` and v0.1.27 made the resolver
+honest about ambiguity, but the **root cause** was deeper: the
+Java import query only captured the trailing identifier
+(`PerfettoTrace`) instead of the full path
+(`android.os.PerfettoTrace`), so `cmd_build_resolutions`'s
+package-narrowing rules saw `(simple="PerfettoTrace", pkg=None)`
+and couldn't match candidates by package. Import-aware narrowing
+silently never fired in production.
+
+**Java import query fix (`scry-lang`):**
+
+- `(import_declaration (scoped_identifier name: (identifier)
+  @ref.import))` → `(import_declaration (scoped_identifier)
+  @ref.import)`. Captures the whole scoped_identifier so the
+  ref's `name` is `android.os.PerfettoTrace`, not `PerfettoTrace`.
+- `process_import` in `cmd_build_resolutions` now correctly
+  splits `android.os.PerfettoTrace` into
+  `(simple="PerfettoTrace", pkg=Some("android.os"))`.
+- New e2e test `java_import_ref_captures_full_qualified_path`
+  guards the regression.
+
+**Import-aware method resolution (resolver):**
+
+- For ambiguous Java/Kotlin method-call refs, the resolver now
+  walks the calling file's import list and checks whether any
+  candidate's enclosing class (`pkg + scope_path[0]`) is imported.
+  If exactly one candidate matches, prefer it.
+- Catches the common pattern: file imports `android.os.PerfettoTrace`
+  → ambiguous `close()` call resolves to `PerfettoTrace.Session.close`.
+- Multiple-imported-classes-define-this-method → stays unresolved
+  (truthful, v0.1.27 semantics).
+- 3 new unit tests:
+  `resolve_one_java_method_call_via_class_import`,
+  `resolve_one_java_method_call_via_wildcard_class_import`,
+  `resolve_one_java_method_call_ambiguous_imports_stay_unresolved`.
+
+**Wildcard imports** (`import android.os.*;`) are NOT yet
+captured — tree-sitter queries can't combine the
+`scoped_identifier` text with the trailing `*` into one capture.
+Slated for v0.1.29 with a custom-walker pass.
+
+**Breaking change for index format:**
+- Existing indexes have Java Import refs with bare trailing
+  names; v0.1.28 expects full paths. Run a full `scry index`
+  rebuild (followed by `scry finalize`) to benefit. The
+  resolutions-sidecar-only rebuild (`scry build-resolutions`)
+  is not enough — the import refs themselves are stored at
+  index time.
+
 ## [0.1.27] — 2026-05-17
 
 Honest Java method-call resolution in `scry build-resolutions`.

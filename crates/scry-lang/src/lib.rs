@@ -1455,7 +1455,15 @@ fn java_refs_spec() -> &'static RefSpec {
                 (superclass (type_identifier) @ref.inherit)
                 (super_interfaces (type_list (type_identifier) @ref.inherit))
                 (extends_interfaces (type_list (type_identifier) @ref.inherit))
-                (import_declaration (scoped_identifier name: (identifier) @ref.import))
+                ; Capture the FULL path of an import (e.g. "android.os.PerfettoTrace"),
+                ; not just the trailing identifier. The resolver splits on the last
+                ; `.` to get (pkg, simple) — without the package side, import-aware
+                ; narrowing in build-resolutions can never fire.
+                ; Wildcard imports (`import android.os.*;`) are not captured here
+                ; because tree-sitter queries can't combine the scoped_identifier
+                ; text with the trailing `*` into one capture; wildcard support
+                ; will land alongside a custom-walker pass.
+                (import_declaration (scoped_identifier) @ref.import)
                 (import_declaration (identifier) @ref.import)
                 "#,
             )

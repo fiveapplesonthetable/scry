@@ -162,10 +162,10 @@ pub struct PolyglotConfig {
 impl Default for PolyglotConfig {
     fn default() -> Self {
         Self {
-            rust_analyzer: PathBuf::from("rust-analyzer"),
-            scip_go: PathBuf::from("scip-go"),
-            scip_typescript: PathBuf::from("scip-typescript"),
-            scip_python: PathBuf::from("scip-python"),
+            rust_analyzer: crate::resolve_indexer_binary("rust-analyzer"),
+            scip_go: crate::resolve_indexer_binary("scip-go"),
+            scip_typescript: crate::resolve_indexer_binary("scip-typescript"),
+            scip_python: crate::resolve_indexer_binary("scip-python"),
             scip_out_dir: crate::scry_tmp_dir().join("scry-polyglot-scip"),
             per_target_timeout_secs: 600,
         }

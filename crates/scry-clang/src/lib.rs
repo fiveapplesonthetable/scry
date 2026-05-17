@@ -112,20 +112,29 @@ pub fn build_clang_usrs(
     let t = Instant::now();
     let parsed = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::atomic::AtomicUsize::new(0);
+    let skipped_missing = std::sync::atomic::AtomicUsize::new(0);
     let n = filtered.len();
 
     filtered.par_iter().for_each(|cmd| {
         match parse_one(cmd, max_file_bytes, &sidecar, &interner) {
-            Ok(()) => {
+            Ok(ParseOutcome::Parsed) => {
                 let done = parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if done % 50 == 0 || done == n {
                     eprintln!(
                         "[clang-index] progress: {done}/{n} TUs parsed, \
-                         {} failed ({}s)",
+                         {} failed, {} skipped (missing source) ({}s)",
                         failed.load(std::sync::atomic::Ordering::Relaxed),
+                        skipped_missing.load(std::sync::atomic::Ordering::Relaxed),
                         t.elapsed().as_secs(),
                     );
                 }
+            }
+            Ok(ParseOutcome::SkippedMissingSource) => {
+                // GN / CMake emit compile_commands.json for every graph
+                // target, including ones whose generated source files
+                // haven't been written by the build yet. Count those
+                // separately from real parse failures.
+                skipped_missing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -147,14 +156,27 @@ pub fn build_clang_usrs(
     std::fs::rename(&tmp, &out)
         .with_context(|| format!("rename {} -> {}", tmp.display(), out.display()))?;
     eprintln!(
-        "[clang-index] done: {} USRs, {} records, {} bytes → {} ({}s)",
+        "[clang-index] done: {} USRs, {} records, {} bytes \
+         ({} parsed, {} failed, {} skipped) → {} ({}s)",
         sidecar.usr_table.len(),
         sidecar.records.len(),
         buf.len(),
+        parsed.load(std::sync::atomic::Ordering::Relaxed),
+        failed.load(std::sync::atomic::Ordering::Relaxed),
+        skipped_missing.load(std::sync::atomic::Ordering::Relaxed),
         out.display(),
         t.elapsed().as_secs(),
     );
     Ok(())
+}
+
+/// What happened when we tried to parse one compile command. Splits
+/// the success case in two so callers can distinguish "the build
+/// didn't emit this source" (a GN/CMake idiosyncrasy — not our bug,
+/// not noise) from "we parsed it cleanly".
+enum ParseOutcome {
+    Parsed,
+    SkippedMissingSource,
 }
 
 fn parse_one(
@@ -162,7 +184,7 @@ fn parse_one(
     max_bytes: u64,
     sidecar: &Mutex<UsrSidecar>,
     interner: &Mutex<std::collections::HashMap<String, u32>>,
-) -> Result<()> {
+) -> Result<ParseOutcome> {
     ensure_libclang_loaded()?;
     let src = PathBuf::from(&cmd.file);
     let src_abs = if src.is_absolute() {
@@ -170,10 +192,17 @@ fn parse_one(
     } else {
         PathBuf::from(&cmd.directory).join(&src)
     };
-    if let Ok(meta) = std::fs::metadata(&src_abs) {
-        if max_bytes > 0 && meta.len() > max_bytes {
-            return Ok(());
-        }
+    let meta = match std::fs::metadata(&src_abs) {
+        Ok(m) => m,
+        // GN and CMake list every graph target in
+        // compile_commands.json including ones whose generated source
+        // hasn't been written yet ("build target was never invoked").
+        // Treat missing source as a clean skip, not a parse failure,
+        // so the failure count reflects real errors only.
+        Err(_) => return Ok(ParseOutcome::SkippedMissingSource),
+    };
+    if max_bytes > 0 && meta.len() > max_bytes {
+        return Ok(ParseOutcome::Parsed);
     }
 
     let raw_args: Vec<String> = if !cmd.arguments.is_empty() {
@@ -198,7 +227,7 @@ fn parse_one(
 
     let records = unsafe { parse_tu_unsafe(&src_abs, &filtered_args)? };
     if records.is_empty() {
-        return Ok(());
+        return Ok(ParseOutcome::Parsed);
     }
 
     let mut local_recs: Vec<UsrRecord> = Vec::with_capacity(records.len());
@@ -224,7 +253,7 @@ fn parse_one(
         }
         side_guard.records.extend(local_recs);
     }
-    Ok(())
+    Ok(ParseOutcome::Parsed)
 }
 
 /// Rewrite every relative path in `-I`, `-isystem`, `-iquote`,

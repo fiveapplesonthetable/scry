@@ -11,7 +11,6 @@ use scry_bridge::polyglot::{
     PolyglotConfig, PolyglotKind, discover as polyglot_discover,
     run as polyglot_run,
 };
-use scry_store::StoreReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -198,21 +197,41 @@ pub(crate) fn cmd_build_jvm_scip(
         index_dir.join("scip_index.bin").display(), t.elapsed().as_secs_f64(),
     );
 
-    // Final sanity check.
-    let reader = StoreReader::open(&index_dir)
-        .context("reopen index after import")?;
-    let sidecar = scry_store::scip_index::ScipIndex::open(&reader.paths.scip_index())?;
-    if let Some(sidx) = sidecar {
-        eprintln!(
-            "[build-jvm-scip] sidecar: {} symbols, {} records",
-            sidx.symbol_count(), sidx.len(),
-        );
-    }
+    report_sidecar_size(&index_dir, "build-jvm-scip", /*require_present=*/ true)?;
 
     eprintln!(
         "[build-jvm-scip] ALL STAGES OK in {:.2}s",
         t_total.elapsed().as_secs_f64(),
     );
+    Ok(())
+}
+
+/// Reports sidecar size from `<index_dir>/scip_index.bin`. Decoupled
+/// from `StoreReader::open` because the sidecar is its own artifact
+/// — `build-jvm-scip` / `build-polyglot-scip` write it without
+/// requiring `scry index` to have populated the rest of the index
+/// directory first. Bails on hard errors (corrupt sidecar). When
+/// `require_present` is true, also bails if the sidecar is missing
+/// — used after a successful import call where absent is a bug; when
+/// false, just logs (some pipelines validly write zero shards).
+fn report_sidecar_size(index_dir: &Path, tag: &str, require_present: bool) -> Result<()> {
+    let sidecar_path = index_dir.join("scip_index.bin");
+    match scry_store::scip_index::ScipIndex::open(&sidecar_path)
+        .with_context(|| format!("decode {}", sidecar_path.display()))?
+    {
+        Some(sidx) => {
+            eprintln!(
+                "[{tag}] sidecar: {} symbols, {} records",
+                sidx.symbol_count(), sidx.len(),
+            );
+        }
+        None if require_present => {
+            anyhow::bail!("sidecar missing after import at {}", sidecar_path.display());
+        }
+        None => {
+            eprintln!("[{tag}] sidecar absent at {}", sidecar_path.display());
+        }
+    }
     Ok(())
 }
 
@@ -307,31 +326,37 @@ pub(crate) fn cmd_build_polyglot_scip(
         t.elapsed().as_secs_f64(),
     );
 
-    // Import each .scip in append mode.
+    // Import each .scip in append mode. Collect every failure and
+    // bail at the end with the full list — silently swallowing
+    // would leave us with a partial sidecar that looks fine but
+    // misses whole languages of symbols.
     let t = Instant::now();
+    let mut import_failures: Vec<(PathBuf, anyhow::Error)> = Vec::new();
     for scip in &report.scip_files {
         if let Err(e) = scry_scip::import_scip_with_mode(
             scip, &index_dir, Some(source_root.as_path()), true,
         ) {
-            eprintln!("[build-polyglot-scip] import failed for {}: {e:#}",
-                      scip.display());
+            import_failures.push((scip.clone(), e));
         }
+    }
+    if !import_failures.is_empty() {
+        for (path, err) in &import_failures {
+            eprintln!("[build-polyglot-scip] import failed for {}: {err:#}",
+                      path.display());
+        }
+        anyhow::bail!(
+            "{} of {} polyglot .scip shards failed to import — \
+             sidecar would be incomplete; refusing to claim success",
+            import_failures.len(), report.scip_files.len(),
+        );
     }
     eprintln!(
         "[build-polyglot-scip] imported {} .scip shards in {:.2}s",
         report.scip_files.len(), t.elapsed().as_secs_f64(),
     );
 
-    // Sanity.
-    let reader = StoreReader::open(&index_dir)
-        .context("reopen index after import")?;
-    let sidecar = scry_store::scip_index::ScipIndex::open(&reader.paths.scip_index())?;
-    if let Some(sidx) = sidecar {
-        eprintln!(
-            "[build-polyglot-scip] sidecar: {} symbols, {} records",
-            sidx.symbol_count(), sidx.len(),
-        );
-    }
+    let require = !report.scip_files.is_empty();
+    report_sidecar_size(&index_dir, "build-polyglot-scip", require)?;
     eprintln!(
         "[build-polyglot-scip] ALL STAGES OK in {:.2}s",
         t_total.elapsed().as_secs_f64(),

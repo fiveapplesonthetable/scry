@@ -43,6 +43,42 @@ pub fn scry_tmp_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/mnt/agent/tmp")
 }
 
+/// Resolve an indexer binary by name. Falls back through the install
+/// script's `${PREFIX}/bin` (default `$HOME/.local/bin`), the standard
+/// `/usr/local/bin`, and the `$SCRY_INDEXER_BIN_DIR` override before
+/// giving up. Returns the bare name as a last resort so the spawn
+/// error remains identifiable; callers should set up their own
+/// `--scip-java`/`--rust-analyzer`/... CLI overrides for fully
+/// non-standard installs.
+///
+/// Order:
+///   1. `$SCRY_INDEXER_BIN_DIR/<name>` if set and the file exists.
+///   2. The first match found via `$PATH`.
+///   3. `$HOME/.local/bin/<name>` (the install script's default).
+///   4. `/usr/local/bin/<name>` (system-wide install).
+///   5. The bare `<name>` (so the spawn error names the binary).
+pub fn resolve_indexer_binary(name: &str) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let exists = |p: &PathBuf| p.is_file();
+    if let Some(dir) = std::env::var_os("SCRY_INDEXER_BIN_DIR") {
+        let p = PathBuf::from(dir).join(name);
+        if exists(&p) { return p; }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for d in std::env::split_paths(&paths) {
+            let p = d.join(name);
+            if exists(&p) { return p; }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = PathBuf::from(home).join(".local/bin").join(name);
+        if exists(&p) { return p; }
+    }
+    let p = PathBuf::from("/usr/local/bin").join(name);
+    if exists(&p) { return p; }
+    PathBuf::from(name)
+}
+
 pub mod cmake;
 pub mod gn;
 pub mod java_indexer;

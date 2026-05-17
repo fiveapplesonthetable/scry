@@ -62,7 +62,7 @@ pub struct KotlinIndexerConfig {
 impl Default for KotlinIndexerConfig {
     fn default() -> Self {
         Self {
-            kotlinc: PathBuf::from("kotlinc-embeddable"),
+            kotlinc: crate::resolve_indexer_binary("kotlinc-embeddable"),
             semanticdb_kotlinc_jar: dirs_semanticdb_kotlinc()
                 .unwrap_or_else(|| PathBuf::from("semanticdb-kotlinc.jar")),
             targetroot: crate::scry_tmp_dir().join("scry-semanticdb"),
@@ -234,11 +234,15 @@ fn run_one(compilation: &Compilation, cfg: &KotlinIndexerConfig) -> CompilationO
     } else {
         CompilationStatus::NoOutput
     };
-    if matches!(status, CompilationStatus::NoOutput) && !output.stderr.is_empty() {
+    if !output.stderr.is_empty() {
+        let label = match status {
+            CompilationStatus::Ok => return CompilationOutcome { status, semanticdb_files },
+            CompilationStatus::PartialOnError => "kotlinc partial",
+            CompilationStatus::NoOutput => "kotlinc no output",
+        };
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().next().unwrap_or("");
-        eprintln!("[scry-bridge] {}: kotlinc no output: {}",
-                  compilation.module, first);
+        let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        eprintln!("[scry-bridge] {}: {label}: {first}", compilation.module);
     }
     CompilationOutcome { status, semanticdb_files }
 }

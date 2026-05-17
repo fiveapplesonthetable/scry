@@ -67,14 +67,28 @@ impl BuildSystem for Soong {
         // Parallelism here is mostly I/O-bound but each shard does
         // string-parsing work too — measurable speedup at AOSP scale
         // (~10 shards, ~150 MiB total, ~5 s wall single-threaded).
-        let per_shard: Vec<(Vec<JavacRule>, Vec<KotlincRule>)> = ninjas
+        let per_shard: Vec<ShardData> = ninjas
             .par_iter()
             .map(|p| extract_jvm_rules(p))
             .collect::<Result<Vec<_>>>()?;
+
+        // Merge the top-level variable tables across shards. Soong
+        // sometimes splits a module's variable defs and its build
+        // rules across different shards (large modules in particular).
+        // Without a unified table, an expansion in shard N that
+        // references `${m.<mod>_<variant>.javacFlags}` defined in
+        // shard M ≠ N silently degrades to the literal "${...}" text.
+        let mut all_vars: HashMap<String, String> = HashMap::new();
+        for shard in &per_shard {
+            for (k, v) in &shard.vars {
+                all_vars.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+
         let mut javac_rules: Vec<JavacRule> = per_shard.iter()
-            .flat_map(|(j, _)| j.iter().cloned()).collect();
+            .flat_map(|s| s.javac_rules.iter().cloned()).collect();
         let mut kotlinc_rules: Vec<KotlincRule> = per_shard.into_iter()
-            .flat_map(|(_, k)| k.into_iter()).collect();
+            .flat_map(|s| s.kotlin_rules.into_iter()).collect();
 
         // Soong sometimes emits the same `<rule>/<mod>.jar` across
         // multiple shards (variant duplication). Keep the first;
@@ -83,6 +97,24 @@ impl BuildSystem for Soong {
         javac_rules.dedup_by(|a, b| a.output == b.output);
         kotlinc_rules.sort_by(|a, b| a.output.cmp(&b.output));
         kotlinc_rules.dedup_by(|a, b| a.output == b.output);
+
+        // Expand `${var}` / `$var` references in every binding using
+        // the unified variable table. Without this step, AOSP modules
+        // that put their actual javac flags behind a
+        // `${m.<module>_<variant>.javacFlags}` indirection (libcore,
+        // ART, anything using `--patch-module=java.base=…`) would lose
+        // the indirection and javac would reject the compilation with
+        // "package exists in another module: java.base".
+        for rule in &mut javac_rules {
+            for v in rule.bindings.values_mut() {
+                *v = expand_ninja_vars(v, &all_vars);
+            }
+        }
+        for rule in &mut kotlinc_rules {
+            for v in rule.bindings.values_mut() {
+                *v = expand_ninja_vars(v, &all_vars);
+            }
+        }
 
         // Hydrate each rule's source list from its sibling
         // `<output>.rsp` file (which Soong always writes alongside)
@@ -177,6 +209,9 @@ impl JavacRule {
             Language::Java
         };
         let module = module_name_from_output(&self.output);
+        let extra_args = self.bindings.get("javacFlags")
+            .map(|s| forward_javac_flags(s, source_root))
+            .unwrap_or_default();
         Ok(Compilation {
             module,
             language,
@@ -186,11 +221,98 @@ impl JavacRule {
             bootclasspath,
             defines: Vec::new(),
             java_version: self.bindings.get("javaVersion").cloned(),
-            extra_args: self.bindings.get("javacFlags")
-                .map(|s| s.split_whitespace().map(str::to_string).collect())
-                .unwrap_or_default(),
+            extra_args,
         })
     }
+}
+
+/// Filter Soong's `javacFlags` for forwarding to javac, with paths
+/// rewritten to absolute. Drops flags that conflict with what we
+/// already synthesize on the javac command line:
+///
+///   - `-source N`, `-target N`, `--release=N` — we set these
+///     ourselves from `compilation.java_version`. Letting Soong's
+///     copy through would either duplicate or contradict ours.
+///   - `-Werror`, `-Werror:*` — turns warnings into fatals, which
+///     defeats the partial-output recovery the SemanticDB plugin
+///     relies on.
+///   - `-d <dir>` — javac output dir, ours.
+///   - `-processorpath …`, `-Xplugin:…` — registered by us.
+///   - `-classpath …`, `-cp …`, `-bootclasspath …`, `--system=…`,
+///     `--module-path=…` — surfaced by us through the typed
+///     `classpath` / `bootclasspath` Compilation slots.
+///
+/// Everything else passes through verbatim, with any colon-separated
+/// path lists in `--patch-module=NAME=path1:path2:…` and the
+/// `--add-modules=` / `--add-exports=` family rewritten to be
+/// absolute under `source_root`. Without the absolute rewrite,
+/// libcore's `--patch-module=java.base=.:out/soong:…` resolves
+/// relative to the scry process cwd and javac can't find the
+/// patched module dirs.
+pub(crate) fn forward_javac_flags(binding: &str, source_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut tokens = binding.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        // Two-token flags whose value we either drop or already have.
+        if matches!(tok, "-source" | "-target" | "-d" | "-processorpath"
+                       | "-classpath" | "-cp" | "-bootclasspath") {
+            tokens.next();
+            continue;
+        }
+        // `-Werror` (with or without `:tag` suffix).
+        if tok == "-Werror" || tok.starts_with("-Werror:") {
+            continue;
+        }
+        // `-Xplugin:semanticdb…` collides with our own plugin
+        // registration. Soong doesn't normally emit Xplugin in
+        // javacFlags, but be defensive.
+        if tok.starts_with("-Xplugin:") {
+            continue;
+        }
+        if let Some(eq) = tok.find('=') {
+            let (k, v) = (&tok[..eq], &tok[eq + 1..]);
+            // Drop the modern single-knob version selector — we set it.
+            if k == "--release" { continue; }
+            // We surface classpath / module-path through typed slots.
+            if matches!(k, "--class-path" | "--module-path"
+                          | "--upgrade-module-path"
+                          | "--system" | "--source-path") {
+                continue;
+            }
+            // `--patch-module=NAME=PATHS` is two-level: the outer `=`
+            // splits flag/value, the inner separates module from
+            // colon-separated patch sources. Rewrite the inner path
+            // list to absolute so javac resolves it from anywhere.
+            if k == "--patch-module" {
+                if let Some(inner_eq) = v.find('=') {
+                    let module = &v[..inner_eq];
+                    let paths = &v[inner_eq + 1..];
+                    let rewritten = rewrite_path_list_to_absolute(paths, source_root);
+                    out.push(format!("--patch-module={module}={rewritten}"));
+                    continue;
+                }
+                // Malformed — pass verbatim.
+                out.push(tok.to_string());
+                continue;
+            }
+            // Generic path-bearing `--FLAG=value` (e.g.
+            // `--processor-module-path=`). Rewrite per the same
+            // whitelist used for classpath/bootclasspath bindings.
+            if is_path_bearing_eq_flag(k) {
+                out.push(format!("{k}={}",
+                    rewrite_path_list_to_absolute(v, source_root)));
+                continue;
+            }
+            // Other `--FLAG=value` — pass verbatim (`--add-modules=`,
+            // `--add-exports=`, `--limit-modules=`, `-Xlint=…`, etc.).
+            out.push(tok.to_string());
+            continue;
+        }
+        // Bare token — pass through (e.g. `-Xlint:all`,
+        // `-XDcompilePolicy=…`, `-XDsuppressNotes`).
+        out.push(tok.to_string());
+    }
+    out
 }
 
 impl KotlincRule {
@@ -300,15 +422,31 @@ fn classify_jvm_target(target: &str) -> Option<JvmRuleKind> {
     None
 }
 
+/// Output of one shard's parse: the JVM build rules + every
+/// top-level `<name> = <value>` variable definition. Variables get
+/// merged across shards by [`Soong::extract_compilations`] before
+/// the bindings are expanded — Soong sometimes defines a module's
+/// variable in one shard and references it from a build rule in
+/// another.
+struct ShardData {
+    javac_rules: Vec<JavacRule>,
+    kotlin_rules: Vec<KotlincRule>,
+    vars: HashMap<String, String>,
+}
+
 /// Stream one ninja shard and extract every JVM compilation rule's
 /// bindings — both `javac/<mod>.jar` (Java) and `kotlin/<mod>.jar`
-/// (Kotlin). Same line-oriented parser as before; the only addition
-/// is a per-rule classifier that routes to the right output bucket.
-fn extract_jvm_rules(path: &Path) -> Result<(Vec<JavacRule>, Vec<KotlincRule>)> {
+/// (Kotlin) — plus every top-level variable definition. The variables
+/// are needed so that bindings like
+/// `javacFlags = ${m.core-libart_android_common.javacFlags}` can be
+/// resolved to the actual flag string (which includes the
+/// `--patch-module=java.base=…` that libcore and friends need).
+fn extract_jvm_rules(path: &Path) -> Result<ShardData> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("read ninja shard {}", path.display()))?;
     let mut javac_out: Vec<JavacRule> = Vec::new();
     let mut kotlin_out: Vec<KotlincRule> = Vec::new();
+    let mut vars: HashMap<String, String> = HashMap::new();
     let mut current: Option<(String, HashMap<String, String>, Option<JvmRuleKind>)> = None;
     let flush = |cur: Option<(String, HashMap<String, String>, Option<JvmRuleKind>)>,
                  jout: &mut Vec<JavacRule>,
@@ -341,11 +479,121 @@ fn extract_jvm_rules(path: &Path) -> Result<(Vec<JavacRule>, Vec<KotlincRule>)> 
                 }
             }
         } else {
+            // Non-indented, non-`build` line ends the current rule
+            // block. Capture top-level variable definitions
+            // (`<name> = <value>`) and skip everything else (`rule`,
+            // `pool`, `default`, `subninja`, `include`, comments).
             flush(current.take(), &mut javac_out, &mut kotlin_out);
+            if is_top_level_var_def(raw_line) {
+                if let Some((k, v)) = parse_binding(raw_line) {
+                    vars.insert(k.to_string(), v.to_string());
+                }
+            }
         }
     }
     flush(current.take(), &mut javac_out, &mut kotlin_out);
-    Ok((javac_out, kotlin_out))
+    Ok(ShardData { javac_rules: javac_out, kotlin_rules: kotlin_out, vars })
+}
+
+/// True when a non-indented line is a `<name> = <value>` variable
+/// definition (the only top-level thing we care about). Filters out
+/// ninja directives (`rule`, `pool`, `default`, `subninja`,
+/// `include`), comments, and the `build` header (already handled
+/// upstream).
+fn is_top_level_var_def(line: &str) -> bool {
+    if line.starts_with('#') || !line.contains('=') {
+        return false;
+    }
+    const DIRECTIVES: &[&str] = &[
+        "build ", "rule ", "pool ", "default ", "subninja ", "include ", "phony ",
+    ];
+    !DIRECTIVES.iter().any(|d| line.starts_with(d))
+}
+
+/// Expand ninja `${name}` and `$name` variable references in `value`
+/// against `vars`. Resolves transitively (a var whose value itself
+/// references another var) up to a small fixed-point bound so a
+/// pathological cycle can't hang us. Unknown refs are kept verbatim
+/// — better to surface them in javac's error than to silently drop.
+fn expand_ninja_vars(value: &str, vars: &HashMap<String, String>) -> String {
+    let mut cur = value.to_string();
+    // 8 passes covers every Soong indirection depth seen in practice
+    // (`m.<mod>.javacFlags` → `g.java.config.<…>` → constant) with
+    // headroom; the loop exits early when no substitution fires.
+    for _ in 0..8 {
+        let next = expand_once(&cur, vars);
+        if next == cur { return cur; }
+        cur = next;
+    }
+    cur
+}
+
+fn expand_once(value: &str, vars: &HashMap<String, String>) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'$' {
+            // Push the longest run of non-`$` bytes in one go.
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'$' { i += 1; }
+            out.push_str(&value[start..i]);
+            continue;
+        }
+        // `b == '$'`. Look at what follows.
+        let next = bytes.get(i + 1).copied();
+        match next {
+            Some(b'{') => {
+                // `${name}` form. Scan to matching `}`.
+                if let Some(end) = value[i + 2..].find('}') {
+                    let name = &value[i + 2 .. i + 2 + end];
+                    if let Some(replacement) = vars.get(name) {
+                        out.push_str(replacement);
+                    } else {
+                        out.push_str(&value[i .. i + 2 + end + 1]);
+                    }
+                    i += 2 + end + 1;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            Some(b'$') => {
+                // Escaped `$$` → literal `$`.
+                out.push('$');
+                i += 2;
+            }
+            Some(c) if is_ninja_ident_byte(c) => {
+                // `$name` bare form. Scan while identifier chars.
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && is_ninja_ident_byte(bytes[end]) {
+                    end += 1;
+                }
+                let name = &value[start..end];
+                if let Some(replacement) = vars.get(name) {
+                    out.push_str(replacement);
+                } else {
+                    out.push_str(&value[i..end]);
+                }
+                i = end;
+            }
+            Some(_) | None => {
+                // `$` followed by something we don't understand (a
+                // space, end-of-string). Pass it through unchanged.
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Bytes that ninja accepts in a variable name. Mirrors the
+/// upstream lexer: letters, digits, underscore, dot, dash.
+fn is_ninja_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-'
 }
 
 
@@ -403,10 +651,18 @@ fn tokenize_javac_arg_line(binding: &str, source_root: &Path) -> Vec<String> {
                 out.push(rewrite_path_list_to_absolute(value, source_root));
             }
         } else if let Some(eq) = tok.find('=') {
-            // `--system=PATH` or `--module-path=...` etc. Rewrite the
-            // value portion to absolute when it looks like a path.
+            // `--FLAG=VALUE` form. Only rewrite the value for the
+            // small whitelist of javac flags whose value is a path or
+            // path list. For anything else (e.g. `--release=21`),
+            // pass the token through unchanged — without the
+            // whitelist, "21" gets path-joined into "<root>/21" and
+            // javac rejects it.
             let (k, v) = (&tok[..eq], &tok[eq + 1..]);
-            out.push(format!("{k}={}", rewrite_path_list_to_absolute(v, source_root)));
+            if is_path_bearing_eq_flag(k) {
+                out.push(format!("{k}={}", rewrite_path_list_to_absolute(v, source_root)));
+            } else {
+                out.push(tok.to_string());
+            }
         } else {
             // Bare token (e.g. `--enable-preview` or a bare path value
             // we already consumed via the previous flag branch — but
@@ -417,15 +673,43 @@ fn tokenize_javac_arg_line(binding: &str, source_root: &Path) -> Vec<String> {
     out
 }
 
+/// True for the small set of javac `--FLAG=VALUE` forms whose VALUE
+/// is a path or a colon-separated path list. Everything else (e.g.
+/// `--release=21`, `--enable-preview`) carries non-path data and
+/// must round-trip verbatim.
+fn is_path_bearing_eq_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--system"
+        | "--module-path"
+        | "--upgrade-module-path"
+        | "--patch-module"
+        | "--module-source-path"
+        | "--processor-path"
+        | "--processor-module-path"
+        | "--source-path"
+        | "--class-path"
+    )
+}
+
 /// Rewrite each colon-separated entry in `list` to an absolute path
-/// under `source_root` when it's relative. Absolute paths and tokens
-/// without colons are returned unchanged.
+/// under `source_root` when it's relative. Absolute paths and empty
+/// entries pass through unchanged. The javac magic value `none`
+/// (used by `--system=none` to mean "no system modules") is also
+/// passed through — without this, libcore/core-all silently becomes
+/// `--system=<source_root>/none` and javac fails with "illegal
+/// argument for --system".
 fn rewrite_path_list_to_absolute(list: &str, source_root: &Path) -> String {
     list.split(':')
-        .map(|s| if s.is_empty() || Path::new(s).is_absolute() {
-            s.to_string()
-        } else {
-            source_root.join(s).display().to_string()
+        .map(|s| {
+            if s.is_empty()
+                || s == "none"
+                || Path::new(s).is_absolute()
+            {
+                s.to_string()
+            } else {
+                source_root.join(s).display().to_string()
+            }
         })
         .collect::<Vec<_>>()
         .join(":")
@@ -526,6 +810,18 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_preserves_javac_magic_values() {
+        // libcore/core-all is compiled with `--system=none` (no system
+        // modules); the literal "none" is a javac magic value and must
+        // not be turned into `<source_root>/none`.
+        let bcp = tokenize_javac_arg_line("--system=none", Path::new("/aosp"));
+        assert_eq!(bcp, vec!["--system=none".to_string()]);
+        // Same for bare version numbers.
+        let rel = tokenize_javac_arg_line("--release=21", Path::new("/aosp"));
+        assert_eq!(rel, vec!["--release=21".to_string()]);
+    }
+
+    #[test]
     fn module_name_strips_intermediates_prefix_and_variant() {
         assert_eq!(
             module_name_from_output(
@@ -566,17 +862,118 @@ build out/soong/.intermediates/myapp/mod/android_common/kotlin_headers/mod.jar: 
     classpath = out/should-not-appear/classpath.rsp
 
 ").unwrap();
-        let (javac, kotlinc) = extract_jvm_rules(&ninja).unwrap();
-        assert_eq!(javac.len(), 1, "javac-header should be skipped");
-        assert_eq!(kotlinc.len(), 1, "kotlin_headers should be skipped");
-        let j = &javac[0];
+        let shard = extract_jvm_rules(&ninja).unwrap();
+        assert_eq!(shard.javac_rules.len(), 1, "javac-header should be skipped");
+        assert_eq!(shard.kotlin_rules.len(), 1, "kotlin_headers should be skipped");
+        let j = &shard.javac_rules[0];
         assert!(j.output.ends_with("/javac/core-libart.jar"));
         assert_eq!(j.bindings["classpath"], "-classpath a.jar:b.jar");
         assert_eq!(j.bindings["bootClasspath"], "-bootclasspath boot.jar");
-        let k = &kotlinc[0];
+        let k = &shard.kotlin_rules[0];
         assert!(k.output.ends_with("/kotlin/mod.jar"));
         assert_eq!(k.bindings["kotlinJvmTarget"], "21");
         assert_eq!(k.bindings["kotlincFlags"], "-Xfriend-paths=foo");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn extract_jvm_rules_collects_top_level_vars() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scry-bridge-soong-vars-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let ninja = tmp.join("build.vars.ninja");
+        std::fs::write(&ninja, "\
+m.core-libart_android_common.javacFlags = -Xlint:-dep-ann --patch-module=java.base=.
+
+build out/soong/.intermediates/libcore/core-libart/android_common/javac/core-libart.jar: javac in.java
+    javacFlags = ${m.core-libart_android_common.javacFlags}
+").unwrap();
+        let shard = extract_jvm_rules(&ninja).unwrap();
+        assert_eq!(
+            shard.vars.get("m.core-libart_android_common.javacFlags").map(String::as_str),
+            Some("-Xlint:-dep-ann --patch-module=java.base=."),
+        );
+        // The raw binding still holds the literal `${…}` reference;
+        // expansion happens in extract_compilations, not here.
+        assert_eq!(
+            shard.javac_rules[0].bindings["javacFlags"],
+            "${m.core-libart_android_common.javacFlags}",
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn expand_ninja_vars_handles_braced_bare_and_escape() {
+        let mut vars = HashMap::new();
+        vars.insert("a".to_string(), "ALPHA".to_string());
+        vars.insert("m.foo.javacFlags".to_string(),
+                    "--patch-module=java.base=.".to_string());
+        // Braced.
+        assert_eq!(
+            expand_ninja_vars("x ${m.foo.javacFlags} y", &vars),
+            "x --patch-module=java.base=. y",
+        );
+        // Bare (identifier stops at space).
+        assert_eq!(expand_ninja_vars("$a end", &vars), "ALPHA end");
+        // Escaped $$ stays literal.
+        assert_eq!(expand_ninja_vars("price$$5", &vars), "price$5");
+        // Unknown ref passes through unchanged (so the operator sees
+        // it in javac stderr instead of getting a silent drop).
+        assert_eq!(expand_ninja_vars("${unknown}", &vars), "${unknown}");
+    }
+
+    #[test]
+    fn forward_javac_flags_keeps_patch_module_with_absolute_paths() {
+        let src = "-Xlint:-dep-ann --patch-module=java.base=.:out/soong:abs/already/handled.jar";
+        let out = forward_javac_flags(src, Path::new("/aosp"));
+        // -Xlint passes verbatim; --patch-module path list is
+        // rewritten to absolute under /aosp; "abs/already/handled.jar"
+        // would also be rewritten since it's relative.
+        assert_eq!(out, vec![
+            "-Xlint:-dep-ann".to_string(),
+            "--patch-module=java.base=/aosp/.:/aosp/out/soong:/aosp/abs/already/handled.jar"
+                .to_string(),
+        ]);
+    }
+
+    #[test]
+    fn forward_javac_flags_drops_synthesized_and_dangerous_flags() {
+        // -Werror, -source/-target/--release, -classpath/-cp,
+        // -bootclasspath, --system=, -d, -processorpath all get
+        // dropped (we synthesize the right versions elsewhere).
+        let src = "-Werror -source 11 -target 11 --release=21 \
+                   -classpath x.jar -cp y.jar -bootclasspath boot.jar \
+                   --system=none -d /tmp/out -processorpath proc.jar \
+                   -Xlint:all";
+        let out = forward_javac_flags(src, Path::new("/aosp"));
+        assert_eq!(out, vec!["-Xlint:all".to_string()]);
+    }
+
+    #[test]
+    fn forward_javac_flags_preserves_module_system_flags() {
+        // --add-modules / --add-exports / --add-reads / --limit-modules
+        // must round-trip — they're how Soong opens cross-module
+        // visibility for libcore consumers.
+        let src = "--add-exports=java.base/java.lang=ALL-UNNAMED \
+                   --add-reads=java.base=ALL-UNNAMED \
+                   --add-modules=java.base \
+                   --limit-modules=java.base";
+        let out = forward_javac_flags(src, Path::new("/aosp"));
+        assert_eq!(out, vec![
+            "--add-exports=java.base/java.lang=ALL-UNNAMED".to_string(),
+            "--add-reads=java.base=ALL-UNNAMED".to_string(),
+            "--add-modules=java.base".to_string(),
+            "--limit-modules=java.base".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn expand_ninja_vars_resolves_nested_indirection() {
+        let mut vars = HashMap::new();
+        vars.insert("outer".to_string(), "${inner}-suffix".to_string());
+        vars.insert("inner".to_string(), "VAL".to_string());
+        assert_eq!(expand_ninja_vars("${outer}", &vars), "VAL-suffix");
     }
 }

@@ -59,10 +59,10 @@ pub struct JavaIndexerConfig {
 impl Default for JavaIndexerConfig {
     fn default() -> Self {
         Self {
-            javac: PathBuf::from("javac"),
+            javac: crate::resolve_indexer_binary("javac"),
             semanticdb_javac_jar: dirs_semanticdb_javac()
                 .unwrap_or_else(|| PathBuf::from("semanticdb-javac.jar")),
-            scip_java: PathBuf::from("scip-java"),
+            scip_java: crate::resolve_indexer_binary("scip-java"),
             targetroot: crate::scry_tmp_dir().join("scry-semanticdb"),
             source_version: "11".into(),
             target_version: "11".into(),
@@ -237,13 +237,20 @@ fn run_one(compilation: &Compilation, cfg: &JavaIndexerConfig) -> CompilationOut
         cmd.arg(format!("--release={release_version}"));
     }
 
-    // We don't pass -Werror or other lint flags from Soong's
-    // `javacFlags`. semanticdb-javac runs as a compiler PLUGIN, not
-    // an annotation processor — it observes every source the compiler
-    // successfully parsed, then writes .semanticdb files irrespective
-    // of later type-resolution errors. So a javac that aborts mid-TU
-    // still leaves us with the symbols it had already resolved. Lint
-    // flags only ever turn that into FEWER outputs.
+    // Forward Soong's surviving javacFlags. The Soong bridge
+    // pre-filtered them through `forward_javac_flags` so anything
+    // that would collide with our synthesized `-source/-target`,
+    // `-Werror`, classpath/bootclasspath, or plugin registration is
+    // already gone. What remains are the module-system flags javac
+    // genuinely needs to compile the module correctly: most
+    // importantly `--patch-module=java.base=…` for libcore + ART
+    // (without it javac sees libcore as a new module trying to
+    // redefine java.base and rejects every source with "package
+    // exists in another module").
+    for tok in &compilation.extra_args {
+        cmd.arg(tok);
+    }
+
     // Sources from an @argfile to dodge ARG_MAX (~2MB Linux default).
     let argfile = per_target.join("sources.args");
     let args_body: String = compilation.sources.iter()
@@ -256,11 +263,6 @@ fn run_one(compilation: &Compilation, cfg: &JavaIndexerConfig) -> CompilationOut
     }
     cmd.arg(format!("@{}", argfile.display()));
 
-    // Don't let extra_args fold in here — Soong's `javacFlags` often
-    // include `-Werror`, `-Xlint:all`, and module-specific settings
-    // that conflict with our `-source/-target` and the plugin
-    // invocation. Production-grade integration would whitelist a
-    // safe subset; for symbol-identity output the defaults are fine.
     let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
@@ -280,13 +282,20 @@ fn run_one(compilation: &Compilation, cfg: &JavaIndexerConfig) -> CompilationOut
     } else {
         CompilationStatus::NoOutput
     };
-    if matches!(status, CompilationStatus::NoOutput) && !output.stderr.is_empty() {
-        // Surface the first stderr line so the operator can see what
-        // went wrong without combing through per-module logs.
+    if !output.stderr.is_empty() {
+        // Surface the first non-empty stderr line for both NoOutput
+        // and PartialOnError. Without this, "5 partial" in the
+        // dispatch summary is opaque — operators can't tell whether
+        // partials are routine `-Werror` noise or a real classpath
+        // bug they'd want to fix.
+        let label = match status {
+            CompilationStatus::Ok => return CompilationOutcome { status, semanticdb_files },
+            CompilationStatus::PartialOnError => "javac partial",
+            CompilationStatus::NoOutput => "javac no output",
+        };
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().next().unwrap_or("");
-        eprintln!("[scry-bridge] {}: javac no output: {}",
-                  compilation.module, first);
+        let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        eprintln!("[scry-bridge] {}: {label}: {first}", compilation.module);
     }
     CompilationOutcome { status, semanticdb_files }
 }

@@ -7,6 +7,33 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.39] — 2026-05-17
+
+Compact resolved-def annotations now show **last 2 path
+components** instead of just the basename. Disambiguates
+the many `MainActivity.java` files in a big corpus without
+dumping the full absolute path.
+
+Before:
+```
+135  → MainActivity.java:56 [MainActivity]
+  4  → MainActivity.java:1043 [MainActivity::ActivityStarter]
+```
+
+After:
+```
+135  → test/MainActivity.java:56 [MainActivity]
+  4  → sdksandboxclient/MainActivity.java:1043 [MainActivity::ActivityStarter]
+```
+
+Affects both `format_resolved_def` (used by `print_refs`'s
+per-row `→ def:` annotation) and `print_refs_by_def` (used
+by the histogram). New `short_path_suffix` helper with unit
+tests covering single-component, two-component, and
+trailing-slash edge cases.
+
+No index format change. Takes effect immediately.
+
 ## [0.1.38] — 2026-05-17
 
 Kotlin Package emission (deferred from v0.1.36).

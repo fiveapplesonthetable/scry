@@ -3285,13 +3285,12 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
                 let path = reader.files.get(s.file_id as usize)
                     .map(|f| f.display_path(&reader.roots))
                     .unwrap_or_default();
-                let fname = path.rsplit('/').next().unwrap_or(&path);
                 let scope = if s.scope_path.is_empty() {
                     String::new()
                 } else {
                     format!(" [{}]", s.scope_path.join("::"))
                 };
-                format!("{}:{}{}", fname, s.line, scope)
+                format!("{}:{}{}", short_path_suffix(&path), s.line, scope)
             })
             .unwrap_or_else(|| format!("def:{:x}", def_id));
         println!("{:>8}  → {}", count, annot);
@@ -4223,15 +4222,31 @@ fn format_resolved_def(reader: &StoreReader, ref_name: &str, def_id: u64) -> Str
             let path = reader.files.get(s.file_id as usize)
                 .map(|f| f.display_path(&reader.roots))
                 .unwrap_or_default();
-            let fname = path.rsplit('/').next().unwrap_or(&path);
             let scope = if s.scope_path.is_empty() {
                 String::new()
             } else {
                 format!(" [{}]", s.scope_path.join("::"))
             };
-            format!("  → {}:{}{}", fname, s.line, scope)
+            format!("  → {}:{}{}", short_path_suffix(&path), s.line, scope)
         }
         None => format!("  → def:{:x}", def_id),
+    }
+}
+
+/// Last two non-empty path components, joined with `/`. Used for
+/// compact ref/by-def annotations so users can disambiguate the
+/// many `MainActivity.java` files in a big corpus without
+/// dumping the full absolute path. v0.1.39.
+fn short_path_suffix(path: &str) -> &str {
+    // Find the last '/' and the one before it.
+    match path.rfind('/') {
+        None => path,
+        Some(last) => {
+            match path[..last].rfind('/') {
+                None => path,                 // already only one component before basename
+                Some(prev) => &path[prev + 1..],
+            }
+        }
     }
 }
 
@@ -9285,6 +9300,30 @@ fn short_lang(k: FileKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.1.39 — disambiguates same-basename files (the many
+    /// MainActivity.java in AOSP) by showing the parent dir too,
+    /// while staying short for users who want a glance.
+    #[test]
+    fn short_path_suffix_renders_last_two_components() {
+        assert_eq!(
+            short_path_suffix("/home/zim/dev/aosp/samples/MainActivity.java"),
+            "samples/MainActivity.java",
+        );
+        assert_eq!(
+            short_path_suffix("/home/zim/dev/aosp/test/MainActivity.java"),
+            "test/MainActivity.java",
+        );
+        // Already short: a single-component path is returned verbatim.
+        assert_eq!(short_path_suffix("MainActivity.java"), "MainActivity.java");
+        // Two-component path: returned verbatim.
+        assert_eq!(short_path_suffix("src/MainActivity.java"), "src/MainActivity.java");
+        // Trailing slash (directory) — degenerate; just return as-is
+        // since the basename is empty.
+        assert_eq!(short_path_suffix("a/b/c/"), "c/");
+        // Leading slash absolute path with only one segment under root.
+        assert_eq!(short_path_suffix("/foo.txt"), "/foo.txt");
+    }
 
     /// `format_eta` contract used by the `[progress]` line. Crosses the
     /// 60s and 1h boundaries cleanly; bad inputs (NaN, negative) render

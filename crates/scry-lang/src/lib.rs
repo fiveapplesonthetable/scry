@@ -389,6 +389,7 @@ pub fn extract_refs(kind: FileKind, source: &[u8]) -> Result<Vec<RawRef>> {
         Rust => (rust_spec(), rust_refs_spec()),
         Go => (go_spec(), go_refs_spec()),
         Python => (python_spec(), python_refs_spec()),
+        TypeScript => (typescript_spec(), typescript_refs_spec()),
         _ => return Ok(Vec::new()),
     };
     extract_refs_with(lang_spec, refs, source)
@@ -1779,6 +1780,43 @@ fn python_refs_spec() -> &'static RefSpec {
             capture_kinds: &[
                 ("ref.call", RefKind::Call),
                 ("ref.import", RefKind::Import),
+            ],
+            wildcard_imports: None,
+        }
+    })
+}
+
+fn typescript_refs_spec() -> &'static RefSpec {
+    static SPEC: OnceLock<RefSpec> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        static Q: OnceLock<Query> = OnceLock::new();
+        let lang = typescript_spec().language;
+        // tree-sitter-typescript's `new_expression` carries the
+        // constructor as `(identifier)` only — not `(type_identifier)`,
+        // unlike the inheritance position which uses `(type_identifier)`.
+        // The constructor path is matched via `(identifier)` here; the
+        // (type_identifier) variant lives only in extends/implements.
+        let q = Q.get_or_init(|| {
+            Query::new(
+                lang,
+                r#"
+                (call_expression function: (identifier) @ref.call)
+                (call_expression function: (member_expression property: (property_identifier) @ref.call))
+                (new_expression constructor: (identifier) @ref.ctor)
+                (class_heritage (extends_clause value: (identifier) @ref.inherit))
+                (class_heritage (implements_clause (type_identifier) @ref.inherit))
+                (type_annotation (type_identifier) @ref.type)
+                "#,
+            )
+            .expect("typescript refs")
+        });
+        RefSpec {
+            query: q,
+            capture_kinds: &[
+                ("ref.call", RefKind::Call),
+                ("ref.ctor", RefKind::Ctor),
+                ("ref.inherit", RefKind::InheritFrom),
+                ("ref.type", RefKind::TypeUse),
             ],
             wildcard_imports: None,
         }

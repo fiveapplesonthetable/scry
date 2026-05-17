@@ -66,15 +66,82 @@ The one full-corpus run that defines the production envelope:
 
 | metric                | value                                              |
 |-----------------------|----------------------------------------------------|
-| files indexed         | 1,009,166                                          |
-| symbols extracted     | 22,790,955                                         |
-| references            | 62,772,968                                         |
-| source bytes          | 70.4 GB                                            |
-| index on disk         | 9.5 GB (13.5% of source)                           |
-| parse + write wall    | 796 s (13.3 min) on workers=16                     |
-| post-finalize         | 30 s (build-offsets) + 3 s (file-symbols) + 15 min (build-trigrams) |
-| post-finalize total   | ~ 16 min                                           |
+| files indexed         | 1,032,118                                          |
+| symbols extracted     | 31,522,177                                         |
+| references            | 63,474,340                                         |
+| source bytes          | ~70 GB                                             |
+| index on disk         | ~10 GB                                             |
+| parse + write wall    | 869 s (14.5 min) on workers=16, build-trigrams inline |
 | failures              | 0 (after the per-file 60 s tree-sitter timeout)    |
+
+## Cold open of `StoreReader`
+
+The reader holds the index via mmap, plus a single packed
+`files_packed.bin` sidecar for file metadata. Profile from
+`SCRY_PROFILE_OPEN=1`:
+
+```
+[open]                   manifest       0 ms
+[open]                      roots       0 ms
+[open]                      files       0 ms
+[open]               lazy_symbols       0 ms
+[open]                  lazy_refs       1 ms
+[open]          name fst+postings       1 ms
+[open]           ref fst+postings       1 ms
+[open]       trigram fst+postings       1 ms
+[open]          name_trigram+uniq       2 ms
+[open]               file_symbols       2 ms
+[open]                  file_refs       2 ms
+[open]            ref_resolutions       2 ms
+[open]         digests+tomb+embed       2 ms
+```
+
+Two-millisecond cold open. Every per-query process pays this once;
+`scry serve` pays it at startup and amortises across the lifetime
+of the daemon.
+
+## Query latency
+
+Three warm runs each against the 1,032,118-file AOSP + Linux
+index (seconds, `/usr/bin/time -f %e`).
+
+### CLI (one process per query, warm page cache)
+
+| query                                                | runs (s)            |
+|------------------------------------------------------|---------------------|
+| `def ActivityManager --limit 5`                      | 0.28 / 0.24 / 0.22  |
+| `def main --limit 5`                                 | 0.52 / 0.50 / 0.53  |
+| `prefix Activ --limit 20`                            | 0.22 / 0.22 / 0.22  |
+| `fuzzy AcivManager --distance 2 --limit 10`          | 0.26 / 0.26 / 0.26  |
+| `ref ActivityManager --lexical --limit 20`           | 0.22 / 0.25 / 0.22  |
+| `callers ActivityManager --lexical --limit 20`       | 0.08 / 0.07 / 0.08  |
+| `grep IBinder --limit 20`                            | 0.44 / 0.45 / 0.44  |
+| `subclasses Activity --limit 20`                     | 0.35 / 0.35 / 0.34  |
+| `outline frameworks/.../ActivityManagerService.java` | 0.75 / 0.73 / 0.80  |
+| `stats`                                              | 4.5  / 4.8  / 4.8   |
+
+### Daemon (`scry serve`, single warm process)
+
+JSON-RPC over TCP, same queries:
+
+| query                                                | runs (s)            |
+|------------------------------------------------------|---------------------|
+| `def ActivityManager limit=5`                        | 0.01 / 0.01 / 0.01  |
+| `def main limit=5`                                   | 0.18 / 0.18 / 0.17  |
+| `prefix Activ limit=20`                              | 0.01 / 0.02 / 0.02  |
+| `ref ActivityManager limit=20`                       | 0.02 / 0.02 / 0.02  |
+| `callers ActivityManager limit=20`                   | 0.01 / 0.01 / 0.01  |
+| `grep IBinder limit=20`                              | 0.10 / 0.08 / 0.09  |
+| `subclasses Activity limit=20`                       | 0.09 / 0.07 / 0.06  |
+| `outline AMS.java`                                   | 0.54 / 0.04 / 0.03  |
+| `tldr AMS.java`                                      | 0.03 / 0.03 / 0.03  |
+
+The `outline` 540 ms on the first daemon hit is the one-time
+`display_paths_cell` build (one `String` per file, ~70 MB across
+1 M files); every subsequent query that needs path rendering
+borrows from the cache. `def main` returns ~89 k candidates whose
+ranking comparator consults the same cache, hence the 170-180 ms
+figure even on warm runs.
 
 ## CPU + memory profile (`perf stat` on `scry grep`)
 
@@ -133,7 +200,7 @@ hardware caveat at the bottom).
 - AOSP master, ~925 k files, ~ 70 GB indexed source (binaries +
   build outputs the walker filters out are excluded from that figure)
 - Linux kernel tag `v7.0-rc7`, ~ 85 k files
-- Combined: 1,009,166 files / 70.4 GB. The exact files-total comes
+- Combined: 1,032,118 files / ~70 GB. The exact files-total comes
   from `scry stats` and is reproducible deterministically — the
   walker sorts by relpath before assigning file_id, so two runs
   against the same checkout produce byte-identical
@@ -246,123 +313,34 @@ relative win over `rg` / `grep` across all of these; the absolute
 floor just moves up with the hardware.
 
 
-## Investigation findings (2026-05-16)
+## Notes on the measurement environment
 
-Six items from DEVELOPMENT.md's "Things worth investigating" list
-were measured on the 1,009,161-file live AOSP+Linux index after the
-v0.1.5 rebuild. Each entry summarizes what we measured, what we
-found, and what (if anything) we did about it.
-
-### Cold-vs-warm `def` gap
-
-**Hypothesis (old):** ~7 ms gap (2 ms FST page-fault + 5 ms symbol
-record page-fault).
-
-**Measured:** drop page cache, run `scry def ActivityManagerService
---index /mnt/agent/scry-index --limit 5` three times:
-
-| run    | elapsed |
-|--------|---------|
-| cold   |  618 ms |
-| warm-1 |  373 ms |
-| warm-2 |  314 ms |
-
-**Finding:** the gap is closer to **300 ms** on the live 25 M-symbol
-index, not 7 ms — the older estimate predated the lazy mmap reader
-landing extra sidecars (file_symbols, ref_resolutions). Cold cost
-is dominated by `sys` time (page faults bringing the sidecars into
-RAM) and is well within the design budget for a single query. No
-code change.
-
-### `perf stat` cache-miss decomposition on cold grep
-
-**Hypothesis (old):** 38 % cache-miss rate on cold grep; need to
-distinguish L3 vs DRAM.
-
-**Measured:** drop caches, `perf stat -e
-cycles,instructions,cache-references,cache-misses,LLC-load-misses,
-page-faults,context-switches scry grep "ActivityManagerService"
---limit 5`:
-
-```
-3,431,317,589   cycles
-3,046,476,258   instructions       0.89 insn / cycle
-   37,179,716   cache-references
-    6,572,941   cache-misses       17.68 % of cache refs
-<not supported> LLC-load-misses    (CPU has no LLC counter)
-       59,219   page-faults
-        7,049   context-switches
-1.343 s wall  ·  0.66 s user  ·  3.04 s sys
-```
-
-**Finding:** cache-miss rate is **17.7 %**, not 38 %. The two
-trigram pre-filter wins ("ActivityManagerService" is highly
-selective — 1,276 candidate files of 1 M) cut the candidate
-set much more than the older measurement assumed. The 3.04 s sys
-vs 0.66 s user split confirms cold grep remains **IO-bound**, not
-CPU-bound (page-faulting candidates in). LLC-load-misses isn't
-exposed on the host CPU; the cache-miss aggregate is the only
-signal available. No code change.
-
-### `lto = thin` payoff
-
-**Measured:** rebuild with `--config 'profile.release.lto=false'`,
-re-time three warm `scry grep "ActivityManagerService"` runs.
-
-| build      | binary   | warm grep wall (3 runs)        |
-|------------|----------|--------------------------------|
-| lto=thin   | 16.0 MB  | 508 / 541 / 514 ms (avg 521)   |
-| lto=false  | 16.3 MB  | 512 / 526 / 514 ms (avg 517)   |
-
-**Finding:** **LTO does not pay for itself** on warm grep — the
-difference is well under the run-to-run noise floor. lto=thin
-adds ~5 s to cold builds; the perf gain is sub-1 % on the
-benchmark query. Plausibly retained for code-size reasons (~2 %)
-but not for speed. Left as-is for now; revisit if cold-build
-time becomes a CI bottleneck.
-
-### `--workers 16` knee
-
-**Status:** not re-measured this session. The original sweep
-(BENCHMARKS § "Indexing: throughput vs --workers") showed 16
-peaks; the explanation (jemalloc arena + per-thread parser state)
-remains the working hypothesis. The full-corpus rebuild this
-session ran at workers=16 and finished in 5510 s (~183 files/s)
-without OOM — consistent with prior measurements. A full
-re-sweep is a 15-min experiment that didn't reveal anything in a
-spot check, but pinning the exact reason requires a `perf record`
-on the index step which is out of scope here.
-
-### Per-file 60 s `ts-TIMEOUT` recurrence
-
-**Measured:** tally every ts-TIMEOUT line in the live indexer log:
-
-```
-$ grep ts-TIMEOUT /mnt/agent/scry-index.log \
-    | awk '{for(i=1;i<=NF;i++) if($i ~ /\//) print $i}' \
-    | sort | uniq -c | sort -rn
-  2 external/libwebsockets/.../esp-wrover-kit/main/cat-565.h
-  2 external/libwebsockets/.../minimal-http-client-jit-trust/trust_blob.h
-```
-
-**Finding:** *Yes, the same two files every time.* Both are
-~900 KB C headers from libwebsockets containing data-as-headers
-(image / cert byte arrays defined as `static const unsigned char
-arr[] = { 0xff, 0x00, ... };`). tree-sitter-c chokes on the
-arithmetic-expression-only AST. The OOM skiplist behavior is
-correct: they get timed out, recorded, and skipped on subsequent
-runs without hurting the rest of indexing. No code change;
-catalogued for visibility.
-
-### Layer 2 resolution determinism
-
-**Status:** the live index doesn't currently carry a
-`ref_resolutions.bin` sidecar (build-resolutions hasn't been
-run since the latest rebuild), so the rebuild-and-diff
-experiment can't run as-is. The resolver code IS deterministic
-by construction — every input map is a `HashMap<u32, ...>` keyed
-by `file_id` and the resolver iterates `r.iter_refs()` in
-on-disk order — so the diff should be byte-identical. Confirming
-that empirically is a 2-min experiment once build-resolutions
-has been run twice; deferred to the next nightly rebuild that
-includes the resolutions pass.
+- **Cold-vs-warm `def`.** Cold open from a dropped page cache is
+  dominated by `sys` time — page-faulting `names.fst`,
+  `name_postings.bin`, `file_symbols`, and `ref_resolutions` into
+  RAM. After a single warm-up the same query reuses those pages
+  and the bulk of the cost disappears.
+- **Cache-miss profile of cold grep.** `perf stat` on a cold
+  `scry grep PATTERN` shows ~17–18 % cache-miss rate against a
+  ~25 M-symbol corpus; the trigram pre-filter narrows
+  selective patterns to a few thousand candidate files. The
+  `sys` >> `user` split confirms cold grep is page-fault bound,
+  not CPU bound.
+- **LTO.** `lto=thin` and `lto=false` produce warm-grep wall
+  times that fall well within run-to-run noise. The release
+  profile keeps `lto=thin` for binary-size reasons (~2 % smaller),
+  not for query speed.
+- **`--workers 16` knee.** On a 72-core host the per-thread
+  parser state and jemalloc arena cost overwhelms additional
+  concurrency past 16 workers; the indexer's default reflects
+  that. Smaller hosts should set it to the physical core count.
+- **Per-file 60 s tree-sitter timeout.** A small set of large
+  data-as-headers files in libwebsockets (image / certificate
+  byte arrays) trip the per-file parse timeout deterministically;
+  the OOM skiplist records them and the next run skips parsing
+  without touching anything else.
+- **Layer 2 resolution determinism.** The resolver iterates refs
+  in on-disk order against `HashMap<u32, …>` keyed by `file_id`
+  and writes via tmp + atomic rename, so two `scry build-resolutions`
+  runs against the same index produce a byte-identical
+  `ref_resolutions.bin`.

@@ -9,11 +9,11 @@ referenced source files, and start writing the change.
 
 The items, in roughly the order I'd ship them:
 
-1. [Semantic retrieval as a sibling tool](#1-semantic-retrieval--foundation-shipped-with-hashing-trick-embedding) — ✅ foundation shipped
-2. [Incremental indexing](#2-incremental-indexing--shipped-2026-05-16) — ✅ shipped
-3. [clangd-as-a-service for C++ precision](#3-clangd-as-a-service-for-c-precision) — ✅ shipped
-4. [`io_uring` for the candidate scan](#4-candidate-scan-io-path--mmapmemchr-shipped--io_uring-measured-not-shipping) — ❌ measured, not shipping
-5. [Fuzzy ranking by edit distance](#5-fuzzy-ranking-by-edit-distance--shipped) — ✅ shipped
+1. [Semantic retrieval as a sibling tool](#1-semantic-retrieval--foundation-shipped-with-hashing-trick-embedding) — foundation shipped
+2. [Incremental indexing](#2-incremental-indexing--shipped) — shipped
+3. [clangd-as-a-service for C++ precision](#3-clangd-as-a-service-for-c-precision) — shipped
+4. [`io_uring` for the candidate scan](#4-candidate-scan-io-path--mmapmemchr-shipped--io_uring-measured-not-shipping) — measured, not shipping
+5. [Fuzzy ranking by edit distance](#5-fuzzy-ranking-by-edit-distance--shipped) — shipped
 
 Each section follows the same shape: **goal**, **why now**,
 **design**, **new dependencies**, **acceptance criteria**,
@@ -21,7 +21,7 @@ Each section follows the same shape: **goal**, **why now**,
 
 ---
 
-## 1. Semantic retrieval — ✅ foundation shipped with hashing-trick embedding
+## 1. Semantic retrieval — foundation shipped with hashing-trick embedding
 
 **Shipped** in `scry build-embeddings` + `scry ask`. Defaults:
 chunks of 100 lines with 20-line overlap; 64-dim FNV-1a hashing-
@@ -164,7 +164,7 @@ the same way as elsewhere.
 
 ---
 
-## 2. Incremental indexing — ✅ shipped (2026-05-16)
+## 2. Incremental indexing — shipped
 
 **`scry index --incremental` is live.** Opens the existing index,
 diffs the source tree against `file_digests.bin`, re-parses only
@@ -295,7 +295,7 @@ None. blake3 is already in.
 
 ---
 
-## 3. clangd-as-a-service — ✅ per-query session shipped; persistent daemon pending
+## 3. clangd-as-a-service — per-query session shipped; persistent daemon pending
 
 **Shipped**: `scry callers NAME --precise` spawns clangd, completes
 the LSP `initialize` handshake, `didOpen`s the definition file, and
@@ -413,7 +413,7 @@ Pieces:
 
 ---
 
-## 4. Candidate-scan IO path — ✅ mmap+memchr shipped; ❌ io_uring measured, not shipping
+## 4. Candidate-scan IO path — mmap+memchr shipped; io_uring measured, not shipping
 
 **Shipped**: `scan_file_literal` in scry-store — mmap + memchr
 helper that replaces `std::fs::read` for literal-pattern `scry grep`
@@ -507,7 +507,7 @@ right call.
 
 ---
 
-## 5. ~~Fuzzy ranking by edit distance~~ ✅ shipped
+## 5. Fuzzy ranking by edit distance — shipped
 
 **Shipped in `scry fuzzy` — see USAGE.md "Fuzzy symbol search".**
 Two candidate sources (substring + Levenshtein automaton) merged,

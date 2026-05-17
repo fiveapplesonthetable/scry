@@ -816,72 +816,60 @@ them concrete.
 
 ## 12. Risks and known unknowns
 
-Status of each risk as of 2026-05-16. ✅ = mitigated/shipped,
-⏳ = partial, 📋 = explicitly accepted, see linked follow-up.
+1. **C++ resolution without compile commands is mediocre.**
+   `scry callers NAME --precise` routes through clangd via LSP
+   (`crates/scry-cli/src/clangd.rs`). Uses the real compiler's
+   overload resolution. Requires `clangd` on PATH plus a
+   `compile_commands.json`; clean error message when missing.
+   The heuristic path stays the default.
 
-1. ✅ **C++ resolution without compile commands is mediocre.**
-   *Mitigation shipped.* `scry callers NAME --precise` routes
-   through clangd via LSP (`crates/scry-cli/src/clangd.rs`,
-   commit 6bf1b3d). Uses the real compiler's overload resolution.
-   Requires `clangd` on PATH + compile_commands.json; clean error
-   message when missing. Heuristic path stays default.
-
-2. ⏳ **Tree-sitter-kotlin is the weakest of the major grammars.**
-   *Partial mitigation.* We pinned `tree-sitter-kotlin-ng` (the
-   actively maintained fork) and patched
-   `kotlin_receiver_for_decl` to handle extension functions and
-   extension properties correctly. Companion objects, sealed-class
-   hierarchies, and `inline reified` fns are still tracked under
+2. **Tree-sitter-kotlin is the weakest of the major grammars.**
+   `tree-sitter-kotlin-ng` (the actively maintained fork) is
+   pinned; `kotlin_receiver_for_decl` handles extension functions
+   and extension properties. Companion objects, sealed-class
+   hierarchies, and `inline reified` fns are tracked under
    "Known coverage gaps" in `docs/DEVELOPMENT.md`.
 
-3. ✅ **AIDL cross-language linkage is the killer feature but
-   also subtle.** *Mitigation shipped.* Every `interface IFoo` in
-   an `.aidl` / `.hal` now emits synthetic shadow symbols
-   (`IFoo.Stub`, `IFoo.Stub.Proxy`, `BpIFoo`, `BnIFoo`,
-   `IFooAsyncServer`; HIDL: `BpIFoo`, `BnIFoo`, `BsIFoo`) via
-   the new `SymbolKind::AidlShadow` / `HidlShadow` (commit
-   f9a506f). `scry def IFoo.Stub` now lands on the AIDL source.
-   The shadow-name set is pinned by tests so a toolchain rename
-   is loud.
+3. **AIDL cross-language linkage is the killer feature but
+   subtle.** Every `interface IFoo` in an `.aidl` / `.hal`
+   emits synthetic shadow symbols (`IFoo.Stub`, `IFoo.Stub.Proxy`,
+   `BpIFoo`, `BnIFoo`, `IFooAsyncServer`; HIDL: `BpIFoo`, `BnIFoo`,
+   `BsIFoo`) via `SymbolKind::AidlShadow` / `HidlShadow`.
+   `scry def IFoo.Stub` lands on the AIDL source. The shadow-name
+   set is pinned by tests so a toolchain rename is loud.
 
-4. ✅ **Incremental index correctness.** *Shipped 2026-05-16.*
-   `scry index --incremental` opens the existing index, diffs the
-   source tree against `file_digests.bin`, re-parses only the
-   changed + added files, replays unchanged records into a fresh
-   staging dir, and atomically swaps it into place. The old index
-   stays queryable for the whole rebuild; a mid-process crash
-   leaves the old index intact. Foundation: `file_digests.bin` +
-   tombstone bitmap + reader-side filter on every query path +
-   `scry index-diff` + `scry tombstone` + `scry health` (commits
-   c89ed40, e711c15, c2c8b9e). The remaining true append-only
-   writer that mutates the index in place (preserving `file_id`s)
-   is a perf-only optimization for huge corpora with tiny change
-   rates — `docs/ROADMAP.md` § 2.
+4. **Incremental index correctness.** `scry index --incremental`
+   opens the existing index, diffs the source tree against
+   `file_digests.bin`, re-parses only the changed + added files,
+   replays unchanged records into a fresh staging dir, and
+   atomically swaps it into place. The old index stays queryable
+   for the whole rebuild; a mid-process crash leaves it intact.
+   Foundation: `file_digests.bin` + tombstone bitmap + reader-side
+   filter on every query path + `scry index-diff` + `scry tombstone`
+   + `scry health`. A true append-only writer that mutates the
+   index in place (preserving `file_id`s) is `docs/ROADMAP.md` § 2.
 
-5. ✅ **Memory pressure during cold index.** *Mitigation
-   shipped — 8-layer envelope.* cgroup `MemoryMax=60G` (outer),
-   `--mem-cap` soft backpressure via jemalloc heartbeat, big-file
-   serial routing, hard `--max-file-bytes` skip, per-file
-   `parse_with_options` 60 s budget, auto OOM skiplist, jemalloc
-   `dirty_decay_ms` aggressive return-to-OS, MemorySwapMax=0.
-   See `§ 11` of this doc. Steady-state RSS on the live indexer
-   stays 600 MB – 1 GB; target met with > 3× headroom.
+5. **Memory pressure during cold index.** Eight overlapping
+   guards: cgroup `MemoryMax=60G` (outer), `--mem-cap` soft
+   backpressure via jemalloc heartbeat, big-file serial routing,
+   hard `--max-file-bytes` skip, per-file `parse_with_options`
+   60 s budget, auto OOM skiplist, jemalloc `dirty_decay_ms`
+   aggressive return-to-OS, `MemorySwapMax=0`. See `§ 11`.
+   Steady-state RSS on the live indexer stays 600 MB – 1 GB.
 
-6. ⏳ **Soong correctness.** *Hand-written parser ships with a
-   broad test surface but doesn't fall back to a real Soong
-   query.* `crates/scry-aosp/src/bp.rs` covers the common module
-   shapes (module-type calls, named-arg lists, srcs/deps/cflags
-   refs, anonymous assignments). Edge-case fallback to a real
-   `b query` invocation is documented in DEVELOPMENT.md
-   "Concrete pending items"; not blocking for the common case.
+6. **Soong correctness.** Hand-written parser
+   (`crates/scry-aosp/src/bp.rs`) covers the common module shapes
+   (module-type calls, named-arg lists, srcs/deps/cflags refs,
+   anonymous assignments). An edge-case fallback to a real
+   `b query` invocation is captured in DEVELOPMENT.md "Concrete
+   pending items"; not blocking the common case.
 
 ## 13. Phases and milestones
 
-Status of each phase as of 2026-05-16. ✅ = exit-gate met,
-⏳ = partial / deferred. Original design text preserved verbatim;
-the status header reflects what shipped vs what was scoped down.
+Original design text preserved verbatim; the status header on each
+phase reflects what shipped vs what was scoped down.
 
-### Phase 0 — scaffold ✅ shipped
+### Phase 0 — scaffold (shipped)
 
 - Crates: `scry-walker`, `scry-lang`, `scry-store`, `scry-aosp`,
   `scry-cli` (we collapsed the planned `scry-index` and
@@ -889,7 +877,7 @@ the status header reflects what shipped vs what was scoped down.
 - `.gitignore`-aware walker excludes `out/`, `prebuilts/`, etc.
 - **Exit gate met**: walks the full AOSP tree in ~25 s.
 
-### Phase 1 — syntactic MVP ✅ shipped
+### Phase 1 — syntactic MVP shipped
 
 - Tree-sitter integration for C, C++, Java, Kotlin, Rust, Go, Python.
 - Per-language `.scm` query files extract definitions.
@@ -901,7 +889,7 @@ the status header reflects what shipped vs what was scoped down.
 - **Exit gate met**: full AOSP+Linux index 13.3 min;
   `scry def Binder` returns 5–15 ms warm.
 
-### Phase 2 — references and resolution ✅ shipped (core); ⏳ sugar commands
+### Phase 2 — references and resolution shipped (core); ⏳ sugar commands
 
 - Reference extraction for the seven languages.
 - Layer 1 resolver (imports + same-file scope + inheritance).
@@ -917,7 +905,7 @@ the status header reflects what shipped vs what was scoped down.
 - **Exit gate met for the core**: `scry callers transact --lang Java`
   returns the right call sites in 80 ms warm.
 
-### Phase 3 — AOSP build awareness ✅ shipped (core); ⏳ sugar commands
+### Phase 3 — AOSP build awareness shipped (core); ⏳ sugar commands
 
 - Android.bp parser → module graph (deps, srcs, cflags, ldflags
   refs). Hand-written; 4 unit tests.
@@ -929,14 +917,13 @@ the status header reflects what shipped vs what was scoped down.
   `--owner` not shipped as standalone filters; module info is
   reachable via `def NAME --kind soong` and `scry module-of`,
   ownership via `scry owner PATH`.
-- `scry module-of`, `scry owner` shipped. The earlier `scry mod`
-  sugar was removed in v0.1.2 — `def --kind soong` is the
-  uniform spelling. ⏳ `scry aidl-link`, `scry cflag` not
-  shipped — same `def --kind` / `ref --kind` story as Phase 2
-  sugar.
+- `scry module-of`, `scry owner` shipped. `def --kind soong` is
+  the uniform spelling for build-system queries. ⏳ `scry aidl-link`,
+  `scry cflag` not shipped — same `def --kind` / `ref --kind`
+  story as Phase 2 sugar.
 - **Exit gate met for the core**.
 
-### Phase 3.5 — AOSP platform configs ✅ shipped (parsers); ⏳ sugar commands
+### Phase 3.5 — AOSP platform configs shipped (parsers); ⏳ sugar commands
 
 - aconfig parser (`crates/scry-aosp/src/aconfig.rs`); flags appear
   as `SymbolKind::AconfigFlag` queryable via
@@ -955,7 +942,7 @@ the status header reflects what shipped vs what was scoped down.
 - Bash tree-sitter integration deferred (low corpus
   signal-to-noise).
 
-### Phase 4 — speed and ergonomics ✅ shipped
+### Phase 4 — speed and ergonomics shipped
 
 - Custom mmap'd columnar format shipped (DESIGN § 5).
 - Russ-Cox trigram index shipped (`FAST_PATH.md`).
@@ -971,27 +958,27 @@ the status header reflects what shipped vs what was scoped down.
 - **Exit gate met**: warm `def` ~ 8 ms; grep is **30–45× faster
   than `rg`** (not within-2x — exceeded expectation).
 
-### Phase 5 — precision uplift ✅ shipped (clangd path); ⏳ SCIP + Stack Graphs
+### Phase 5 — precision uplift (clangd shipped; SCIP + Stack Graphs partial)
 
-- ✅ `scry callers NAME --precise` via clangd (commit 6bf1b3d).
-  Covers the C++ overload-resolution use case SCIP-clang was
-  originally planned for.
-- ⏳ Direct SCIP file ingestion deferred — clangd-direct gives
-  same precision without requiring users to manage SCIP files.
-  If user demand for SCIP appears, the ingestion path is a
-  contained add.
-- ⏳ Stack Graphs experiment for Kotlin/Python and cross-language
+- `scry callers NAME --precise` via clangd. Covers the C++
+  overload-resolution use case SCIP-clang was originally planned
+  for.
+- Direct SCIP file ingestion deferred — the clangd path gives
+  the same precision without requiring users to manage SCIP
+  files. If user demand for SCIP appears, the ingestion path is
+  a contained add.
+- Stack Graphs experiment for Kotlin/Python and cross-language
   JNI binding inference not shipped. Both documented as future
   work in `docs/DEVELOPMENT.md`.
 
-### Phase 6 — polish ⏳ partial
+### Phase 6 — polish (partial)
 
 - Ranking shipped with composite `rank_score` (DESIGN.md § 5;
   4 unit tests on the tier ordering).
-- ✅ `scry stats` shipped; ✅ `scry health` shipped this commit
-  (validates every required + optional sidecar; non-zero exit
-  on any required failure; spot-decodes the FST + lazy vec).
-- ⏳ Web UI deferred (not blocking the LLM-agent or terminal use
+- `scry stats` shipped; `scry health` shipped (validates every
+  required + optional sidecar; non-zero exit on any required
+  failure; spot-decodes the FST + lazy vec).
+- Web UI deferred (not blocking the LLM-agent or terminal use
   case; minimal effort to add if a browser-facing path becomes
   necessary).
 - Packaging: cargo build produces a static binary; install

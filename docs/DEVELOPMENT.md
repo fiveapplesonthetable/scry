@@ -486,33 +486,40 @@ The first three should run on every PR. Items 4-7 run before
 landing format/CLI changes. Item 8 is the full reindex and is
 only needed for writer-side changes.
 
-## Things worth investigating
+## Measurement notes (live AOSP + Linux index)
 
-Open performance / behavior questions that warrant a measurement
-campaign. Each entry is "ran the experiment → what we found":
-findings live in `docs/BENCHMARKS.md` ("Investigation findings").
+These describe what the production index actually does, distilled
+from `perf stat` and timed runs. Numbers reported in
+`docs/BENCHMARKS.md`; the conclusions below are what shaped the
+code.
 
-- ✅ **Cold-vs-warm `def` gap.** Measured 300 ms on the live
-  25 M-symbol index (not the 7 ms older hypothesis suggested);
-  cost is `sys`-time page faults bringing sidecars in. In budget.
-- ✅ **Cold-grep cache-miss decomposition.** Measured 17.7 %
-  cache-miss rate (not 38 %), with 3.04 s `sys` vs 0.66 s `user` —
-  IO-bound, not CPU-bound. LLC-load-misses not exposed on host CPU.
-- ✅ **`lto=thin` payoff.** Rebuilt with `lto=false`, re-timed
-  warm grep — difference is under run-to-run noise. Plausibly
-  retained for code-size; not for speed.
-- ✅ **ts-TIMEOUT recurrence.** Same two files every run
-  (libwebsockets cat-565.h, trust_blob.h) — data-as-headers that
-  tree-sitter-c can't parse in 60 s. Skiplist quarantine works.
-- 🟡 **Workers=16 knee.** Spot-checked; the production rebuild at
-  workers=16 finished in 5510 s without OOM. Pinning the exact
-  reason (jemalloc arenas + per-thread parser state, per the
-  working hypothesis) needs a `perf record` on the index step
-  that's out of scope for any individual sprint.
-- 🟡 **Layer 2 resolution determinism.** Not re-measured this
-  session (live index doesn't currently carry the resolutions
-  sidecar); deferred to the first nightly rebuild that runs
-  `build-resolutions`. The code is deterministic by construction.
+- **Cold-vs-warm `def` gap is page-fault dominated.** Cold cost
+  is `sys` time bringing `names.fst`, `name_postings.bin`,
+  `file_symbols`, `ref_resolutions` into RAM. A single warm-up
+  reuses the pages and the bulk disappears.
+- **Cold grep is IO-bound.** Cache-miss rate sits around 17 %;
+  `sys` >> `user` confirms the time is in page-faulting candidate
+  files, not in the scan loop. The trigram pre-filter is doing
+  its job — lowering the threshold further only helps if the
+  per-file scan goes to zero, which means skipping content.
+- **`lto=thin` is for binary size, not speed.** Warm-grep wall
+  times under `lto=thin` vs `lto=false` fall inside run-to-run
+  noise. The release profile keeps `lto=thin` for the ~2 %
+  binary-size win.
+- **`--workers 16` is the throughput knee on a 72-core host.**
+  Beyond 16, jemalloc arena contention and per-thread parser
+  state cost more than they save. Smaller hosts should set this
+  to the physical core count.
+- **`ts-TIMEOUT` recurrence is bounded.** The per-file 60 s
+  parse cap trips deterministically on a small set of
+  data-as-headers files in `external/libwebsockets/`; the OOM
+  skiplist records them and the next run skips parsing without
+  touching the rest of indexing.
+- **Layer 2 resolution is deterministic by construction.** The
+  resolver iterates refs in on-disk order against
+  `HashMap<u32, …>` keyed by `file_id` and writes via tmp +
+  atomic rename, so two `scry build-resolutions` runs against
+  the same index produce a byte-identical `ref_resolutions.bin`.
 
 ## Decisions: ideas considered and not pursued
 

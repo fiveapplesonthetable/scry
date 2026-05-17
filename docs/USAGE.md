@@ -48,7 +48,7 @@ Java` to narrow further.
 | `-t`  | `--lang LANG`    | Filter by language (Java, Kotlin, Cpp, Soong, ApiTxt, …)   |
 | `-k`  | `--kind KIND`    | Filter by kind (class, fn, method, soong, init.svc, …)     |
 |       | `--in SUBSTR`    | Restrict to files whose absolute path contains SUBSTR      |
-|       | `--not-in SUBSTR`| Drop files whose absolute path contains SUBSTR (v0.1.51)   |
+|       | `--not-in SUBSTR`| Drop files whose absolute path contains SUBSTR             |
 |       | `--limit N`      | Cap results (default 100)                                  |
 |       | `--json`         | Emit one JSON object per line (NDJSON)                     |
 |       | `--md`           | Emit Markdown with code snippets (LLM-friendly)            |
@@ -112,7 +112,7 @@ $ scry def Activity --in frameworks/base/ --limit 3
 /home/zim/dev/aosp/frameworks/base/tools/aapt2/dump/DumpManifest.cpp:1540:7  (class cpp)  [aapt::Activity]  Activity
 ```
 
-Negative scoping with `--not-in` (v0.1.51) drops anything whose
+Negative scoping with `--not-in` drops anything whose
 path contains the substring. Symmetric to `--in`; both can combine:
 
 ```sh
@@ -263,7 +263,7 @@ $ scry callers transact --lang Java --limit 3
 [scry] cmd=callers q="transact" hits=1524 shown=3 files=1009166 elapsed=84ms
 ```
 
-`→ libs/binder/Binder.cpp:411 [android::BBinder]` (v0.1.30+) is the
+`→ libs/binder/Binder.cpp:411 [android::BBinder]` is the
 Layer 2 resolution — the resolver picked that specific def. Without
 `--def-in`/`--strict` (see below) this is permissive: unresolved refs
 show no `→` annotation. Pass `--json` to get the raw `resolved_to`
@@ -273,7 +273,7 @@ u64 instead of the human-readable file:line.
 ctor, type-use, field-access, import, inherit). `callers` is the
 common-case shorthand for `ref --kind call`.
 
-### Cutting through polymorphism (v0.1.26+)
+### Cutting through polymorphism
 
 Polymorphic names like `close`, `onCreate`, `transact` have
 thousands of distinct defs in a big corpus. Three flags help
@@ -300,7 +300,7 @@ $ scry callers transact --strict --format by-def --limit 8
      219 refs in 19 groups (showing 8)
 ```
 
-`--format by-def` composes with `--json` (v0.1.37+) for
+`--format by-def` composes with `--json` for
 programmatic consumers — emits a JSON array of
 `{count, def: {path, line, col, scope, kind, id}}` entries.
 
@@ -326,7 +326,7 @@ $ scry ref BatteryStats --format count
 Mutually exclusive with `--json`. Useful as a cheap probe
 before deciding whether to spend tokens on the full list.
 
-### `--format paths` (v0.1.56)
+### `--format paths`
 
 Cheap "which files reference X?" shape: deduped sorted file
 paths only, no line/col/scope noise. Pipes straight into
@@ -714,7 +714,7 @@ by kind:
      ...
 ```
 
-The `refs-resolved` line (v0.1.41+) shows what fraction of refs
+The `refs-resolved` line shows what fraction of refs
 the Layer 2 resolutions sidecar attributes to a specific def.
 `<no sidecar — run scry build-resolutions to enable>` appears
 when the sidecar hasn't been built yet. Higher is better — it's
@@ -824,8 +824,7 @@ the connection is dropped immediately (clients see a TCP RST or
 Unix-socket EOF). Workers release their slot via an RAII guard
 so a panic still frees capacity.
 
-`--max-conns 0` (default) preserves the v0.1.3 behavior:
-unlimited.
+`--max-conns 0` (default) is unlimited.
 
 #### Cap-rejected connections get an actionable error
 

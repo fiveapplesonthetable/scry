@@ -7,10 +7,10 @@ for any tree scry indexes. Each editor below talks to one long-lived
 scry web UI uses.
 
 | editor   | install                                 | autocomplete | jump-to-def | find-refs | outline | tested |
-|----------|-----------------------------------------|:------------:|:-----------:|:---------:|:-------:|:------:|
-| Emacs    | [emacs/README.md](emacs/README.md)      | ✓ CAPF       | ✓ xref      | ✓ xref    | ✓       | 8/8    |
-| Vim      | [vim/README.md](vim/README.md)          | ✓ omnifunc   | ✓ :ScryDef  | ✓         | ✓       | 8/8    |
-| VS Code  | [vscode/README.md](vscode/README.md)    | ✓ LSP-style  | ✓ F12       | ✓ Sh+F12  | ✓       | 7/7    |
+|----------|-----------------------------------------|--------------|-------------|-----------|---------|--------|
+| Emacs    | [emacs/README.md](emacs/README.md)      | CAPF         | xref        | xref      | yes     | 8/8    |
+| Vim      | [vim/README.md](vim/README.md)          | omnifunc     | :ScryDef    | yes       | yes     | 8/8    |
+| VS Code  | [vscode/README.md](vscode/README.md)    | LSP-style    | F12         | Shift+F12 | yes     | 7/7    |
 
 The protocol every plugin implements is in
 [common/PROTOCOL.md](common/PROTOCOL.md). It is the entire surface

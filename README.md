@@ -202,11 +202,11 @@ First-class plugins for Emacs, Vim, and VS Code live in
 per editor session and hooks into the editor's standard
 autocomplete / jump-to-def / find-references APIs:
 
-| editor   | install                                               | autocomplete    | jump-to-def | find-refs | outline |
-|----------|-------------------------------------------------------|:---------------:|:-----------:|:---------:|:-------:|
-| Emacs    | [editors/emacs/README.md](editors/emacs/README.md)    | ✓ CAPF          | ✓ M-./xref  | ✓ M-?/xref| ✓       |
-| Vim      | [editors/vim/README.md](editors/vim/README.md)        | ✓ omnifunc      | ✓ :ScryDef  | ✓         | ✓       |
-| VS Code  | [editors/vscode/README.md](editors/vscode/README.md)  | ✓ provider API  | ✓ F12       | ✓ Sh+F12  | ✓       |
+| editor   | install                                               | autocomplete  | jump-to-def | find-refs | outline |
+|----------|-------------------------------------------------------|---------------|-------------|-----------|---------|
+| Emacs    | [editors/emacs/README.md](editors/emacs/README.md)    | CAPF          | M-./xref    | M-?/xref  | yes     |
+| Vim      | [editors/vim/README.md](editors/vim/README.md)        | omnifunc      | :ScryDef    | yes       | yes     |
+| VS Code  | [editors/vscode/README.md](editors/vscode/README.md)  | provider API  | F12         | Shift+F12 | yes     |
 
 All three pass an end-to-end suite (`editors/tests/run_all.sh`)
 that exercises every primitive against a real index. Sub-10 ms

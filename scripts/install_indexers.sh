@@ -198,14 +198,14 @@ open(path, "w").write(src.replace(needle, repl, 1))
 summary() {
     log "---- indexer install summary ----"
     for tool in scip-typescript scip-python rust-analyzer scip-go scip-java gradle sbt; do
-        if have "$tool"; then printf "  \033[32m✓\033[0m %s -> %s\n" "$tool" "$(command -v "$tool")"
-        else printf "  \033[31m✗\033[0m %s (not installed)\n" "$tool"
+        if have "$tool"; then printf "  \033[32mOK\033[0m   %s -> %s\n" "$tool" "$(command -v "$tool")"
+        else printf "  \033[31mMISS\033[0m %s (not installed)\n" "$tool"
         fi
     done
     if [[ -d "$HOME/.m2/repository/com/sourcegraph/semanticdb-kotlinc" ]]; then
-        printf "  \033[32m✓\033[0m semanticdb-kotlinc (~/.m2/repository/com/sourcegraph/semanticdb-kotlinc)\n"
+        printf "  \033[32mOK\033[0m   semanticdb-kotlinc (~/.m2/repository/com/sourcegraph/semanticdb-kotlinc)\n"
     else
-        printf "  \033[31m✗\033[0m semanticdb-kotlinc (~/.m2)\n"
+        printf "  \033[31mMISS\033[0m semanticdb-kotlinc (~/.m2)\n"
     fi
     log "PATH still needs \$PREFIX/bin? Add to your shell rc:"
     echo "    export PATH=\"$PREFIX/bin:\$PATH\""

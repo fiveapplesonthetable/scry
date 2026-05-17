@@ -2101,17 +2101,17 @@ index (1357 symbols, 53 files, 591 ms cold build). The full
 matrix:
 
 | primitive  | Emacs | Vim | VS Code |
-|------------|:-----:|:---:|:-------:|
-| `stats`    | ✓     | ✓   | ✓       |
-| `prefix`   | ✓     | ✓   | ✓       |
-| `def`      | ✓     | ✓   | ✓       |
-| `callers`  | ✓     | ✓   | ✓       |
-| `outline`  | ✓     | ✓   | ✓       |
-| `fuzzy`    | ✓     | ✓   | ✓       |
-| `xref-backend-definitions` integration | ✓ | — | — |
-| `completion-at-point` CAPF shape | ✓ | — | — |
-| `omnifunc` findstart + candidates | — | ✓ | — |
-| u64 ID JSON precision | (via json.el) | (via json_decode) | ✓ explicit assertion |
+|------------|-------|-----|---------|
+| `stats`    | yes   | yes | yes     |
+| `prefix`   | yes   | yes | yes     |
+| `def`      | yes   | yes | yes     |
+| `callers`  | yes   | yes | yes     |
+| `outline`  | yes   | yes | yes     |
+| `fuzzy`    | yes   | yes | yes     |
+| `xref-backend-definitions` integration | yes | — | — |
+| `completion-at-point` CAPF shape | yes | — | — |
+| `omnifunc` findstart + candidates | — | yes | — |
+| u64 ID JSON precision | (via json.el) | (via json_decode) | yes (explicit assertion) |
 
 ### Notes
 

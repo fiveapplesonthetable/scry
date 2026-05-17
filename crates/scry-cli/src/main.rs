@@ -6516,54 +6516,6 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
               child_to_parents.len(), class_to_ancestors.len(),
               t2.elapsed().as_millis());
 
-    // --- Pass 2.5 (v0.1.62): receiver-aware narrowing data. ---
-    //
-    // Pair adjacent TypeUse + Call refs into (call_site → receiver_class)
-    // tuples. `Foo.bar()` parses as a TypeUse ref to `Foo` ending at the
-    // dot byte, then a Call ref to `bar` starting at the dot byte + 1.
-    // Two-pass build:
-    //   (a) bucket every TypeUse ref by (file_id, byte_end).
-    //   (b) for each Call ref, look up `(file_id, byte_start - 1)` —
-    //       a hit means the call is preceded by an identifier-shaped
-    //       receiver. That receiver's name (filtered to PascalCase
-    //       upstream in v0.1.60/v0.1.61) is the static-receiver class.
-    //
-    // Used in resolve_one: for refs in this map, candidates are
-    // constrained to defs whose enclosing class is the receiver OR in
-    // its ancestor set (via class_to_ancestors). Closes most of the
-    // gap on static-utility-method calls (Log.d, Objects.equals,
-    // TextUtils.isEmpty, etc.) where the receiver class is unambiguous.
-    //
-    // Memory: ~tens-of-millions of String entries at AOSP scale. Built
-    // once; dropped before resolve_one parallelism kicks in to free
-    // memory for parsing. Worst case ~500 MB on a 63M-ref corpus,
-    // acceptable peak.
-    let t2_5 = Instant::now();
-    let mut tu_end: HashMap<(u32, u32), String> = HashMap::new();
-    let mut tu_seen: u64 = 0;
-    for rr in r.iter_refs() {
-        if matches!(rr.kind, scry_store::RefKind::TypeUse)
-            && rr.name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        {
-            tu_end.insert((rr.file_id, rr.byte_end), rr.name.clone());
-            tu_seen += 1;
-        }
-    }
-    let mut call_recv: HashMap<(u32, u32), String> = HashMap::new();
-    for rr in r.iter_refs() {
-        if matches!(rr.kind, scry_store::RefKind::Call) && rr.byte_start > 0 {
-            // Adjacent only: the dot character sits at byte_start - 1
-            // (we deliberately don't handle `Foo . bar()` with
-            // whitespace; rare enough in real code to skip).
-            if let Some(recv) = tu_end.get(&(rr.file_id, rr.byte_start - 1)) {
-                call_recv.insert((rr.file_id, rr.byte_start), recv.clone());
-            }
-        }
-    }
-    drop(tu_end);
-    eprintln!("[res] pass 2.5 (call→receiver map: {} pairs from {} uppercase TypeUse refs) in {} ms",
-        call_recv.len(), tu_seen, t2_5.elapsed().as_millis());
-
     // --- Pass 3: resolve every ref, write sidecar. ---
     //
     // Parallel resolution with rayon: collect refs into chunks of
@@ -6590,8 +6542,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         let ids: Vec<u64> = chunk.par_iter().map(|rr| {
             let mut local_narrowed = 0u64;
             let id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
-                                 &per_file_using_ns, &class_to_ancestors,
-                                 &call_recv, &mut local_narrowed);
+                                 &per_file_using_ns, &class_to_ancestors, &mut local_narrowed);
             if local_narrowed > 0 { narrowed_count.fetch_add(local_narrowed, Ordering::Relaxed); }
             if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
             id
@@ -6630,7 +6581,6 @@ fn resolve_one(
     per_file_imports: &std::collections::HashMap<u32, Vec<(String, Option<String>)>>,
     per_file_using_ns: &std::collections::HashMap<u32, Vec<String>>,
     class_to_ancestors: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    call_recv: &std::collections::HashMap<(u32, u32), String>,
     narrowed: &mut u64,
 ) -> u64 {
     let cands = match by_name.get(&rr.name) {
@@ -6644,43 +6594,6 @@ fn resolve_one(
         return cands[0].id;
     };
     if pool.len() == 1 { return pool[0].id; }
-
-    // v0.1.62 — receiver-aware narrowing. For static-method calls
-    // shaped like `Foo.bar()`, pass 2.5 paired the bar Call ref with
-    // its preceding Foo TypeUse ref into `call_recv`. If we have a
-    // receiver class for this call, candidates are constrained to
-    // defs whose enclosing class is the receiver OR in its ancestor
-    // set (so `Animal.toString()` finds `Animal.toString` and also
-    // inherited `Object.toString`). This is the slice that moves the
-    // 50% unresolved ceiling — most static-utility-method calls
-    // (Log.d, Objects.equals, TextUtils.isEmpty) are unambiguous
-    // under this rule.
-    //
-    // Tried first (before same-file etc.) because a successful
-    // receiver match is the strongest signal: source-level evidence
-    // that the call target is in this specific class chain.
-    if matches!(rr.kind, RefKind::Call) {
-        if let Some(recv_class) = call_recv.get(&(rr.file_id, rr.byte_start)) {
-            let mut allowed: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            allowed.insert(recv_class.as_str());
-            if let Some(ancs) = class_to_ancestors.get(recv_class) {
-                for a in ancs { allowed.insert(a.as_str()); }
-            }
-            let recv_matches: Vec<&&ResolveDef> = pool.iter()
-                .filter(|c| c.scope_path.last()
-                    .is_some_and(|cls| allowed.contains(cls.as_str())))
-                .collect();
-            if recv_matches.len() == 1 {
-                *narrowed += 1;
-                return recv_matches[0].id;
-            }
-            // Multiple matches (e.g. method overloads in same class):
-            // fall through, let downstream rules disambiguate within
-            // the broader pool. We deliberately don't shrink `pool`
-            // here because the existing rules expect the full
-            // candidate set.
-        }
-    }
 
     // Same-file preference (all langs). A call to `foo()` inside file F
     // is much more likely to resolve to `foo` defined in F than to one
@@ -10461,7 +10374,7 @@ mod tests {
         by_name.insert("Foo".into(), vec![mk_def(42, FileKind::Java, None)]);
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(chosen, 42);
         assert_eq!(n, 0);
     }
@@ -10471,7 +10384,7 @@ mod tests {
         let by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 0);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 0);
     }
 
     #[test]
@@ -10484,7 +10397,7 @@ mod tests {
         ]);
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 200);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 200);
     }
 
     #[test]
@@ -10499,7 +10412,7 @@ mod tests {
         pkg.insert(5u32, "android.app".to_string());
         let r = mk_ref("Activity", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10514,7 +10427,7 @@ mod tests {
         imports.insert(5u32, vec![("Binder".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10529,7 +10442,7 @@ mod tests {
         imports.insert(5u32, vec![("*".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10542,7 +10455,7 @@ mod tests {
         ]);
         let r = mk_ref("String", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10562,7 +10475,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 0, "ambiguous Java method call should resolve to 0 (unresolved), not arbitrary pool[0]");
         assert_eq!(n, 0);
     }
@@ -10581,7 +10494,7 @@ mod tests {
         let mut r = mk_ref("Foo", FileKind::Java, 5);
         r.kind = RefKind::TypeUse;
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 11);
         assert_eq!(n, 0);
     }
@@ -10604,7 +10517,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 7);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99, "same-file def should win over corpus-wide ambiguity");
         assert_eq!(n, 1, "same-file pick counts as narrowed");
     }
@@ -10637,7 +10550,7 @@ mod tests {
         let mut n = 0u64;
         let got = resolve_one(
             &r, &by_name, &HashMap::new(), &HashMap::new(),
-            &empty_ns(), &ancestors, &HashMap::new(), &mut n,
+            &empty_ns(), &ancestors, &mut n,
         );
         assert_eq!(got, 42, "should walk Inner → Outer and find inherited method");
         assert_eq!(n, 1);
@@ -10663,7 +10576,7 @@ mod tests {
         let mut n = 0u64;
         let got = resolve_one(
             &r, &by_name, &HashMap::new(), &HashMap::new(),
-            &empty_ns(), &ancestors, &HashMap::new(), &mut n,
+            &empty_ns(), &ancestors, &mut n,
         );
         assert_eq!(got, 7);
         assert_eq!(n, 1);
@@ -10690,7 +10603,7 @@ mod tests {
         let mut n = 0u64;
         let got = resolve_one(
             &r, &by_name, &HashMap::new(), &HashMap::new(),
-            &empty_ns(), &ancestors, &HashMap::new(), &mut n,
+            &empty_ns(), &ancestors, &mut n,
         );
         assert_eq!(got, 0,
             "ambiguous inheritance (two ancestors define close) → unresolved");
@@ -10717,7 +10630,7 @@ mod tests {
         ]);
         let r = mk_ref_scoped("helper", FileKind::Java, 5, &["Foo"]);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99, "should prefer same-class def even in different file");
         assert_eq!(n, 1);
     }
@@ -10742,7 +10655,7 @@ mod tests {
         // ref scope = [Outer, Inner] — call from inside the inner class.
         let r = mk_ref_scoped("parentMethod", FileKind::Java, 5, &["Outer", "Inner"]);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 42, "implicit-this from inner class should reach parent's methods");
         assert_eq!(n, 1);
     }
@@ -10770,7 +10683,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99, "should resolve to the imported class's method");
         assert_eq!(n, 1, "import-aware narrowing counts as narrowed");
     }
@@ -10794,7 +10707,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99);
         assert_eq!(n, 1);
     }
@@ -10821,7 +10734,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 0, "two viable imported candidates → unresolved (truthful)");
         assert_eq!(n, 0);
     }
@@ -10837,7 +10750,7 @@ mod tests {
         pkg.insert(5u32, "android.app".to_string());
         let r = mk_ref("Activity", FileKind::Kotlin, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10853,7 +10766,7 @@ mod tests {
         ]);
         let r = mk_ref("List", FileKind::Kotlin, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10869,7 +10782,7 @@ mod tests {
         imports.insert(5u32, vec![("Bundle".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Bundle", FileKind::Kotlin, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10888,7 +10801,7 @@ mod tests {
         ]);
         let r = mk_ref_scoped("Parcel", FileKind::Cpp, 5, &["android", "os"]);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -10905,7 +10818,7 @@ mod tests {
         using.insert(5u32, vec!["android::base".to_string()]);
         let r = mk_ref("StringPrintf", FileKind::Cpp, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &using, &HashMap::new(), &HashMap::new(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &using, &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 

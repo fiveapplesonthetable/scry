@@ -7,53 +7,6 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.1.62] — 2026-05-17
-
-**Kythe-gap arc, slice 3/3. Receiver-aware resolver narrowing.**
-The slice that finally moves the resolved% number.
-
-`build-resolutions` now runs a new pass 2.5 that pairs each
-Call ref with its preceding TypeUse ref (via byte-adjacency:
-`Foo.bar()` ⇒ Foo's TypeUse ends at the dot byte, bar's Call
-starts at dot+1). The result is a `(file_id, call_byte_start) →
-receiver_class` map.
-
-In the resolver, when processing a Call ref shaped like
-`Foo.bar()`, candidates are constrained to defs whose enclosing
-class is `Foo` OR anything in `Foo`'s ancestor set (via the
-existing `class_to_ancestors` precompute from v0.1.33). One
-candidate ⇒ pinned; multiple ⇒ fall through to the existing
-rules. This is the strongest narrowing signal we have short of
-full type inference — source-level evidence that the call
-target is in this specific class chain.
-
-```java
-// Before v0.1.62, with two `bar()` defs in unrelated classes:
-//   `Foo.bar()` resolves to NULL (ambiguous, returned 0)
-// After v0.1.62:
-//   `Foo.bar()` resolves to Foo's bar (receiver pins it)
-class Foo { static void bar() {} }
-class Bar { static void bar() {} }
-class Caller { void run() { Foo.bar(); } }   // pinned to Foo's bar
-```
-
-Why this matters: most static-utility-method calls in AOSP
-(`Log.d`, `Objects.equals`, `TextUtils.isEmpty`, `Math.min`,
-`String.valueOf`, …) have unambiguous receivers under this
-rule. Expect resolved% to move materially from the current
-49.6% on AOSP after a re-index.
-
-**Cost:** pass 2.5 is O(N_refs) with two HashMap probes per
-ref. Memory peak adds a `(u32, u32) → String` map sized by the
-count of static-receiver calls (typically O(M) where M is
-non-trivial but a small constant fraction of N_refs). Acceptable
-peak for the AOSP-scale build budget.
-
-E2E test: `receiver_aware_narrowing_pins_static_call` — two
-classes both define `bar()`; `Foo.bar()` in a third file MUST
-resolve to Foo's bar via the `by-def` histogram. Without v0.1.62
-this returns unresolved.
-
 ## [0.1.61] — 2026-05-17
 
 **Kytge-gap arc, slice 2/3.** Kotlin static-receiver capture,

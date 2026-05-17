@@ -807,6 +807,14 @@ fn kotlin_spec() -> &'static LangSpec {
                 (property_declaration (variable_declaration (identifier) @name)) @def.field
                 (type_alias (identifier) @name) @def.type
                 (enum_entry (identifier) @name) @def.variant
+                ; Kotlin package header — emit one Package symbol per
+                ; file so cmd_build_resolutions's per_file_pkg map gets
+                ; populated for Kotlin too (Java already handled via its
+                ; own package_declaration rule). tree-sitter-kotlin-NG
+                ; always wraps the package name in qualified_identifier
+                ; (even single-segment packages — qualified_identifier
+                ; uses `repeat`, not `repeat1`), so one pattern suffices.
+                (package_header (qualified_identifier) @name) @def.package
                 "#,
             )
             .unwrap_or_else(|_| Query::new(lang, "(source_file) @def.module").unwrap())
@@ -817,6 +825,7 @@ fn kotlin_spec() -> &'static LangSpec {
             capture_kinds: &[
                 ("def.class", SymbolKind::Class),
                 ("def.function", SymbolKind::Function),
+                ("def.package", SymbolKind::Package),
                 ("def.field", SymbolKind::Field),
                 ("def.type", SymbolKind::Type),
                 ("def.variant", SymbolKind::EnumVariant),

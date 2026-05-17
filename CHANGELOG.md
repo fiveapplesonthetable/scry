@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.38] — 2026-05-17
+
+Kotlin Package emission (deferred from v0.1.36).
+
+v0.1.36 fixed the Java side and noted the Kotlin attempt broke
+the companion-object scope tests. Root cause: the naive query
+included `(package_header (identifier) @name) @def.package`,
+but tree-sitter-kotlin-NG's `package_header` rule only accepts
+`qualified_identifier` as a child — bare `identifier` can never
+match. Tree-sitter rejects queries containing patterns that can
+never match by collapsing the WHOLE query to the no-op fallback
+(`(source_file) @def.module`), silently losing every Kotlin
+symbol that wasn't injected by a post-processing walker.
+
+Fix: drop the impossible pattern. tree-sitter-kotlin-NG's
+`qualified_identifier` uses `repeat`, not `repeat1`, so it
+matches even single-segment packages like `package x`.
+
+```
+(package_header (qualified_identifier) @name) @def.package
+```
+
+`SymbolKind::Package` added to the Kotlin spec's
+`capture_kinds`. With this fix, `cmd_build_resolutions`'s
+`per_file_pkg` is now populated for Kotlin files too —
+same-pkg narrowing, import-aware narrowing, and the
+`kotlin.collections` / `kotlin.text` / etc implicit-pkg
+fallback all fire as designed.
+
+Full `scry index` rebuild required to benefit (Package symbols
+are stored at index time).
+
 ## [0.1.37] — 2026-05-17
 
 `--json` now composes with `--format by-def`. Useful for

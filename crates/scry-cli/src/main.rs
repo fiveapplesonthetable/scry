@@ -4,6 +4,7 @@
 
 mod build_adapter;
 mod clangd;
+mod finalize;
 
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
 // keeps a high-water-mark — fine for short jobs, disastrous for our pattern
@@ -1191,7 +1192,7 @@ fn default_roots() -> Vec<PathBuf> {
     v
 }
 
-fn default_index_dir() -> PathBuf {
+pub(crate) fn default_index_dir() -> PathBuf {
     if let Ok(p) = std::env::var("SCRY_INDEX_DIR") {
         PathBuf::from(p)
     } else {
@@ -1323,7 +1324,7 @@ fn main() -> Result<()> {
         Cmd::Finalize {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, build_out, workers,
-        } => cmd_finalize(
+        } => finalize::cmd_finalize(
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, build_out, workers,
         ),
@@ -2543,248 +2544,8 @@ fn cmd_def(
     Ok(())
 }
 
-/// `scry finalize` — one-shot post-index sidecar pipeline.
-///
-/// Composition of existing build-* commands; the value here is
-/// discoverability + one-stop CI hook. Each stage reports its
-/// own timing and exits non-zero on failure so the caller can
-/// fail-fast.
-#[allow(clippy::too_many_arguments)]
-fn cmd_finalize(
-    index: Option<PathBuf>,
-    build_soong: Option<PathBuf>,
-    build_kernel: Option<PathBuf>,
-    build_gn: Option<PathBuf>,
-    build_bazel: Option<PathBuf>,
-    build_cargo: Option<PathBuf>,
-    scip: Option<PathBuf>,
-    clang_compile_commands: Option<PathBuf>,
-    clang_root: Option<PathBuf>,
-    build_out: Vec<PathBuf>,
-    workers: usize,
-) -> Result<()> {
-    let dir = index.unwrap_or_else(default_index_dir);
-    let t_total = Instant::now();
-    eprintln!("[finalize] index: {}", dir.display());
-
-    fn stage<R, F: FnOnce() -> Result<R>>(name: &str, f: F) -> Result<R> {
-        let t = Instant::now();
-        eprintln!("[finalize] === {name} ===");
-        let r = f().with_context(|| format!("finalize stage {name}"))?;
-        eprintln!("[finalize] {name} done in {} ms", t.elapsed().as_millis());
-        Ok(r)
-    }
-
-    stage("build-offsets", || cmd_build_offsets(Some(dir.clone())))?;
-    stage("build-file-symbols", || cmd_build_file_symbols(Some(dir.clone())))?;
-    stage("build-file-refs", || cmd_build_file_refs(Some(dir.clone())))?;
-    stage("build-trigrams", || cmd_build_trigrams(Some(dir.clone()), Some(workers), 5 * 1024 * 1024))?;
-    stage("build-resolutions", || cmd_build_resolutions(Some(dir.clone())))?;
-
-    // Module-graph. Pick one source — first non-None wins, with a
-    // clear log line stating the choice. Multiple precision sidecars
-    // for the same index don't compose: a single module_graph.json
-    // lives in the dir.
-    let mg_out = dir.join("module_graph.json");
-    let mg_source = build_soong.as_ref().map(|r| ("soong", r))
-        .or_else(|| build_kernel.as_ref().map(|r| ("kernel", r)))
-        .or_else(|| build_gn.as_ref().map(|r| ("gn", r)))
-        .or_else(|| build_bazel.as_ref().map(|r| ("bazel", r)))
-        .or_else(|| build_cargo.as_ref().map(|r| ("cargo", r)));
-    if let Some((kind, root)) = mg_source {
-        let kind_str = kind.to_string();
-        let root = root.clone();
-        let out = mg_out.clone();
-        stage(&format!("build-modgraph {kind_str}"),
-              || cmd_build_modgraph(&kind_str, &root, &out))?;
-    } else {
-        eprintln!("[finalize] (no --build-<kind> flag — skipping module_graph)");
-    }
-
-    if let Some(scip_path) = scip.as_ref() {
-        let dir2 = dir.clone();
-        let sp = scip_path.clone();
-        stage("scip-import", || scry_scip::import_scip(&sp, &dir2, None))?;
-    }
-
-    if let Some(cc_path) = clang_compile_commands.as_ref() {
-        let dir2 = dir.clone();
-        let cc = cc_path.clone();
-        let root = clang_root.clone();
-        let workers_for_clang = workers;
-        stage("clang-index", || scry_clang::build_clang_usrs(
-            &cc, &dir2, root.as_deref(), workers_for_clang, 4 * 1024 * 1024,
-        ))?;
-    }
-
-    // Auto-discover compile_commands.json and .scip artifacts inside
-    // each indexed root and stage them as clang-index / scip-import
-    // runs. This is the Kythe-style "indexer composition" path: scry
-    // consumes existing compiler-backed indexer output as the resolver
-    // of record when present, and falls back to tree-sitter for the
-    // rest. Skipped when the user already passed --clang-compile-
-    // commands / --scip explicitly.
-    //
-    // Coverage by artifact:
-    //   compile_commands.json  →  C / C++ / ObjC (consumed by libclang)
-    //   *.scip                 →  Java         (scip-java)
-    //                             Kotlin       (scip-java / scip-kotlin)
-    //                             Rust         (rust-analyzer scip)
-    //                             TypeScript   (scip-typescript)
-    //                             Go           (scip-go)
-    //                             Python       (scip-python)
-    // See docs/BUILD_AWARE.md for per-language instructions.
-    //
-    // Single-artifact contract: build_clang_usrs and import_scip each
-    // write a single sidecar that the previous run would overwrite.
-    // If multiple cc.json or .scip files are found across the indexed
-    // roots, auto-discovery would silently drop all but the last —
-    // so we refuse to guess. The user must pick one by passing
-    // --clang-compile-commands / --scip explicitly.
-    if clang_compile_commands.is_none() {
-        if let Some(picked) = pick_single_auto_discovered(
-            &dir, "compile_commands.json", false, &build_out,
-        )? {
-            let dir2 = dir.clone();
-            let cc = picked.clone();
-            let root = clang_root.clone();
-            let workers_for_clang = workers;
-            let stage_name = format!("clang-index (auto: {})", cc.display());
-            // Soft-fail: a missing libclang shouldn't break the whole
-            // finalize run for users who happen to have a cc.json in
-            // a root. Explicit --clang-compile-commands stays strict
-            // because the user opted in.
-            let res = stage(&stage_name, || scry_clang::build_clang_usrs(
-                &cc, &dir2, root.as_deref(), workers_for_clang, 4 * 1024 * 1024,
-            ));
-            if let Err(e) = res {
-                eprintln!(
-                    "[finalize] WARN: auto clang-index failed; \
-                     continuing without clang USR sidecar: {e}"
-                );
-            }
-        }
-    }
-    if scip.is_none() {
-        if let Some(picked) = pick_single_auto_discovered(
-            &dir, ".scip", true, &build_out,
-        )? {
-            let dir2 = dir.clone();
-            let sp = picked.clone();
-            let stage_name = format!("scip-import (auto: {})", sp.display());
-            let res = stage(&stage_name, || scry_scip::import_scip(&sp, &dir2, None));
-            if let Err(e) = res {
-                eprintln!(
-                    "[finalize] WARN: auto scip-import failed; \
-                     continuing without SCIP sidecar: {e}"
-                );
-            }
-        }
-    }
-
-    eprintln!(
-        "[finalize] ALL STAGES OK in {} sec — run `scry health --index {}` \
-         to verify sidecar shapes.",
-        t_total.elapsed().as_secs(), dir.display(),
-    );
-    Ok(())
-}
-
-/// Walk each indexed root + each `--build-out` path looking for
-/// files whose name == `pattern` (when `match_ext_suffix` is false)
-/// or whose name ends with `pattern` (when true, for `.scip`-style
-/// extension matching). Returns `Ok(Some(path))` only when EXACTLY
-/// one file is found across all locations. On zero or multiple
-/// matches, returns `Ok(None)`; on multiple, emits a warning naming
-/// the candidates so the user knows to disambiguate via the
-/// explicit flag.
-///
-/// Indexed-root walk: depth-capped (5) and hit-capped (8) so
-/// AOSP-class trees can't turn discovery into a multi-minute scan.
-/// Uses the `ignore` crate with standard filters on, so `.gitignore`
-/// is honored — vendored artifacts won't show up.
-///
-/// `--build-out` walk: deeper cap (10) and same hit cap, but
-/// standard filters are OFF. Build outputs (`out/soong/...`,
-/// `build/`, `target/`, `.gradle/`) are exactly what `.gitignore`
-/// hides, so a filter-respecting walker can't see them; that's
-/// the whole reason `--build-out` exists as a separate signal.
-fn pick_single_auto_discovered(
-    index_dir: &Path,
-    pattern: &str,
-    match_ext_suffix: bool,
-    build_out: &[PathBuf],
-) -> Result<Option<PathBuf>> {
-    let roots: Vec<PathBuf> = match StoreReader::open(index_dir) {
-        Ok(r) => r.roots.iter().map(|root| PathBuf::from(&root.path)).collect(),
-        Err(e) => {
-            eprintln!("[finalize] WARN: cannot open index for auto-discovery: {e}");
-            Vec::new()
-        }
-    };
-    const SRC_MAX_DEPTH: usize = 5;
-    const OUT_MAX_DEPTH: usize = 10;
-    const MAX_HITS: usize = 8;
-    // Track seen canonical paths so an indexed root and a --build-out
-    // path that overlap don't add the same physical file twice (which
-    // would falsely trigger the "multiple found" warning). Paths that
-    // fail to canonicalize fall back to identity comparison.
-    let mut hits: Vec<PathBuf> = Vec::new();
-    let mut seen: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
-    let match_name = |name: &str| -> bool {
-        if match_ext_suffix { name.ends_with(pattern) } else { name == pattern }
-    };
-    let push_hit = |hits: &mut Vec<PathBuf>,
-                    seen: &mut std::collections::HashSet<PathBuf>,
-                    p: PathBuf| -> bool {
-        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
-        if seen.insert(key) {
-            hits.push(p);
-        }
-        hits.len() >= MAX_HITS
-    };
-    'outer: for root in &roots {
-        let mut walker = ignore::WalkBuilder::new(root);
-        walker.max_depth(Some(SRC_MAX_DEPTH));
-        walker.standard_filters(true);
-        for entry in walker.build().flatten() {
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
-            if match_name(&entry.file_name().to_string_lossy())
-                && push_hit(&mut hits, &mut seen, entry.into_path())
-            {
-                break 'outer;
-            }
-        }
-    }
-    'outer2: for out_root in build_out {
-        let mut walker = ignore::WalkBuilder::new(out_root);
-        walker.max_depth(Some(OUT_MAX_DEPTH));
-        walker.standard_filters(false);
-        for entry in walker.build().flatten() {
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
-            if match_name(&entry.file_name().to_string_lossy())
-                && push_hit(&mut hits, &mut seen, entry.into_path())
-            {
-                break 'outer2;
-            }
-        }
-    }
-    match hits.len() {
-        0 => Ok(None),
-        1 => Ok(Some(hits.remove(0))),
-        n => {
-            eprintln!(
-                "[finalize] auto-discovery: found {n} {pattern} files; \
-                 skipping (pass an explicit flag to pick one). Candidates:"
-            );
-            for h in &hits {
-                eprintln!("[finalize]   {}", h.display());
-            }
-            Ok(None)
-        }
-    }
-}
+// `cmd_finalize` + the auto-discovery helper live in
+// crate::finalize.
 
 /// `scry callgraph NAME` — recursive callers tree.
 ///
@@ -5254,7 +5015,7 @@ struct Hit {
 // build-offsets (standalone — add offsets sidecars for lazy reader)
 // ---------------------------------------------------------------------------
 
-fn cmd_build_offsets(index: Option<PathBuf>) -> Result<()> {
+pub(crate) fn cmd_build_offsets(index: Option<PathBuf>) -> Result<()> {
     use std::io::{BufReader, BufWriter, Read, Write};
     let index_dir = index.unwrap_or_else(default_index_dir);
     eprintln!("[offsets] target index: {}", index_dir.display());
@@ -5315,7 +5076,7 @@ fn cmd_build_offsets(index: Option<PathBuf>) -> Result<()> {
 // build-file-symbols (standalone — file→symbol-ids sidecar)
 // ---------------------------------------------------------------------------
 
-fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
+pub(crate) fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
     use std::io::{BufWriter, Write};
     let index_dir = index.unwrap_or_else(default_index_dir);
     eprintln!("[fsyms] target index: {}", index_dir.display());
@@ -5380,7 +5141,7 @@ fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
 /// but groups refs.bin entries by file_id. Powers `scry uses`.
 /// Walks the lazy ref vec once; ~140MB sidecar on AOSP+Linux
 /// (63M refs × 4 bytes per id + offsets).
-fn cmd_build_file_refs(index: Option<PathBuf>) -> Result<()> {
+pub(crate) fn cmd_build_file_refs(index: Option<PathBuf>) -> Result<()> {
     use std::io::{BufWriter, Write};
     let index_dir = index.unwrap_or_else(default_index_dir);
     eprintln!("[frefs] target index: {}", index_dir.display());
@@ -6556,7 +6317,7 @@ fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
+pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     use std::collections::HashMap;
     use std::io::{BufWriter, Write};
     let index_dir = index.unwrap_or_else(default_index_dir);
@@ -6983,7 +6744,7 @@ struct ResolveDef {
 // build-trigrams (standalone — add trigram index to an existing index)
 // ---------------------------------------------------------------------------
 
-fn cmd_build_trigrams(
+pub(crate) fn cmd_build_trigrams(
     index: Option<PathBuf>,
     workers: Option<usize>,
     max_file_bytes: u64,
@@ -8566,7 +8327,7 @@ fn cmd_serve(index: Option<PathBuf>, listen: Option<String>, max_conns: u32) -> 
 /// emits scry's canonical v1 module_graph.json at `output`. After
 /// this, `scry callers X --reachable` honors the build-graph
 /// reachability filter automatically.
-fn cmd_build_modgraph(kind: &str, root: &Path, output: &Path) -> Result<()> {
+pub(crate) fn cmd_build_modgraph(kind: &str, root: &Path, output: &Path) -> Result<()> {
     let t = Instant::now();
     let g = build_adapter::build_modgraph(kind, root)?;
     let json = serde_json::to_string_pretty(&g)

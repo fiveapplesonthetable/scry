@@ -707,6 +707,26 @@ fn classify_jvm_target(target: &str) -> Option<JvmRuleKind> {
     None
 }
 
+/// Classify a build rule by its ninja rule name. Soong publishes many
+/// `g.java.*` and `g.kotlin.*` rules (jarjar, kaptStubs, kotlin-jar-snapshot,
+/// javac-split-srcJars, …) that the path classifier alone can't
+/// distinguish: `g.java.javac-split-srcJars` produces a multi-output
+/// build statement whose first output is `…/javac/srcjarsNN.jar`, which
+/// matches the `/javac/` path heuristic but is NOT a javac compile and
+/// has no sibling `.rsp` file.
+///
+/// Returning Some here means "this is the real javac/kotlinc rule that
+/// has a sibling sources `.rsp` file the bridge can use". Accepts both
+/// the full Soong form (`g.java.javac`) and the bare form used in
+/// hand-written test fixtures (`javac`).
+fn classify_jvm_rule_name(rule_name: &str) -> Option<JvmRuleKind> {
+    match rule_name {
+        "g.java.javac" | "javac" => Some(JvmRuleKind::Javac),
+        "g.java.kotlinc" | "kotlinc" => Some(JvmRuleKind::Kotlinc),
+        _ => None,
+    }
+}
+
 /// Output of one shard's parse: the JVM build rules + every
 /// top-level `<name> = <value>` variable definition. Variables get
 /// merged across shards by [`Soong::extract_compilations`] before
@@ -753,8 +773,16 @@ fn extract_jvm_rules(path: &Path) -> Result<ShardData> {
         }
         if raw_line.starts_with("build ") {
             flush(current.take(), &mut javac_out, &mut kotlin_out);
-            if let Some(output) = parse_build_header_output(raw_line) {
-                let kind = classify_jvm_target(&output);
+            if let Some((output, rule_name)) = parse_build_header(raw_line) {
+                // Two-stage classifier: the rule name is authoritative
+                // (only `g.java.javac` / `g.java.kotlinc` carry a sibling
+                // sources `.rsp` file), but we still gate on output path
+                // so test fixtures using bare `javac` for unrelated
+                // outputs don't get pulled in.
+                let kind = match classify_jvm_rule_name(&rule_name) {
+                    Some(k) => classify_jvm_target(&output).filter(|t| *t == k),
+                    None => None,
+                };
                 current = Some((output, HashMap::new(), kind));
             }
         } else if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
@@ -882,18 +910,22 @@ fn is_ninja_ident_byte(b: u8) -> bool {
 }
 
 
-/// Parse the first output path off a `build out1 out2: rule ...`
-/// header. Soong's javac rules emit only one output, so we return
-/// the first whitespace-delimited token after `build`. Returns None
-/// for malformed headers; the caller skips them silently.
-fn parse_build_header_output(line: &str) -> Option<String> {
-    // Strip the `build ` prefix and the `: <rule> ...` suffix.
+/// Parse a `build out1 out2: rule arg1 arg2` header into
+/// `(first_output, rule_name)`. Returns None if the header is
+/// malformed (no `:`, missing rule, etc.). Used by the JVM rule
+/// classifier so it can distinguish `g.java.javac` (the real javac
+/// rule whose output has a sibling `.rsp`) from sibling rules like
+/// `g.java.javac-split-srcJars` that share an output prefix.
+fn parse_build_header(line: &str) -> Option<(String, String)> {
     let rest = line.strip_prefix("build ")?;
     let colon = rest.find(':')?;
     let outputs = &rest[..colon];
-    // Take the first output (Soong javac rules only have one).
-    let first = outputs.split_whitespace().next()?;
-    Some(first.to_string())
+    let first_output = outputs.split_whitespace().next()?;
+    // After the `:` comes `<rule_name> <input1> <input2> …`. Whitespace
+    // before the rule name is harmless.
+    let after = rest[colon + 1..].trim_start();
+    let rule_name = after.split_whitespace().next()?;
+    Some((first_output.to_string(), rule_name.to_string()))
 }
 
 /// Parse an indented `<key> = <value>` binding line. Whitespace
@@ -1035,15 +1067,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_build_header_extracts_first_output() {
-        let line = "build out/soong/.intermediates/x/y/z/javac/y.jar: javac in.java";
-        assert_eq!(
-            parse_build_header_output(line).as_deref(),
-            Some("out/soong/.intermediates/x/y/z/javac/y.jar"),
-        );
-    }
-
-    #[test]
     fn parse_binding_handles_spacing() {
         let line = "    classpath = -classpath a.jar:b.jar";
         let (k, v) = parse_binding(line).unwrap();
@@ -1060,6 +1083,75 @@ mod tests {
         assert!(classify_jvm_target("x/kotlin-jar-snapshot/foo.jar").is_none());
         assert!(classify_jvm_target("x/turbine/foo.jar").is_none());
         assert!(classify_jvm_target("x/javac/foo.txt").is_none());
+    }
+
+    #[test]
+    fn classify_jvm_rule_name_accepts_real_and_fixture_forms() {
+        assert_eq!(classify_jvm_rule_name("g.java.javac"), Some(JvmRuleKind::Javac));
+        assert_eq!(classify_jvm_rule_name("g.java.kotlinc"), Some(JvmRuleKind::Kotlinc));
+        // Bare forms used in hand-written ninja fixtures.
+        assert_eq!(classify_jvm_rule_name("javac"), Some(JvmRuleKind::Javac));
+        assert_eq!(classify_jvm_rule_name("kotlinc"), Some(JvmRuleKind::Kotlinc));
+        // Sibling rules whose first output lives under /javac/ must NOT
+        // be classified as javac — they don't have a sources .rsp.
+        assert!(classify_jvm_rule_name("g.java.javac-split-srcJars").is_none());
+        assert!(classify_jvm_rule_name("g.java.jarjar").is_none());
+        assert!(classify_jvm_rule_name("g.java.kaptStubs").is_none());
+        assert!(classify_jvm_rule_name("g.java.kotlin-jar-snapshot").is_none());
+        assert!(classify_jvm_rule_name("g.java.zip").is_none());
+        assert!(classify_jvm_rule_name("phony").is_none());
+    }
+
+    #[test]
+    fn parse_build_header_extracts_first_output_and_rule_name() {
+        // Single-output, on-one-line.
+        let line = "build out/x/y/javac/y.jar: g.java.javac in.java out2.kt";
+        let (out, rule) = parse_build_header(line).unwrap();
+        assert_eq!(out, "out/x/y/javac/y.jar");
+        assert_eq!(rule, "g.java.javac");
+    }
+
+    #[test]
+    fn parse_build_header_handles_multi_output_split_srcjars() {
+        // The g.java.javac-split-srcJars rule emits many outputs whose
+        // FIRST happens to live under /javac/ but the rule itself is
+        // not javac. Confirm the rule name comes back so the caller
+        // can reject it.
+        let line = "build out/a/javac/srcjars44.jar out/a/javac/srcjars45.jar: \
+                    g.java.javac-split-srcJars in1 in2";
+        let (out, rule) = parse_build_header(line).unwrap();
+        assert_eq!(out, "out/a/javac/srcjars44.jar");
+        assert_eq!(rule, "g.java.javac-split-srcJars");
+    }
+
+    #[test]
+    fn extract_jvm_rules_skips_split_srcjars_lookalike() {
+        // Two build statements:
+        //   1. g.java.javac-split-srcJars whose first output is
+        //      srcjarsNN.jar under /javac/ — must be skipped.
+        //   2. Real g.java.javac whose output is core-libart.jar — kept.
+        let ninja_body = "\
+build out/soong/.intermediates/X/Y/android_common/javac/srcjars44.jar \
+out/soong/.intermediates/X/Y/android_common/javac/srcjars45.jar: \
+g.java.javac-split-srcJars
+    foo = bar
+
+build out/soong/.intermediates/libcore/core-libart/android_common/javac/core-libart.jar: \
+g.java.javac in.java
+    classpath = -classpath a.jar:b.jar
+";
+        let tmpdir = crate::scry_tmp_dir().join(format!(
+            "scry-soong-classify-{}", std::process::id(),
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let p = tmpdir.join("build.ninja");
+        std::fs::write(&p, ninja_body).unwrap();
+        let shard = extract_jvm_rules(&p).unwrap();
+        // Only the real javac rule should survive.
+        assert_eq!(shard.javac_rules.len(), 1);
+        assert!(shard.javac_rules[0].output.ends_with("/javac/core-libart.jar"));
+        assert!(shard.kotlin_rules.is_empty());
+        std::fs::remove_dir_all(&tmpdir).ok();
     }
 
     #[test]

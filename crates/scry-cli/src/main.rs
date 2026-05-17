@@ -5785,10 +5785,43 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         }
     };
     for rr in r.iter_refs() { process_import(&rr); }
+    // Precompute the transitive ancestor set for each child class
+    // ONCE (v0.1.33), so resolve_one doesn't BFS per-ref. Per-ref
+    // cost drops from O(depth × pool) to O(pool) + 1 HashMap lookup.
+    // Depth-capped at 8 levels — same as the previous BFS — to bound
+    // pathological diamond hierarchies. Memory: ~139K classes × ~5
+    // avg ancestors × ~20 B/string ≈ 14 MB, negligible.
+    let class_to_ancestors: HashMap<String, std::collections::HashSet<String>> = {
+        let mut out: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for child in child_to_parents.keys() {
+            let mut visited: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            visited.insert(child.clone());
+            let mut queue: std::collections::VecDeque<String> = child_to_parents
+                .get(child).map(|v| v.iter().cloned().collect()).unwrap_or_default();
+            let mut ancestors: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut steps = 0usize;
+            while let Some(cls) = queue.pop_front() {
+                if !visited.insert(cls.clone()) { continue; }
+                if steps > 8 { break; }
+                steps += 1;
+                ancestors.insert(cls.clone());
+                if let Some(parents) = child_to_parents.get(&cls) {
+                    for p in parents { queue.push_back(p.clone()); }
+                }
+            }
+            if !ancestors.is_empty() {
+                out.insert(child.clone(), ancestors);
+            }
+        }
+        out
+    };
     eprintln!("[res] pass 2 (per-file imports: {} files, cpp using-ns: {} files, \
-               inheritance edges: {} children) in {} ms",
+               inheritance edges: {} children, ancestor sets: {}) in {} ms",
               per_file_imports.len(), per_file_using_ns.len(),
-              child_to_parents.len(), t2.elapsed().as_millis());
+              child_to_parents.len(), class_to_ancestors.len(),
+              t2.elapsed().as_millis());
 
     // --- Pass 3: resolve every ref, write sidecar. ---
     //
@@ -5816,7 +5849,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         let ids: Vec<u64> = chunk.par_iter().map(|rr| {
             let mut local_narrowed = 0u64;
             let id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
-                                 &per_file_using_ns, &child_to_parents, &mut local_narrowed);
+                                 &per_file_using_ns, &class_to_ancestors, &mut local_narrowed);
             if local_narrowed > 0 { narrowed_count.fetch_add(local_narrowed, Ordering::Relaxed); }
             if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
             id
@@ -5854,7 +5887,7 @@ fn resolve_one(
     per_file_pkg: &std::collections::HashMap<u32, String>,
     per_file_imports: &std::collections::HashMap<u32, Vec<(String, Option<String>)>>,
     per_file_using_ns: &std::collections::HashMap<u32, Vec<String>>,
-    child_to_parents: &std::collections::HashMap<String, Vec<String>>,
+    class_to_ancestors: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     narrowed: &mut u64,
 ) -> u64 {
     let cands = match by_name.get(&rr.name) {
@@ -5901,38 +5934,19 @@ fn resolve_one(
         }
     }
 
-    // Inheritance walk (v0.1.32). When the ref is inside a class that
-    // extends/implements another, the method might be defined on an
-    // ancestor. BFS up the chain collecting all candidates whose
-    // enclosing class equals any ancestor. If EXACTLY ONE candidate
-    // across the whole chain qualifies → prefer it. Multiple matches
-    // (diamond / interface conflict) → fall through to later rules
-    // rather than short-circuiting at the first level (so an
-    // import-aware narrowing could still disambiguate).
-    // Caps depth at 8 to bound pathological hierarchies — real
-    // Java/Kotlin/C++ inheritance rarely exceeds 5 levels deep.
+    // Inheritance walk (v0.1.32, optimized in v0.1.33). The
+    // class_to_ancestors map is precomputed ONCE in pass 2, so
+    // here we just check if any candidate's enclosing class is in
+    // the ref's ancestor set. If exactly one candidate qualifies →
+    // prefer it. Multiple matches (diamond / interface conflict) →
+    // fall through (so an import-aware narrowing could still
+    // disambiguate).
     if let Some(my_class) = rr.scope_path.last() {
-        if let Some(parents) = child_to_parents.get(my_class) {
-            let mut visited: std::collections::HashSet<&str> =
-                std::collections::HashSet::new();
-            visited.insert(my_class.as_str());
-            let mut queue: std::collections::VecDeque<&str> =
-                parents.iter().map(String::as_str).collect();
-            let mut ancestor_matches: Vec<&&ResolveDef> = Vec::new();
-            let mut steps = 0usize;
-            while let Some(cls) = queue.pop_front() {
-                if !visited.insert(cls) { continue; }
-                if steps > 8 { break; }
-                steps += 1;
-                for c in pool {
-                    if c.scope_path.last().map(String::as_str) == Some(cls) {
-                        ancestor_matches.push(c);
-                    }
-                }
-                if let Some(next_parents) = child_to_parents.get(cls) {
-                    for p in next_parents { queue.push_back(p.as_str()); }
-                }
-            }
+        if let Some(ancestors) = class_to_ancestors.get(my_class) {
+            let ancestor_matches: Vec<&&ResolveDef> = pool.iter()
+                .filter(|c| c.scope_path.last()
+                    .is_some_and(|cls| ancestors.contains(cls)))
+                .collect();
             if ancestor_matches.len() == 1 {
                 *narrowed += 1;
                 return ancestor_matches[0].id;
@@ -9524,13 +9538,14 @@ mod tests {
                          scope_path: vec!["Unrelated".into()] },
         ]);
         // Inner extends Outer; call site is inside Inner.
-        let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
-        child_to_parents.insert("Inner".to_string(), vec!["Outer".to_string()]);
+        let mut ancestors: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        ancestors.insert("Inner".to_string(),
+            ["Outer".to_string()].into_iter().collect());
         let r = mk_ref_scoped("inherited", FileKind::Java, 5, &["Inner"]);
         let mut n = 0u64;
         let got = resolve_one(
             &r, &by_name, &HashMap::new(), &HashMap::new(),
-            &empty_ns(), &child_to_parents, &mut n,
+            &empty_ns(), &ancestors, &mut n,
         );
         assert_eq!(got, 42, "should walk Inner → Outer and find inherited method");
         assert_eq!(n, 1);
@@ -9548,15 +9563,15 @@ mod tests {
                          pkg: Some("com.other".into()),
                          scope_path: vec!["Unrelated".into()] },
         ]);
-        // Child → Parent → Grandparent chain.
-        let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
-        child_to_parents.insert("Child".to_string(), vec!["Parent".to_string()]);
-        child_to_parents.insert("Parent".to_string(), vec!["Grandparent".to_string()]);
+        // Child → Parent → Grandparent chain — precomputed transitive set.
+        let mut ancestors: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        ancestors.insert("Child".to_string(),
+            ["Parent".to_string(), "Grandparent".to_string()].into_iter().collect());
         let r = mk_ref_scoped("inherited", FileKind::Java, 5, &["Child"]);
         let mut n = 0u64;
         let got = resolve_one(
             &r, &by_name, &HashMap::new(), &HashMap::new(),
-            &empty_ns(), &child_to_parents, &mut n,
+            &empty_ns(), &ancestors, &mut n,
         );
         assert_eq!(got, 7);
         assert_eq!(n, 1);
@@ -9576,14 +9591,14 @@ mod tests {
                          scope_path: vec!["IB".into()] },
         ]);
         // Child implements both IA and IB — both define close.
-        let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
-        child_to_parents.insert("Child".to_string(),
-            vec!["IA".to_string(), "IB".to_string()]);
+        let mut ancestors: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        ancestors.insert("Child".to_string(),
+            ["IA".to_string(), "IB".to_string()].into_iter().collect());
         let r = mk_ref_scoped("close", FileKind::Java, 5, &["Child"]);
         let mut n = 0u64;
         let got = resolve_one(
             &r, &by_name, &HashMap::new(), &HashMap::new(),
-            &empty_ns(), &child_to_parents, &mut n,
+            &empty_ns(), &ancestors, &mut n,
         );
         assert_eq!(got, 0,
             "ambiguous inheritance (two ancestors define close) → unresolved");

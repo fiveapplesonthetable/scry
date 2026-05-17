@@ -7,6 +7,32 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.33] — 2026-05-17
+
+Refactor: precompute transitive ancestor sets in pass 2.
+
+v0.1.32 shipped the inheritance walk as a per-ref BFS, which
+worked but allocated a `HashSet` + `VecDeque` for each of 63 M
+refs. v0.1.33 precomputes the closure ONCE in pass 2:
+`class_to_ancestors: HashMap<String, HashSet<String>>`, one
+entry per child class. `resolve_one` then does a single HashMap
+lookup + a HashSet membership test per candidate.
+
+**Trade-off:**
+- Pass 2 cost: +~400 ms for 139,573 child classes (precompute
+  the closure).
+- Pass 3 cost: identical correctness — same 24.4 M resolved,
+  same 8.3 M narrowed. Wall time is dominated by system noise
+  (~170-185 s either way), but the new path has fewer
+  allocations per ref and better cache locality on the inner
+  loop.
+- Memory: ~14 MB for the precomputed ancestor sets — negligible
+  versus the 4.9 GB refs file.
+
+**No behavior change.** Resolution decisions are bit-identical
+to v0.1.32. Tests updated to construct `HashSet<String>`
+ancestor sets directly instead of `Vec<String>` parent lists.
+
 ## [0.1.32] — 2026-05-17
 
 Inheritance-aware method resolution in `cmd_build_resolutions`.

@@ -98,6 +98,18 @@ impl BuildSystem for Soong {
         kotlinc_rules.sort_by(|a, b| a.output.cmp(&b.output));
         kotlinc_rules.dedup_by(|a, b| a.output == b.output);
 
+        // Variant fallback. A module can appear with several
+        // variants (`android_common`, `android_common_apex31`, …);
+        // Soong defines a build rule for each but only materializes
+        // the .rsp / classpath.rsp files for the variants that were
+        // actually built. The default variant's rule often points
+        // at paths that don't exist on disk, so its compilation
+        // would die at `read_to_string` time with no useful
+        // output. Group rules by (module, language) and pick the
+        // variant whose files we can actually read; drop the rest.
+        javac_rules = select_built_variant(javac_rules, &self.source_root, "/javac/");
+        kotlinc_rules = select_built_variant(kotlinc_rules, &self.source_root, "/kotlin/");
+
         // Expand `${var}` / `$var` references in every binding using
         // the unified variable table. Without this step, AOSP modules
         // that put their actual javac flags behind a
@@ -142,6 +154,83 @@ impl BuildSystem for Soong {
         }));
         Ok(compilations)
     }
+}
+
+/// Per-rule kind that knows enough about itself to (a) report which
+/// module it represents, (b) report its sibling `.rsp` paths, and
+/// (c) be sorted/grouped by module. Implemented for both
+/// [`JavacRule`] and [`KotlincRule`] so [`select_built_variant`]
+/// can dedup either kind by "the variant whose rsps exist".
+trait JvmRule {
+    /// Logical module name (variant stripped). Two rules with the
+    /// same `module_key()` represent the same logical module
+    /// compiled for different variants.
+    fn module_key(&self) -> String;
+    /// Output jar path (`out/soong/.intermediates/<…>.jar`).
+    fn output(&self) -> &str;
+    /// Absolute paths to the sibling `.rsp` files this rule needs
+    /// to compile (source list, classpath list, etc.). The variant
+    /// selector picks the rule for which all of these exist.
+    fn required_rsps(&self, source_root: &Path) -> Vec<PathBuf>;
+}
+
+impl JvmRule for JavacRule {
+    fn module_key(&self) -> String { module_name_from_output(&self.output) }
+    fn output(&self) -> &str { &self.output }
+    fn required_rsps(&self, source_root: &Path) -> Vec<PathBuf> {
+        vec![source_root.join(format!("{}.rsp", self.output))]
+    }
+}
+
+impl JvmRule for KotlincRule {
+    fn module_key(&self) -> String { module_name_from_kotlin_output(&self.output) }
+    fn output(&self) -> &str { &self.output }
+    fn required_rsps(&self, source_root: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![source_root.join(format!("{}.rsp", self.output))];
+        if let Some(cp_rsp_rel) = self.bindings.get("classpath") {
+            paths.push(source_root.join(cp_rsp_rel.trim()));
+        }
+        paths
+    }
+}
+
+/// Among multi-variant duplicates of the same module, keep ONE rule
+/// — the one whose required `.rsp` files all exist on disk. Modules
+/// with no built variant get a single representative kept (so the
+/// downstream skip-with-clear-log path still fires); modules with
+/// exactly one variant pass through unchanged.
+fn select_built_variant<R: JvmRule>(rules: Vec<R>, source_root: &Path, _marker: &str)
+    -> Vec<R>
+{
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<R>> = HashMap::new();
+    for rule in rules {
+        groups.entry(rule.module_key()).or_default().push(rule);
+    }
+    let mut out: Vec<R> = Vec::with_capacity(groups.len());
+    for (_module, variants) in groups {
+        if variants.len() == 1 {
+            out.extend(variants);
+            continue;
+        }
+        // Pick the first variant whose required rsps all exist.
+        let mut picked: Option<R> = None;
+        let mut last_resort: Option<R> = None;
+        for r in variants {
+            let all_exist = r.required_rsps(source_root).iter().all(|p| p.is_file());
+            if all_exist && picked.is_none() {
+                picked = Some(r);
+            } else if last_resort.is_none() {
+                last_resort = Some(r);
+            }
+        }
+        if let Some(r) = picked.or(last_resort) {
+            out.push(r);
+        }
+    }
+    // Re-sort by output for stable downstream processing.
+    out.sort_by(|a, b| a.output().cmp(b.output()));
+    out
 }
 
 /// A javac rule extracted from a single ninja shard. Intermediate

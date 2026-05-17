@@ -3032,3 +3032,199 @@ public class Cat extends Animal {}
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// `scry finalize` auto-discovers compile_commands.json inside
+/// indexed roots and stages a clang-index run on it without the
+/// user passing --clang-compile-commands. This test uses a REAL
+/// C++ TU (not an empty `[]` placeholder) so the full Path B
+/// pipeline executes end-to-end: discovery → stage queue → libclang
+/// parse → USR sidecar on disk → `scry health` reports it.
+///
+/// libclang detection: if libclang isn't available in the test
+/// environment, the new soft-fail contract means finalize succeeds
+/// with a warning and no sidecar gets written. In that case the
+/// test asserts the warning path; it does NOT silently pass and
+/// does NOT incorrectly fail.
+#[test]
+fn finalize_auto_discovers_real_compile_commands() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-autodisc-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // Real C++ TU: a class with a definition + a free function that
+    // calls into it. Three USR-producing cursors guarantee a non-
+    // trivial sidecar when libclang processes the file.
+    std::fs::write(src.join("widget.h"), r#"#pragma once
+namespace demo {
+class Widget {
+public:
+    Widget();
+    int poke(int x) const;
+};
+int kick(const Widget& w);
+}
+"#).unwrap();
+    std::fs::write(src.join("widget.cpp"), r#"#include "widget.h"
+namespace demo {
+Widget::Widget() {}
+int Widget::poke(int x) const { return x + 1; }
+int kick(const Widget& w) { return w.poke(41); }
+}
+"#).unwrap();
+
+    // Valid compile_commands.json — single TU, absolute directory,
+    // relative file, plain c++17 args. clang-sys will parse this.
+    let cc_json = format!(
+        r#"[{{
+  "directory": "{dir}",
+  "file": "widget.cpp",
+  "arguments": ["clang++", "-std=c++17", "-c", "widget.cpp"]
+}}]
+"#,
+        dir = src.display(),
+    );
+    std::fs::write(src.join("compile_commands.json"), cc_json).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = Command::new(scry_bin())
+        .args(["finalize", "--index"]).arg(&idx)
+        .output().expect("spawn finalize");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(),
+        "finalize failed: stderr={stderr}");
+    assert!(stderr.contains("clang-index (auto:"),
+        "finalize stderr should log the auto clang-index stage; got:\n{stderr}");
+    assert!(stderr.contains("compile_commands.json"),
+        "finalize stderr should name the discovered compile_commands.json; \
+         got:\n{stderr}");
+    assert!(stderr.contains("ALL STAGES OK"),
+        "finalize should report ALL STAGES OK even when libclang is absent; \
+         got:\n{stderr}");
+
+    // Distinguish "libclang worked" from "libclang unavailable, soft-failed".
+    let libclang_failed = stderr.contains("auto clang-index failed");
+    let health_out = Command::new(scry_bin())
+        .args(["health", "--index"]).arg(&idx).arg("--json")
+        .output().expect("spawn health");
+    assert!(health_out.status.success(),
+        "health failed: {}", String::from_utf8_lossy(&health_out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&health_out.stdout)
+        .expect("health --json output should parse");
+    // `scry health --json` keys checks by `artifact`. There are two
+    // clang_usrs entries: one for the raw file presence ("clang_usrs.bin"),
+    // and one for the open+decode summary ("clang_usrs"). We want the
+    // latter — it carries the "v1, N USRs, M records" status line.
+    let cu = v["checks"].as_array().expect("checks array").iter()
+        .find(|c| c["artifact"] == "clang_usrs").expect("clang_usrs check present")
+        .clone();
+    let status = cu["status"].as_str().unwrap_or("").to_string();
+
+    if libclang_failed {
+        // Soft-fail contract: warning in stderr, sidecar absent,
+        // health reports "absent".
+        assert!(
+            status.contains("absent"),
+            "libclang-absent path: clang_usrs status should be 'absent'; got: {status}",
+        );
+    } else {
+        // Happy path: libclang parsed the TU, sidecar exists with
+        // > 0 USRs from the Widget class + methods + kick().
+        assert!(
+            status.starts_with("v1,"),
+            "libclang-present path: clang_usrs status should be 'v1, …'; got: {status}",
+        );
+        // Extract "v1, N USRs, M records" and assert N > 0.
+        let n_usrs: usize = status
+            .strip_prefix("v1, ").and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(n_usrs > 0,
+            "libclang-present path: sidecar should have > 0 USRs from the \
+             C++ fixture; got: {status}");
+    }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Mimics the Soong/CMake-out-of-tree layout: source has no
+/// compile_commands.json, but the build dir (which is gitignored
+/// in real projects) does. The source-root walker (which honors
+/// .gitignore) misses it; `--build-out <path>` walks the build
+/// dir verbatim and picks it up.
+#[test]
+fn finalize_build_out_discovers_cc_json_in_gitignored_dir() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-build-out-{nanos}"));
+    let src = base.join("src");
+    let out = base.join("out/build/compdb");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Source tree has the .cpp but no cc.json. .gitignore would
+    // hide `out/` in a real project; this test makes that hiding
+    // even stricter by putting `out/` outside the indexed root
+    // entirely.
+    std::fs::write(src.join("widget.h"), r#"#pragma once
+namespace demo {
+class Widget { public: Widget(); int poke(int x) const; };
+}
+"#).unwrap();
+    std::fs::write(src.join("widget.cpp"), r#"#include "widget.h"
+namespace demo {
+Widget::Widget() {}
+int Widget::poke(int x) const { return x + 1; }
+}
+"#).unwrap();
+
+    // cc.json lives in the build dir, pointing back at the source
+    // tree (out-of-tree build pattern).
+    let cc_json = format!(
+        r#"[{{"directory": "{src}", "file": "widget.cpp", "arguments": ["clang++", "-std=c++17", "-c", "widget.cpp"]}}]"#,
+        src = src.display(),
+    );
+    std::fs::write(out.join("compile_commands.json"), cc_json).unwrap();
+
+    let r = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(r.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&r.stderr));
+
+    // First: confirm that WITHOUT --build-out, source-root
+    // discovery finds nothing (since cc.json isn't in `src/`).
+    let r = Command::new(scry_bin())
+        .args(["finalize", "--index"]).arg(&idx)
+        .output().expect("spawn finalize (no build-out)");
+    let stderr_noflag = String::from_utf8_lossy(&r.stderr);
+    assert!(r.status.success(),
+        "finalize (no flag) failed: {stderr_noflag}");
+    assert!(!stderr_noflag.contains("clang-index (auto:"),
+        "without --build-out, auto clang-index should NOT fire \
+         (cc.json is outside indexed roots); got:\n{stderr_noflag}");
+
+    // Then: with --build-out pointing at the build dir, auto
+    // discovery picks it up.
+    let r = Command::new(scry_bin())
+        .args(["finalize", "--index"]).arg(&idx)
+        .args(["--build-out"]).arg(&out)
+        .output().expect("spawn finalize --build-out");
+    let stderr_with = String::from_utf8_lossy(&r.stderr);
+    assert!(r.status.success(),
+        "finalize --build-out failed: {stderr_with}");
+    assert!(stderr_with.contains("clang-index (auto:"),
+        "--build-out should make auto clang-index fire; got:\n{stderr_with}");
+    assert!(stderr_with.contains(&out.display().to_string()),
+        "--build-out auto stage should name the build-out path; got:\n{stderr_with}");
+
+    std::fs::remove_dir_all(&base).ok();
+}
+

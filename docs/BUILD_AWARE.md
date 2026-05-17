@@ -1,3 +1,171 @@
+# Build-aware indexing
+
+This file has two halves. The first is the **user-facing quick start**:
+how to make scry consume compiler-backed indexer artifacts
+(`compile_commands.json`, `*.scip`) for each major language + build
+system. The second is the original v0.1.12 **design narrative** that
+shaped the precision sidecars — kept for historical context.
+
+For language-by-language SCIP producer commands (one-liners per tool),
+see [`SCIP_PRODUCERS.md`](SCIP_PRODUCERS.md). This file focuses on
+**how to point scry at the artifacts those tools produce.**
+
+---
+
+## Quick start
+
+`scry finalize` auto-discovers two kinds of artifacts inside each
+indexed source root:
+
+| Artifact                  | Consumed by              | Used for                                  |
+|---------------------------|--------------------------|-------------------------------------------|
+| `compile_commands.json`   | `scry clang-index`       | C / C++ / ObjC (libclang USRs)            |
+| `*.scip`                  | `scry scip-import`       | Java, Kotlin, Rust, TypeScript, Go, Python (SCIP-producer outputs) |
+
+Each artifact type is matched at most once per index. If multiple
+candidates are found, `scry finalize` warns and skips — pass an
+explicit flag (`--clang-compile-commands` / `--scip`) to disambiguate.
+
+The source-root walker honors `.gitignore`. Most build systems write
+their outputs to gitignored directories (`out/`, `build/`, `target/`,
+`.gradle/`), so a normal walk can't see them. Use `--build-out PATH`
+(repeatable) to point at one or more build-output dirs that should be
+walked without the gitignore filter.
+
+### AOSP / Soong (C / C++)
+
+```bash
+# 1. Generate the compdb. SOONG_GEN_COMPDB=1 makes Soong emit
+#    out/soong/development/ide/compdb/compile_commands.json during
+#    the build.
+SOONG_GEN_COMPDB=1 m nothing      # or any other build target
+
+# 2. Index and finalize, pointing --build-out at the compdb dir.
+scry index /path/to/aosp -o /path/to/scry-index
+scry finalize \
+  --index /path/to/scry-index \
+  --build-out /path/to/aosp/out/soong/development/ide/compdb \
+  --build-soong /path/to/aosp        # also builds module_graph.json
+```
+
+Auto-discovery picks up `compile_commands.json` from the build-out
+path and runs `scry clang-index` on it. `--build-soong` separately
+builds the Soong module graph so `--reachable` queries work.
+
+### CMake (C / C++)
+
+Out-of-tree build with the compdb in `build/`:
+
+```bash
+cmake -B build -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build
+
+scry index . -o ../scry-index
+scry finalize --index ../scry-index --build-out build
+```
+
+Or in-tree build (compdb lives in source root, source-root walker
+finds it without `--build-out`):
+
+```bash
+cmake . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build .
+scry index . -o ../scry-index
+scry finalize --index ../scry-index    # no flag needed
+```
+
+### Make / autotools (C / C++)
+
+Use [`bear`](https://github.com/rizsotto/Bear) to wrap the build and
+emit a compdb:
+
+```bash
+bear -- make all
+scry index . -o ../scry-index
+scry finalize --index ../scry-index     # bear writes ./compile_commands.json
+```
+
+### Java (Gradle / Maven / Bazel) via scip-java
+
+```bash
+coursier launch com.sourcegraph:scip-java_2.13:0.10.0 -- \
+  index --build-tool gradle              # writes index.scip in cwd
+
+scry index . -o ../scry-index
+scry finalize --index ../scry-index      # picks up ./index.scip
+```
+
+### Kotlin via scip-kotlin
+
+```bash
+scip-kotlin --output index.scip src/
+scry index . -o ../scry-index
+scry finalize --index ../scry-index
+```
+
+### Rust via rust-analyzer
+
+```bash
+rust-analyzer scip .                     # writes index.scip
+scry index . -o ../scry-index
+scry finalize --index ../scry-index --build-out target
+# --build-out target catches the .scip if rust-analyzer wrote it under target/
+```
+
+### TypeScript / JavaScript via scip-typescript
+
+```bash
+npm i -D @sourcegraph/scip-typescript
+npx scip-typescript index                # writes index.scip
+scry index . -o ../scry-index
+scry finalize --index ../scry-index
+```
+
+### Go via scip-go / gopls
+
+```bash
+gopls scip ./...                         # writes index.scip
+scry index . -o ../scry-index
+scry finalize --index ../scry-index
+```
+
+### Python via scip-python
+
+```bash
+npx @sourcegraph/scip-python index .
+scry index . -o ../scry-index
+scry finalize --index ../scry-index
+```
+
+### Verifying the sidecar landed
+
+After `scry finalize`, run:
+
+```bash
+scry health --index /path/to/scry-index
+```
+
+Look for the `clang_usrs` and `scip_index` rows: `v1, N USRs, M
+records` means the sidecar built and parsed; `absent (run ...)` means
+the artifact wasn't found.
+
+Then queries auto-engage the precision filter:
+
+```bash
+scry callers Foo --index /path/to/scry-index   # auto-uses both sidecars
+scry ref Bar    --index /path/to/scry-index    # same
+```
+
+`--clang-precise` and `--scip-precise` flags explicitly opt in
+to one filter; absent flags use both when available.
+
+---
+
+## Design notes (archived)
+
+Below is the original v0.1.12 design narrative that shaped this work.
+Kept for historical context — the **Quick start** above reflects what
+actually shipped.
+
 # scry v0.1.12 design: `--build soong` (build-boundary-aware)
 
 Status: **DESIGN** (v0.1.11 ships first; this work begins after).

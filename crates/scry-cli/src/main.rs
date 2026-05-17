@@ -8126,9 +8126,6 @@ pub(crate) fn cmd_build_modgraph(kind: &str, root: &Path, output: &Path) -> Resu
     Ok(())
 }
 
-/// `scry clang-index --compile-commands … --index DIR` entrypoint —
-/// drives libclang per-TU and writes `clang_usrs.bin` next to the
-/// main scry index.
 // `cmd_clang_*` and `cmd_scip_*` live in crate::precision_subcmds.
 
 /// Run the warm pass and print a one-line summary. Standalone

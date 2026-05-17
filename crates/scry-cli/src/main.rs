@@ -409,6 +409,12 @@ enum Cmd {
         /// calls that the heuristic resolver couldn't attribute.
         #[arg(long)]
         strict: bool,
+        /// Compact output. `count` emits just `N edges`. `paths`
+        /// emits deduped sorted file paths of the outgoing refs —
+        /// "which files does NAME touch?". Same shape as on ref /
+        /// callers. Mutually exclusive with --json.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -1292,8 +1298,8 @@ fn main() -> Result<()> {
             cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, limit, json),
         Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, json } =>
             cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, json),
-        Cmd::Uses { name, index, in_, not_in, kind, strict, limit, json } =>
-            cmd_uses(name, index, in_, not_in, kind, strict, limit, json),
+        Cmd::Uses { name, index, in_, not_in, kind, strict, format, limit, json } =>
+            cmd_uses(name, index, in_, not_in, kind, strict, format, limit, json),
         Cmd::Finalize {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, workers,
@@ -5212,9 +5218,18 @@ fn cmd_uses(
     not_in: Option<String>,
     kind: Option<String>,
     strict: bool,
+    format: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
+    if let Some(f) = format.as_deref() {
+        if !matches!(f, "count" | "paths") {
+            anyhow::bail!("--format must be 'count' or 'paths' (got '{f}')");
+        }
+    }
+    if json && format.as_deref() == Some("count") {
+        anyhow::bail!("--json and --format=count are mutually exclusive");
+    }
     let t = Instant::now();
     let r = open_index(index)?;
     let defs: Vec<SymbolRecord> = r.lookup_exact(&name).into_iter()
@@ -5289,25 +5304,38 @@ fn cmd_uses(
         );
     }
 
-    if json {
-        for rr in out_refs.iter().take(limit) {
-            println!("{}", ref_to_json(&r, rr));
+    // v0.1.57 — --format paths / count on uses (symmetric with ref/callers).
+    match format.as_deref() {
+        Some("count") => {
+            println!("{} edges", out_refs.len());
         }
-    } else {
-        let shown = out_refs.len().min(limit);
-        for rr in out_refs.iter().take(shown) {
-            let path = r.files.get(rr.file_id as usize)
-                .map(|fe| fe.display_path(&r.roots))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            println!("{path}:{}:{}  ({} {})  {}",
-                rr.line, rr.col, rr.kind.short(), rr.lang.as_str(), rr.name);
+        Some("paths") => {
+            print_refs_paths(&r, &out_refs, limit, json);
+            eprintln!("[scry] cmd=uses q={:?} defs={} hits={} elapsed={}ms",
+                name, defs.len(), out_refs.len(), t.elapsed().as_millis());
         }
-        println!("\n{} use{} (showing {})",
-            out_refs.len(),
-            if out_refs.len() == 1 { "" } else { "s" },
-            shown);
-        eprintln!("[scry] cmd=uses q={:?} defs={} hits={} elapsed={}ms",
-            name, defs.len(), out_refs.len(), t.elapsed().as_millis());
+        _ => {
+            if json {
+                for rr in out_refs.iter().take(limit) {
+                    println!("{}", ref_to_json(&r, rr));
+                }
+            } else {
+                let shown = out_refs.len().min(limit);
+                for rr in out_refs.iter().take(shown) {
+                    let path = r.files.get(rr.file_id as usize)
+                        .map(|fe| fe.display_path(&r.roots))
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    println!("{path}:{}:{}  ({} {})  {}",
+                        rr.line, rr.col, rr.kind.short(), rr.lang.as_str(), rr.name);
+                }
+                println!("\n{} use{} (showing {})",
+                    out_refs.len(),
+                    if out_refs.len() == 1 { "" } else { "s" },
+                    shown);
+                eprintln!("[scry] cmd=uses q={:?} defs={} hits={} elapsed={}ms",
+                    name, defs.len(), out_refs.len(), t.elapsed().as_millis());
+            }
+        }
     }
     Ok(())
 }
@@ -7940,6 +7968,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "limit": limit_prop,
                 "strict": {"type": "boolean", "default": false,
                     "description": "Drop outgoing edges whose Layer 2 resolution didn't pin a target. Use for `what does NAME call that we KNOW the target of?` — strips heuristic-only matches the resolver couldn't attribute."},
+                "format": {"type": "string", "enum": ["count", "paths"],
+                    "description": "Optional. `count` returns `{count: N}` — cheapest probe for `how many edges`. `paths` returns a deduped sorted array of file paths — `which files does NAME touch?`. Without `format`, returns per-ref JSONL stream."},
             })),
         ),
         tool(
@@ -8823,7 +8853,8 @@ fn serve_one_request<W: std::io::Write>(
         }
         "uses" => {
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_uses(reader, arg_str("name"), in_, not_in, kind, strict, limit)
+            let format = args.get("format").and_then(serde_json::Value::as_str);
+            serve_uses(reader, arg_str("name"), in_, not_in, kind, strict, format, limit)
         }
         "grep"    => {
             let ci = args.get("case_insensitive")
@@ -9274,6 +9305,7 @@ fn serve_uses(
     not_in: Option<&str>,
     kind: Option<&str>,
     strict: bool,
+    format: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
     let defs: Vec<SymbolRecord> = r.lookup_exact(name).into_iter()
@@ -9282,9 +9314,15 @@ fn serve_uses(
     if defs.is_empty() {
         return serde_json::json!([]);
     }
+    let paths_only = format == Some("paths");
+    let count_only = format == Some("count");
+    // paths/count both need every surviving edge to compute the right
+    // shape; default JSONL still caps at `limit` for cost.
     let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut paths_keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut count_total: usize = 0;
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for def in &defs {
+    'outer: for def in &defs {
         let body_end = next_function_byte_start(r, def.file_id, def.byte_start)
             .unwrap_or(u32::MAX);
         let refs_in_file = match r.refs_for_file(def.file_id) {
@@ -9293,7 +9331,8 @@ fn serve_uses(
             None => continue,
         };
         for ref_idx in refs_in_file {
-            if out.len() >= limit { break; }
+            if !paths_only && !count_only && out.len() >= limit { break 'outer; }
+            if paths_only && paths_keep.len() >= limit { break 'outer; }
             let Some(rr) = r.get_ref(ref_idx) else { continue };
             if rr.byte_start < def.byte_start || rr.byte_start >= body_end { continue; }
             if let Some(k) = kind {
@@ -9303,10 +9342,25 @@ fn serve_uses(
             if strict && rr.resolved_to.is_none() { continue; }
             let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
             if seen.insert(key) {
-                out.push(ref_to_json(r, &rr));
+                if paths_only {
+                    if let Some(fe) = r.files.get(rr.file_id as usize) {
+                        paths_keep.insert(fe.display_path(&r.roots));
+                    }
+                } else if count_only {
+                    count_total += 1;
+                } else {
+                    out.push(ref_to_json(r, &rr));
+                }
             }
         }
-        if out.len() >= limit { break; }
+    }
+    if paths_only {
+        let arr: Vec<serde_json::Value> = paths_keep.into_iter()
+            .map(serde_json::Value::String).collect();
+        return serde_json::Value::Array(arr);
+    }
+    if count_only {
+        return serde_json::json!({"count": count_total});
     }
     serde_json::Value::Array(out)
 }

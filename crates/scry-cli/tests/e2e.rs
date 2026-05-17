@@ -2797,3 +2797,125 @@ public class Idle {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.57 — `--format paths` and `--format count` on `scry uses`,
+/// symmetric with the ref/callers shape from v0.1.56. The CLI prints
+/// "<N> edges" for count and the path list for paths; the daemon
+/// returns `{count: N}` and a sorted `[...path...]` array respectively.
+#[test]
+fn uses_format_paths_and_count() {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-uses-fmt-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+    // A method that calls helpers in two distinct files. `--format
+    // paths` on `uses caller` should list both helper files; `--format
+    // count` should report the total outgoing-edge count > 0.
+    std::fs::write(src.join("Caller.java"), r#"package p;
+public class Caller {
+    public void caller() {
+        new Helper().help();
+        new Other().work();
+    }
+}
+"#).unwrap();
+    std::fs::write(src.join("Helper.java"), r#"package p;
+public class Helper { public void help() {} }
+"#).unwrap();
+    std::fs::write(src.join("Other.java"), r#"package p;
+public class Other { public void work() {} }
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["build-file-refs", "--index"]).arg(&idx)
+        .output().expect("spawn build-file-refs");
+    assert!(out.status.success(),
+        "build-file-refs failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // (1) CLI --format count: single "N edges" line on stdout.
+    let out = Command::new(scry_bin())
+        .args(["uses", "caller", "--index"]).arg(&idx)
+        .args(["--format", "count"])
+        .output().expect("spawn uses count");
+    assert!(out.status.success(),
+        "uses count failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first_line = stdout.lines().next().unwrap_or("");
+    assert!(first_line.ends_with(" edges"),
+        "expected '<N> edges' stdout line; got: {stdout:?}");
+    let n: usize = first_line.split_whitespace().next().unwrap().parse().unwrap();
+    assert!(n >= 1, "expected at least 1 outgoing edge; got {n}");
+
+    // (2) CLI --format paths: path list on stdout, deduped sorted.
+    let out = Command::new(scry_bin())
+        .args(["uses", "caller", "--index"]).arg(&idx)
+        .args(["--format", "paths", "--limit", "10"])
+        .output().expect("spawn uses paths");
+    assert!(out.status.success(),
+        "uses paths failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with('/')).collect();
+    assert!(!path_lines.is_empty(),
+        "expected at least one path on stdout; got: {stdout:?}");
+    // dedup check: no path appears twice
+    let mut sorted = path_lines.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(path_lines.len(), sorted.len(),
+        "paths list contains duplicates: {path_lines:?}");
+    // sorted-ascending check
+    assert_eq!(path_lines, sorted,
+        "paths list must be sorted ascending: {path_lines:?}");
+
+    // (3) CLI --format paths --json: bare JSON array of strings.
+    let out = Command::new(scry_bin())
+        .args(["uses", "caller", "--index"]).arg(&idx)
+        .args(["--format", "paths", "--limit", "10", "--json"])
+        .output().expect("spawn uses paths --json");
+    assert!(out.status.success(),
+        "uses paths --json failed: {}", String::from_utf8_lossy(&out.stderr));
+    let arr: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!arr.is_empty(), "expected non-empty JSON path array");
+
+    // (4) Daemon parity: serve_uses with format=paths / format=count.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"uses","args":{{"name":"caller","format":"paths","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"uses","args":{{"name":"caller","format":"count","limit":20}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(),
+        "serve failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 responses, got {lines:?}");
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let arr1 = r1["result"].as_array().expect("daemon uses paths must be an array");
+    assert!(!arr1.is_empty(), "daemon uses paths returned empty array: {arr1:?}");
+    for v in arr1 {
+        assert!(v.is_string(), "daemon uses paths element must be a string: {v}");
+    }
+    let count_obj = &r2["result"];
+    assert!(count_obj["count"].is_number(),
+        "daemon uses count must return {{count: N}}; got {count_obj:?}");
+    let n2 = count_obj["count"].as_u64().unwrap();
+    assert!(n2 >= 1, "daemon uses count: expected >=1 edge; got {n2}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

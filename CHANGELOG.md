@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.57] — 2026-05-17
+
+`--format paths` and `--format count` on `scry uses` — symmetric
+with the ref/callers shape from v0.1.56. Lets agents ask cheap
+versions of "what does NAME touch?" and "how many outgoing
+edges?" without the per-ref JSONL noise.
+
+```
+$ scry uses bindService --format count
+16655 edges
+
+$ scry uses bindService --format paths --limit 5
+…/AppEnumerationTests.java
+…/CtsSupervisionAppService.kt
+…/DynamicPermissionsTest.kt
+…/FileChannelInterProcessLockTest.java
+…/TestActivity.java
+
+5 unique files (from 16655 refs)
+```
+
+Daemon parity: `args.format: "paths"` returns `["...", ...]`;
+`args.format: "count"` returns `{count: N}`. MCP `uses` schema
+gains `format.enum = ["count", "paths"]`.
+
+Combined with v0.1.56's coverage of ref + callers, this closes
+the `--format` triad across every command that yields a stream
+of refs — uniform compact-output surface for agents.
+
+E2E test: `uses_format_paths_and_count` — CLI count + paths
+shapes, dedup + sort assertions, daemon parity.
+
 ## [0.1.56] — 2026-05-17
 
 `--format paths` on `scry ref` / `scry callers` — deduped sorted

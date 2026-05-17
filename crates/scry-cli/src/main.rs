@@ -1676,6 +1676,19 @@ fn cmd_index(
     let mut grand_syms: u64 = 0;
     let mut grand_refs: u64 = 0;
 
+    // Phase progress. cmd_index runs three top-level phases: walk
+    // (file enumeration), parse (tree-sitter + symbol extraction with
+    // streaming chunk flushes), and finalize-write (the in-memory
+    // writer commits its packed sidecars and manifest).
+    // build-resolutions / build-trigrams / build-digests live in
+    // `scry finalize`, not here. Each phase brackets one terse start
+    // line and a one-line done summary so operators can grep
+    // `^\[index\] phase ` for a milestone trace.
+    const N_PHASES: u32 = 3;
+    let t_phase_walk = Instant::now();
+    eprintln!("[index] phase 1/{N_PHASES}: walk source roots ({} root{})",
+        roots.len(), if roots.len() == 1 { "" } else { "s" });
+
     for (root_id, root) in roots.iter().enumerate() {
         if root_id > u8::MAX as usize {
             anyhow::bail!("too many roots (max 256)");
@@ -1729,6 +1742,11 @@ fn cmd_index(
             file_entries,
         });
     }
+    eprintln!(
+        "[index] phase 1/{N_PHASES} done in {:.1}s ({} files / {})",
+        t_phase_walk.elapsed().as_secs_f64(),
+        total_files_total, human_bytes(total_bytes),
+    );
 
     // -- OOM auto-skiplist --
     // After each cgroup OOM-kill, on resume we read last_attempted.txt
@@ -1910,6 +1928,16 @@ fn cmd_index(
     // how close indexing is to done on a 1 M-file corpus.
     let job_start = Instant::now();
     let mut files_done_at_root_start: u64 = 0;
+
+    let to_parse = total_files_total.saturating_sub(watermark as u64);
+    eprintln!(
+        "[index] phase 2/{N_PHASES}: parse + extract symbols ({} file{} to parse{})",
+        to_parse, if to_parse == 1 { "" } else { "s" },
+        if watermark > 0 {
+            format!(", {watermark} already done via --resume")
+        } else { String::new() },
+    );
+    let t_phase_parse = Instant::now();
 
     // ----- per-root batched parse -----
     for pr in &prepared {
@@ -2262,6 +2290,11 @@ fn cmd_index(
         }
         eprintln!("[parse] root done in {} ms", parse_total.elapsed().as_millis());
     }
+    eprintln!(
+        "[index] phase 2/{N_PHASES} done in {:.1}s ({} parsed / {} failed / {} syms / {} refs)",
+        t_phase_parse.elapsed().as_secs_f64(),
+        total_files_parsed, total_files_failed, grand_syms, grand_refs,
+    );
 
     // In streaming mode we skip in-memory resolve (would require all records).
     // A streaming resolve pass over chunk files can be added later.
@@ -2275,6 +2308,8 @@ fn cmd_index(
         );
     }
 
+    eprintln!("[index] phase 3/{N_PHASES}: finalize writer (packed sidecars, names.fst, manifest)");
+    let t_phase_write = Instant::now();
     let elapsed_ms = t_total.elapsed().as_millis();
     let stats = IndexStats {
         files_total: total_files_total,
@@ -2300,6 +2335,11 @@ fn cmd_index(
     } else {
         eprintln!("[write] count_only=true, not writing index");
     }
+    eprintln!(
+        "[index] phase 3/{N_PHASES} done in {:.1}s -> {}",
+        t_phase_write.elapsed().as_secs_f64(),
+        out_dir.display(),
+    );
     eprintln!("\nDONE: {} files, {} symbols, {} refs, total {} ms ({:.1} files/s)",
         total_files_total, grand_syms, grand_refs, elapsed_ms,
         total_files_total as f64 / (elapsed_ms.max(1) as f64 / 1000.0),

@@ -7,6 +7,46 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.64] — 2026-05-17
+
+**Revert v0.1.60-v0.1.63 (lexical receiver heuristics).**
+
+The "Kythe-gap arc" of v0.1.60-v0.1.63 leaned on three lexical
+hacks that this revert removes:
+
+1. PascalCase filter to decide if an identifier is a class
+   (`Foo.bar()` ⇒ "Foo is a class because it starts uppercase").
+2. Byte-adjacency pairing of TypeUse + Call refs to recover
+   the (receiver, method) tuple after the fact.
+3. Receiver-aware resolver narrowing that consumed (1)+(2).
+
+These produced a measurable but narrow win on static-utility-
+method calls (`Log.d`, `Objects.equals`, …) while leaving
+~80%+ of method dispatch untouched (instance calls, chained
+calls, generic methods, etc.) — and the approach didn't
+generalize. Trying to extend it broke more than it fixed
+(C++ template patterns, whitespace-tolerant pairing).
+
+The right path — what Kythe actually does — is structured
+semantic refs from real compilers, not lexical approximations.
+scry already has both Kythe-equivalent ingestors:
+
+- **Path B**: `scry clang-index` consumes libclang USRs from
+  `compile_commands.json` (the C/C++/ObjC compiler's own
+  per-occurrence symbol IDs).
+- **Path C**: `scry scip-import` consumes SCIP indexes from
+  scip-java / scip-rust / scip-go / scip-typescript / etc.
+  (compiler-backed per-occurrence symbol IDs across languages).
+
+Both produce true cross-TU symbol identity — the actual
+Kythe-grade signal. v0.1.65 wires auto-discovery so they
+fire on-by-default whenever their inputs are present in the
+indexed tree.
+
+The lexical-receiver work is preserved in git history (tags
+v0.1.60-v0.1.63 still resolve) for anyone who wants to study
+the dead end.
+
 ## [0.1.59] — 2026-05-17
 
 `scry health` now reports two more signals that were silently

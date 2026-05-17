@@ -384,7 +384,7 @@ pub fn write(
     // Sort by (path_id, byte_offset). Stable sort keeps insertion
     // order for ties (rare: same path+offset with different symbol
     // id usually means decl-as-ref overlap from the indexer).
-    decorated.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    decorated.sort_by_key(|r| (r.0, r.1));
 
     // Compute per-path (records_start, records_count). decorated
     // is sorted by path_id, so we can sweep.

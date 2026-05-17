@@ -7,6 +7,50 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.63] — 2026-05-17
+
+**Kythe-gap arc, cross-language extension.** Receiver-aware
+narrowing now works for C++ (`Foo::bar()`) and Rust
+(`Foo::bar()`) — same pass 2.5 + resolver mechanism from v0.1.62,
+fed by language-specific tree-sitter queries that capture the
+scope identifier of scoped calls.
+
+```cpp
+// C++ — Foo::bar() captures Foo as a TypeUse ref, pass 2.5 pairs
+// it with the bar Call ref, resolver narrows to Foo's bar.
+namespace Foo { void bar(); }
+namespace Bar { void bar(); }
+void caller() { Foo::bar(); }  // pinned to Foo::bar
+```
+
+```rust
+// Rust — same shape for impl methods and trait associated fns.
+struct Foo; impl Foo { fn bar() {} }
+struct Quux; impl Quux { fn bar() {} }
+pub fn caller() { Foo::bar(); }  // pinned to Foo::bar
+```
+
+Combined with v0.1.60/v0.1.61 (Java/Kotlin), the receiver-aware
+resolution rule now covers the four highest-volume languages in
+the AOSP+Linux corpus: Java, Kotlin, C++, Rust. C is intentionally
+skipped — C has no `Foo::bar` scoping; struct-field calls
+(`obj.fn()`) have lowercase receivers that don't fit the
+PascalCase filter (the filter would over-include false positives
+without strong signal).
+
+Implementation note: tree-sitter-cpp's `qualified_identifier`
+node only exposes `namespace_identifier` as a valid `scope:`
+child — even when the scope is logically a class (`MyClass::foo`),
+the grammar reports it as a namespace_identifier without
+semantic analysis. The capture catches both shapes regardless.
+
+Go and TypeScript queued for next session (Go's heuristic needs
+care around package vs class receivers; TypeScript isn't a heavy
+AOSP language).
+
+E2E test: `receiver_aware_narrowing_cpp_and_rust` — pins TypeUse
+ref capture for both languages.
+
 ## [0.1.62] — 2026-05-17
 
 **Kythe-gap arc, slice 3/3. Receiver-aware resolver narrowing.**

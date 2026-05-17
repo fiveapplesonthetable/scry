@@ -3254,3 +3254,104 @@ public class Caller {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.63 — receiver-aware narrowing extended to C++ (`Foo::bar()`)
+/// and Rust (`Foo::bar()`). Same shape as the Java path in v0.1.62
+/// — scoped calls' scope identifier is captured as a TypeUse ref,
+/// pass 2.5 pairs it with the immediately-following Call ref, and
+/// the resolver narrows method dispatch to the receiver's defs.
+#[test]
+fn receiver_aware_narrowing_cpp_and_rust() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-recv-cpp-rust-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // C++ shape: namespace Foo with static-like free function bar.
+    // Two namespaces define `bar`; Foo::bar() in caller must pin
+    // resolution to Foo's bar.
+    std::fs::write(src.join("foo.h"), r#"namespace Foo {
+void bar();
+}
+namespace Bar {
+void bar();
+}
+"#).unwrap();
+    std::fs::write(src.join("foo.cpp"), r#"#include "foo.h"
+namespace Foo { void bar() {} }
+namespace Bar { void bar() {} }
+"#).unwrap();
+    std::fs::write(src.join("caller.cpp"), r#"#include "foo.h"
+void call_it() {
+    Foo::bar();
+}
+"#).unwrap();
+
+    // Rust shape: two impl blocks define an associated fn `bar`.
+    // Foo::bar() in a third file resolves via the same pass.
+    std::fs::write(src.join("lib.rs"), r#"pub struct Foo;
+impl Foo {
+    pub fn bar() {}
+}
+pub struct Quux;
+impl Quux {
+    pub fn bar() {}
+}
+pub fn use_foo() {
+    Foo::bar();
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["build-resolutions", "--index"]).arg(&idx)
+        .output().expect("spawn build-resolutions");
+    assert!(out.status.success(),
+        "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // (1) C++ — `scry ref Foo` should include a TypeUse hit from
+    // caller.cpp (the scope identifier in Foo::bar()).
+    let out = Command::new(scry_bin())
+        .args(["ref", "Foo", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "50", "--kind", "type"])
+        .output().expect("spawn ref Foo (cpp)");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let refs: Vec<serde_json::Value> = stdout.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap()).collect();
+    let cpp_caller_hits: Vec<&serde_json::Value> = refs.iter()
+        .filter(|r| r["path"].as_str().is_some_and(|p| p.ends_with("/caller.cpp"))
+                    && r["name"].as_str() == Some("Foo"))
+        .collect();
+    assert!(!cpp_caller_hits.is_empty(),
+        "expected a TypeUse ref to Foo from caller.cpp (C++ scope capture); \
+         got refs={refs:?}");
+
+    // (2) Rust — same shape: `scry ref Foo --kind type` should pick
+    // up the Foo::bar() scope from lib.rs.
+    let out = Command::new(scry_bin())
+        .args(["ref", "Foo", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "50", "--kind", "type", "--lang", "rust"])
+        .output().expect("spawn ref Foo (rust)");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let refs: Vec<serde_json::Value> = stdout.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap()).collect();
+    let rust_hits: Vec<&serde_json::Value> = refs.iter()
+        .filter(|r| r["path"].as_str().is_some_and(|p| p.ends_with("/lib.rs"))
+                    && r["name"].as_str() == Some("Foo"))
+        .collect();
+    assert!(!rust_hits.is_empty(),
+        "expected a TypeUse ref to Foo from lib.rs (Rust scope capture); \
+         got refs={refs:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

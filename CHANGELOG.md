@@ -7,6 +7,26 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+**Precision sidecar packed format.** `clang_usrs.bin` and
+`scip_index.bin` are now mmap-backed packed files sharing one layout
+(records sorted by `(path_id, byte_offset)`, interned symbol/path
+tables, ~12 bytes per record). Cold open of the AOSP-scale SCIP
+sidecar (14 M records, was 1.9 GB on disk) drops from ~17 s to
+sub-millisecond; on-disk size drops to ~285 MB. Both readers reject
+old bincode-format sidecars with a `bad magic` error — sidecars must
+be regenerated once via `scry clang-index` / `scry scip-import` after
+upgrading.
+
+**Soong bridge rule-name classifier.** The bridge now extracts the
+ninja rule name from build headers and only classifies a rule as
+`g.java.javac` / `g.java.kotlinc` if the rule name matches exactly.
+The previous path-only classifier caught
+`g.java.javac-split-srcJars` (a multi-output srcjars merge whose
+first output happens to live under `…/javac/srcjarsNN.jar`); for
+sharded modules like `framework-minus-apex` that misclassification
+could mask the real javac rules and leave the SCIP sidecar with no
+records for files in those modules.
+
 ## [0.1.64] — 2026-05-17
 
 **Revert v0.1.60-v0.1.63 (lexical receiver heuristics).**

@@ -7676,11 +7676,13 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "limit": limit_prop,
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
-                    "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar."},
-                "clang_precise": {"type": "boolean", "default": false,
-                    "description": "Filter refs by clang USR identity (C/C++/ObjC name-collision pruning). No-op without the clang_usrs.bin sidecar (`scry clang-index ...`)."},
-                "scip_precise": {"type": "boolean", "default": false,
-                    "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer). No-op without the scip_index.bin sidecar (`scry scip-import ...`)."},
+                    "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar. Opt-in (not default) because the module graph is ~256MB and adds ~50-500ms to first query in a process."},
+                "lexical": {"type": "boolean", "default": false,
+                    "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever their sidecars are present, dropping name-collision false positives across C/C++/ObjC + Java/Kotlin/Rust/Go/TS/Python. Set true to see raw name-match results (debugging / want-everything mode)."},
+                "clang_precise": {"type": "boolean", "default": true,
+                    "description": "Filter refs by clang USR identity (C/C++/ObjC). DEFAULTS TO TRUE: auto-engages whenever the clang_usrs.bin sidecar is present (`scry clang-index ...` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
+                "scip_precise": {"type": "boolean", "default": true,
+                    "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer: Java / Kotlin / Rust / Go / TS / Python). DEFAULTS TO TRUE: auto-engages whenever the scip_index.bin sidecar is present (`scry scip-import ...` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
                 "scope": {"type": "string",
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
                 "def_in": {"type": "string",
@@ -7696,9 +7698,11 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "Find call sites of NAME (shorthand for `ref` with \
              kind=call). For 'does X get called anywhere?' or 'how \
              many?', pass `format: 'count'` — it returns just `N \
-             callers` and costs almost nothing. Set `reachable: true` \
-             to drop call sites in modules the build graph proves \
-             can't actually invoke a definition of NAME.",
+             callers` and costs almost nothing. Build-symbol \
+             precision filters (clang USRs / SCIP symbols) \
+             auto-engage when their sidecars are present; pass \
+             `lexical: true` for raw name-match. Set `reachable: \
+             true` for build-graph pruning (extra ~50-500ms cost).",
             obj(&["name"], serde_json::json!({
                 "name": {"type": "string"},
                 "lang": lang_prop,
@@ -7707,11 +7711,13 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "limit": limit_prop,
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
-                    "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present."},
-                "clang_precise": {"type": "boolean", "default": false,
-                    "description": "Same as on `ref` — clang USR identity filter; no-op without clang_usrs.bin."},
-                "scip_precise": {"type": "boolean", "default": false,
-                    "description": "Same as on `ref` — SCIP symbol identity filter; no-op without scip_index.bin."},
+                    "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present. Opt-in."},
+                "lexical": {"type": "boolean", "default": false,
+                    "description": "Same as on `ref` — opt out of all auto-engaged precision filters and return raw name-match callers."},
+                "clang_precise": {"type": "boolean", "default": true,
+                    "description": "Same as on `ref` — clang USR identity filter; auto-engages when sidecar present."},
+                "scip_precise": {"type": "boolean", "default": true,
+                    "description": "Same as on `ref` — SCIP symbol identity filter; auto-engages when sidecar present."},
                 "scope": {"type": "string",
                     "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
                 "def_in": {"type": "string",

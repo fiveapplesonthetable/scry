@@ -2375,3 +2375,104 @@ public class Caller {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.40 — daemon/JSON-RPC parity for `format: "by-def"`.
+/// Pins the serve_ref histogram path so it doesn't drift away
+/// from the CLI's print_refs_by_def shape (CLI tested by
+/// close_polymorphism_full_stack above).
+///
+/// Also asserts the v0.1.42 `serve_stats` adds `refs_resolved`
+/// + `refs_resolved_pct` once a resolutions sidecar exists.
+#[test]
+fn daemon_format_by_def_and_stats_refs_resolved() {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-daemon-bydef-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("com/a")).unwrap();
+    std::fs::create_dir_all(src.join("com/b")).unwrap();
+    // Two distinct close defs + two callers of close — gives the
+    // histogram >1 group to render.
+    std::fs::write(src.join("com/a/A.java"), r#"package com.a;
+public class A {
+    public void close() {}
+    public void self_call() { close(); }
+}
+"#).unwrap();
+    std::fs::write(src.join("com/b/B.java"), r#"package com.b;
+public class B {
+    public void close() {}
+    public void self_call() { close(); }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["build-resolutions", "--index"]).arg(&idx)
+        .output().expect("spawn scry build-resolutions");
+    assert!(out.status.success(),
+            "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Daemon: send a callers-by-def request + a stats request.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn scry serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"callers","args":{{"name":"close","format":"by-def","limit":10}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"stats","args":{{}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(),
+            "serve failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 RPC responses, got {:?}", lines);
+
+    // (1) by-def histogram shape: [{count, def: {...}}, ...].
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(r1["id"], 1);
+    let groups = r1["result"].as_array()
+        .expect("by-def result must be an array");
+    assert!(!groups.is_empty(), "by-def should return at least one group");
+    for g in groups {
+        assert!(g["count"].is_number(), "each group needs a numeric count: {g}");
+        // `def` is either a struct (resolved) or null (unresolved bucket).
+        assert!(g["def"].is_object() || g["def"].is_null(),
+                "each group's def must be object or null: {g}");
+    }
+    // At least one group should resolve to A.java or B.java by name.
+    let any_resolved = groups.iter().any(|g| {
+        g["def"].as_object().and_then(|d| d["path"].as_str())
+            .is_some_and(|p| p.ends_with("A.java") || p.ends_with("B.java"))
+    });
+    assert!(any_resolved,
+        "expected at least one by-def group resolving to A.java or B.java; got {:?}",
+        groups);
+
+    // (2) stats includes the v0.1.42 refs_resolved + refs_resolved_pct.
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(r2["id"], 2);
+    let stats = &r2["result"];
+    assert!(stats["refs_resolved"].is_number(),
+        "stats.refs_resolved should be a number once build-resolutions ran; got {:?}",
+        stats["refs_resolved"]);
+    assert!(stats["refs_resolved_pct"].is_number(),
+        "stats.refs_resolved_pct should be a number; got {:?}",
+        stats["refs_resolved_pct"]);
+    let resolved = stats["refs_resolved"].as_u64().unwrap();
+    let total = stats["refs"].as_u64().unwrap();
+    assert!(resolved <= total,
+        "refs_resolved ({resolved}) must not exceed refs ({total})");
+
+    std::fs::remove_dir_all(&base).ok();
+}

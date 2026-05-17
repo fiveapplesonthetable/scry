@@ -7,6 +7,29 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.47] — 2026-05-17
+
+E2E test guarding the daemon's `format: "by-def"` histogram
+endpoint (shipped in v0.1.40) and the daemon's
+`stats.refs_resolved` + `stats.refs_resolved_pct` fields
+(shipped in v0.1.42).
+
+`daemon_format_by_def_and_stats_refs_resolved` builds a 2-file
+Java fixture with two distinct `close()` defs, indexes it,
+runs `build-resolutions`, then spins up `scry serve` and
+asserts:
+
+- A `{"cmd":"callers","args":{"name":"close","format":"by-def"}}`
+  response is an array of `{count, def}` where `def` is either
+  an object (resolved) or null (unresolved bucket), and at
+  least one group resolves to one of the fixture's `.java`
+  files.
+- A `{"cmd":"stats"}` response includes `refs_resolved` and
+  `refs_resolved_pct` as numbers, with
+  `refs_resolved <= refs`.
+
+No code change — pure regression test addition.
+
 ## [0.1.46] — 2026-05-17
 
 Daemon / JSON-RPC / MCP parity for v0.1.45's impact

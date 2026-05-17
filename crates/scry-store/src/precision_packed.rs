@@ -1,0 +1,567 @@
+//! Mmap-backed packed layout shared by the two precision sidecars
+//! (`clang_usrs.bin` from libclang USRs, `scip_index.bin` from SCIP
+//! imports). Both sidecars carry the same shape: per-record
+//! `(abs_path, byte_offset, symbol_id, kind)` plus two interned
+//! string tables (symbol strings, absolute paths).
+//!
+//! The earlier bincode shape stored an owned `String abs_path` per
+//! record. On the AOSP-scale SCIP sidecar (14 M records, 1.9 GB on
+//! disk) the open-time decode + per-record `String::clone` for the
+//! `HashMap<String, …>` indices cost ~17 s wall-clock and dominated
+//! every strict-precision query. This layout retires that:
+//!
+//! - mmap the whole file (`safe_mmap`, single syscall).
+//! - Records sorted by `(path_id, byte_offset)` so the records for
+//!   a given path are a contiguous slice. Path table stores the
+//!   `(records_start, records_count)` range — windowed lookup
+//!   becomes a `partition_point` over a slice.
+//! - Symbol/path string tables use the offsets+blob pattern from
+//!   [`crate::files_packed`]: `(n+1) * u32` offsets pointing into a
+//!   single concatenated UTF-8 blob, sentinel last.
+//!
+//! Open is two `safe_mmap` calls + header parse + range checks
+//! (sub-millisecond). All accessors return borrowed `&str` /
+//! `&[..]` from the mmap, so the per-query cost is the algorithmic
+//! cost only — no decode tax.
+//!
+//! ## On-disk layout (little-endian throughout)
+//!
+//! ```text
+//! Header (64 bytes):
+//!   [ 0.. 8] magic              = b"SCRYUP01" (USR variant)
+//!                                 b"SCRYSP01" (SCIP variant)
+//!   [ 8..12] version            = 1                u32
+//!   [12..16] n_records                              u32
+//!   [16..20] n_symbols                              u32
+//!   [20..24] n_paths                                u32
+//!   [24..32] records_off                            u64
+//!   [32..40] sym_table_off                          u64
+//!   [40..48] sym_blob_off                           u64
+//!   [48..56] path_table_off                         u64
+//!   [56..64] path_blob_off                          u64
+//!
+//! Records (n_records * RECORD_LEN = 12 bytes each), sorted by
+//!   (path_id ASC, byte_offset ASC):
+//!     [ 0.. 4] byte_offset                          u32
+//!     [ 4.. 8] symbol_id                            u32
+//!     [ 8.. 9] kind / role                          u8
+//!     [ 9..12] pad                                  [u8; 3]
+//!
+//! Symbol table ((n_symbols + 1) * 4 bytes): sentinel last so
+//!   sym_blob[off[i]..off[i+1]] is the i'th symbol's UTF-8 bytes.
+//!
+//! Symbol blob: concatenated UTF-8 bytes of every unique symbol.
+//!
+//! Path table ((n_paths + 1) * 12 bytes), one entry per unique path:
+//!     [ 0.. 4] path_blob_off (offset into path_blob)            u32
+//!     [ 4.. 8] records_start (first record_id for this path)    u32
+//!     [ 8..12] records_count                                    u32
+//!   (The sentinel n_paths'th entry only carries path_blob_off so
+//!   path_i bytes = path_blob[off[i]..off[i+1]].)
+//!
+//! Path blob: concatenated UTF-8 bytes of every unique abs_path.
+//! ```
+
+use anyhow::{anyhow, Context, Result};
+use memmap2::Mmap;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::OnceLock;
+
+pub const VERSION: u32 = 1;
+pub const HEADER_LEN: usize = 64;
+pub const RECORD_LEN: usize = 12;
+pub const PATH_TABLE_ENTRY_LEN: usize = 12;
+
+pub const MAGIC_CLANG_USR: &[u8; 8] = b"SCRYUP01";
+pub const MAGIC_SCIP: &[u8; 8] = b"SCRYSP01";
+
+/// Mmap'd precision sidecar. Both variants (clang USR / SCIP) share
+/// the same code path; only the magic bytes differ.
+pub struct PrecisionPacked {
+    mmap: Mmap,
+    n_records: u32,
+    n_symbols: u32,
+    n_paths: u32,
+    records_off: usize,
+    sym_table_off: usize,
+    sym_blob_off: usize,
+    path_table_off: usize,
+    path_blob_off: usize,
+    /// `abs_path` → `path_id`. Built lazily on first lookup so
+    /// callers that go through `precompute_by_file_ids` directly
+    /// (file_id-indexed) skip building it.
+    path_index_cell: OnceLock<HashMap<String, u32>>,
+}
+
+impl std::fmt::Debug for PrecisionPacked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrecisionPacked")
+            .field("n_records", &self.n_records)
+            .field("n_symbols", &self.n_symbols)
+            .field("n_paths", &self.n_paths)
+            .field("size_bytes", &self.mmap.len())
+            .finish()
+    }
+}
+
+impl PrecisionPacked {
+    /// Open and validate the sidecar. `expected_magic` selects USR
+    /// vs SCIP variant — wrong magic returns an error so a clang
+    /// reader can't accidentally consume a SCIP sidecar and vice
+    /// versa. Missing file → `Ok(None)`.
+    pub fn open(path: &Path, expected_magic: &[u8; 8]) -> Result<Option<Self>> {
+        if !path.exists() { return Ok(None); }
+        let f = File::open(path)
+            .with_context(|| format!("open {} for mmap", path.display()))?;
+        // SAFETY: see crate::safe_mmap docs — the indexer writes via
+        // tmp+rename so a finalized sidecar is never mutated in place.
+        let mmap = unsafe { Mmap::map(&f) }
+            .with_context(|| format!("mmap {}", path.display()))?;
+        if mmap.len() < HEADER_LEN {
+            return Err(anyhow!("{}: short header", path.display()));
+        }
+        if &mmap[0..8] != expected_magic {
+            return Err(anyhow!(
+                "{}: bad magic — got {:?}, expected {:?}",
+                path.display(), &mmap[0..8], expected_magic,
+            ));
+        }
+        let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        if version != VERSION {
+            return Err(anyhow!(
+                "{}: unsupported precision_packed version {} (expected {})",
+                path.display(), version, VERSION,
+            ));
+        }
+        let n_records = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
+        let n_symbols = u32::from_le_bytes(mmap[16..20].try_into().unwrap());
+        let n_paths = u32::from_le_bytes(mmap[20..24].try_into().unwrap());
+        let records_off = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let sym_table_off = u64::from_le_bytes(mmap[32..40].try_into().unwrap()) as usize;
+        let sym_blob_off = u64::from_le_bytes(mmap[40..48].try_into().unwrap()) as usize;
+        let path_table_off = u64::from_le_bytes(mmap[48..56].try_into().unwrap()) as usize;
+        let path_blob_off = u64::from_le_bytes(mmap[56..64].try_into().unwrap()) as usize;
+        // Bounds sanity.
+        let need = records_off
+            .checked_add((n_records as usize).checked_mul(RECORD_LEN)
+                .ok_or_else(|| anyhow!("{}: n_records*RECORD_LEN overflow", path.display()))?)
+            .ok_or_else(|| anyhow!("{}: records segment overflow", path.display()))?;
+        if mmap.len() < need
+            || mmap.len() < sym_table_off
+            || mmap.len() < sym_blob_off
+            || mmap.len() < path_table_off
+            || mmap.len() < path_blob_off
+        {
+            return Err(anyhow!("{}: truncated body", path.display()));
+        }
+        Ok(Some(Self {
+            mmap, n_records, n_symbols, n_paths,
+            records_off, sym_table_off, sym_blob_off,
+            path_table_off, path_blob_off,
+            path_index_cell: OnceLock::new(),
+        }))
+    }
+
+    pub fn record_count(&self) -> usize { self.n_records as usize }
+    pub fn symbol_count(&self) -> usize { self.n_symbols as usize }
+    pub fn path_count(&self) -> usize { self.n_paths as usize }
+    pub fn is_empty(&self) -> bool { self.n_records == 0 }
+
+    /// Symbol string by id. None if id out of range.
+    pub fn symbol(&self, sym_id: u32) -> Option<&str> {
+        if sym_id >= self.n_symbols { return None; }
+        let table = self.sym_table_off + (sym_id as usize) * 4;
+        let off = u32::from_le_bytes(self.mmap.get(table..table + 4)?.try_into().ok()?) as usize;
+        let next = u32::from_le_bytes(self.mmap.get(table + 4..table + 8)?.try_into().ok()?) as usize;
+        let start = self.sym_blob_off + off;
+        let end = self.sym_blob_off + next;
+        std::str::from_utf8(self.mmap.get(start..end)?).ok()
+    }
+
+    /// Absolute path by id. None if id out of range.
+    pub fn path_of(&self, path_id: u32) -> Option<&str> {
+        if path_id >= self.n_paths { return None; }
+        let table = self.path_table_off + (path_id as usize) * PATH_TABLE_ENTRY_LEN;
+        let off = u32::from_le_bytes(self.mmap.get(table..table + 4)?.try_into().ok()?) as usize;
+        // The NEXT entry's path_blob_off is the upper bound. The
+        // n_paths'th entry is a sentinel that only carries the
+        // upper-bound offset.
+        let next_table = table + PATH_TABLE_ENTRY_LEN;
+        let next = u32::from_le_bytes(self.mmap.get(next_table..next_table + 4)?.try_into().ok()?) as usize;
+        let start = self.path_blob_off + off;
+        let end = self.path_blob_off + next;
+        std::str::from_utf8(self.mmap.get(start..end)?).ok()
+    }
+
+    /// (records_start, records_count) range for a given path_id.
+    pub fn path_records_range(&self, path_id: u32) -> Option<(u32, u32)> {
+        if path_id >= self.n_paths { return None; }
+        let table = self.path_table_off + (path_id as usize) * PATH_TABLE_ENTRY_LEN;
+        let start = u32::from_le_bytes(self.mmap.get(table + 4..table + 8)?.try_into().ok()?);
+        let count = u32::from_le_bytes(self.mmap.get(table + 8..table + 12)?.try_into().ok()?);
+        Some((start, count))
+    }
+
+    /// Read one record's (byte_offset, symbol_id, kind).
+    pub fn record(&self, record_id: u32) -> Option<(u32, u32, u8)> {
+        if record_id >= self.n_records { return None; }
+        let base = self.records_off + (record_id as usize) * RECORD_LEN;
+        let bo = u32::from_le_bytes(self.mmap.get(base..base + 4)?.try_into().ok()?);
+        let sid = u32::from_le_bytes(self.mmap.get(base + 4..base + 8)?.try_into().ok()?);
+        let kind = *self.mmap.get(base + 8)?;
+        Some((bo, sid, kind))
+    }
+
+    /// Build (or borrow) the `abs_path → path_id` HashMap. Cost on
+    /// first call: n_paths string-clone+insert (~50 k on AOSP), a
+    /// few ms. Cached for subsequent lookups.
+    fn path_index(&self) -> &HashMap<String, u32> {
+        self.path_index_cell.get_or_init(|| {
+            let mut m: HashMap<String, u32> = HashMap::with_capacity(self.n_paths as usize);
+            for i in 0..self.n_paths {
+                if let Some(p) = self.path_of(i) {
+                    m.insert(p.to_string(), i);
+                }
+            }
+            m
+        })
+    }
+
+    /// Look up the symbol id for an exact (abs_path, byte_offset).
+    /// None if no record covers that site.
+    pub fn symbol_at(&self, abs_path: &str, byte_offset: u32) -> Option<&str> {
+        let &path_id = self.path_index().get(abs_path)?;
+        let (start, count) = self.path_records_range(path_id)?;
+        let slice_start = start as usize;
+        let slice_end = slice_start + count as usize;
+        for i in slice_start..slice_end {
+            let (bo, sid, _) = self.record(i as u32)?;
+            if bo == byte_offset { return self.symbol(sid); }
+            if bo > byte_offset { return None; }  // sorted
+        }
+        None
+    }
+
+    /// Windowed lookup: returns the symbol id of the record whose
+    /// `byte_offset` is closest to `byte_offset` within ±`window`,
+    /// or None if no record falls in that range. Same semantics as
+    /// the bincode-era `usr_for_window`/`symbol_for_window`.
+    pub fn symbol_for_window(
+        &self,
+        abs_path: &str,
+        byte_offset: u32,
+        window: u32,
+    ) -> Option<&str> {
+        let &path_id = self.path_index().get(abs_path)?;
+        self.symbol_for_window_by_path_id(path_id, byte_offset, window)
+    }
+
+    /// Same as [`symbol_for_window`] but when the caller already
+    /// has the path_id (e.g. via `precompute_by_file_ids`). Skips
+    /// the HashMap probe.
+    pub fn symbol_for_window_by_path_id(
+        &self,
+        path_id: u32,
+        byte_offset: u32,
+        window: u32,
+    ) -> Option<&str> {
+        let (start, count) = self.path_records_range(path_id)?;
+        if count == 0 { return None; }
+        let lo = byte_offset.saturating_sub(window);
+        let hi = byte_offset.saturating_add(window);
+        // Bisect to find the first record whose byte_offset >= lo.
+        let slice_start = start as usize;
+        let slice_end = slice_start + count as usize;
+        let mut left = slice_start;
+        let mut right = slice_end;
+        while left < right {
+            let mid = (left + right) / 2;
+            let (bo, _, _) = self.record(mid as u32)?;
+            if bo < lo { left = mid + 1; } else { right = mid; }
+        }
+        let mut best: Option<(u32, u32)> = None;
+        for i in left..slice_end {
+            let (bo, sid, _) = self.record(i as u32)?;
+            if bo > hi { break; }
+            let d = bo.abs_diff(byte_offset);
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, sid));
+            }
+        }
+        best.and_then(|(_, sid)| self.symbol(sid))
+    }
+
+    /// Build a per-file_id slice index for the query hot path.
+    /// Walks the provided `(file_id, abs_path)` iterator, probes
+    /// the lazy path index, and records the path_id per file_id
+    /// (or `u32::MAX` for files the sidecar doesn't cover).
+    /// Per-ref lookup then becomes a `Vec::get(file_id)` +
+    /// bisect-on-records, no HashMap probe.
+    pub fn precompute_by_file_ids<'a>(
+        &'a self,
+        paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
+        file_count: usize,
+    ) -> ByFileLookup<'a> {
+        let idx = self.path_index();
+        let mut path_ids: Vec<u32> = vec![u32::MAX; file_count];
+        for (fid, path) in paths_by_file_id {
+            if (fid as usize) >= path_ids.len() { continue; }
+            if let Some(&pid) = idx.get(path) {
+                path_ids[fid as usize] = pid;
+            }
+        }
+        ByFileLookup { packed: self, path_ids }
+    }
+}
+
+/// Per-query precomputed lookup keyed by `file_id`. Yielded by
+/// [`PrecisionPacked::precompute_by_file_ids`].
+pub struct ByFileLookup<'a> {
+    packed: &'a PrecisionPacked,
+    path_ids: Vec<u32>,
+}
+
+impl<'a> ByFileLookup<'a> {
+    pub fn symbol_for_window(
+        &self,
+        file_id: u32,
+        byte_offset: u32,
+        window: u32,
+    ) -> Option<&'a str> {
+        let pid = *self.path_ids.get(file_id as usize)?;
+        if pid == u32::MAX { return None; }
+        self.packed.symbol_for_window_by_path_id(pid, byte_offset, window)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/// Input record handed to [`write`]. Owned strings on the writer
+/// side; the writer interns them.
+pub struct Record<'a> {
+    pub abs_path: &'a str,
+    pub byte_offset: u32,
+    pub symbol: &'a str,
+    pub kind: u8,
+}
+
+/// Write a packed sidecar from the given records. `magic` selects
+/// USR vs SCIP variant. Records are de-duplicated within a path
+/// (same offset + same symbol = one row); symbol and path strings
+/// are interned. Output is sorted by `(path_id, byte_offset)` so
+/// the reader can binary-search per-path.
+pub fn write(
+    path: &Path,
+    magic: &[u8; 8],
+    records: &[Record<'_>],
+) -> Result<()> {
+    // Intern symbols and paths in insertion order to keep the
+    // writer deterministic (two runs against the same input emit
+    // the same bytes).
+    let mut sym_to_id: HashMap<&str, u32> = HashMap::new();
+    let mut symbols: Vec<&str> = Vec::new();
+    let mut path_to_id: HashMap<&str, u32> = HashMap::new();
+    let mut paths: Vec<&str> = Vec::new();
+    let mut decorated: Vec<(u32, u32, u32, u8)> = Vec::with_capacity(records.len());
+    for r in records {
+        let sid = *sym_to_id.entry(r.symbol).or_insert_with(|| {
+            let id = symbols.len() as u32;
+            symbols.push(r.symbol);
+            id
+        });
+        let pid = *path_to_id.entry(r.abs_path).or_insert_with(|| {
+            let id = paths.len() as u32;
+            paths.push(r.abs_path);
+            id
+        });
+        decorated.push((pid, r.byte_offset, sid, r.kind));
+    }
+    // Sort by (path_id, byte_offset). Stable sort keeps insertion
+    // order for ties (rare: same path+offset with different symbol
+    // id usually means decl-as-ref overlap from the indexer).
+    decorated.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+    // Compute per-path (records_start, records_count). decorated
+    // is sorted by path_id, so we can sweep.
+    let n_paths = paths.len() as u32;
+    let mut path_ranges: Vec<(u32, u32)> = vec![(0, 0); paths.len()];
+    {
+        let mut i = 0usize;
+        while i < decorated.len() {
+            let pid = decorated[i].0;
+            let mut j = i;
+            while j < decorated.len() && decorated[j].0 == pid { j += 1; }
+            path_ranges[pid as usize] = (i as u32, (j - i) as u32);
+            i = j;
+        }
+    }
+
+    // Compute symbol/path blob offsets (and sentinels).
+    let mut sym_offsets: Vec<u32> = Vec::with_capacity(symbols.len() + 1);
+    let mut sym_blob: Vec<u8> = Vec::new();
+    for s in &symbols {
+        sym_offsets.push(sym_blob.len() as u32);
+        sym_blob.extend_from_slice(s.as_bytes());
+    }
+    sym_offsets.push(sym_blob.len() as u32);
+
+    let mut path_offsets_only: Vec<u32> = Vec::with_capacity(paths.len() + 1);
+    let mut path_blob: Vec<u8> = Vec::new();
+    for p in &paths {
+        path_offsets_only.push(path_blob.len() as u32);
+        path_blob.extend_from_slice(p.as_bytes());
+    }
+    path_offsets_only.push(path_blob.len() as u32);
+
+    // Layout the file:
+    //   header  (HEADER_LEN)
+    //   records (n_records * RECORD_LEN)
+    //   sym table  ((n_symbols + 1) * 4)
+    //   sym blob
+    //   path table ((n_paths + 1) * PATH_TABLE_ENTRY_LEN)
+    //   path blob
+    let n_records = decorated.len() as u32;
+    let records_off = HEADER_LEN as u64;
+    let sym_table_off = records_off + (n_records as u64) * (RECORD_LEN as u64);
+    let sym_blob_off = sym_table_off + ((symbols.len() as u64) + 1) * 4;
+    let path_table_off = sym_blob_off + (sym_blob.len() as u64);
+    let path_blob_off = path_table_off + ((paths.len() as u64) + 1) * (PATH_TABLE_ENTRY_LEN as u64);
+
+    let mut f = std::io::BufWriter::with_capacity(
+        1 << 20,
+        File::create(path)
+            .with_context(|| format!("create {}", path.display()))?,
+    );
+    // Header
+    f.write_all(magic)?;
+    f.write_all(&VERSION.to_le_bytes())?;
+    f.write_all(&n_records.to_le_bytes())?;
+    f.write_all(&(symbols.len() as u32).to_le_bytes())?;
+    f.write_all(&n_paths.to_le_bytes())?;
+    f.write_all(&records_off.to_le_bytes())?;
+    f.write_all(&sym_table_off.to_le_bytes())?;
+    f.write_all(&sym_blob_off.to_le_bytes())?;
+    f.write_all(&path_table_off.to_le_bytes())?;
+    f.write_all(&path_blob_off.to_le_bytes())?;
+    // Records
+    let mut buf = [0u8; RECORD_LEN];
+    for (_pid, bo, sid, kind) in &decorated {
+        buf[0..4].copy_from_slice(&bo.to_le_bytes());
+        buf[4..8].copy_from_slice(&sid.to_le_bytes());
+        buf[8] = *kind;
+        buf[9..12].fill(0);
+        f.write_all(&buf)?;
+    }
+    // Symbol table
+    for off in &sym_offsets {
+        f.write_all(&off.to_le_bytes())?;
+    }
+    // Symbol blob
+    f.write_all(&sym_blob)?;
+    // Path table — for each path, (path_blob_off, records_start, records_count).
+    // Sentinel n_paths'th entry only carries path_blob_off (the
+    // other 8 bytes are zero, never read).
+    let mut entry = [0u8; PATH_TABLE_ENTRY_LEN];
+    for i in 0..paths.len() {
+        let off = path_offsets_only[i];
+        let (rs, rc) = path_ranges[i];
+        entry[0..4].copy_from_slice(&off.to_le_bytes());
+        entry[4..8].copy_from_slice(&rs.to_le_bytes());
+        entry[8..12].copy_from_slice(&rc.to_le_bytes());
+        f.write_all(&entry)?;
+    }
+    // Sentinel: only off matters; rs/rc zeroed.
+    let sentinel_off = *path_offsets_only.last().unwrap_or(&0);
+    entry[0..4].copy_from_slice(&sentinel_off.to_le_bytes());
+    entry[4..12].fill(0);
+    f.write_all(&entry)?;
+    // Path blob
+    f.write_all(&path_blob)?;
+    f.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_roundtrip() {
+        let tmp = crate::scry_tmp_dir().join(format!("scry-pp-empty-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        write(&tmp, MAGIC_CLANG_USR, &[]).unwrap();
+        let p = PrecisionPacked::open(&tmp, MAGIC_CLANG_USR).unwrap().unwrap();
+        assert!(p.is_empty());
+        assert_eq!(p.record_count(), 0);
+        assert_eq!(p.symbol_count(), 0);
+        assert_eq!(p.path_count(), 0);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn roundtrip_two_files() {
+        let tmp = crate::scry_tmp_dir().join(format!("scry-pp-rt-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let recs = vec![
+            Record { abs_path: "/x/A.cpp", byte_offset: 100, symbol: "c:@F@foo#",  kind: 0 },
+            Record { abs_path: "/x/A.cpp", byte_offset: 200, symbol: "c:@F@bar#",  kind: 1 },
+            Record { abs_path: "/x/B.cpp", byte_offset:  10, symbol: "c:@F@foo#",  kind: 0 },
+            Record { abs_path: "/x/B.cpp", byte_offset: 500, symbol: "c:@F@bar#",  kind: 2 },
+            // Reverse-order insertion: writer must still emit in sorted order.
+            Record { abs_path: "/x/B.cpp", byte_offset:  50, symbol: "c:@F@baz#",  kind: 1 },
+        ];
+        write(&tmp, MAGIC_SCIP, &recs).unwrap();
+        let p = PrecisionPacked::open(&tmp, MAGIC_SCIP).unwrap().unwrap();
+        assert_eq!(p.record_count(), 5);
+        assert_eq!(p.symbol_count(), 3);  // foo, bar, baz
+        assert_eq!(p.path_count(), 2);    // A.cpp, B.cpp
+
+        // Exact lookup
+        assert_eq!(p.symbol_at("/x/A.cpp", 100), Some("c:@F@foo#"));
+        assert_eq!(p.symbol_at("/x/A.cpp", 200), Some("c:@F@bar#"));
+        assert_eq!(p.symbol_at("/x/B.cpp",  10), Some("c:@F@foo#"));
+        assert_eq!(p.symbol_at("/x/B.cpp", 500), Some("c:@F@bar#"));
+        assert_eq!(p.symbol_at("/x/B.cpp",  50), Some("c:@F@baz#"));
+        // Miss
+        assert_eq!(p.symbol_at("/x/A.cpp", 150), None);
+        assert_eq!(p.symbol_at("/x/C.cpp", 100), None);
+
+        // Window — prefers the closer record.
+        assert_eq!(p.symbol_for_window("/x/A.cpp", 105, 32), Some("c:@F@foo#"));
+        assert_eq!(p.symbol_for_window("/x/A.cpp", 195, 32), Some("c:@F@bar#"));
+        // Distance 50 ties; first found (foo at 100) wins via strict-less tie-break.
+        assert_eq!(p.symbol_for_window("/x/A.cpp", 150, 60), Some("c:@F@foo#"));
+        // Out of window
+        assert_eq!(p.symbol_for_window("/x/A.cpp", 400, 32), None);
+
+        // Wrong magic rejected
+        assert!(PrecisionPacked::open(&tmp, MAGIC_CLANG_USR).is_err());
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn precompute_by_file_ids_borrows() {
+        let tmp = crate::scry_tmp_dir().join(format!("scry-pp-fid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let recs = vec![
+            Record { abs_path: "/x/A.cpp", byte_offset: 100, symbol: "s1", kind: 0 },
+            Record { abs_path: "/x/B.cpp", byte_offset: 200, symbol: "s2", kind: 1 },
+        ];
+        write(&tmp, MAGIC_CLANG_USR, &recs).unwrap();
+        let p = PrecisionPacked::open(&tmp, MAGIC_CLANG_USR).unwrap().unwrap();
+        // Pretend scry's file table has 3 files: 0=A.cpp, 1=B.cpp, 2=unknown.
+        let pairs = [(0u32, "/x/A.cpp"), (1u32, "/x/B.cpp"), (2u32, "/x/Z.cpp")];
+        let lookup = p.precompute_by_file_ids(pairs.iter().copied(), 3);
+        assert_eq!(lookup.symbol_for_window(0, 100, 16), Some("s1"));
+        assert_eq!(lookup.symbol_for_window(1, 200, 16), Some("s2"));
+        assert_eq!(lookup.symbol_for_window(2, 0, 16), None);  // unknown file
+        assert_eq!(lookup.symbol_for_window(7, 0, 16), None);  // OOB file_id
+        std::fs::remove_file(&tmp).ok();
+    }
+}

@@ -5,17 +5,18 @@
 //! rust-analyzer, …) while `clang_usrs` is produced by the in-tree
 //! `scry clang-index` helper for C/C++/ObjC.
 //!
-//! The on-wire schema must match the writer in `scry-scip`; both ship
-//! in the same release so the version field is the only knob.
+//! On-disk layout is owned by [`crate::precision_packed`]; this
+//! module is a thin wrapper that supplies the SCIP-flavoured method
+//! names (`symbol_for`, `symbol_for_window`, `symbol_count`, …).
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::precision_packed::{self, PrecisionPacked, Record};
+use anyhow::Result;
 use std::path::Path;
 
 /// One occurrence (decl, ref, or write/read access) at an exact
-/// source location.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// source location. Writer-side carrier; the on-disk format interns
+/// `symbol_table[symbol_id]` into a single blob.
+#[derive(Debug, Clone)]
 pub struct ScipRecord {
     /// Absolute path the SCIP indexer recorded (resolved against the
     /// SCIP file's `project_root` at import time).
@@ -24,7 +25,7 @@ pub struct ScipRecord {
     /// `(line, col)` by reading the source — matches tree-sitter's
     /// `byte_start` for occurrences on the same identifier.
     pub byte_offset: u32,
-    /// Index into [`ScipSidecar::symbol_table`].
+    /// Index into the writer's `symbol_table`.
     pub symbol_id: u32,
     /// Low 8 bits of SCIP's `symbol_roles` bitmap:
     /// `0x01` = Definition, `0x02` = Import, `0x04` = WriteAccess,
@@ -33,67 +34,21 @@ pub struct ScipRecord {
     pub role: u8,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct ScipSidecar {
-    pub version: u32,
-    /// Interned SCIP symbol strings (the structured language-agnostic
-    /// IDs like `scip-java . maven/x/y jvm 1 com/example/Foo#bar().`).
-    pub symbol_table: Vec<String>,
-    pub records: Vec<ScipRecord>,
-}
-
-/// In-memory index over a SCIP sidecar. Exact + windowed lookups
-/// mirror [`super::clang_usrs::ClangUsrIndex`] so the query side
-/// can compose both filters uniformly.
+/// Mmap'd SCIP sidecar. All accessors borrow from the mmap.
 #[derive(Debug)]
 pub struct ScipIndex {
-    pub sidecar: ScipSidecar,
-    /// `(abs_path, byte_offset)` → `symbol_id`. First record wins.
-    by_loc: HashMap<(String, u32), u32>,
-    /// `abs_path` → sorted `Vec<(byte_offset, symbol_id)>` for
-    /// `symbol_for_window`.
-    by_path: HashMap<String, Vec<(u32, u32)>>,
+    packed: PrecisionPacked,
 }
 
 impl ScipIndex {
     /// Open `scip_index.bin`; missing → `Ok(None)`.
     pub fn open(path: &Path) -> Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let buf = std::fs::read(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let sidecar: ScipSidecar = bincode::deserialize(&buf)
-            .with_context(|| format!("decode {}", path.display()))?;
-        if sidecar.version != 1 {
-            anyhow::bail!(
-                "{}: unsupported scip_index.bin version {} (this scry expects v1)",
-                path.display(),
-                sidecar.version,
-            );
-        }
-        let mut by_loc: HashMap<(String, u32), u32> =
-            HashMap::with_capacity(sidecar.records.len());
-        let mut by_path: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-        for r in &sidecar.records {
-            by_loc
-                .entry((r.abs_path.clone(), r.byte_offset))
-                .or_insert(r.symbol_id);
-            by_path
-                .entry(r.abs_path.clone())
-                .or_default()
-                .push((r.byte_offset, r.symbol_id));
-        }
-        for v in by_path.values_mut() {
-            v.sort_by_key(|x| x.0);
-        }
-        Ok(Some(Self { sidecar, by_loc, by_path }))
+        Ok(PrecisionPacked::open(path, precision_packed::MAGIC_SCIP)?
+            .map(|packed| Self { packed }))
     }
 
     pub fn symbol_for(&self, abs_path: &str, byte_offset: u32) -> Option<&str> {
-        self.by_loc
-            .get(&(abs_path.to_string(), byte_offset))
-            .and_then(|&id| self.sidecar.symbol_table.get(id as usize).map(String::as_str))
+        self.packed.symbol_at(abs_path, byte_offset)
     }
 
     /// Windowed lookup — same shape as
@@ -106,26 +61,36 @@ impl ScipIndex {
         byte_offset: u32,
         window: u32,
     ) -> Option<&str> {
-        let entries = self.by_path.get(abs_path)?;
-        let lo = byte_offset.saturating_sub(window);
-        let hi = byte_offset.saturating_add(window);
-        let start = entries.partition_point(|(o, _)| *o < lo);
-        let mut best: Option<(u32, u32)> = None;
-        for (o, id) in entries.iter().skip(start) {
-            if *o > hi { break; }
-            let d = o.abs_diff(byte_offset);
-            if best.map_or(true, |(bd, _)| d < bd) {
-                best = Some((d, *id));
-            }
-        }
-        best.and_then(|(_, id)| {
-            self.sidecar.symbol_table.get(id as usize).map(String::as_str)
-        })
+        self.packed.symbol_for_window(abs_path, byte_offset, window)
     }
 
-    pub fn len(&self) -> usize { self.sidecar.records.len() }
-    pub fn is_empty(&self) -> bool { self.sidecar.records.is_empty() }
-    pub fn symbol_count(&self) -> usize { self.sidecar.symbol_table.len() }
+    pub fn len(&self) -> usize { self.packed.record_count() }
+    pub fn is_empty(&self) -> bool { self.packed.is_empty() }
+    pub fn symbol_count(&self) -> usize { self.packed.symbol_count() }
+
+    /// Iterate the interned SCIP symbol table (string at id 0, 1, …).
+    /// Used by `scry sidecar-inspect` for sample output.
+    pub fn iter_symbols(&self) -> impl Iterator<Item = &str> {
+        (0..self.packed.symbol_count() as u32)
+            .filter_map(|i| self.packed.symbol(i))
+    }
+
+    /// Stream every `(abs_path, byte_offset, symbol, role)` row in the
+    /// sidecar. Used by `scry scip-import --append` to seed the
+    /// rebuild with the existing rows. Path order matches on-disk
+    /// (sorted by path_id then byte_offset), so callers get
+    /// per-path runs together.
+    pub fn iter_records(&self) -> impl Iterator<Item = (&str, u32, &str, u8)> {
+        (0..self.packed.path_count() as u32).flat_map(move |pid| {
+            let path = self.packed.path_of(pid).unwrap_or("");
+            let (start, count) = self.packed.path_records_range(pid).unwrap_or((0, 0));
+            (start..start + count).filter_map(move |rid| {
+                let (bo, sid, role) = self.packed.record(rid)?;
+                let sym = self.packed.symbol(sid)?;
+                Some((path, bo, sym, role))
+            })
+        })
+    }
 
     /// Sibling of [`super::clang_usrs::ClangUsrIndex::precompute_by_file_ids`].
     /// See that doc for rationale — same fast-path for the SCIP
@@ -135,22 +100,16 @@ impl ScipIndex {
         paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
         file_count: usize,
     ) -> ByFileSymbolLookup<'a> {
-        let mut entries: Vec<Option<&[(u32, u32)]>> = vec![None; file_count];
-        for (fid, path) in paths_by_file_id {
-            if (fid as usize) >= entries.len() { continue; }
-            if let Some(v) = self.by_path.get(path) {
-                entries[fid as usize] = Some(v.as_slice());
-            }
+        ByFileSymbolLookup {
+            inner: self.packed.precompute_by_file_ids(paths_by_file_id, file_count),
         }
-        ByFileSymbolLookup { entries, symbol_table: &self.sidecar.symbol_table }
     }
 }
 
 /// Per-query precomputed lookup keyed by `file_id` for the SCIP
 /// sidecar. Mirror of `clang_usrs::ByFileLookup`.
 pub struct ByFileSymbolLookup<'a> {
-    entries: Vec<Option<&'a [(u32, u32)]>>,
-    symbol_table: &'a [String],
+    inner: precision_packed::ByFileLookup<'a>,
 }
 
 impl<'a> ByFileSymbolLookup<'a> {
@@ -160,20 +119,28 @@ impl<'a> ByFileSymbolLookup<'a> {
         byte_offset: u32,
         window: u32,
     ) -> Option<&'a str> {
-        let entries = (*self.entries.get(file_id as usize)?)?;
-        let lo = byte_offset.saturating_sub(window);
-        let hi = byte_offset.saturating_add(window);
-        let start = entries.partition_point(|(o, _)| *o < lo);
-        let mut best: Option<(u32, u32)> = None;
-        for (o, id) in entries.iter().skip(start) {
-            if *o > hi { break; }
-            let d = o.abs_diff(byte_offset);
-            if best.map_or(true, |(bd, _)| d < bd) {
-                best = Some((d, *id));
-            }
-        }
-        best.and_then(|(_, id)| self.symbol_table.get(id as usize).map(String::as_str))
+        self.inner.symbol_for_window(file_id, byte_offset, window)
     }
+}
+
+/// Write the sidecar in packed format. Writer side keeps owned
+/// `String`s in `symbol_table` and indexes them by `symbol_id`; we
+/// expand each record to a borrowed (path, symbol) pair for
+/// [`precision_packed::write`] to intern.
+pub fn write(path: &Path, symbol_table: &[String], records: &[ScipRecord]) -> Result<()> {
+    let pp_records: Vec<Record<'_>> = records
+        .iter()
+        .map(|r| Record {
+            abs_path: r.abs_path.as_str(),
+            byte_offset: r.byte_offset,
+            symbol: symbol_table
+                .get(r.symbol_id as usize)
+                .map(String::as_str)
+                .unwrap_or(""),
+            kind: r.role,
+        })
+        .collect();
+    precision_packed::write(path, precision_packed::MAGIC_SCIP, &pp_records)
 }
 
 #[cfg(test)]
@@ -181,11 +148,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_empty_and_versioned() {
+    fn roundtrip_empty() {
         let tmp = crate::scry_tmp_dir().join(format!("scry-scip-empty-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        let s = ScipSidecar { version: 1, symbol_table: vec![], records: vec![] };
-        std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
+        write(&tmp, &[], &[]).unwrap();
         let opened = ScipIndex::open(&tmp).unwrap().unwrap();
         assert!(opened.is_empty());
         std::fs::remove_file(&tmp).ok();
@@ -195,16 +161,15 @@ mod tests {
     fn lookup_exact_and_window() {
         let tmp = crate::scry_tmp_dir().join(format!("scry-scip-look-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        let s = ScipSidecar {
-            version: 1,
-            symbol_table: vec!["scip-java . . jvm 0 com/Foo#".into(),
-                               "scip-java . . jvm 0 com/Bar#".into()],
-            records: vec![
-                ScipRecord { abs_path: "/x/A.java".into(), byte_offset: 100, symbol_id: 0, role: 1 },
-                ScipRecord { abs_path: "/x/A.java".into(), byte_offset: 120, symbol_id: 1, role: 0 },
-            ],
-        };
-        std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
+        let symbol_table = vec![
+            "scip-java . . jvm 0 com/Foo#".to_string(),
+            "scip-java . . jvm 0 com/Bar#".to_string(),
+        ];
+        let records = vec![
+            ScipRecord { abs_path: "/x/A.java".into(), byte_offset: 100, symbol_id: 0, role: 1 },
+            ScipRecord { abs_path: "/x/A.java".into(), byte_offset: 120, symbol_id: 1, role: 0 },
+        ];
+        write(&tmp, &symbol_table, &records).unwrap();
         let idx = ScipIndex::open(&tmp).unwrap().unwrap();
         // Exact.
         assert_eq!(idx.symbol_for("/x/A.java", 100), Some("scip-java . . jvm 0 com/Foo#"));
@@ -217,13 +182,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_version() {
-        let tmp = crate::scry_tmp_dir().join(format!("scry-scip-badv-{}", std::process::id()));
+    fn rejects_wrong_magic() {
+        let tmp = crate::scry_tmp_dir().join(format!("scry-scip-badmagic-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        let s = ScipSidecar { version: 99, ..Default::default() };
-        std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
+        // Write a USR-magic sidecar, try to open it as SCIP → error.
+        precision_packed::write(&tmp, precision_packed::MAGIC_CLANG_USR, &[]).unwrap();
         let err = ScipIndex::open(&tmp).unwrap_err();
-        assert!(format!("{err}").contains("v1"));
+        assert!(format!("{err}").contains("bad magic"));
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -232,5 +197,34 @@ mod tests {
         let nope = crate::scry_tmp_dir().join(format!("scry-scip-missing-{}", std::process::id()));
         let _ = std::fs::remove_file(&nope);
         assert!(ScipIndex::open(&nope).unwrap().is_none());
+    }
+
+    #[test]
+    fn iter_records_round_trips() {
+        let tmp = crate::scry_tmp_dir().join(format!("scry-scip-iter-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let symbol_table = vec!["s1".into(), "s2".into(), "s3".into()];
+        let records = vec![
+            ScipRecord { abs_path: "/x/B.java".into(), byte_offset: 50, symbol_id: 1, role: 0 },
+            ScipRecord { abs_path: "/x/A.java".into(), byte_offset: 10, symbol_id: 0, role: 1 },
+            ScipRecord { abs_path: "/x/A.java".into(), byte_offset: 30, symbol_id: 2, role: 2 },
+        ];
+        write(&tmp, &symbol_table, &records).unwrap();
+        let idx = ScipIndex::open(&tmp).unwrap().unwrap();
+        let collected: Vec<_> = idx
+            .iter_records()
+            .map(|(p, bo, s, r)| (p.to_string(), bo, s.to_string(), r))
+            .collect();
+        assert_eq!(collected.len(), 3);
+        // Verify every input row survived (order is by path_id then byte_offset;
+        // writer interns in insertion order so /x/B.java has the lower path_id).
+        let pairs: std::collections::HashSet<_> = collected
+            .iter()
+            .map(|(p, bo, s, r)| (p.as_str(), *bo, s.as_str(), *r))
+            .collect();
+        assert!(pairs.contains(&("/x/B.java", 50, "s2", 0)));
+        assert!(pairs.contains(&("/x/A.java", 10, "s1", 1)));
+        assert!(pairs.contains(&("/x/A.java", 30, "s3", 2)));
+        std::fs::remove_file(&tmp).ok();
     }
 }

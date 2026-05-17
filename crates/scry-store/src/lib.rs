@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 pub mod trigram;
 pub mod embed;
 pub mod modgraph;
+pub mod precision_packed;
 pub mod clang_usrs;
 pub mod scip_index;
 pub mod files_packed;

@@ -598,6 +598,37 @@ A change is mergeable when:
 State as of the last commit. Each entry should land its own PR + a
 test pinning the new behaviour.
 
+### Coverage vs full Kythe parity
+
+What's currently shipping vs what's missing for 100% Kythe-class
+symbol-identity coverage on the four reference corpora:
+
+| Language | Corpus      | Current | Gap to 100% | Blocker                                    |
+|----------|-------------|---------|-------------|--------------------------------------------|
+| C/C++/ObjC | Perfetto (GN)    | 100% real-failures-free (1349 missing-source TUs correctly classified as skipped) | none | — |
+| C        | Linux (Kbuild)    | ~97% (634 / 24,980 TUs `CXError_ASTReadError`) | 3% | classify the 634 by directory + dump representative `CXDiagnostic` per group; most are likely arch-specific include paths in the compdb |
+| Java     | AOSP (Soong)      | 92% OK + partial (1119 OK / 81 partial / 13 no-output of 1213) | 8% | modules whose ALL variants are unbuilt — needs `m droid` to materialise Soong intermediates |
+| Kotlin   | AOSP (Soong)      | ~89% (200 OK + 31 partial of 258, pre-variant-fallback) | 11% | same as Java + kotlinc 2.x codegen bugs (`Exception while generating code for`) we can't fix in our patch |
+| Rust     | scry (Cargo)     | 100% | none | — |
+| Rust     | AOSP             | not exercised | n/a | AOSP's Rust crates compile via Soong's `cargo` integration; bridge plumbing exists but no end-to-end run yet |
+| Go       | AOSP             | not exercised | n/a | no Go in AOSP root; would apply to a separate Go corpus |
+| TypeScript | scry-ui          | partial — `editors/vscode` works | unknown | full scry-ui workspace not yet indexed |
+| Python   | scry             | partial — one .py file missing on disk gets cleanly skipped | unknown | full Python corpus not yet exercised |
+
+The **only blocker for AOSP Java + Kotlin reaching 100%** is
+running `m droid` (or targeted `m <module>` for the specific
+failing modules) to materialise the Soong intermediates the
+build-symbols pipeline reads. scry's own bridge can't generate
+KAPT / AAPT2 / AIDL / aconfig stubs — that's Soong's job, and
+re-implementing it inside scry-bridge is explicitly out of scope
+(2-3 weeks of work, would conflict with the user's existing
+`out/soong/` state).
+
+What this means in practice: every CALLER of any AOSP symbol that
+WAS reached during the build is precisely resolvable. The
+remaining 8% / 11% are modules where we have neither source nor
+classpath because the build never produced them.
+
 ### build-symbols: AOSP coverage ceiling without a full `m`
 
 Current AOSP pipeline ships every JVM-side fix that doesn't require

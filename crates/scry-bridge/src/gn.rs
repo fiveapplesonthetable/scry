@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn locate_finds_existing_compile_commands() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-gn-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join("args.gn"), b"is_debug=false\n").unwrap();
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn locate_returns_none_when_missing_compile_commands() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-gn-empty-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join("args.gn"), b"is_debug=false\n").unwrap();
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn locate_errors_for_non_gn_directory() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-gn-nope-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let r = locate_compile_commands(&tmp);

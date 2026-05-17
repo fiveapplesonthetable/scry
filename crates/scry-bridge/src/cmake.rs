@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn locate_finds_existing_compile_commands() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-cmake-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join("CMakeCache.txt"), b"//\n").unwrap();
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn locate_errors_for_non_cmake_directory() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-cmake-nope-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         assert!(locate_compile_commands(&tmp).is_err());

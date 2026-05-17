@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn extract_jvm_rules_splits_javac_and_kotlinc_skips_headers() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-soong-test-{}",
             std::process::id()
         ));
@@ -878,7 +878,7 @@ build out/soong/.intermediates/myapp/mod/android_common/kotlin_headers/mod.jar: 
 
     #[test]
     fn extract_jvm_rules_collects_top_level_vars() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-soong-vars-{}",
             std::process::id()
         ));

@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn discover_finds_cargo_roots() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-polyglot-disco-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("foo")).unwrap();
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn discover_dedups_cargo_workspace_members() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-polyglot-ws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("crates/a")).unwrap();
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn discover_keeps_independent_cargo_roots() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-polyglot-ind-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("a")).unwrap();
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn discover_python_yields_single_root() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-polyglot-py-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let targets = discover(&tmp, &[PolyglotKind::Python]).unwrap();

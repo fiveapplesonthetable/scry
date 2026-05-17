@@ -120,7 +120,7 @@ pub(crate) fn cmd_build_jvm_scip(
     // Shared targetroot: both indexers write `.semanticdb` files
     // under here so the single merge step handles both languages.
     let shared_targetroot = targetroot.unwrap_or_else(||
-        std::env::temp_dir().join("scry-semanticdb"));
+        scry_bridge::scry_tmp_dir().join("scry-semanticdb"));
 
     // Stage 2a: Java compilations → javac + semanticdb-javac.
     let mut java_cfg = JavaIndexerConfig::default();

@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn count_semanticdb_files_counts_only_target_files() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-count-{}", std::process::id()));
         let _ = std::fs::create_dir_all(tmp.join("META-INF/semanticdb"));
         std::fs::write(

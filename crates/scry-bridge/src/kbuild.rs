@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn locate_finds_existing_compile_commands() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-kbuild-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join(".config"), b"CONFIG_X=y\n").unwrap();
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn locate_returns_none_when_missing() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-kbuild-empty-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join(".config"), b"CONFIG_X=y\n").unwrap();
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn locate_errors_for_non_kbuild_directory() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-kbuild-nope-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let r = locate_compile_commands(&tmp);
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn looks_like_kernel_source_detects_marker_files() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = crate::scry_tmp_dir().join(format!(
             "scry-bridge-kbuild-src-{}", std::process::id()));
         let _ = std::fs::create_dir_all(tmp.join("scripts"));
         std::fs::write(tmp.join("Makefile"), b"obj-y :=\n").unwrap();

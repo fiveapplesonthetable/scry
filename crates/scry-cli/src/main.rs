@@ -7134,6 +7134,12 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         ("refs_offsets.bin",     paths.ref_offsets()),
         ("file_symbols.bin",     paths.file_symbols()),
         ("file_symbols_offsets.bin", paths.file_symbols_offsets()),
+        // file_refs sidecar powers `scry uses` — listed alongside
+        // file_symbols (which powers `scry outline`/`tldr`) for the
+        // symmetric report. Absent ⇒ `uses` falls back to a slow
+        // linear scan; missing here would silently hide that.
+        ("file_refs.bin",        paths.file_refs()),
+        ("file_refs_offsets.bin", paths.file_refs_offsets()),
         ("ref_resolutions.bin",  paths.ref_resolutions()),
         ("file_digests.bin",     paths.file_digests()),
         ("tombstones.bin",       paths.tombstones()),
@@ -7226,6 +7232,27 @@ fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         Err(e) => format!("present but FAILED to open: {e:#}"),
     };
     checks.push(Check { name: "scip_index", status: si_status, required: false, ok: true });
+
+    // Layer 2 resolution coverage (v0.1.59). Surface the resolved/total
+    // ratio so users know up-front whether `--def-in` / `--strict` will
+    // be useful on this index. Soft signal — low coverage isn't a
+    // failure, but a sub-10% number usually means the sidecar is stale
+    // (built before a major resolver change) or absent entirely.
+    let resolution_status = match StoreReader::open(&index_dir).ok()
+        .and_then(|r| r.count_resolved_refs().map(|n| (n, r.n_refs())))
+    {
+        None => "absent (run `scry build-resolutions` to enable \
+                 --def-in/--strict narrowing)".to_string(),
+        Some((_, 0)) => "no refs in index (sidecar dimension unknown)".to_string(),
+        Some((resolved, total)) => {
+            let pct = (resolved as f64) * 100.0 / (total as f64);
+            format!("v1, {resolved}/{total} refs resolved ({pct:.1}%)")
+        }
+    };
+    checks.push(Check {
+        name: "refs_resolved", status: resolution_status,
+        required: false, ok: true,
+    });
 
     // Version-skew check. Surface the scry_version that built the
     // index alongside the running binary's version. A mismatch is

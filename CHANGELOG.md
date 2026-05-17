@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.59] — 2026-05-17
+
+`scry health` now reports two more signals that were silently
+missing:
+
+1. **`file_refs.bin` + `file_refs_offsets.bin`** — the sidecar
+   that powers `scry uses`. Absent ⇒ `uses` falls back to a slow
+   linear scan; users hit that warning on every invocation
+   without `health` flagging it upfront. The omission was a real
+   gap (health listed `file_symbols.bin` but not its symmetric
+   refs counterpart).
+
+2. **`refs_resolved` coverage** — Layer 2 resolution stats
+   (resolved/total + percentage). Sub-10% usually means the
+   sidecar is stale or absent; high coverage tells you
+   `--def-in` / `--strict` narrowing will be useful on this
+   index.
+
+```
+$ scry health --index /mnt/agent/scry-index
+  …
+  [ OK] file_refs.bin                  OK (257402208 bytes)
+  [ OK] file_refs_offsets.bin          OK (8256672 bytes)
+  …
+  [ OK] refs_resolved                  v1, 31426932/63318468 refs resolved (49.6%)
+```
+
+`synthetic_tree_roundtrip` test extended with regression-guard
+assertions: the three new artifacts must appear in the JSON
+health output (would have caught the original `file_refs.bin`
+omission).
+
 ## [0.1.58] — 2026-05-17
 
 `--format count` and `--format paths` on `scry subclasses` and

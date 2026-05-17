@@ -976,6 +976,17 @@ fn synthetic_tree_roundtrip() {
                        "required check {} failed: {c}", c["artifact"]);
         }
     }
+    // v0.1.59 — file_refs sidecars and refs_resolved must appear in
+    // the checks list (regression guards: they were missing before
+    // v0.1.59 even though they're real on-disk artifacts / signals).
+    let names: std::collections::HashSet<&str> = checks.iter()
+        .filter_map(|c| c["artifact"].as_str()).collect();
+    assert!(names.contains("file_refs.bin"),
+        "health output missing file_refs.bin check: {names:?}");
+    assert!(names.contains("file_refs_offsets.bin"),
+        "health output missing file_refs_offsets.bin check: {names:?}");
+    assert!(names.contains("refs_resolved"),
+        "health output missing refs_resolved check: {names:?}");
 
     // 9. scry diff --since: turn the synthetic root into a git repo
     // with two commits, then assert `scry diff --since HEAD~1` finds

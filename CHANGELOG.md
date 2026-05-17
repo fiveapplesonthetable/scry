@@ -7,6 +7,67 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.36] — 2026-05-17
+
+**Critical fix: Package symbols were never emitted.** Plus a
+new full-stack e2e test that would have caught this.
+
+### The bug
+
+`cmd_build_resolutions` builds a `per_file_pkg` map from
+symbols of `SymbolKind::Package` to power same-pkg narrowing,
+import-aware narrowing (v0.1.28), and the implicit-pkg
+fallback (`java.lang`, `kotlin.*`).
+
+But the Java tree-sitter query in `scry-lang` had **no rule
+that emitted Package symbols**. `SymbolKind::Package` was
+defined as an enum variant and used in rank scoring, but
+nothing ever produced one. So `per_file_pkg` was silently
+empty in every production index — every Java/Kotlin package
+narrowing rule was a no-op.
+
+This was invisible because the resolver still picked SOME
+candidate via later rules (same-class preference, inheritance
+walk), so `narrowed_count` looked healthy. But the v0.1.28
+import-aware rule and the same-pkg rule never fired.
+
+### The fix
+
+scry-lang Java query now captures `package_declaration`:
+```
+(package_declaration (scoped_identifier) @name) @def.package
+(package_declaration (identifier) @name) @def.package
+```
+This emits one `SymbolKind::Package` symbol per Java file,
+with the package text (e.g. `android.os`) as the name.
+`cmd_build_resolutions` pass 1 picks them up unchanged.
+
+Kotlin Package emission is **deferred to a follow-up** — the
+naive `package_header` rule broke the companion-object scope
+tests in an unexpected way that needs separate investigation.
+
+### Full-stack e2e test
+
+New test `close_polymorphism_full_stack` builds a 4-file Java
+fixture (PerfettoTrace.java with Session.close, Other.java
+with close, two callers — one that imports PerfettoTrace and
+calls close, one that uses Other). Asserts:
+
+1. `scry callers close --def-in PerfettoTrace.java --strict`
+   returns EXACTLY the import-resolved Caller's call.
+2. `scry callers close --format by-def` shows both defs as
+   distinct groups.
+
+This is the canary for the polymorphism story shipped across
+v0.1.26-v0.1.35. Caught the silent-Package-symbol bug
+immediately; would have caught it if added earlier.
+
+### Upgrading
+
+Run a full `scry index` rebuild followed by `scry finalize`
+(or `scry build-resolutions`). The resolutions-only rebuild
+isn't enough — Package symbols are stored at index time.
+
 ## [0.1.35] — 2026-05-17
 
 New `--format by-def` output mode on `scry ref` / `scry callers`.

@@ -741,6 +741,14 @@ fn java_spec() -> &'static LangSpec {
                 (method_declaration name: (identifier) @name) @def.method
                 (constructor_declaration name: (identifier) @name) @def.ctor
                 (field_declaration declarator: (variable_declarator name: (identifier) @name)) @def.field
+                ; Package declaration — emit one Package symbol per file.
+                ; cmd_build_resolutions builds per_file_pkg from these so
+                ; same-pkg and import-aware narrowing can fire. The inner
+                ; scoped_identifier text (e.g. "android.os") becomes the
+                ; symbol's name; the kind comes from the outer
+                ; @def.package capture.
+                (package_declaration (scoped_identifier) @name) @def.package
+                (package_declaration (identifier) @name) @def.package
                 "#,
             )
             .expect("java query")
@@ -756,6 +764,7 @@ fn java_spec() -> &'static LangSpec {
                 ("def.method", SymbolKind::Method),
                 ("def.ctor", SymbolKind::Constructor),
                 ("def.field", SymbolKind::Field),
+                ("def.package", SymbolKind::Package),
             ],
             name_capture: "name",
             scope_node_kinds: &[

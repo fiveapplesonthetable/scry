@@ -47,10 +47,37 @@ use std::time::Instant;
 /// the SCIP index's `project_root` for path resolution — useful when
 /// the SCIP file was generated in a different working tree (e.g.
 /// CI vs local checkout).
+///
+/// Replace mode (calls [`import_scip_with_mode`] with `append=false`).
 pub fn import_scip(
     scip_path: &Path,
     index_dir: &Path,
     root_override: Option<&Path>,
+) -> Result<()> {
+    import_scip_with_mode(scip_path, index_dir, root_override, false)
+}
+
+/// Like [`import_scip`] but with explicit append-vs-replace semantics.
+///
+/// `append=true`: load the existing `scip_index.bin` (if any) and
+/// merge the new SCIP file into it. Symbol-table IDs are remapped so
+/// the resulting bin's `symbol_table` is the union of both. Records
+/// are deduped on `(abs_path, byte_offset, symbol_id)` so re-running
+/// the same language pipeline doesn't bloat the sidecar.
+///
+/// `append=false` (default for [`import_scip`]): replace the existing
+/// sidecar with the imported content. Use this when you've re-merged
+/// every input from scratch (e.g. the JVM pipeline that always produces
+/// one mega-SCIP from a fresh `scip-java index-semanticdb` pass).
+///
+/// Append mode is what makes per-language indexer composition work:
+/// run scip-go, then rust-analyzer scip, then scip-python, etc. Each
+/// imports into the same sidecar additively.
+pub fn import_scip_with_mode(
+    scip_path: &Path,
+    index_dir: &Path,
+    root_override: Option<&Path>,
+    append: bool,
 ) -> Result<()> {
     let t = Instant::now();
     let raw = std::fs::read(scip_path)
@@ -72,11 +99,39 @@ pub fn import_scip(
              cannot resolve document paths"
         ))?;
 
+    // Seed the in-memory tables from the existing sidecar when appending.
+    // We re-key existing symbols by string so the rest of the loop can
+    // intern new symbols against the same map without an O(N) walk.
     let mut symbol_table: Vec<String> = Vec::new();
     let mut symbol_id: HashMap<String, u32> = HashMap::new();
     let mut records: Vec<ScipRecord> = Vec::new();
     let mut docs_processed = 0u64;
     let mut docs_skipped = 0u64;
+    let mut starting_records = 0usize;
+    if append {
+        let existing_path = index_dir.join("scip_index.bin");
+        if existing_path.exists() {
+            let raw = std::fs::read(&existing_path)
+                .with_context(|| format!("read existing {}", existing_path.display()))?;
+            let existing: ScipSidecar = bincode::deserialize(&raw)
+                .with_context(|| format!("decode existing {}", existing_path.display()))?;
+            for (i, s) in existing.symbol_table.iter().enumerate() {
+                symbol_id.insert(s.clone(), i as u32);
+            }
+            starting_records = existing.records.len();
+            symbol_table = existing.symbol_table;
+            records = existing.records;
+        }
+    }
+    // Set used to dedup `(abs_path, byte_offset, symbol_id)` across
+    // the existing + incoming records. Only populated in append mode.
+    let mut seen: std::collections::HashSet<(String, u32, u32)> = if append {
+        records.iter()
+            .map(|r| (r.abs_path.clone(), r.byte_offset, r.symbol_id))
+            .collect()
+    } else {
+        Default::default()
+    };
 
     for doc in &index.documents {
         let abs = project_root.join(&doc.relative_path);
@@ -113,6 +168,11 @@ pub fn import_scip(
             // SCIP's `symbol_roles` is a bitmap. We pack the low 8
             // bits verbatim so readers can match by role kind.
             let role: u8 = (occ.symbol_roles & 0xFF) as u8;
+            // Dedup in append mode — re-imports of the same SCIP file
+            // shouldn't grow the sidecar.
+            if append && !seen.insert((abs_str.clone(), byte_offset, id)) {
+                continue;
+            }
             records.push(ScipRecord {
                 abs_path: abs_str.clone(),
                 byte_offset,
@@ -133,13 +193,16 @@ pub fn import_scip(
     std::fs::write(&tmp, &buf).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &out)
         .with_context(|| format!("rename {} -> {}", tmp.display(), out.display()))?;
+    let mode = if append { "append" } else { "replace" };
+    let added = sidecar.records.len().saturating_sub(starting_records);
     eprintln!(
-        "[scip-import] {} docs processed ({} skipped: file missing on disk), \
-         {} unique symbols, {} occurrences, {} bytes → {} ({}s)",
+        "[scip-import {mode}] {} docs processed ({} skipped: file missing on disk), \
+         +{} occurrences (total {}), {} unique symbols, {} bytes → {} ({}s)",
         docs_processed,
         docs_skipped,
-        sidecar.symbol_table.len(),
+        added,
         sidecar.records.len(),
+        sidecar.symbol_table.len(),
         buf.len(),
         out.display(),
         t.elapsed().as_secs(),

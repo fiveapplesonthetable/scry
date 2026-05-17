@@ -986,6 +986,57 @@ enum Cmd {
         #[arg(long)]
         skip_java: bool,
     },
+    /// `scry build-polyglot-scip` — Rust + Go + TypeScript + Python.
+    ///
+    /// Walks the source root for native project markers
+    /// (`Cargo.toml`, `go.mod`, `tsconfig.json`, or `.py` files) and
+    /// runs the corresponding indexer per project. Each indexer's
+    /// `.scip` output lands in the scry sidecar via APPEND-mode
+    /// import, so this command composes cleanly with
+    /// `build-jvm-scip` and `clang-index` (which already wrote
+    /// SCIP / clang USR sidecars).
+    BuildPolyglotScip {
+        /// Source root to walk for project markers.
+        #[arg(long, value_name = "PATH")]
+        source_root: PathBuf,
+        /// Existing scry index dir; sidecar lands at <index>/scip_index.bin.
+        #[arg(long, value_name = "DIR")]
+        index: Option<PathBuf>,
+        /// Per-target `.scip` files land here. Defaults to
+        /// `$TMPDIR/scry-polyglot-scip`.
+        #[arg(long, value_name = "PATH")]
+        scip_out_dir: Option<PathBuf>,
+        /// Override the rust-analyzer binary.
+        #[arg(long, value_name = "PATH")]
+        rust_analyzer: Option<PathBuf>,
+        /// Override the scip-go binary.
+        #[arg(long, value_name = "PATH")]
+        scip_go: Option<PathBuf>,
+        /// Override the scip-typescript binary.
+        #[arg(long, value_name = "PATH")]
+        scip_typescript: Option<PathBuf>,
+        /// Override the scip-python binary.
+        #[arg(long, value_name = "PATH")]
+        scip_python: Option<PathBuf>,
+        /// Skip Rust.
+        #[arg(long)]
+        no_rust: bool,
+        /// Skip Go.
+        #[arg(long)]
+        no_go: bool,
+        /// Skip TypeScript.
+        #[arg(long)]
+        no_typescript: bool,
+        /// Skip Python.
+        #[arg(long)]
+        no_python: bool,
+        /// Filter project roots by substring.
+        #[arg(long, value_name = "SUBSTR")]
+        only_root: Option<String>,
+        /// Cap the number of targets processed.
+        #[arg(long, value_name = "N")]
+        max_targets: Option<usize>,
+    },
     /// Import a SCIP index (https://github.com/sourcegraph/scip)
     /// produced by scip-java / scip-kotlin / gopls / rust-analyzer /
     /// scip-typescript / etc., into the scry sidecar
@@ -1402,6 +1453,15 @@ fn main() -> Result<()> {
             targetroot, only_module, max_compilations,
             skip_kotlin, skip_java,
         ),
+        Cmd::BuildPolyglotScip { source_root, index, scip_out_dir, rust_analyzer,
+                                  scip_go, scip_typescript, scip_python,
+                                  no_rust, no_go, no_typescript, no_python,
+                                  only_root, max_targets } =>
+            bridge_subcmds::cmd_build_polyglot_scip(
+                source_root, index, scip_out_dir, rust_analyzer, scip_go,
+                scip_typescript, scip_python, no_rust, no_go, no_typescript,
+                no_python, only_root, max_targets,
+            ),
         Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => precision_subcmds::cmd_scip_lookup(index, &path, offset),

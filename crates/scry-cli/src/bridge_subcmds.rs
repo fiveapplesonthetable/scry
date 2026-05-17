@@ -6,6 +6,10 @@ use anyhow::{Context, Result};
 use scry_bridge::{BuildSystem, soong::Soong, Language};
 use scry_bridge::java_indexer::{JavaIndexerConfig, run as run_javac, merge as merge_scip};
 use scry_bridge::kotlin_indexer::{KotlinIndexerConfig, run as run_kotlinc};
+use scry_bridge::polyglot::{
+    PolyglotConfig, PolyglotKind, discover as polyglot_discover,
+    run as polyglot_run,
+};
 use scry_store::StoreReader;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -184,6 +188,129 @@ pub(crate) fn cmd_build_jvm_scip(
 
     eprintln!(
         "[build-jvm-scip] ALL STAGES OK in {:.2}s",
+        t_total.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+
+/// `scry build-polyglot-scip` — Rust / Go / TypeScript / Python SCIP.
+///
+/// Walks the source root for project markers of each enabled
+/// language and runs that language's native indexer per project.
+/// Each indexer produces a `.scip` file that is then imported into
+/// scry's sidecar in APPEND mode, so this command composes with
+/// `build-jvm-scip` and `clang-index` (both of which already wrote
+/// to `scip_index.bin` / `clang_usrs.bin`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_build_polyglot_scip(
+    source_root: PathBuf,
+    index: Option<PathBuf>,
+    scip_out_dir: Option<PathBuf>,
+    rust_analyzer: Option<PathBuf>,
+    scip_go: Option<PathBuf>,
+    scip_typescript: Option<PathBuf>,
+    scip_python: Option<PathBuf>,
+    no_rust: bool,
+    no_go: bool,
+    no_typescript: bool,
+    no_python: bool,
+    only_root: Option<String>,
+    max_targets: Option<usize>,
+) -> Result<()> {
+    let t_total = Instant::now();
+    let index_dir = index.unwrap_or_else(default_index_dir);
+    let mut kinds: Vec<PolyglotKind> = Vec::new();
+    if !no_rust       { kinds.push(PolyglotKind::Rust); }
+    if !no_go         { kinds.push(PolyglotKind::Go); }
+    if !no_typescript { kinds.push(PolyglotKind::TypeScript); }
+    if !no_python     { kinds.push(PolyglotKind::Python); }
+    if kinds.is_empty() {
+        anyhow::bail!("all languages disabled — nothing to do");
+    }
+
+    eprintln!("[build-polyglot-scip] source_root: {}", source_root.display());
+    eprintln!("[build-polyglot-scip] index_dir:   {}", index_dir.display());
+    eprintln!("[build-polyglot-scip] languages:   {}",
+        kinds.iter().map(|k| k.label()).collect::<Vec<_>>().join(", "));
+
+    // Discover.
+    let t = Instant::now();
+    let mut targets = polyglot_discover(&source_root, &kinds)
+        .context("discover polyglot project roots")?;
+    eprintln!(
+        "[build-polyglot-scip] discovered {} targets in {:.2}s",
+        targets.len(), t.elapsed().as_secs_f64(),
+    );
+    if let Some(filter) = only_root {
+        let before = targets.len();
+        targets.retain(|t| t.root.to_string_lossy().contains(&filter));
+        eprintln!(
+            "[build-polyglot-scip] --only-root {filter:?}: {before} → {} targets",
+            targets.len(),
+        );
+    }
+    if let Some(cap) = max_targets {
+        if targets.len() > cap {
+            eprintln!(
+                "[build-polyglot-scip] --max-targets: trimming {} → {cap}",
+                targets.len(),
+            );
+            targets.truncate(cap);
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("[build-polyglot-scip] no targets matched — nothing to do");
+        return Ok(());
+    }
+
+    // Run indexers.
+    let mut cfg = PolyglotConfig::default();
+    if let Some(p) = rust_analyzer { cfg.rust_analyzer = p; }
+    if let Some(p) = scip_go { cfg.scip_go = p; }
+    if let Some(p) = scip_typescript { cfg.scip_typescript = p; }
+    if let Some(p) = scip_python { cfg.scip_python = p; }
+    if let Some(p) = scip_out_dir { cfg.scip_out_dir = p; }
+    eprintln!("[build-polyglot-scip] rust-analyzer:   {}", cfg.rust_analyzer.display());
+    eprintln!("[build-polyglot-scip] scip-go:         {}", cfg.scip_go.display());
+    eprintln!("[build-polyglot-scip] scip-typescript: {}", cfg.scip_typescript.display());
+    eprintln!("[build-polyglot-scip] scip-python:     {}", cfg.scip_python.display());
+
+    let t = Instant::now();
+    let report = polyglot_run(&targets, &cfg)
+        .context("polyglot dispatch")?;
+    eprintln!(
+        "[build-polyglot-scip] {} OK, {} failed ({} .scip files) in {:.2}s",
+        report.ok, report.failed, report.scip_files.len(),
+        t.elapsed().as_secs_f64(),
+    );
+
+    // Import each .scip in append mode.
+    let t = Instant::now();
+    for scip in &report.scip_files {
+        if let Err(e) = scry_scip::import_scip_with_mode(
+            scip, &index_dir, Some(source_root.as_path()), true,
+        ) {
+            eprintln!("[build-polyglot-scip] import failed for {}: {e:#}",
+                      scip.display());
+        }
+    }
+    eprintln!(
+        "[build-polyglot-scip] imported {} .scip shards in {:.2}s",
+        report.scip_files.len(), t.elapsed().as_secs_f64(),
+    );
+
+    // Sanity.
+    let reader = StoreReader::open(&index_dir)
+        .context("reopen index after import")?;
+    let sidecar = scry_store::scip_index::ScipIndex::open(&reader.paths.scip_index())?;
+    if let Some(sidx) = sidecar {
+        eprintln!(
+            "[build-polyglot-scip] sidecar: {} symbols, {} records",
+            sidx.symbol_count(), sidx.len(),
+        );
+    }
+    eprintln!(
+        "[build-polyglot-scip] ALL STAGES OK in {:.2}s",
         t_total.elapsed().as_secs_f64(),
     );
     Ok(())

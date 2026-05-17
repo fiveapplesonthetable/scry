@@ -32,6 +32,7 @@
 
 pub mod java_indexer;
 pub mod kotlin_indexer;
+pub mod polyglot;
 pub mod soong;
 
 /// Source language of a compilation unit. Determines which

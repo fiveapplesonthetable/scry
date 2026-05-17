@@ -7,6 +7,32 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.45] — 2026-05-17
+
+`--def-in PATH` and `--strict` on `scry impact`.
+
+Impact = callers + transitive subclasses + files-touched. The
+new flags narrow the CALLERS portion (and downstream
+files-touched) by callee location. They don't affect the
+subclass walk — subclasses are about the TYPE, not a specific
+method, so narrowing by def file doesn't apply.
+
+**Live example:**
+```
+$ scry impact transact --def-in libs/binder/Binder.cpp --strict
+[scry] impact --def-in "libs/binder/Binder.cpp" --strict: 1524 → 166 callers
+impact of "transact": 166 callers, 0 subclasses (depth 2), 29 files touched
+```
+
+The unfiltered version would report all 1524 callers across
+every `transact` overload (BBinder, BpBinder, BHwBinder, test
+mocks, ndk versions, sandbox code). With the filter,
+refactoring decisions about `android::BBinder::transact`
+specifically see the right impact set.
+
+Diagnostic line reports the before→after counts and tells you
+which mode is engaged. JSON output shape unchanged.
+
 ## [0.1.44] — 2026-05-17
 
 Daemon / JSON-RPC / MCP parity for v0.1.43's callgraph

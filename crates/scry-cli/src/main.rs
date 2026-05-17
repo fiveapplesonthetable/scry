@@ -451,6 +451,17 @@ enum Cmd {
         /// Build-graph reachability filter on callers; off by default.
         #[arg(long)]
         reachable: bool,
+        /// Narrow the CALLERS portion of impact by callee location —
+        /// same shape as `scry ref --def-in PATH`. Doesn't affect the
+        /// subclass walk (subclasses are about the type, not the
+        /// method). Use when impact is being asked about ONE specific
+        /// `close()` overload, not every method named close.
+        #[arg(long, value_name = "PATH")]
+        def_in: Option<String>,
+        /// Strict mode: drop callers whose Layer 2 resolution didn't
+        /// land on a specific def. See `scry ref --strict`.
+        #[arg(long)]
+        strict: bool,
         #[arg(long, default_value = "200")]
         limit: usize,
         #[arg(long)]
@@ -1216,8 +1227,8 @@ fn main() -> Result<()> {
         Cmd::ScipImport { scip, index, root } => cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => cmd_scip_lookup(index, &path, offset),
-        Cmd::Impact { name, index, in_, subclass_depth, reachable, limit, json } =>
-            cmd_impact(name, index, in_, subclass_depth, reachable, limit, json),
+        Cmd::Impact { name, index, in_, subclass_depth, reachable, def_in, strict, limit, json } =>
+            cmd_impact(name, index, in_, subclass_depth, reachable, def_in, strict, limit, json),
         Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, def_in, strict, json } =>
             cmd_callgraph(name, index, in_, depth, max_nodes, reachable, def_in, strict, json),
         Cmd::Uses { name, index, in_, kind, limit, json } =>
@@ -2717,6 +2728,8 @@ fn cmd_impact(
     in_: Option<String>,
     subclass_depth: usize,
     reachable: bool,
+    def_in: Option<String>,
+    strict: bool,
     limit: usize,
     json: bool,
 ) -> Result<()> {
@@ -2734,6 +2747,40 @@ fn cmd_impact(
                 .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
         })
         .collect();
+    // v0.1.45 — narrow callers by callee location (same as ref --def-in).
+    // Doesn't affect subclasses (which are about the type, not the method).
+    if let Some(def_path) = def_in.as_deref() {
+        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
+            .iter()
+            .filter(|s| r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(def_path)))
+            .map(|s| s.id)
+            .collect();
+        if target_ids.is_empty() {
+            eprintln!(
+                "[scry] impact --def-in: no def of {name:?} found in any file \
+                 containing {def_path:?}; callers will not be narrowed.",
+            );
+        } else {
+            let before = callers.len();
+            callers.retain(|rr| match rr.resolved_to {
+                Some(id) => target_ids.contains(&id),
+                None => !strict,
+            });
+            eprintln!(
+                "[scry] impact --def-in {def_path:?}{}: {} → {} callers",
+                if strict { " --strict" } else { "" },
+                before, callers.len(),
+            );
+        }
+    } else if strict {
+        let before = callers.len();
+        callers.retain(|rr| rr.resolved_to.is_some());
+        eprintln!(
+            "[scry] impact --strict: {} → {} callers (unresolved dropped)",
+            before, callers.len(),
+        );
+    }
     if reachable {
         if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(&name);

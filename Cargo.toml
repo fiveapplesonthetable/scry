@@ -8,6 +8,7 @@ members = [
     "crates/scry-aosp",
     "crates/scry-clang",
     "crates/scry-scip",
+    "crates/scry-bridge",
 ]
 
 [workspace.package]

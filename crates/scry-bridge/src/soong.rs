@@ -370,10 +370,71 @@ impl KotlincRule {
             defines: Vec::new(),
             java_version,
             extra_args: self.bindings.get("kotlincFlags")
-                .map(|s| s.split_whitespace().map(str::to_string).collect())
+                .map(|s| forward_kotlinc_flags(s, source_root))
                 .unwrap_or_default(),
         })
     }
+}
+
+/// Filter Soong's `kotlincFlags` for forwarding to kotlinc, with
+/// any path values rewritten to absolute. Symmetric to
+/// [`forward_javac_flags`]: drops flags that collide with what
+/// kotlin_indexer synthesizes (`-d`, `-no-stdlib`, `-jvm-target`,
+/// `-Xplugin:semanticdb*`, `-P plugin:semanticdb-kotlinc:*`,
+/// `-classpath`/`-cp`), keeps everything else. Most importantly
+/// keeps `-Xmultiplatform` / `-Xexpect-actual-classes` which AOSP
+/// modules like kotlinx-coroutines need or kotlinc rejects every
+/// `expect`/`actual` declaration.
+pub(crate) fn forward_kotlinc_flags(binding: &str, source_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut tokens = binding.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        // Two-token flags whose value we either drop or already have.
+        if matches!(tok, "-d" | "-jvm-target" | "-classpath" | "-cp"
+                       | "-language-version" | "-api-version") {
+            tokens.next();
+            continue;
+        }
+        // `-no-stdlib`, `-no-jdk`, `-no-reflect` — we set our own.
+        if matches!(tok, "-no-stdlib" | "-no-jdk" | "-no-reflect") {
+            continue;
+        }
+        // Our own plugin registration must not be duplicated.
+        if tok.starts_with("-Xplugin=") && tok.contains("semanticdb-kotlinc") {
+            continue;
+        }
+        // -P plugin:semanticdb-kotlinc:* — same.
+        if tok == "-P" {
+            if let Some(next) = tokens.peek() {
+                if next.starts_with("plugin:semanticdb-kotlinc:") {
+                    tokens.next();
+                    continue;
+                }
+            }
+            out.push(tok.to_string());
+            continue;
+        }
+        // -Xfriend-paths=PATH:PATH — colon-separated path list; rewrite.
+        if let Some(eq) = tok.find('=') {
+            let (k, v) = (&tok[..eq], &tok[eq + 1..]);
+            if matches!(k, "-Xfriend-paths" | "-Xklib"
+                          | "-Xcommon-sources"
+                          | "-Xplugin"
+                          | "-Xklib-relative-path-base") {
+                out.push(format!("{k}={}",
+                    rewrite_path_list_to_absolute(v, source_root)));
+                continue;
+            }
+            // Other `--FLAG=value` — pass verbatim
+            // (`-Xexpect-actual-classes`, `-Xmultiplatform`, etc.).
+            out.push(tok.to_string());
+            continue;
+        }
+        // Bare token — pass through (covers `-Xmultiplatform`,
+        // `-Xjvm-default=all`, `-Xskip-prerelease-check`, etc.).
+        out.push(tok.to_string());
+    }
+    out
 }
 
 /// Discover all `build*.ninja` shards inside the given build dir.
@@ -949,6 +1010,36 @@ build out/soong/.intermediates/libcore/core-libart/android_common/javac/core-lib
                    -Xlint:all";
         let out = forward_javac_flags(src, Path::new("/aosp"));
         assert_eq!(out, vec!["-Xlint:all".to_string()]);
+    }
+
+    #[test]
+    fn forward_kotlinc_flags_keeps_multiplatform_and_friend_paths() {
+        let src = "-Xmultiplatform -Xexpect-actual-classes \
+                   -Xfriend-paths=foo/a.jar:bar/b.jar \
+                   -Xjvm-default=all -no-stdlib -d /tmp/out \
+                   -jvm-target 21 -classpath some/jar.jar";
+        let out = forward_kotlinc_flags(src, Path::new("/aosp"));
+        // -no-stdlib, -d <dir>, -jvm-target <ver>, -classpath <jar> dropped.
+        // Others pass through verbatim; -Xfriend-paths has its
+        // colon-separated entries rewritten absolute.
+        assert_eq!(out, vec![
+            "-Xmultiplatform".to_string(),
+            "-Xexpect-actual-classes".to_string(),
+            "-Xfriend-paths=/aosp/foo/a.jar:/aosp/bar/b.jar".to_string(),
+            "-Xjvm-default=all".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn forward_kotlinc_flags_drops_duplicate_semanticdb_plugin() {
+        // A duplicate `-Xplugin=…semanticdb-kotlinc…` from Soong
+        // must not collide with our own plugin registration; same
+        // for any inherited `-P plugin:semanticdb-kotlinc:…` pairs.
+        let src = "-Xplugin=/some/path/semanticdb-kotlinc-1.0.jar \
+                   -P plugin:semanticdb-kotlinc:sourceroot=/old \
+                   -Xmultiplatform";
+        let out = forward_kotlinc_flags(src, Path::new("/aosp"));
+        assert_eq!(out, vec!["-Xmultiplatform".to_string()]);
     }
 
     #[test]

@@ -203,6 +203,19 @@ fn run_one(compilation: &Compilation, cfg: &KotlinIndexerConfig) -> CompilationO
         cmd.arg(tok);
     }
 
+    // Forward Soong's surviving kotlincFlags. Matches the javac
+    // forwarder's contract: the Soong bridge has already filtered
+    // out flags that would collide with what we synthesize. What
+    // remains are the multiplatform / language-feature flags
+    // kotlinc needs to compile the module correctly — without
+    // `-Xmultiplatform` (or `-Xexpect-actual-classes`) modules like
+    // kotlinx-coroutines that use `expect`/`actual` declarations
+    // fail with "expect and actual declarations can be used only in
+    // multiplatform projects" and emit zero semanticdb files.
+    for tok in &compilation.extra_args {
+        cmd.arg(tok);
+    }
+
     // Sources via @argfile to dodge ARG_MAX on big Kotlin modules.
     let argfile = per_target.join("sources.args");
     let args_body: String = abs_sources.iter()

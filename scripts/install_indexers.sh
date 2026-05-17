@@ -155,6 +155,40 @@ install_sbt_and_scip_kotlin() {
     if [[ ! -d "$kt_src" ]]; then
         git clone --depth 1 https://github.com/sourcegraph/scip-kotlin.git "$kt_src"
     fi
+    # Patch: silence the spurious "unknown symbol kind FirFileSymbol"
+    # stderr noise upstream emits on Kotlin 2.x. The plugin already
+    # returned NONE for that case — it just printed first, which made
+    # scry-bridge mis-classify every kotlinc compilation containing
+    # a top-level fun/val as "partial / no output". The fix is one
+    # explicit `is FirFileSymbol -> SemanticdbSymbolDescriptor.NONE`
+    # arm before the catch-all in the `semanticdbDescriptor` cascade.
+    local cache_file="$kt_src/semanticdb-kotlinc/src/main/kotlin/com/sourcegraph/semanticdb_kotlinc/SymbolsCache.kt"
+    if [[ -f "$cache_file" ]] && ! grep -q "symbol is FirFileSymbol -> SemanticdbSymbolDescriptor.NONE" "$cache_file"; then
+        log "applying FirFileSymbol noise-suppression patch to $cache_file"
+        # Insert the explicit FirFileSymbol arm before the catch-all `else`
+        # that prints "unknown symbol kind …" to stderr.
+        python3 -c '
+import io, sys, re
+path = "'"$cache_file"'"
+src = open(path).read()
+needle = ("            symbol is FirVariableSymbol ->\n"
+          "                SemanticdbSymbolDescriptor(Kind.TERM, symbol.name.toString())\n"
+          "            else -> {\n"
+          "                err.println(\"unknown symbol kind ${symbol.javaClass.simpleName}\")")
+repl   = ("            symbol is FirVariableSymbol ->\n"
+          "                SemanticdbSymbolDescriptor(Kind.TERM, symbol.name.toString())\n"
+          "            // patched-by-scry-install: FirFileSymbol legitimately has no\n"
+          "            // SemanticDB descriptor (file-level container, not a declaration).\n"
+          "            // Returning NONE silently here matches the previous catch-all\n"
+          "            // behaviour minus the spurious stderr noise.\n"
+          "            symbol is FirFileSymbol -> SemanticdbSymbolDescriptor.NONE\n"
+          "            else -> {\n"
+          "                err.println(\"unknown symbol kind ${symbol.javaClass.simpleName}\")")
+if needle not in src:
+    sys.exit("patch needle not found; upstream may have refactored — skipping")
+open(path, "w").write(src.replace(needle, repl, 1))
+' || warn "patch could not be applied (upstream may have changed); proceeding anyway"
+    fi
     (cd "$kt_src" && "$PREFIX/bin/sbt" publishM2)
 }
 

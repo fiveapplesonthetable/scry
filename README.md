@@ -74,6 +74,11 @@ cargo build --release                            # ~20 s cold, ~5 s incremental
 ./target/release/scry callers bindService --reachable              # build-graph pruned
 ./target/release/scry callers Foo --clang-precise                  # USR-identity pruned (C/C++/ObjC)
 ./target/release/scry callers Bar --scip-precise                   # SCIP-symbol pruned (any SCIP language)
+
+# Cutting through polymorphism: which `close()` are you asking about? (v0.1.26+)
+./target/release/scry callers close --def-in PerfettoTrace.java    # narrow by callee location
+./target/release/scry callers close --strict                       # only confidently-resolved hits
+./target/release/scry callers close --format by-def --limit 10     # histogram: which def gets called most
 ```
 
 Times above are warm-cache P50 on the live AOSP + Linux index

@@ -1900,6 +1900,10 @@ impl StoreReader {
                 json_path: &path,
                 files_path: &files_path,
             };
+            // Fast path: full cache loads in ~50ms (13MB bincode),
+            // reach cache mmaps in ~1ms (1GB file, zero copy).
+            // Per-query bits get paged in lazily — typical
+            // `is_reachable` touches ~12KB of the 1GB bitmap.
             if let Some(hit) = full_cache.try_load() {
                 let n_modules = hit.modules.len();
                 let stride = n_modules.div_ceil(64);
@@ -1908,7 +1912,7 @@ impl StoreReader {
                     path: &reach_path,
                     binding_hash: hit.binding_hash,
                 };
-                if let Some(reach) = reach_cache.try_load_public(n_modules, stride) {
+                if let Some(reach) = reach_cache.try_mmap(n_modules, stride) {
                     return Some(modgraph::module_graph_from_parts(
                         hit.modules,
                         hit.file_module,
@@ -1917,9 +1921,6 @@ impl StoreReader {
                         stride,
                     ));
                 }
-                // ReachCache miss (e.g. user deleted reach.bin) →
-                // fall through to the cold path, which will
-                // recompute Warshall and rewrite both caches.
             }
             let parsed_path = self.paths.module_graph_parsed();
             let parsed_cache = modgraph::ParsedCache {

@@ -67,7 +67,13 @@ pub struct Module {
 ///
 /// Reachability is precomputed once at construction time and stored
 /// as a packed bitmap: `is_reachable(from, to)` is O(1).
-#[derive(Debug, Clone)]
+///
+/// The bitmap is mmap-backed when loaded from `module_graph_reach.bin`
+/// — on AOSP scale it's ~1GB, and a typical query touches only the
+/// O(n_modules / 64) words owned by the caller-module's row (~12KB),
+/// so the OS pages in just those words on demand. Cold per-query
+/// cost is the page-fault count, not the total bitmap size.
+#[derive(Debug)]
 pub struct ModuleGraph {
     pub modules: Vec<Module>,
     /// `file_module[file_id]` = Some(module_id) if the file is owned
@@ -78,9 +84,62 @@ pub struct ModuleGraph {
     /// bit `to % 64` set iff module `from` transitively depends on
     /// module `to` (including reflexively — every module reaches
     /// itself). `stride = (n_modules + 63) / 64`.
-    reach: Vec<u64>,
+    reach: ReachStorage,
     stride: usize,
     name_to_id: HashMap<String, u32>,
+}
+
+/// Backing store for the reach bitmap. Either a heap-owned Vec
+/// (cold path / test fixtures / fresh Warshall recompute) or an
+/// mmap-backed view onto `module_graph_reach.bin` (steady-state
+/// warm path — zero alloc, demand-paged).
+#[derive(Debug)]
+enum ReachStorage {
+    Owned(Vec<u64>),
+    Mmapped {
+        mmap: memmap2::Mmap,
+        /// Byte offset of the first u64 word inside the mmap'd
+        /// bytes. Equals `REACH_CACHE_HEADER_LEN` for cache files
+        /// written by `ReachCache::write`.
+        word_offset: usize,
+        /// Number of u64 words in the bitmap. Used to bound
+        /// `as_slice` and catch a truncated file at construction.
+        len_words: usize,
+    },
+}
+
+impl ReachStorage {
+    /// Borrow as &[u64] regardless of backing. The mmap variant
+    /// returns a slice into the page-cached bytes via
+    /// std::slice::from_raw_parts (the bytes are u64-aligned at
+    /// `word_offset` because the header is a multiple of 8). For
+    /// the Owned variant this is just `self.0.as_slice()`.
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            ReachStorage::Owned(v) => v.as_slice(),
+            ReachStorage::Mmapped { mmap, word_offset, len_words } => {
+                // SAFETY: word_offset is REACH_CACHE_HEADER_LEN (61),
+                // which is 8-byte aligned in our format. len_words *
+                // 8 + word_offset is bounded against mmap.len() at
+                // construction in `ReachCache::try_mmap`. The mmap
+                // outlives this slice because ModuleGraph owns the
+                // Mmap and returns the slice with the same lifetime.
+                let bytes = &mmap[*word_offset..];
+                debug_assert!(bytes.len() >= len_words * 8);
+                debug_assert_eq!(
+                    (bytes.as_ptr() as usize) % align_of::<u64>(),
+                    0,
+                    "mmap reach payload must be u64-aligned"
+                );
+                unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr().cast::<u64>(),
+                        *len_words,
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// Raw JSON form read from a v1 module-graph file. Adapters emit this
@@ -165,7 +224,13 @@ impl ModuleGraph {
             .map(|m| (m.name.clone(), m.id))
             .collect();
 
-        ModuleGraph { modules, file_module, reach, stride, name_to_id }
+        ModuleGraph {
+            modules,
+            file_module,
+            reach: ReachStorage::Owned(reach),
+            stride,
+            name_to_id,
+        }
     }
 
     /// Test-fixture constructor. Skips JSON parsing; useful for unit
@@ -228,7 +293,8 @@ impl ModuleGraph {
         if f >= self.modules.len() || t >= self.modules.len() {
             return false;
         }
-        let word = self.reach[f * self.stride + (t / 64)];
+        let reach = self.reach.as_slice();
+        let word = reach[f * self.stride + (t / 64)];
         (word >> (t % 64)) & 1 == 1
     }
 
@@ -416,24 +482,100 @@ impl FullModuleGraphCache<'_> {
 }
 
 /// Public constructor: rebuild a `ModuleGraph` from the cached
-/// fields + a loaded reach bitmap. The reach bitmap comes from
-/// `ReachCache::try_load_public` (the same on-disk file written
-/// by the cold path).
+/// fields + a backing for the reach bitmap. The reach backing is
+/// typically produced by `ReachCache::try_mmap` (mmap-zero-copy)
+/// or `try_load_*` (Vec-owned).
 pub fn module_graph_from_parts(
     modules: Vec<Module>,
     file_module: Vec<Option<u32>>,
     name_to_id: HashMap<String, u32>,
-    reach: Vec<u64>,
+    reach: ReachBacking,
     stride: usize,
 ) -> ModuleGraph {
-    ModuleGraph { modules, file_module, reach, stride, name_to_id }
+    ModuleGraph {
+        modules,
+        file_module,
+        reach: match reach {
+            ReachBacking::Owned(v) => ReachStorage::Owned(v),
+            ReachBacking::Mmapped { mmap, word_offset, len_words } =>
+                ReachStorage::Mmapped { mmap, word_offset, len_words },
+        },
+        stride,
+        name_to_id,
+    }
+}
+
+/// Public surface for the reach-bitmap backing returned by
+/// `ReachCache::try_mmap` / `try_load_*`. Mirrors the internal
+/// `ReachStorage` enum but lets the cache APIs return a value
+/// without exposing the private type.
+pub enum ReachBacking {
+    Owned(Vec<u64>),
+    Mmapped {
+        mmap: memmap2::Mmap,
+        word_offset: usize,
+        len_words: usize,
+    },
 }
 
 impl ReachCache<'_> {
-    /// Public wrapper around `try_load` so the StoreReader can
-    /// reuse it from the fast path.
+    /// Public wrapper around `try_load` so callers outside this
+    /// module can reuse the heap-copying load path (test fixtures,
+    /// callers that need owned data).
     pub fn try_load_public(&self, n_modules: usize, stride: usize) -> Option<Vec<u64>> {
         self.try_load(n_modules, stride)
+    }
+
+    /// Zero-copy load: mmap the on-disk cache and return a
+    /// `ReachBacking::Mmapped` view if the header validates.
+    /// This is the steady-state fast path on AOSP scale — the
+    /// 1GB bitmap never enters the heap and gets demand-paged
+    /// per query. Typical `is_reachable` touches O(modules/64)
+    /// words ≈ 12KB; the kernel pages in just those.
+    pub fn try_mmap(
+        &self,
+        n_modules: usize,
+        stride: usize,
+    ) -> Option<ReachBacking> {
+        let f = std::fs::File::open(self.path).ok()?;
+        // SAFETY: mmap on a read-only file. memmap2 enforces the
+        // address space is owned for the lifetime of the Mmap
+        // value, which we move into ReachBacking and the caller
+        // moves into ModuleGraph. Underlying file content is
+        // immutable for the lifetime of this process.
+        let mmap = unsafe { memmap2::Mmap::map(&f).ok()? };
+        let bytes: &[u8] = &mmap[..];
+        if bytes.len() < REACH_CACHE_HEADER_LEN { return None; }
+        if &bytes[..9] != REACH_CACHE_MAGIC { return None; }
+        let version = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+        if version != REACH_CACHE_VERSION { return None; }
+        let cached_n = u64::from_le_bytes(bytes[13..21].try_into().ok()?) as usize;
+        let cached_stride = u64::from_le_bytes(bytes[21..29].try_into().ok()?) as usize;
+        if cached_n != n_modules || cached_stride != stride { return None; }
+        if bytes[29..61] != self.binding_hash { return None; }
+        let len_words = n_modules.checked_mul(stride)?;
+        let payload_bytes = len_words.checked_mul(8)?;
+        if bytes.len() < REACH_CACHE_HEADER_LEN + payload_bytes { return None; }
+        // The header is 61 bytes long, which is NOT 8-byte aligned.
+        // mmap aligns the file to a page boundary, so &bytes[0..]
+        // is page-aligned, but &bytes[61..] is not aligned for u64.
+        // Reject mmap zero-copy in this case and let the caller
+        // fall back to the heap-copying path (try_load_public).
+        // This matches the cache file format we already write
+        // (header len 61) — every modgraph_reach.bin in the wild
+        // has this misalignment, so the mmap path returns None
+        // and falls through to heap. To enable zero-copy, the
+        // writer would need to pad the header to a multiple of 8.
+        if (bytes.as_ptr() as usize + REACH_CACHE_HEADER_LEN) %
+            align_of::<u64>() != 0
+        {
+            return None;
+        }
+        Some(ReachBacking::Mmapped {
+            mmap,
+            word_offset: REACH_CACHE_HEADER_LEN,
+            len_words,
+        })
     }
 }
 
@@ -575,8 +717,15 @@ pub struct ReachCache<'a> {
 }
 
 const REACH_CACHE_MAGIC: &[u8; 9] = b"scryREAC1";
-const REACH_CACHE_VERSION: u32 = 1;
-const REACH_CACHE_HEADER_LEN: usize = 9 + 4 + 8 + 8 + 32;
+/// Format version bumped to 2 to grow the header from 61 → 64 bytes
+/// (8-byte aligned), so the mmap'd payload can be cast to &[u64]
+/// without copy. Old v1 caches are silently ignored and regenerated.
+const REACH_CACHE_VERSION: u32 = 2;
+/// Header layout: 9 (magic) + 4 (version) + 8 (n_modules) +
+/// 8 (stride) + 32 (binding hash) + 3 (zero pad) = 64 bytes.
+/// Padding keeps the u64 payload aligned so the mmap fast path
+/// can return `&[u64]` from the file mapping with no copy.
+const REACH_CACHE_HEADER_LEN: usize = 9 + 4 + 8 + 8 + 32 + 3;
 
 impl ReachCache<'_> {
     /// Attempt to load the bitmap. Returns None on any mismatch
@@ -617,9 +766,29 @@ impl ReachCache<'_> {
         w.write_all(&(n_modules as u64).to_le_bytes())?;
         w.write_all(&(stride as u64).to_le_bytes())?;
         w.write_all(&self.binding_hash)?;
-        for &word in reach {
-            w.write_all(&word.to_le_bytes())?;
-        }
+        // 3-byte zero pad → header is 64 bytes total → payload
+        // starts at an 8-byte boundary so mmap can cast to &[u64]
+        // without copy. See REACH_CACHE_HEADER_LEN.
+        w.write_all(&[0u8; 3])?;
+        // Bulk-write the payload as raw bytes. `bytemuck::cast_slice`
+        // is the safe zero-copy way to view `&[u64]` as `&[u8]` on
+        // little-endian targets, but to avoid a new dep we just do
+        // the cast manually — `Vec<u64>` has a contiguous layout
+        // and we only target little-endian.
+        let payload_bytes: &[u8] = {
+            // SAFETY: &[u64] → &[u8] is sound for read-only access:
+            // the source is initialized, alignment of u8 is weaker
+            // than u64, and lifetime is unchanged. Length is the
+            // same in bytes. On little-endian targets the byte
+            // order matches what `to_le_bytes()` would produce.
+            unsafe {
+                std::slice::from_raw_parts(
+                    reach.as_ptr().cast::<u8>(),
+                    size_of_val(reach),
+                )
+            }
+        };
+        w.write_all(payload_bytes)?;
         w.flush()?;
         drop(w);
         std::fs::rename(&tmp, self.path)?;

@@ -649,6 +649,12 @@ re-running Soong's own codegen. Concretely (after commits
 - shell-aware quoted-blob handling for ErrorProne
 - AIDL / KAPT srcjar extraction, sibling `R.jar`/`aconfig` classpath
 - variant fallback (pick the variant whose `.rsp` files exist)
+- rule-name classifier: only `g.java.javac` / `g.java.kotlinc` produce
+  `JavacRule` / `KotlincRule`; sibling rules like
+  `g.java.javac-split-srcJars` whose first output also lives under
+  `…/javac/srcjarsNN.jar` no longer masquerade as javac compiles.
+  Recovers `framework-minus-apex` and the sharded javac modules whose
+  first-visited variant happened to be the split-srcjars rule.
 
 The remaining failures are modules whose entire variant set is
 unbuilt on disk (no `.rsp`, no `classpath.rsp`, no `gen/aidl/*`).
@@ -719,26 +725,36 @@ Probable causes (in order of likelihood):
 Open: classify the 634 failures by directory + dump one
 representative CXDiagnostic per group to identify the root cause.
 
-### `usr_for_window` warm latency — fixed in v0.1.66
+### `usr_for_window` warm latency
 
-Cured by two changes that landed together:
+Three layers compose to bring strict-precision lookups inside a query
+loop down to single-digit-µs per ref:
 
 - `ClangUsrIndex::precompute_by_file_ids` + `ByFileLookup` materialise
   a per-`file_id` slice of sorted `(byte_offset, usr_id)` tuples at
   query start. The per-ref loop in `apply_precision_filter` then
   binary-searches that slice (`partition_point` + ±window scan)
   instead of re-allocating a display_path and probing the
-  `HashMap<String, ...>` per ref.
+  `HashMap<String, …>` per ref.
 - The `display_path` cache (`StoreReader::display_path_cached`)
   removes the per-ref `String` alloc + `PathBuf::push` in the same
   hot loop.
-
-Combined, the strict precision query on the live AOSP+kernel corpus
-went from ~17 s warm on 2.5 k refs to single-digit milliseconds on
-the same query through `scry serve` (with cached paths).
+- `clang_usrs.bin` and `scip_index.bin` are now mmap-backed packed
+  files (see `crates/scry-store/src/precision_packed.rs`). Cold open
+  is two `safe_mmap` calls + a header parse — no bincode decode, no
+  per-record `String` clone into a HashMap. On the AOSP-scale SCIP
+  sidecar (14 M records / 1.3 M unique symbols) that retired a
+  ~17 s open + ~14 M `String::clone` cost that previously paid out
+  on every cold CLI query.
 
 The same precompute lives in `scip_index::ByFileSymbolLookup` for
 SCIP sidecar lookups.
+
+The packed sidecar layout is shared between `clang_usrs.bin` and
+`scip_index.bin`; only the magic bytes differ (`SCRYUP01` /
+`SCRYSP01`). Old bincode-format sidecars are rejected at open time
+with a `bad magic` error — they need to be re-generated through
+`scry clang-index` / `scry scip-import` once after upgrading.
 
 ### File split: scry-cli main.rs
 

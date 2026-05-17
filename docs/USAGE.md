@@ -175,15 +175,51 @@ $ scry callers transact --lang Java --limit 3
 [scry] cmd=callers q="transact" hits=1524 shown=3 files=1009166 elapsed=84ms
 ```
 
-`→ def:fb80a66b3db3efd5` is the Layer 2 resolution — every Java
-caller of `transact` resolves to the same `android.os.Binder.transact`
-definition (id `fb80a66b3db3efd5`). The C++ callers resolve to a
-different `def:` id, the C++ Binder. Pass `--json` to get the raw
-`resolved_to` u64.
+`→ libs/binder/Binder.cpp:411 [android::BBinder]` (v0.1.30+) is the
+Layer 2 resolution — the resolver picked that specific def. Without
+`--def-in`/`--strict` (see below) this is permissive: unresolved refs
+show no `→` annotation. Pass `--json` to get the raw `resolved_to`
+u64 instead of the human-readable file:line.
 
 `scry ref` is the generic version that includes all ref kinds (call,
 ctor, type-use, field-access, import, inherit). `callers` is the
 common-case shorthand for `ref --kind call`.
+
+### Cutting through polymorphism (v0.1.26+)
+
+Polymorphic names like `close`, `onCreate`, `transact` have
+thousands of distinct defs in a big corpus. Three flags help
+narrow:
+
+```sh
+# --def-in PATH — keep only refs resolving to a def in PATH
+$ scry callers transact --def-in libs/binder/Binder.cpp
+# returns the 166 callers whose resolved_to lands at BBinder.transact
+# (plus the over-included permissive bucket if --strict isn't set)
+
+# --strict — drop refs that resolved to anything else, including
+# unresolved. Trades recall for precision.
+$ scry callers transact --def-in libs/binder/Binder.cpp --strict
+# returns only the 166 confidently-resolved hits, no over-include
+
+# --format by-def — histogram of which def gets called most
+$ scry callers transact --strict --format by-def --limit 8
+     166  → libs/binder/Binder.cpp:411 [android::BBinder]
+      14  → securityPatch/CVE-2016-2412/poc.cpp:77
+       7  → libs/binder/Binder.cpp:114 [android::hardware::BHwBinder]
+       7  → libs/binder/BpBinder.cpp:400 [android::BpBinder]
+       ...
+     219 refs in 19 groups (showing 8)
+```
+
+`--format by-def` composes with `--json` (v0.1.37+) for
+programmatic consumers — emits a JSON array of
+`{count, def: {path, line, col, scope, kind, id}}` entries.
+
+These three flags also work on `scry ref`, `scry callgraph`
+(root-level only), and `scry impact` (callers leg only), and
+are exposed via the same args on the JSON-RPC + MCP `ref` /
+`callers` / `callgraph` / `impact` tools.
 
 ### `--format count`
 
@@ -534,18 +570,19 @@ symbols:      22790955
 
 ```sh
 $ scry stats
-scry-version: 0.0.1
-indexed-at:   2026-05-16T04:51:51Z
+scry-version: 0.1.36
+indexed-at:   2026-05-17T02:26:57Z
 roots:        2
   - /home/zim/dev/aosp (Aosp)
   - /mnt/agent/dev/linux (Linux)
-files-total:  1009166
-files-parsed: 1009166
+files-total:  1032084
+files-parsed: 1032084
 files-failed: 0
 bytes-total:  70.4 GB
-symbols:      22790955
-refs:         62772968
-elapsed-ms:   796238
+symbols:      31496680
+refs:         63318468
+refs-resolved: 31426932 (49.6%)
+elapsed-ms:   690040
 
 by language:
      7607137  Header
@@ -561,6 +598,13 @@ by kind:
      6543210  method
      ...
 ```
+
+The `refs-resolved` line (v0.1.41+) shows what fraction of refs
+the Layer 2 resolutions sidecar attributes to a specific def.
+`<no sidecar — run scry build-resolutions to enable>` appears
+when the sidecar hasn't been built yet. Higher is better — it's
+the lever the `--def-in` / `--strict` flags operate on (see the
+ref/callers section above).
 
 ### Machine-readable: `scry stats --json`
 

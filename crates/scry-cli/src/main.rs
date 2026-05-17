@@ -226,6 +226,15 @@ enum Cmd {
         /// strongest narrowing.
         #[arg(long, value_name = "PATH")]
         def_in: Option<String>,
+        /// Strict mode: drop refs whose Layer 2 resolution didn't
+        /// land on a specific def (resolved_to=None). With --def-in
+        /// PATH, also drops refs resolving to a def outside PATH —
+        /// no permissive over-include. Useful when you want HIGH
+        /// PRECISION at the cost of recall: only refs the resolver
+        /// can confidently attribute survive. Without --def-in,
+        /// just shows refs that resolved to ANY specific def.
+        #[arg(long)]
+        strict: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -277,6 +286,10 @@ enum Cmd {
         /// --def-in` for the full description.
         #[arg(long, value_name = "PATH")]
         def_in: Option<String>,
+        /// Strict mode: drop callers whose Layer 2 resolution didn't
+        /// land on a specific def. See `scry ref --strict`.
+        #[arg(long)]
+        strict: bool,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -1154,18 +1167,18 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in } => {
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, reachable, clang_precise, scip_precise);
-            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in)
+            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, def_in, format } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict, format } => {
             if precise {
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, reachable, clang_precise, scip_precise);
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in)
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -2898,6 +2911,7 @@ fn cmd_ref(
     scip_precise: bool,
     scope: Option<String>,
     def_in: Option<String>,
+    strict: bool,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2968,19 +2982,43 @@ fn cmd_ref(
             let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
                 match rr.resolved_to {
                     Some(id) => target_ids.contains(&id),
-                    None => true, // permissive: keep unresolved
+                    // Strict mode (v0.1.34): drop unresolved instead of
+                    // permissively keeping them. Trades recall for
+                    // precision — only refs the resolver could confidently
+                    // attribute to PATH survive.
+                    None => !strict,
                 }
             }).collect();
             let resolved_kept = kept.iter().filter(|rr| rr.resolved_to.is_some()).count();
             let unresolved = kept.len() - resolved_kept;
-            eprintln!(
-                "[scry] --def-in {def_path:?}: {} → {} refs ({} resolved to a \
-                 def in scope, {} unresolved-but-kept; run `scry build-resolutions` \
-                 for tighter narrowing)",
-                before, kept.len(), resolved_kept, unresolved,
-            );
+            if strict {
+                eprintln!(
+                    "[scry] --def-in {def_path:?} --strict: {} → {} refs \
+                     ({} resolved to a def in scope; unresolved dropped)",
+                    before, kept.len(), resolved_kept,
+                );
+            } else {
+                eprintln!(
+                    "[scry] --def-in {def_path:?}: {} → {} refs ({} resolved to a \
+                     def in scope, {} unresolved-but-kept; pass --strict to drop \
+                     unresolved, or run `scry build-resolutions` for tighter narrowing)",
+                    before, kept.len(), resolved_kept, unresolved,
+                );
+            }
             kept
         }
+    } else if strict {
+        // --strict without --def-in: drop refs the resolver couldn't
+        // attribute to any specific def. Useful for "show me only the
+        // confidently-resolved call sites of X".
+        let before = filtered.len();
+        let kept: Vec<RefRecord> = filtered.into_iter()
+            .filter(|rr| rr.resolved_to.is_some()).collect();
+        eprintln!(
+            "[scry] --strict: {} → {} refs (unresolved dropped)",
+            before, kept.len(),
+        );
+        kept
     } else {
         filtered
     };
@@ -7248,6 +7286,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
                 "def_in": {"type": "string",
                     "description": "Substring of the def-site file path. Keeps only refs whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` disambiguates `close` when many unrelated classes also define `close`. Refs whose resolved_to is None pass through (over-include rather than silently drop). No-op without a build-resolutions sidecar."},
+                "strict": {"type": "boolean", "default": false,
+                    "description": "Drop refs whose Layer 2 resolution didn't land on a specific def (resolved_to=None). With `def_in`, also drops the permissive over-include — only refs the resolver confidently attributed to the target survive. Without `def_in`, shows only refs that resolved to some specific def."},
             })),
         ),
         tool(
@@ -7274,6 +7314,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
                 "def_in": {"type": "string",
                     "description": "Substring of the def-site file path. Keeps only callers whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` cuts through cases where many classes share a method name like `close`. Callers whose resolved_to is None pass through. No-op without a build-resolutions sidecar."},
+                "strict": {"type": "boolean", "default": false,
+                    "description": "Drop callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include — only callers the resolver confidently attributed survive. Trades recall for precision."},
             })),
         ),
         tool(
@@ -8127,7 +8169,8 @@ fn serve_one_request<W: std::io::Write>(
                 resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope, def_in)
+            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         "callers" => {
             let no_precise = args.get("no_precise")
@@ -8142,7 +8185,8 @@ fn serve_one_request<W: std::io::Write>(
                 resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope, def_in)
+            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         "subclasses" | "implementations" => {
             let depth = args.get("depth")
@@ -8410,6 +8454,7 @@ fn serve_ref(
     scip_precise: bool,
     scope: Option<&str>,
     def_in: Option<&str>,
+    strict: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     // --def-in PATH: precompute the target def id set. Empty target
@@ -8475,15 +8520,22 @@ fn serve_ref(
             if !rr.scope_path.iter().any(|seg| seg == sc) { continue; }
         }
         // --def-in filter: keep refs whose resolved_to lands in the
-        // target def set (or resolved_to=None, kept permissively).
-        // Empty target set ⇒ no narrowing.
+        // target def set. Permissive mode keeps unresolved (None) too;
+        // --strict (v0.1.34) drops them.
+        // Empty target set ⇒ no narrowing (target def list was empty).
         if let Some(tids) = def_target_ids.as_ref() {
             if !tids.is_empty() {
                 match rr.resolved_to {
                     Some(id) if !tids.contains(&id) => continue,
+                    None if strict => continue,
                     _ => {}
                 }
             }
+        }
+        // --strict without --def-in: drop unresolved refs entirely
+        // (only keep refs the resolver could attribute to some def).
+        if strict && def_target_ids.is_none() && rr.resolved_to.is_none() {
+            continue;
         }
         // Reachability filter: keep only refs whose owning module can
         // reach at least one module that defines `name`.

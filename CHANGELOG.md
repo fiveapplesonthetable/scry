@@ -7,6 +7,36 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.34] — 2026-05-17
+
+`--strict` flag on `scry ref` / `scry callers` (and matching
+`strict: bool` on the JSON-RPC + MCP tools).
+
+**Behavior:**
+- Drops refs whose Layer 2 resolution didn't land on a specific
+  def (`resolved_to=None`).
+- With `--def-in PATH`, also drops the permissive over-include —
+  ONLY refs the resolver confidently attributed to PATH survive.
+- Without `--def-in`, shows just the refs that resolved to ANY
+  specific def.
+
+**Use case:** when you want HIGH PRECISION at the cost of recall.
+The default `--def-in` over-includes unresolved refs (better recall;
+the resolver might not have receiver-type info to disambiguate).
+`--strict` flips the trade-off — only confident hits.
+
+**Live AOSP+Linux examples:**
+
+| Query | Hits | Notes |
+|---|---|---|
+| `callers startActivity` (no flags) | 3585 | every method named startActivity, anywhere |
+| `callers startActivity --def-in Activity.java` | 3323 | permissive: 151 resolved + 3172 unresolved-but-kept |
+| `callers startActivity --def-in Activity.java --strict` | **151** | strict: only confident hits |
+| `callers startActivity --strict` | **429** | only the calls that resolved to *some* def |
+
+CLI diagnostic line reports the strict→kept reduction so users
+see immediately what the flag filtered out.
+
 ## [0.1.33] — 2026-05-17
 
 Refactor: precompute transitive ancestor sets in pass 2.

@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod java_indexer;
+pub mod kotlin_indexer;
 pub mod soong;
 
 /// Source language of a compilation unit. Determines which

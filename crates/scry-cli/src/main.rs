@@ -920,18 +920,20 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// `scry build-java-scip` — Soong-native Java SCIP pipeline.
+    /// `scry build-jvm-scip` — Soong-native Java + Kotlin SCIP pipeline.
     ///
-    /// Walks AOSP's Soong intermediates, replays each javac invocation
-    /// with the SemanticDB compiler plugin attached, merges the
-    /// per-source `.semanticdb` files into one SCIP index via
-    /// `scip-java index-semanticdb`, and imports the merged SCIP
-    /// into the scry sidecar at `<index>/scip_index.bin`.
+    /// Walks AOSP's Soong intermediates and replays each javac /
+    /// kotlinc invocation with the appropriate SemanticDB compiler
+    /// plugin attached. Both languages emit per-source `.semanticdb`
+    /// files into a shared targetroot; a single
+    /// `scip-java index-semanticdb` merge pass produces one SCIP
+    /// index that imports into the scry sidecar at
+    /// `<index>/scip_index.bin`.
     ///
     /// This is the bridge that makes strict-precise queries work on
     /// AOSP Java/Kotlin code without depending on Gradle / Maven —
     /// neither of which Soong uses.
-    BuildJavaScip {
+    BuildJvmScip {
         /// AOSP source root (the parent of `out/soong/`).
         #[arg(long, value_name = "PATH")]
         source_root: PathBuf,
@@ -954,6 +956,15 @@ enum Cmd {
         /// when not set.
         #[arg(long, value_name = "PATH")]
         semanticdb_javac_jar: Option<PathBuf>,
+        /// Override the kotlinc launcher. Must load the embeddable
+        /// jar (see install_indexers.sh's `kotlinc-embeddable`).
+        #[arg(long, value_name = "PATH")]
+        kotlinc: Option<PathBuf>,
+        /// Override the path to the semanticdb-kotlinc plugin jar.
+        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
+        /// when not set.
+        #[arg(long, value_name = "PATH")]
+        semanticdb_kotlinc_jar: Option<PathBuf>,
         /// Where the per-compilation .semanticdb shards land.
         /// Defaults to `$TMPDIR/scry-semanticdb`.
         #[arg(long, value_name = "PATH")]
@@ -968,6 +979,12 @@ enum Cmd {
         /// before running the full AOSP set.
         #[arg(long, value_name = "N")]
         max_compilations: Option<usize>,
+        /// Skip Kotlin compilations.
+        #[arg(long)]
+        skip_kotlin: bool,
+        /// Skip Java compilations.
+        #[arg(long)]
+        skip_java: bool,
     },
     /// Import a SCIP index (https://github.com/sourcegraph/scip)
     /// produced by scip-java / scip-kotlin / gopls / rust-analyzer /
@@ -1376,11 +1393,14 @@ fn main() -> Result<()> {
             precision_subcmds::cmd_clang_index(compile_commands, index, root, workers, max_file_bytes),
         Cmd::ClangStats { index } => precision_subcmds::cmd_clang_stats(index),
         Cmd::ClangLookup { index, path, offset } => precision_subcmds::cmd_clang_lookup(index, &path, offset),
-        Cmd::BuildJavaScip { source_root, soong_build_dir, index, javac, scip_java,
-                             semanticdb_javac_jar, targetroot, only_module,
-                             max_compilations } => bridge_subcmds::cmd_build_java_scip(
+        Cmd::BuildJvmScip { source_root, soong_build_dir, index, javac, scip_java,
+                            semanticdb_javac_jar, kotlinc, semanticdb_kotlinc_jar,
+                            targetroot, only_module, max_compilations,
+                            skip_kotlin, skip_java } => bridge_subcmds::cmd_build_jvm_scip(
             source_root, soong_build_dir, index, javac, scip_java,
-            semanticdb_javac_jar, targetroot, only_module, max_compilations,
+            semanticdb_javac_jar, kotlinc, semanticdb_kotlinc_jar,
+            targetroot, only_module, max_compilations,
+            skip_kotlin, skip_java,
         ),
         Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),

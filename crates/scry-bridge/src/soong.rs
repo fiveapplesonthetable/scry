@@ -67,23 +67,29 @@ impl BuildSystem for Soong {
         // Parallelism here is mostly I/O-bound but each shard does
         // string-parsing work too — measurable speedup at AOSP scale
         // (~10 shards, ~150 MiB total, ~5 s wall single-threaded).
-        let per_shard: Vec<Vec<JavacRule>> = ninjas
+        let per_shard: Vec<(Vec<JavacRule>, Vec<KotlincRule>)> = ninjas
             .par_iter()
-            .map(|p| extract_javac_rules(p))
+            .map(|p| extract_jvm_rules(p))
             .collect::<Result<Vec<_>>>()?;
-        let mut rules: Vec<JavacRule> = per_shard.into_iter().flatten().collect();
+        let mut javac_rules: Vec<JavacRule> = per_shard.iter()
+            .flat_map(|(j, _)| j.iter().cloned()).collect();
+        let mut kotlinc_rules: Vec<KotlincRule> = per_shard.into_iter()
+            .flat_map(|(_, k)| k.into_iter()).collect();
 
-        // Soong sometimes emits the same `javac/<mod>.jar` rule across
-        // multiple shards (variant duplication). Keep the first; the
-        // bindings are identical when this happens.
-        rules.sort_by(|a, b| a.output.cmp(&b.output));
-        rules.dedup_by(|a, b| a.output == b.output);
+        // Soong sometimes emits the same `<rule>/<mod>.jar` across
+        // multiple shards (variant duplication). Keep the first;
+        // the bindings are identical when this happens.
+        javac_rules.sort_by(|a, b| a.output.cmp(&b.output));
+        javac_rules.dedup_by(|a, b| a.output == b.output);
+        kotlinc_rules.sort_by(|a, b| a.output.cmp(&b.output));
+        kotlinc_rules.dedup_by(|a, b| a.output == b.output);
 
         // Hydrate each rule's source list from its sibling
-        // `<output>.rsp` file (which Soong always writes alongside).
-        // Sequential here — each file is small and the I/O parallelism
-        // we already paid for above dominates.
-        let compilations: Vec<Compilation> = rules
+        // `<output>.rsp` file (which Soong always writes alongside)
+        // and (for kotlinc) the classpath.rsp file the binding
+        // pointed at. Sequential here — each file is small and the
+        // I/O parallelism we already paid for above dominates.
+        let mut compilations: Vec<Compilation> = javac_rules
             .into_par_iter()
             .filter_map(|r| match r.into_compilation(&self.source_root) {
                 Ok(c) => Some(c),
@@ -93,6 +99,15 @@ impl BuildSystem for Soong {
                 }
             })
             .collect();
+        compilations.par_extend(kotlinc_rules.into_par_iter().filter_map(|r| {
+            match r.into_compilation(&self.source_root) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("[scry-bridge] soong: skip kotlinc rule: {e:#}");
+                    None
+                }
+            }
+        }));
         Ok(compilations)
     }
 }
@@ -109,6 +124,20 @@ struct JavacRule {
     /// can pull out exactly the ones they care about (`classpath`,
     /// `bootClasspath`, `javacFlags`, etc.) without paying for parses
     /// we don't use.
+    bindings: HashMap<String, String>,
+}
+
+/// A kotlinc rule extracted from a single ninja shard. Same shape
+/// as [`JavacRule`] but the bindings differ: kotlinc's `classpath`
+/// is a path to a sibling `classpath.rsp` file (one space-separated
+/// jar list inside) rather than an inline `-classpath J1:J2`
+/// string. The source `.jar.rsp` may contain a mix of `.kt` and
+/// `.java` files since kotlinc compiles both.
+#[derive(Debug, Clone)]
+struct KotlincRule {
+    /// Output jar path, relative to the build dir (e.g.
+    /// `out/soong/.intermediates/<mod>/<variant>/kotlin/<mod>.jar`).
+    output: String,
     bindings: HashMap<String, String>,
 }
 
@@ -164,6 +193,67 @@ impl JavacRule {
     }
 }
 
+impl KotlincRule {
+    /// Convert the parsed kotlinc rule to a [`Compilation`]. The
+    /// classpath in Soong's kotlinc rule is indirect: the binding
+    /// names a `.../kotlinc/classpath.rsp` file whose body is the
+    /// space-separated jar list. We resolve it.
+    fn into_compilation(self, source_root: &Path) -> Result<Compilation> {
+        let rsp_path = source_root.join(format!("{}.rsp", self.output));
+        let rsp_contents = std::fs::read_to_string(&rsp_path)
+            .with_context(|| format!("read sources rsp {}", rsp_path.display()))?;
+        let sources: Vec<String> = rsp_contents
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if sources.is_empty() {
+            anyhow::bail!("rsp file {} contained no sources", rsp_path.display());
+        }
+
+        // Classpath binding: a path to the kotlinc classpath.rsp file.
+        let classpath = if let Some(cp_rsp_rel) = self.bindings.get("classpath") {
+            let cp_rsp = source_root.join(cp_rsp_rel.trim());
+            match std::fs::read_to_string(&cp_rsp) {
+                Ok(body) => {
+                    let jars: Vec<String> = body
+                        .split_whitespace()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| source_root.join(s).display().to_string())
+                        .collect();
+                    if jars.is_empty() {
+                        Vec::new()
+                    } else {
+                        // kotlinc accepts `-classpath J1:J2:...`
+                        vec!["-classpath".to_string(), jars.join(":")]
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        // kotlinc target version — bind from Soong's `kotlinJvmTarget`.
+        let java_version = self.bindings.get("kotlinJvmTarget").cloned();
+
+        let language = Language::Kotlin;
+        let module = module_name_from_kotlin_output(&self.output);
+        Ok(Compilation {
+            module,
+            language,
+            source_root: source_root.to_path_buf(),
+            sources,
+            classpath,
+            bootclasspath: Vec::new(),
+            defines: Vec::new(),
+            java_version,
+            extra_args: self.bindings.get("kotlincFlags")
+                .map(|s| s.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default(),
+        })
+    }
+}
+
 /// Discover all `build*.ninja` shards inside the given build dir.
 /// Soong emits ten or so per target with names like
 /// `build.aosp_arm64.0.ninja`. We deliberately skip the `.ninja.d`
@@ -186,68 +276,78 @@ fn discover_ninja_shards(build_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Stream one ninja shard and extract every `javac/<mod>.jar` rule's
-/// bindings. The parser is line-oriented: a `build` header starts a
-/// rule, subsequent indented lines bind variables to it, and any
-/// non-indented line ends the rule. Continuations (lines ending in
-/// `$`) are joined back into the previous line.
-fn extract_javac_rules(path: &Path) -> Result<Vec<JavacRule>> {
+/// Classify a build-rule output path as a JVM compilation we care
+/// about. Yields the Kind so the caller can route it to the right
+/// rule type without re-matching the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JvmRuleKind {
+    Javac,
+    Kotlinc,
+}
+
+fn classify_jvm_target(target: &str) -> Option<JvmRuleKind> {
+    if !target.ends_with(".jar") {
+        return None;
+    }
+    if target.contains("/javac/") && !target.contains("javac-header") {
+        return Some(JvmRuleKind::Javac);
+    }
+    if target.contains("/kotlin/") && !target.contains("kotlin_headers")
+        && !target.contains("kotlin-jar-snapshot")
+    {
+        return Some(JvmRuleKind::Kotlinc);
+    }
+    None
+}
+
+/// Stream one ninja shard and extract every JVM compilation rule's
+/// bindings — both `javac/<mod>.jar` (Java) and `kotlin/<mod>.jar`
+/// (Kotlin). Same line-oriented parser as before; the only addition
+/// is a per-rule classifier that routes to the right output bucket.
+fn extract_jvm_rules(path: &Path) -> Result<(Vec<JavacRule>, Vec<KotlincRule>)> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("read ninja shard {}", path.display()))?;
-    let mut out: Vec<JavacRule> = Vec::new();
-    let mut current: Option<JavacRule> = None;
-    // Pre-join `$\n` continuations so each logical line is one record.
-    // This is cheaper than line-by-line continuation tracking and the
-    // ninja files are already in memory.
+    let mut javac_out: Vec<JavacRule> = Vec::new();
+    let mut kotlin_out: Vec<KotlincRule> = Vec::new();
+    let mut current: Option<(String, HashMap<String, String>, Option<JvmRuleKind>)> = None;
+    let flush = |cur: Option<(String, HashMap<String, String>, Option<JvmRuleKind>)>,
+                 jout: &mut Vec<JavacRule>,
+                 kout: &mut Vec<KotlincRule>| {
+        if let Some((output, bindings, kind)) = cur {
+            match kind {
+                Some(JvmRuleKind::Javac) => jout.push(JavacRule { output, bindings }),
+                Some(JvmRuleKind::Kotlinc) => kout.push(KotlincRule { output, bindings }),
+                None => {}
+            }
+        }
+    };
+
     let joined = contents.replace("$\n", "");
     for raw_line in joined.lines() {
         if raw_line.is_empty() {
-            // Blank line ends the current rule.
-            if let Some(r) = current.take() {
-                if is_javac_target(&r.output) { out.push(r); }
-            }
+            flush(current.take(), &mut javac_out, &mut kotlin_out);
             continue;
         }
         if raw_line.starts_with("build ") {
-            // Flush the previous rule first.
-            if let Some(r) = current.take() {
-                if is_javac_target(&r.output) { out.push(r); }
-            }
+            flush(current.take(), &mut javac_out, &mut kotlin_out);
             if let Some(output) = parse_build_header_output(raw_line) {
-                current = Some(JavacRule {
-                    output,
-                    bindings: HashMap::new(),
-                });
+                let kind = classify_jvm_target(&output);
+                current = Some((output, HashMap::new(), kind));
             }
         } else if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
-            // Binding line — indented `key = value`.
-            if let Some(rule) = current.as_mut() {
+            if let Some((_, bindings, _)) = current.as_mut() {
                 if let Some((k, v)) = parse_binding(raw_line) {
-                    rule.bindings.insert(k.to_string(), v.to_string());
+                    bindings.insert(k.to_string(), v.to_string());
                 }
             }
         } else {
-            // Non-indented, non-`build` line — ends the current rule.
-            if let Some(r) = current.take() {
-                if is_javac_target(&r.output) { out.push(r); }
-            }
+            flush(current.take(), &mut javac_out, &mut kotlin_out);
         }
     }
-    if let Some(r) = current.take() {
-        if is_javac_target(&r.output) { out.push(r); }
-    }
-    Ok(out)
+    flush(current.take(), &mut javac_out, &mut kotlin_out);
+    Ok((javac_out, kotlin_out))
 }
 
-/// Return true when `target` looks like a javac compilation output —
-/// i.e. matches `.../javac/<module>.jar`. We deliberately exclude
-/// `javac-header` and `turbine` outputs: those are signature-only
-/// jars that don't compile method bodies, so the symbol IDs they
-/// emit would be incomplete.
-fn is_javac_target(target: &str) -> bool {
-    target.contains("/javac/") && target.ends_with(".jar")
-        && !target.contains("javac-header")
-}
 
 /// Parse the first output path off a `build out1 out2: rule ...`
 /// header. Soong's javac rules emit only one output, so we return
@@ -335,20 +435,28 @@ fn rewrite_path_list_to_absolute(list: &str, source_root: &Path) -> String {
 /// `out/soong/.intermediates/libcore/core-libart/android_common/javac/core-libart.jar`
 /// becomes `libcore/core-libart`. Used for grouping + diagnostics.
 fn module_name_from_output(output: &str) -> String {
-    // Strip the `out/soong/.intermediates/` prefix and the trailing
-    // `<variant>/javac/<mod>.jar` suffix.
+    module_name_for_marker(output, "/javac/")
+}
+
+/// Same as [`module_name_from_output`] but for kotlinc outputs that
+/// use `/kotlin/` instead of `/javac/`. Kept symmetric so the two
+/// rule types produce comparable module slugs (a Kotlin module's
+/// kotlinc compilation gets the same slug a hypothetical javac
+/// compilation of the same module would).
+fn module_name_from_kotlin_output(output: &str) -> String {
+    module_name_for_marker(output, "/kotlin/")
+}
+
+fn module_name_for_marker(output: &str, marker: &str) -> String {
     let stripped = output
         .strip_prefix("out/soong/.intermediates/")
         .unwrap_or(output);
-    // Find the `/javac/` boundary — everything before the
-    // <variant>/javac suffix is the module path.
-    if let Some(javac_idx) = stripped.rfind("/javac/") {
-        // Trim the variant segment too (last component before /javac/).
-        let before_javac = &stripped[..javac_idx];
-        if let Some(slash) = before_javac.rfind('/') {
-            return before_javac[..slash].to_string();
+    if let Some(idx) = stripped.rfind(marker) {
+        let before = &stripped[..idx];
+        if let Some(slash) = before.rfind('/') {
+            return before[..slash].to_string();
         }
-        return before_javac.to_string();
+        return before.to_string();
     }
     stripped.to_string()
 }
@@ -375,11 +483,14 @@ mod tests {
     }
 
     #[test]
-    fn is_javac_target_filters_header_and_turbine_outputs() {
-        assert!(is_javac_target("x/javac/foo.jar"));
-        assert!(!is_javac_target("x/javac-header/foo.jar"));
-        assert!(!is_javac_target("x/javac/foo.txt"));
-        assert!(!is_javac_target("x/turbine/foo.jar"));
+    fn classify_jvm_target_routes_javac_kotlin_skips_headers() {
+        assert_eq!(classify_jvm_target("x/javac/foo.jar"), Some(JvmRuleKind::Javac));
+        assert_eq!(classify_jvm_target("x/kotlin/foo.jar"), Some(JvmRuleKind::Kotlinc));
+        assert!(classify_jvm_target("x/javac-header/foo.jar").is_none());
+        assert!(classify_jvm_target("x/kotlin_headers/foo.jar").is_none());
+        assert!(classify_jvm_target("x/kotlin-jar-snapshot/foo.jar").is_none());
+        assert!(classify_jvm_target("x/turbine/foo.jar").is_none());
+        assert!(classify_jvm_target("x/javac/foo.txt").is_none());
     }
 
     #[test]
@@ -425,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_javac_rules_finds_javac_skips_others() {
+    fn extract_jvm_rules_splits_javac_and_kotlinc_skips_headers() {
         let tmp = std::env::temp_dir().join(format!(
             "scry-bridge-soong-test-{}",
             std::process::id()
@@ -435,6 +546,8 @@ mod tests {
         std::fs::write(&ninja, "\
 rule javac
     command = javac
+rule kotlinc
+    command = kotlinc
 
 build out/soong/.intermediates/libcore/core-libart/android_common/javac/core-libart.jar: javac in.java
     classpath = -classpath a.jar:b.jar
@@ -444,14 +557,26 @@ build out/soong/.intermediates/libcore/core-libart/android_common/javac/core-lib
 build out/soong/.intermediates/libcore/core-libart/android_common/javac-header/core-libart.jar: turbine in.java
     classpath = -classpath should-not-appear.jar
 
+build out/soong/.intermediates/myapp/mod/android_common/kotlin/mod.jar: kotlinc in.kt
+    classpath = out/soong/.intermediates/myapp/mod/android_common/kotlinc/classpath.rsp
+    kotlinJvmTarget = 21
+    kotlincFlags = -Xfriend-paths=foo
+
+build out/soong/.intermediates/myapp/mod/android_common/kotlin_headers/mod.jar: kotlinc-header in.kt
+    classpath = out/should-not-appear/classpath.rsp
+
 ").unwrap();
-        let rules = extract_javac_rules(&ninja).unwrap();
-        assert_eq!(rules.len(), 1, "header-only rule should be skipped");
-        let r = &rules[0];
-        assert!(r.output.ends_with("/javac/core-libart.jar"));
-        assert_eq!(r.bindings["classpath"], "-classpath a.jar:b.jar");
-        assert_eq!(r.bindings["bootClasspath"], "-bootclasspath boot.jar");
-        assert_eq!(r.bindings["javacFlags"], "-Xlint:all");
+        let (javac, kotlinc) = extract_jvm_rules(&ninja).unwrap();
+        assert_eq!(javac.len(), 1, "javac-header should be skipped");
+        assert_eq!(kotlinc.len(), 1, "kotlin_headers should be skipped");
+        let j = &javac[0];
+        assert!(j.output.ends_with("/javac/core-libart.jar"));
+        assert_eq!(j.bindings["classpath"], "-classpath a.jar:b.jar");
+        assert_eq!(j.bindings["bootClasspath"], "-bootclasspath boot.jar");
+        let k = &kotlinc[0];
+        assert!(k.output.ends_with("/kotlin/mod.jar"));
+        assert_eq!(k.bindings["kotlinJvmTarget"], "21");
+        assert_eq!(k.bindings["kotlincFlags"], "-Xfriend-paths=foo");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -3174,3 +3174,83 @@ class Caller {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.62 — receiver-aware Java resolver narrowing (Kythe-gap arc
+/// slice 3/3). Two classes both define `bar()`. A static-receiver
+/// call `Foo.bar()` in a third file must resolve to Foo's `bar`,
+/// NOT Bar's bar — the receiver provides unambiguous evidence.
+/// Without v0.1.62 the heuristic resolver returned 0 (ambiguous).
+#[test]
+fn receiver_aware_narrowing_pins_static_call() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-recv-narrow-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+    // Two classes, both define a method named `bar`. Without
+    // receiver info the resolver can't pick one.
+    std::fs::write(src.join("Foo.java"), r#"package p;
+public class Foo {
+    public static void bar() {}
+}
+"#).unwrap();
+    std::fs::write(src.join("Bar.java"), r#"package p;
+public class Bar {
+    public static void bar() {}
+}
+"#).unwrap();
+    // Caller invokes `Foo.bar()` — static-receiver evidence pins
+    // the target to Foo's bar.
+    std::fs::write(src.join("Caller.java"), r#"package p;
+public class Caller {
+    public void run() {
+        Foo.bar();
+    }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(scry_bin())
+        .args(["build-resolutions", "--index"]).arg(&idx)
+        .output().expect("spawn build-resolutions");
+    assert!(out.status.success(),
+        "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
+    // Confirm pass 2.5 ran (the "call→receiver map" log line).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("call→receiver map") || stderr.contains("call->receiver map")
+            || stderr.contains("call\u{2192}receiver map"),
+        "build-resolutions should report the pass-2.5 receiver-map line; got: {stderr}");
+
+    // `scry callers bar --format by-def` shows WHICH def the bar
+    // call resolves to. With receiver-aware narrowing, it MUST be
+    // Foo's bar (in Foo.java), not Bar's.
+    let out = Command::new(scry_bin())
+        .args(["callers", "bar", "--index"]).arg(&idx)
+        .args(["--format", "by-def", "--json", "--limit", "20"])
+        .output().expect("spawn callers by-def");
+    assert!(out.status.success(),
+        "callers by-def failed: {}", String::from_utf8_lossy(&out.stderr));
+    let groups: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    // Find the group that's NOT the unresolved bucket and has count > 0.
+    let resolved_groups: Vec<&serde_json::Value> = groups.iter()
+        .filter(|g| g["def"].is_object()).collect();
+    assert!(!resolved_groups.is_empty(),
+        "expected at least one resolved group; got {groups:?}");
+    // Of the resolved groups, find the one whose def lives in Foo.java.
+    let foo_group = resolved_groups.iter()
+        .find(|g| g["def"]["path"].as_str().is_some_and(|p| p.ends_with("/Foo.java")));
+    assert!(foo_group.is_some(),
+        "receiver-aware narrowing should pin the Foo.bar() call to Foo's bar; \
+         resolved_groups={resolved_groups:?}");
+    // And that group should have count >= 1.
+    let foo_count = foo_group.unwrap()["count"].as_u64().unwrap_or(0);
+    assert!(foo_count >= 1,
+        "Foo.bar should have at least one resolved caller; got count={foo_count}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

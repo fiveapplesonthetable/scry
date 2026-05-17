@@ -1055,6 +1055,41 @@ enum Cmd {
         /// Per-target `.scip` files (polyglot only).
         #[arg(long, value_name = "PATH")]
         scip_out_dir: Option<PathBuf>,
+        /// Override the javac binary used by the JVM pipeline (Soong only).
+        /// AOSP ships its own at `prebuilts/jdk/jdk21/linux-x86/bin/javac` —
+        /// pass that for byte-exact reproducibility with the build.
+        #[arg(long, value_name = "PATH")]
+        javac: Option<PathBuf>,
+        /// Override the `scip-java` binary used in the JVM merge step.
+        #[arg(long, value_name = "PATH")]
+        scip_java: Option<PathBuf>,
+        /// Override the path to the semanticdb-javac plugin jar.
+        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
+        /// when not set.
+        #[arg(long, value_name = "PATH")]
+        semanticdb_javac_jar: Option<PathBuf>,
+        /// Override the kotlinc launcher (Soong only). Must load the
+        /// embeddable jar — see install_indexers.sh's `kotlinc-embeddable`.
+        #[arg(long, value_name = "PATH")]
+        kotlinc: Option<PathBuf>,
+        /// Override the path to the semanticdb-kotlinc plugin jar.
+        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
+        /// when not set.
+        #[arg(long, value_name = "PATH")]
+        semanticdb_kotlinc_jar: Option<PathBuf>,
+        /// Filter Soong compilations by substring of the module name.
+        /// Useful for incremental testing.
+        #[arg(long, value_name = "SUBSTR")]
+        only_module: Option<String>,
+        /// Cap the number of Soong compilations processed.
+        #[arg(long, value_name = "N")]
+        max_compilations: Option<usize>,
+        /// Skip Kotlin compilations on the Soong path.
+        #[arg(long)]
+        skip_kotlin: bool,
+        /// Skip Java compilations on the Soong path.
+        #[arg(long)]
+        skip_java: bool,
         /// Override the rust-analyzer binary used by the polyglot pass.
         #[arg(long, value_name = "PATH")]
         rust_analyzer: Option<PathBuf>,
@@ -1067,6 +1102,12 @@ enum Cmd {
         /// Override the scip-python binary used by the polyglot pass.
         #[arg(long, value_name = "PATH")]
         scip_python: Option<PathBuf>,
+        /// Filter polyglot targets by substring of their root path.
+        #[arg(long, value_name = "SUBSTR")]
+        only_root: Option<String>,
+        /// Cap the number of polyglot targets processed.
+        #[arg(long, value_name = "N")]
+        max_targets: Option<usize>,
     },
     /// `scry build-polyglot-scip` — Rust + Go + TypeScript + Python.
     ///
@@ -1548,7 +1589,11 @@ fn main() -> Result<()> {
                             build_kbuild, build_cmake, cmake_binary, build_cargo,
                             index, with_polyglot, no_rust, no_go, no_typescript,
                             no_python, workers, targetroot, scip_out_dir,
-                            rust_analyzer, scip_go, scip_typescript, scip_python } => {
+                            javac, scip_java, semanticdb_javac_jar,
+                            kotlinc, semanticdb_kotlinc_jar,
+                            only_module, max_compilations, skip_kotlin, skip_java,
+                            rust_analyzer, scip_go, scip_typescript, scip_python,
+                            only_root, max_targets } => {
             let build = match (build_soong, build_gn, build_kbuild, build_cmake, build_cargo) {
                 (Some(d), None, None, None, false) => bridge_subcmds::BuildKind::Soong { build_dir: d },
                 (None, Some(d), None, None, false) => bridge_subcmds::BuildKind::Gn { build_dir: d, gn_binary },
@@ -1559,12 +1604,16 @@ fn main() -> Result<()> {
                     "build-symbols requires exactly one --build-{{soong,gn,kbuild,cmake,cargo}} flag"
                 ),
             };
-            bridge_subcmds::cmd_build_symbols(
+            bridge_subcmds::cmd_build_symbols(bridge_subcmds::BuildSymbolsArgs {
                 source_root, build, index, with_polyglot,
                 no_rust, no_go, no_typescript, no_python,
                 workers, targetroot, scip_out_dir,
+                javac, scip_java, semanticdb_javac_jar,
+                kotlinc, semanticdb_kotlinc_jar,
+                only_module, max_compilations, skip_kotlin, skip_java,
                 rust_analyzer, scip_go, scip_typescript, scip_python,
-            )
+                only_root, max_targets,
+            })
         }
         Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),

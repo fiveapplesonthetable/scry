@@ -339,6 +339,38 @@ pub(crate) fn cmd_build_polyglot_scip(
     Ok(())
 }
 
+/// Inputs to [`cmd_build_symbols`]. Grouped into one struct so the
+/// CLI dispatch reads top-to-bottom without a 20-arg call site, and
+/// new knobs slot in without churning every caller.
+pub(crate) struct BuildSymbolsArgs {
+    pub source_root: PathBuf,
+    pub build: BuildKind,
+    pub index: Option<PathBuf>,
+    pub with_polyglot: bool,
+    pub no_rust: bool,
+    pub no_go: bool,
+    pub no_typescript: bool,
+    pub no_python: bool,
+    pub workers: usize,
+    pub targetroot: Option<PathBuf>,
+    pub scip_out_dir: Option<PathBuf>,
+    pub javac: Option<PathBuf>,
+    pub scip_java: Option<PathBuf>,
+    pub semanticdb_javac_jar: Option<PathBuf>,
+    pub kotlinc: Option<PathBuf>,
+    pub semanticdb_kotlinc_jar: Option<PathBuf>,
+    pub only_module: Option<String>,
+    pub max_compilations: Option<usize>,
+    pub skip_kotlin: bool,
+    pub skip_java: bool,
+    pub rust_analyzer: Option<PathBuf>,
+    pub scip_go: Option<PathBuf>,
+    pub scip_typescript: Option<PathBuf>,
+    pub scip_python: Option<PathBuf>,
+    pub only_root: Option<String>,
+    pub max_targets: Option<usize>,
+}
+
 /// `scry build-symbols` — unified Kythe-class precision pipeline.
 ///
 /// Takes ONE explicit build-system flag (`--build-soong PATH`,
@@ -351,24 +383,18 @@ pub(crate) fn cmd_build_polyglot_scip(
 /// `--with-polyglot` flag is on. Each output is imported into the
 /// scry sidecar in append mode (SCIP) or replace mode (clang USR
 /// — only one C-family pass per index).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_build_symbols(
-    source_root: PathBuf,
-    build: BuildKind,
-    index: Option<PathBuf>,
-    with_polyglot: bool,
-    no_rust: bool,
-    no_go: bool,
-    no_typescript: bool,
-    no_python: bool,
-    workers: usize,
-    targetroot: Option<PathBuf>,
-    scip_out_dir: Option<PathBuf>,
-    rust_analyzer: Option<PathBuf>,
-    scip_go: Option<PathBuf>,
-    scip_typescript: Option<PathBuf>,
-    scip_python: Option<PathBuf>,
-) -> Result<()> {
+pub(crate) fn cmd_build_symbols(args: BuildSymbolsArgs) -> Result<()> {
+    let BuildSymbolsArgs {
+        source_root, build, index, with_polyglot,
+        no_rust, no_go, no_typescript, no_python,
+        workers, targetroot, scip_out_dir,
+        javac, scip_java, semanticdb_javac_jar,
+        kotlinc, semanticdb_kotlinc_jar,
+        only_module, max_compilations, skip_kotlin, skip_java,
+        rust_analyzer, scip_go, scip_typescript, scip_python,
+        only_root, max_targets,
+    } = args;
+
     let t_total = Instant::now();
     let index_dir = index.clone().unwrap_or_else(default_index_dir);
 
@@ -377,7 +403,10 @@ pub(crate) fn cmd_build_symbols(
             eprintln!("[build-symbols] soong build_dir: {}", build_dir.display());
             cmd_build_jvm_scip(
                 source_root.clone(), Some(build_dir.clone()), index.clone(),
-                None, None, None, None, None, targetroot, None, None, false, false,
+                javac, scip_java, semanticdb_javac_jar,
+                kotlinc, semanticdb_kotlinc_jar,
+                targetroot, only_module, max_compilations,
+                skip_kotlin, skip_java,
             )?;
         }
         BuildKind::Gn { build_dir, gn_binary } => {
@@ -417,7 +446,7 @@ pub(crate) fn cmd_build_symbols(
             source_root.clone(), index, scip_out_dir,
             rust_analyzer, scip_go, scip_typescript, scip_python,
             no_rust, no_go, no_typescript, no_python,
-            None, None,
+            only_root, max_targets,
         )?;
     }
 

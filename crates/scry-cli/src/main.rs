@@ -176,6 +176,12 @@ enum Cmd {
         /// and absolute prefixes; same semantics as gtags' --path filter.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop refs whose file path contains SUBSTR. Symmetric to
+        /// `--in`; useful for "show me refs but not in tests" type
+        /// queries, e.g. `scry ref Activity --not-in /tests/`.
+        /// Applied after `--in`, so both can be combined.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -253,6 +259,10 @@ enum Cmd {
         lang: Option<String>,
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop callers whose file path contains SUBSTR. See `scry ref
+        /// --not-in`.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -311,6 +321,11 @@ enum Cmd {
         /// `scry def Activity --in frameworks/base/services/`.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop symbols whose file path contains SUBSTR. Symmetric to
+        /// `--in`; useful for "all defs except in tests/generated":
+        /// `scry def Activity --not-in /tests/`.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -379,6 +394,11 @@ enum Cmd {
         /// path contains this substring.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop candidate defs whose file path contains SUBSTR.
+        /// Symmetric to `--in`; lets you exclude noisy test/generated
+        /// defs when introspecting a method's outgoing edges.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         /// Filter outgoing refs by kind (call, type, field, …).
         /// Default: all kinds.
         #[arg(long, short = 'k')]
@@ -410,6 +430,11 @@ enum Cmd {
         /// Restrict to call sites in files whose path contains SUBSTR.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop call sites in files whose path contains SUBSTR.
+        /// Symmetric to `--in`. Applied at every walk level — useful
+        /// for pruning entire subtrees (e.g. `--not-in /tests/`).
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         /// How many levels of caller-of-caller to walk.
         #[arg(long, default_value_t = 3)]
         depth: usize,
@@ -451,6 +476,11 @@ enum Cmd {
         /// Restrict to symbols/files whose path contains SUBSTR.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop symbols/files whose path contains SUBSTR. Symmetric
+        /// to `--in`. Lets you ask "what breaks if I change X, ignoring
+        /// tests?" via `--not-in /tests/`.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         /// Walk subclass hierarchy this many levels deep.
         #[arg(long, default_value_t = 2)]
         subclass_depth: usize,
@@ -1188,8 +1218,8 @@ fn main() -> Result<()> {
                 )
             }
         }
-        Cmd::Def { name, index, lang, kind, in_, limit, json, md, budget } => {
-            cmd_def(name, index, lang, kind, in_, limit, json, md, budget)
+        Cmd::Def { name, index, lang, kind, in_, not_in, limit, json, md, budget } => {
+            cmd_def(name, index, lang, kind, in_, not_in, limit, json, md, budget)
         }
         Cmd::Prefix { prefix, index, limit, json } => {
             cmd_prefix(prefix, index, limit, json)
@@ -1197,18 +1227,18 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
+        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, reachable, clang_precise, scip_precise);
-            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
+            cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict, format } => {
+        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict, format } => {
             if precise {
-                return cmd_callers_precise(name, index, lang, in_, limit, json);
+                return cmd_callers_precise(name, index, lang, in_, not_in, limit, json);
             }
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, reachable, clang_precise, scip_precise);
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -1233,12 +1263,12 @@ fn main() -> Result<()> {
         Cmd::ScipImport { scip, index, root } => cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => cmd_scip_lookup(index, &path, offset),
-        Cmd::Impact { name, index, in_, subclass_depth, reachable, def_in, strict, limit, json } =>
-            cmd_impact(name, index, in_, subclass_depth, reachable, def_in, strict, limit, json),
-        Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, def_in, strict, json } =>
-            cmd_callgraph(name, index, in_, depth, max_nodes, reachable, def_in, strict, json),
-        Cmd::Uses { name, index, in_, kind, strict, limit, json } =>
-            cmd_uses(name, index, in_, kind, strict, limit, json),
+        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, limit, json } =>
+            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, limit, json),
+        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, json } =>
+            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, json),
+        Cmd::Uses { name, index, in_, not_in, kind, strict, limit, json } =>
+            cmd_uses(name, index, in_, not_in, kind, strict, limit, json),
         Cmd::Finalize {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, workers,
@@ -2415,6 +2445,7 @@ fn cmd_def(
     lang: Option<String>,
     kind: Option<String>,
     in_: Option<String>,
+    not_in: Option<String>,
     limit: usize,
     json: bool,
     md: bool,
@@ -2424,9 +2455,9 @@ fn cmd_def(
     let r = open_index(index)?;
     let results = r.lookup_exact(&name);
     let mut filtered: Vec<SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
-    if let Some(prefix) = in_.as_deref() {
+    if in_.is_some() || not_in.is_some() {
         filtered.retain(|s| match r.files.get(s.file_id as usize) {
-            Some(fe) => fe.display_path(&r.roots).contains(prefix),
+            Some(fe) => path_matches(&fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()),
             None => false,
         });
     }
@@ -2540,6 +2571,7 @@ fn cmd_callgraph(
     name: String,
     index: Option<PathBuf>,
     in_: Option<String>,
+    not_in: Option<String>,
     depth: usize,
     max_nodes: usize,
     reachable: bool,
@@ -2599,6 +2631,7 @@ fn cmd_callgraph(
         callee: &str,
         depth_left: usize,
         in_prefix: &str,
+        not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
         // v0.1.43: root-level only. Some(set) ⇒ filter by Layer 2
         // resolved_to ∈ set (with strict toggle). None ⇒ no filter
@@ -2615,9 +2648,11 @@ fn cmd_callgraph(
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for rr in r.lookup_refs_exact(callee).into_iter() {
             if rr.kind != scry_store::RefKind::Call { continue; }
-            if !in_prefix.is_empty() {
+            if !in_prefix.is_empty() || !not_in_prefix.is_empty() {
                 let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
-                if !fe.display_path(&r.roots).contains(in_prefix) { continue; }
+                let p = fe.display_path(&r.roots);
+                if !in_prefix.is_empty() && !p.contains(in_prefix) { continue; }
+                if !not_in_prefix.is_empty() && p.contains(not_in_prefix) { continue; }
             }
             // Reachability filter on the caller side.
             if let (Some(mg), Some(cms)) =
@@ -2668,7 +2703,7 @@ fn cmd_callgraph(
         // at the topmost level (we don't have per-frame def context).
         for (caller_name, node) in &mut out {
             node.callers = expand(
-                r, caller_name, depth_left - 1, in_prefix,
+                r, caller_name, depth_left - 1, in_prefix, not_in_prefix,
                 callee_modules, None, strict, visited, budget,
             );
         }
@@ -2679,7 +2714,8 @@ fn cmd_callgraph(
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let prefix = in_.as_deref().unwrap_or("");
-    let tree = expand(&r, &name, depth, prefix, callee_modules.as_ref(),
+    let neg_prefix = not_in.as_deref().unwrap_or("");
+    let tree = expand(&r, &name, depth, prefix, neg_prefix, callee_modules.as_ref(),
                       root_def_target_ids.as_ref(), strict,
                       &mut visited, &mut budget);
 
@@ -2741,6 +2777,7 @@ fn cmd_impact(
     name: String,
     index: Option<PathBuf>,
     in_: Option<String>,
+    not_in: Option<String>,
     subclass_depth: usize,
     reachable: bool,
     def_in: Option<String>,
@@ -2756,10 +2793,11 @@ fn cmd_impact(
     let mut callers: Vec<RefRecord> = r.lookup_refs_exact(&name)
         .into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
-        .filter(|rr| match in_.as_deref() {
-            None => true,
-            Some(p) => r.files.get(rr.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        .filter(|rr| match r.files.get(rr.file_id as usize) {
+            Some(fe) => path_matches(
+                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+            ),
+            None => in_.is_none() && not_in.is_none(),
         })
         .collect();
     // v0.1.45 — narrow callers by callee location (same as ref --def-in).
@@ -2814,10 +2852,11 @@ fn cmd_impact(
     let subclasses: Vec<SymbolRecord> = r
         .subclasses_transitive(&name, subclass_depth)
         .into_iter()
-        .filter(|s| match in_.as_deref() {
-            None => true,
-            Some(p) => r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        .filter(|s| match r.files.get(s.file_id as usize) {
+            Some(fe) => path_matches(
+                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+            ),
+            None => in_.is_none() && not_in.is_none(),
         })
         .collect();
 
@@ -3025,6 +3064,7 @@ fn cmd_ref(
     lang: Option<String>,
     kind: Option<String>,
     in_: Option<String>,
+    not_in: Option<String>,
     limit: usize,
     json: bool,
     format: Option<String>,
@@ -3053,9 +3093,11 @@ fn cmd_ref(
     let filtered: Vec<RefRecord> = results
         .into_iter()
         .filter(|rr| {
-            if let Some(prefix) = &in_ {
+            if in_.is_some() || not_in.is_some() {
                 match r.files.get(rr.file_id as usize) {
-                    Some(fe) => if !fe.display_path(&r.roots).contains(prefix.as_str()) {
+                    Some(fe) => if !path_matches(
+                        &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+                    ) {
                         return false;
                     },
                     None => return false,
@@ -4019,6 +4061,23 @@ fn filter_results(
         .collect()
 }
 
+/// Shared `--in` / `--not-in` substring filter. Returns true if
+/// `path` passes both filters (contains `in_` AND does not contain
+/// `not_in`). Either filter may be absent. Empty string filters
+/// match conservatively: an empty `in_` matches everything, an
+/// empty `not_in` rejects nothing — matches what a user expects
+/// when an upstream caller forwards Option<String> from CLI without
+/// trimming.
+fn path_matches(path: &str, in_: Option<&str>, not_in: Option<&str>) -> bool {
+    if let Some(p) = in_ {
+        if !p.is_empty() && !path.contains(p) { return false; }
+    }
+    if let Some(p) = not_in {
+        if !p.is_empty() && path.contains(p) { return false; }
+    }
+    true
+}
+
 /// Markdown formatter: one section per result, optional code snippet. Stops
 /// emitting if the byte budget is exhausted.
 fn print_results_md(
@@ -4958,6 +5017,7 @@ fn cmd_uses(
     name: String,
     index: Option<PathBuf>,
     in_: Option<String>,
+    not_in: Option<String>,
     kind: Option<String>,
     strict: bool,
     limit: usize,
@@ -4966,15 +5026,18 @@ fn cmd_uses(
     let t = Instant::now();
     let r = open_index(index)?;
     let defs: Vec<SymbolRecord> = r.lookup_exact(&name).into_iter()
-        .filter(|s| match in_.as_deref() {
-            None => true,
-            Some(p) => r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        .filter(|s| match r.files.get(s.file_id as usize) {
+            Some(fe) => path_matches(
+                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+            ),
+            None => in_.is_none() && not_in.is_none(),
         })
         .collect();
     if defs.is_empty() {
-        eprintln!("[scry] uses: no def of {name:?} found{}",
-            in_.as_deref().map(|p| format!(" matching --in {p:?}")).unwrap_or_default());
+        let mut hint = String::new();
+        if let Some(p) = in_.as_deref() { hint.push_str(&format!(" matching --in {p:?}")); }
+        if let Some(p) = not_in.as_deref() { hint.push_str(&format!(" (excluding --not-in {p:?})")); }
+        eprintln!("[scry] uses: no def of {name:?} found{hint}");
         return Ok(());
     }
 
@@ -5712,6 +5775,7 @@ fn cmd_callers_precise(
     index: Option<PathBuf>,
     _lang: Option<String>,
     in_: Option<String>,
+    not_in: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
@@ -5768,7 +5832,8 @@ fn cmd_callers_precise(
 
     // 4. Build a (path -> file_id) lookup so we can map LSP results
     // back to scry's path display + lang.
-    let in_prefix = in_.as_deref().unwrap_or("");
+    let in_prefix = in_.as_deref();
+    let not_in_prefix = not_in.as_deref();
     let by_path: std::collections::HashMap<String, &FileEntry> =
         r.files.iter().map(|fe| (fe.display_path(&r.roots), fe)).collect();
     let mut emitted = 0usize;
@@ -5776,7 +5841,7 @@ fn cmd_callers_precise(
         for loc in &locs {
             let p = match loc.fs_path() { Some(p) => p, None => continue };
             let p_str = p.display().to_string();
-            if !in_prefix.is_empty() && !p_str.contains(in_prefix) { continue; }
+            if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
             let lang = by_path.get(&p_str).map(|fe| fe.kind.as_str()).unwrap_or("?");
             println!("{}:{}:{}  (ref-precise {})  {}",
                 p_str, loc.line, loc.character, lang, name);
@@ -5790,7 +5855,7 @@ fn cmd_callers_precise(
         for loc in &locs {
             let p = match loc.fs_path() { Some(p) => p, None => continue };
             let p_str = p.display().to_string();
-            if !in_prefix.is_empty() && !p_str.contains(in_prefix) { continue; }
+            if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
             let lang = by_path.get(&p_str).map(|fe| fe.kind.as_str()).unwrap_or("?");
             let obj = serde_json::json!({
                 "name": name,
@@ -7540,6 +7605,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
         "description": "Language filter — narrow results to one of: java, kotlin, cpp, rust, go, python, soong, aidl. Always pass this when you know the language; cuts noise on cross-language names."});
     let in_prop = serde_json::json!({"type": "string",
         "description": "Path substring filter (e.g. 'frameworks/base/' to scope to a subtree). Useful when one name lives in many directories."});
+    let not_in_prop = serde_json::json!({"type": "string",
+        "description": "Negative path substring filter — drop results whose file path contains this substring. Symmetric to `in`. Common use: `not_in: '/tests/'` to exclude test files. Combined with `in` to scope + exclude in one call."});
     let limit_prop = serde_json::json!({"type": "integer", "default": 20,
         "description": "Max records returned. Pass a small integer (5-20). Do NOT pass placeholders like 'N' — they fail to parse."});
     let format_count_prop = serde_json::json!({"type": "string",
@@ -7560,6 +7627,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "kind": {"type": "string",
                     "description": "Kind filter. Common values: class, method, fn (Rust/Go function), interface, struct, enum, aidl.iface, soong (Soong module), init.svc, sepolicy. Strongly recommended when name is ambiguous."},
                 "in":   in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
             })),
         ),
@@ -7579,6 +7647,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "kind": {"type": "string",
                     "description": "Ref-kind filter. Common: call, ctor, inherit, import, type-use, field-access."},
                 "in":   in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
@@ -7609,6 +7678,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "name": {"type": "string"},
                 "lang": lang_prop,
                 "in":   in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
@@ -7663,6 +7733,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "kind":  {"type": "string",
                     "description": "Filter by ref kind: call, type, field, import, inherit, using-ns. Default: all."},
                 "limit": limit_prop,
@@ -7681,6 +7752,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "depth": {"type": "integer", "minimum": 1, "default": 3},
                 "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
                 "reachable": {"type": "boolean", "default": false},
@@ -7701,6 +7773,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
                 "subclass_depth": {"type": "integer", "minimum": 0, "default": 2,
                     "description": "BFS depth for the subclass leg of the impact set."},
@@ -8454,6 +8527,7 @@ fn serve_one_request<W: std::io::Write>(
     let lang = args.get("lang").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
     let in_ = args.get("in").and_then(|v| v.as_str());
+    let not_in = args.get("not_in").and_then(|v| v.as_str());
     let stream = req.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false);
     let budget = req.get("budget").and_then(serde_json::Value::as_u64).map(|n| n as usize);
 
@@ -8472,7 +8546,7 @@ fn serve_one_request<W: std::io::Write>(
     };
 
     let mut result = match cmd {
-        "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, limit),
+        "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, not_in, limit),
         "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, limit),
         "fuzzy"   => {
             let dist = args.get("distance").and_then(serde_json::Value::as_u64)
@@ -8494,7 +8568,7 @@ fn serve_one_request<W: std::io::Write>(
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
+            serve_ref(reader, arg_str("name"), lang, kind, in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
         }
         "callers" => {
             let no_precise = args.get("no_precise")
@@ -8511,7 +8585,7 @@ fn serve_one_request<W: std::io::Write>(
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
         }
         "subclasses" | "implementations" => {
             let depth = args.get("depth")
@@ -8527,7 +8601,7 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_impact(reader, arg_str("name"), in_, depth, reachable, def_in, strict, limit)
+            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable, def_in, strict, limit)
         }
         "callgraph" => {
             let depth = args.get("depth")
@@ -8540,11 +8614,11 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_callgraph(reader, arg_str("name"), in_, depth, max_nodes, reachable, def_in, strict)
+            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes, reachable, def_in, strict)
         }
         "uses" => {
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_uses(reader, arg_str("name"), in_, kind, strict, limit)
+            serve_uses(reader, arg_str("name"), in_, not_in, kind, strict, limit)
         }
         "grep"    => {
             let ci = args.get("case_insensitive")
@@ -8705,15 +8779,25 @@ fn file_in_prefix(r: &StoreReader, file_id: u32, prefix: &str) -> bool {
     }
 }
 
+/// Daemon-path companion of `path_matches`. Combines `--in` (must
+/// contain) and `--not-in` (must NOT contain) substring filters in
+/// one lookup. Empty / None on either side skips that filter.
+fn file_path_matches(r: &StoreReader, file_id: u32, in_: Option<&str>, not_in: Option<&str>) -> bool {
+    match r.files.get(file_id as usize) {
+        Some(fe) => path_matches(&fe.display_path(&r.roots), in_, not_in),
+        None => in_.is_none() && not_in.is_none(),
+    }
+}
+
 fn serve_def(
     r: &StoreReader,
     name: &str,
     lang: Option<&str>,
     kind: Option<&str>,
     in_: Option<&str>,
+    not_in: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
-    let prefix = in_.unwrap_or("");
     let mut filtered: Vec<SymbolRecord> = r.lookup_exact(name).into_iter()
         .filter(|s| {
             if let Some(l) = lang {
@@ -8722,7 +8806,7 @@ fn serve_def(
             if let Some(k) = kind {
                 if !s.kind.short().eq_ignore_ascii_case(k) { return false; }
             }
-            file_in_prefix(r, s.file_id, prefix)
+            file_path_matches(r, s.file_id, in_, not_in)
         })
         .collect();
     rank_symbols(&mut filtered, r);
@@ -8778,6 +8862,7 @@ fn serve_ref(
     lang: Option<&str>,
     kind: Option<&str>,
     in_: Option<&str>,
+    not_in: Option<&str>,
     limit: usize,
     reachable: bool,
     clang_precise: bool,
@@ -8787,7 +8872,6 @@ fn serve_ref(
     strict: bool,
     format: Option<&str>,
 ) -> serde_json::Value {
-    let prefix = in_.unwrap_or("");
     // --def-in PATH: precompute the target def id set. Empty target
     // set ⇒ no filtering (matches cmd_ref's "over-include rather than
     // silently drop" policy; daemon stays quiet on diagnostics).
@@ -8850,7 +8934,7 @@ fn serve_ref(
         if let Some(k) = kind {
             if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
         }
-        if !file_in_prefix(r, rr.file_id, prefix) { continue; }
+        if !file_path_matches(r, rr.file_id, in_, not_in) { continue; }
         if let Some(sc) = scope {
             if !rr.scope_path.iter().any(|seg| seg == sc) { continue; }
         }
@@ -8975,13 +9059,13 @@ fn serve_uses(
     r: &StoreReader,
     name: &str,
     in_: Option<&str>,
+    not_in: Option<&str>,
     kind: Option<&str>,
     strict: bool,
     limit: usize,
 ) -> serde_json::Value {
-    let in_prefix = in_.unwrap_or("");
     let defs: Vec<SymbolRecord> = r.lookup_exact(name).into_iter()
-        .filter(|s| in_prefix.is_empty() || file_in_prefix(r, s.file_id, in_prefix))
+        .filter(|s| file_path_matches(r, s.file_id, in_, not_in))
         .collect();
     if defs.is_empty() {
         return serde_json::json!([]);
@@ -9023,6 +9107,7 @@ fn serve_callgraph(
     r: &StoreReader,
     name: &str,
     in_: Option<&str>,
+    not_in: Option<&str>,
     depth: usize,
     max_nodes: usize,
     reachable: bool,
@@ -9030,6 +9115,7 @@ fn serve_callgraph(
     strict: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
+    let neg_prefix = not_in.unwrap_or("");
     let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
         r.module_graph().map(|mg| {
             r.lookup_exact(name).iter()
@@ -9061,6 +9147,7 @@ fn serve_callgraph(
         callee: &str,
         depth_left: usize,
         in_prefix: &str,
+        not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
         root_def_target_ids: Option<&std::collections::HashSet<u64>>,
         strict: bool,
@@ -9072,9 +9159,11 @@ fn serve_callgraph(
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for rr in r.lookup_refs_exact(callee).into_iter() {
             if rr.kind != scry_store::RefKind::Call { continue; }
-            if !in_prefix.is_empty() {
+            if !in_prefix.is_empty() || !not_in_prefix.is_empty() {
                 let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
-                if !fe.display_path(&r.roots).contains(in_prefix) { continue; }
+                let p = fe.display_path(&r.roots);
+                if !in_prefix.is_empty() && !p.contains(in_prefix) { continue; }
+                if !not_in_prefix.is_empty() && p.contains(not_in_prefix) { continue; }
             }
             if let (Some(mg), Some(cms)) = (r.module_graph(), callee_modules) {
                 if !cms.is_empty() {
@@ -9115,7 +9204,7 @@ fn serve_callgraph(
         // Recurse without root filter — narrowing only applies at the
         // top level (same limitation as cmd_callgraph).
         for (caller_name, node) in &mut out {
-            node.callers = expand(r, caller_name, depth_left - 1, in_prefix,
+            node.callers = expand(r, caller_name, depth_left - 1, in_prefix, not_in_prefix,
                 callee_modules, None, strict, visited, budget);
         }
         visited.remove(callee);
@@ -9124,7 +9213,7 @@ fn serve_callgraph(
 
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let tree = expand(r, name, depth, prefix, callee_modules.as_ref(),
+    let tree = expand(r, name, depth, prefix, neg_prefix, callee_modules.as_ref(),
                       root_def_target_ids.as_ref(), strict, &mut visited, &mut budget);
     serde_json::json!({
         "callee": name,
@@ -9143,16 +9232,16 @@ fn serve_impact(
     r: &StoreReader,
     name: &str,
     in_: Option<&str>,
+    not_in: Option<&str>,
     subclass_depth: usize,
     reachable: bool,
     def_in: Option<&str>,
     strict: bool,
     limit: usize,
 ) -> serde_json::Value {
-    let prefix = in_.unwrap_or("");
     let mut callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
-        .filter(|rr| prefix.is_empty() || file_in_prefix(r, rr.file_id, prefix))
+        .filter(|rr| file_path_matches(r, rr.file_id, in_, not_in))
         .collect();
     // v0.1.46 — same root-level narrowing as cmd_impact.
     if let Some(def_path) = def_in {
@@ -9186,7 +9275,7 @@ fn serve_impact(
     }
     let subclasses: Vec<SymbolRecord> = r.subclasses_transitive(name, subclass_depth)
         .into_iter()
-        .filter(|s| prefix.is_empty() || file_in_prefix(r, s.file_id, prefix))
+        .filter(|s| file_path_matches(r, s.file_id, in_, not_in))
         .collect();
     let mut files_touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for rr in &callers {

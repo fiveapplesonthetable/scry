@@ -7,6 +7,43 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.51] — 2026-05-17
+
+`--not-in SUBSTR` path filter — symmetric to `--in`. Drops
+results whose file path contains the substring; combines
+with `--in` so you can scope a subtree AND exclude noise in
+one call.
+
+Wired through CLI, JSON-RPC daemon, and MCP for six commands
+that already accept `--in`: `def`, `ref`, `callers`, `uses`,
+`callgraph`, `impact`.
+
+```
+# "Show me callers of bindService, but not in tests."
+$ scry callers bindService --not-in /tests/ --format count
+1389 callers      # vs 1981 unfiltered — 592 test sites dropped
+
+# Combined --in + --not-in: scope to frameworks, exclude tests.
+$ scry ref bindService --in frameworks --not-in /tests/ --format count
+96 ref
+
+# Same shape on the daemon: `args.not_in: "/tests/"` on def/ref/
+# callers/uses/callgraph/impact does the equivalent drop.
+```
+
+Why this matters: `--def-in` (v0.1.27) narrows by the *callee's*
+file path; `--not-in` narrows by the *call site's* path. Together
+they let you ask precise questions like "everywhere in
+frameworks/ that calls this specific overload of `close`, but
+exclude the unit tests" without piping through `grep -v`.
+
+Implementation: shared `path_matches` helper (CLI) and
+`file_path_matches` helper (daemon) keep both code paths in
+lock-step. Empty / None on either side skips that filter.
+
+E2E test: `not_in_filter_cli_and_daemon` (CLI + daemon parity,
+combined-filter empty-set edge case, callers path).
+
 ## [0.1.50] — 2026-05-17
 
 `scry def` dedupes Package symbols in human-readable output.

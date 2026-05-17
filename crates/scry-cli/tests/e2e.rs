@@ -2476,3 +2476,130 @@ public class B {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.51 — `--not-in SUBSTR` path filter on CLI + daemon. Symmetric
+/// to `--in`; useful for "show me callers but not in tests" workflows.
+/// Pins both code paths so they don't drift apart.
+#[test]
+fn not_in_filter_cli_and_daemon() {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-not-in-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    // Lay out a "prod + tests" shape so --not-in /tests/ has work to do.
+    std::fs::create_dir_all(src.join("prod")).unwrap();
+    std::fs::create_dir_all(src.join("tests")).unwrap();
+    std::fs::write(src.join("prod/Service.java"), r#"package prod;
+public class Service {
+    public void open() {}
+    public void use_it() { open(); }
+}
+"#).unwrap();
+    std::fs::write(src.join("tests/ServiceTest.java"), r#"package tests;
+import prod.Service;
+public class ServiceTest {
+    public void test_open() { new Service().open(); }
+    public void open() {}
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // CLI emits JSONL (one symbol per stdout line); parse line-by-line.
+    fn parse_jsonl(bytes: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(bytes).unwrap().lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    // (1) CLI `def open` baseline — picks up both defs.
+    let baseline = Command::new(scry_bin())
+        .args(["def", "open", "--index"]).arg(&idx).args(["--json", "--limit", "20"])
+        .output().expect("spawn def baseline");
+    assert!(baseline.status.success(),
+        "def baseline failed: {}", String::from_utf8_lossy(&baseline.stderr));
+    let baseline_arr = parse_jsonl(&baseline.stdout);
+    let baseline_count = baseline_arr.len();
+    assert!(baseline_count >= 2,
+        "expected >=2 baseline defs of open, got {baseline_count}: {baseline_arr:?}");
+    let baseline_has_prod = baseline_arr.iter()
+        .any(|s| s["path"].as_str().is_some_and(|p| p.contains("/prod/")));
+    let baseline_has_tests = baseline_arr.iter()
+        .any(|s| s["path"].as_str().is_some_and(|p| p.contains("/tests/")));
+    assert!(baseline_has_prod && baseline_has_tests,
+        "baseline missing prod or tests def: prod={baseline_has_prod} tests={baseline_has_tests}");
+
+    // (2) CLI `def open --not-in /tests/` — tests defs must drop.
+    let filtered = Command::new(scry_bin())
+        .args(["def", "open", "--index"]).arg(&idx)
+        .args(["--not-in", "/tests/", "--json", "--limit", "20"])
+        .output().expect("spawn def --not-in");
+    assert!(filtered.status.success(),
+        "def --not-in failed: {}", String::from_utf8_lossy(&filtered.stderr));
+    let filtered_arr = parse_jsonl(&filtered.stdout);
+    assert!(filtered_arr.len() < baseline_count,
+        "--not-in should strip at least one def; baseline={baseline_count} \
+         filtered={} arr={filtered_arr:?}", filtered_arr.len());
+    let any_tests = filtered_arr.iter()
+        .any(|s| s["path"].as_str().is_some_and(|p| p.contains("/tests/")));
+    assert!(!any_tests,
+        "--not-in /tests/ leaked a tests path: {filtered_arr:?}");
+
+    // (3) CLI combined --in + --not-in. /prod/ matches Service.java,
+    // and --not-in Service.java drops it, so the result must be empty.
+    let combined = Command::new(scry_bin())
+        .args(["def", "open", "--index"]).arg(&idx)
+        .args(["--in", "/prod/", "--not-in", "Service.java", "--json", "--limit", "20"])
+        .output().expect("spawn def --in/--not-in");
+    assert!(combined.status.success());
+    let combined_arr = parse_jsonl(&combined.stdout);
+    assert!(combined_arr.is_empty(),
+        "--in /prod/ --not-in Service.java should be empty; got {combined_arr:?}");
+
+    // (4) Daemon parity: same --not-in semantics on def + callers.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"def","args":{{"name":"open","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"def","args":{{"name":"open","not_in":"/tests/","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":3,"cmd":"callers","args":{{"name":"open","not_in":"/tests/","limit":20}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(),
+        "serve failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3, "expected 3 responses, got {lines:?}");
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let r3: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let arr1 = r1["result"].as_array().unwrap();
+    let arr2 = r2["result"].as_array().unwrap();
+    let arr3 = r3["result"].as_array().unwrap();
+    assert!(arr2.len() < arr1.len(),
+        "daemon --not-in /tests/ should strip >=1: baseline={} filtered={} arr2={arr2:?}",
+        arr1.len(), arr2.len());
+    let arr2_has_tests = arr2.iter()
+        .any(|s| s["path"].as_str().is_some_and(|p| p.contains("/tests/")));
+    assert!(!arr2_has_tests,
+        "daemon def --not-in /tests/ leaked tests path: {arr2:?}");
+    let arr3_has_tests = arr3.iter()
+        .any(|c| c["path"].as_str().is_some_and(|p| p.contains("/tests/")));
+    assert!(!arr3_has_tests,
+        "daemon callers --not-in /tests/ leaked tests call site: {arr3:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

@@ -54,9 +54,9 @@ Any other method gets a JSON-RPC `-32601` (method not found) error.
 
 | tool             | required args | optional args                                                                                            | what it returns                              |
 |------------------|---------------|----------------------------------------------------------------------------------------------------------|----------------------------------------------|
-| `def`            | `name`        | `lang`, `kind`, `in`, `limit`                                                                            | symbol definition records                    |
-| `ref`            | `name`        | `lang`, `kind`, `in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                        | reference records (any kind)                 |
-| `callers`        | `name`        | `lang`, `in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                                | references with `kind=call`                  |
+| `def`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`                                                                  | symbol definition records                    |
+| `ref`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`              | reference records (any kind)                 |
+| `callers`        | `name`        | `lang`, `in`, `not_in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                      | references with `kind=call`                  |
 | `prefix`         | `prefix`      | `in`, `limit`                                                                                            | symbols whose name starts with PREFIX        |
 | `fuzzy`          | `substr`      | `in`, `distance`, `limit`                                                                                | edit-distance-ranked symbol matches          |
 | `grep`           | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `limit`, `format`                                             | content matches                              |
@@ -65,15 +65,19 @@ Any other method gets a JSON-RPC `-32601` (method not found) error.
 | `stats`          | —             | —                                                                                                        | index metadata (incl `refs_resolved` %)      |
 | `subclasses`     | `name`        | `in`, `limit`, `depth`                                                                                   | direct or transitive subtypes                |
 | `implementations`| `name`        | `in`, `limit`, `depth`                                                                                   | alias of `subclasses` (LSP shape)            |
-| `impact`         | `name`        | `in`, `limit`, `subclass_depth`, `reachable`, `def_in`, `strict`                                         | callers + subclasses + files_touched         |
-| `callgraph`      | `name`        | `in`, `depth`, `max_nodes`, `reachable`, `def_in`, `strict`                                              | recursive caller tree                        |
-| `uses`           | `name`        | `in`, `kind`, `limit`                                                                                    | outgoing edges from NAME's body              |
+| `impact`         | `name`        | `in`, `not_in`, `limit`, `subclass_depth`, `reachable`, `def_in`, `strict`                               | callers + subclasses + files_touched         |
+| `callgraph`      | `name`        | `in`, `not_in`, `depth`, `max_nodes`, `reachable`, `def_in`, `strict`                                    | recursive caller tree                        |
+| `uses`           | `name`        | `in`, `not_in`, `kind`, `limit`                                                                          | outgoing edges from NAME's body              |
 | `ask`            | `query`       | `in`, `limit`                                                                                            | semantic-retrieval chunks (cosine-ranked)    |
 
 `limit` defaults to 20. `in` is a path-substring filter, same
-semantics as the CLI's `--in`. Tool `ask` requires the index to have
-been processed by `scry build-embeddings`; otherwise the tool returns
-a tool-level error (see "Error semantics" below).
+semantics as the CLI's `--in`. `not_in` (v0.1.51) is the
+symmetric negative filter — drops results whose file path
+contains the substring. Both can combine (`in: "frameworks", not_in: "/tests/"`
+scopes to frameworks AND drops test paths in one call).
+Tool `ask` requires the index to have been processed by
+`scry build-embeddings`; otherwise the tool returns a tool-level
+error (see "Error semantics" below).
 
 #### Resolver-aware flags (v0.1.26+)
 

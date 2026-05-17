@@ -48,6 +48,7 @@ Java` to narrow further.
 | `-t`  | `--lang LANG`    | Filter by language (Java, Kotlin, Cpp, Soong, ApiTxt, …)   |
 | `-k`  | `--kind KIND`    | Filter by kind (class, fn, method, soong, init.svc, …)     |
 |       | `--in SUBSTR`    | Restrict to files whose absolute path contains SUBSTR      |
+|       | `--not-in SUBSTR`| Drop files whose absolute path contains SUBSTR (v0.1.51)   |
 |       | `--limit N`      | Cap results (default 100)                                  |
 |       | `--json`         | Emit one JSON object per line (NDJSON)                     |
 |       | `--md`           | Emit Markdown with code snippets (LLM-friendly)            |
@@ -110,6 +111,23 @@ $ scry def Activity --in frameworks/base/ --limit 3
 /home/zim/dev/aosp/frameworks/base/core/java/android/app/Activity.java:774:14  (class java)  [Activity]  Activity
 /home/zim/dev/aosp/frameworks/base/tools/aapt2/dump/DumpManifest.cpp:1540:7  (class cpp)  [aapt::Activity]  Activity
 ```
+
+Negative scoping with `--not-in` (v0.1.51) drops anything whose
+path contains the substring. Symmetric to `--in`; both can combine:
+
+```sh
+# "callers of bindService, but exclude /tests/ paths"
+$ scry callers bindService --not-in /tests/ --format count
+1389 callers           # vs 1981 unfiltered (592 test sites dropped)
+
+# scope to frameworks AND exclude tests in one call
+$ scry ref bindService --in frameworks --not-in /tests/ --format count
+96 ref
+```
+
+Wired through `def`, `ref`, `callers`, `uses`, `callgraph`,
+`impact` (everywhere `--in` works). On the daemon /
+MCP, pass `args.not_in: "/tests/"` with the same semantics.
 
 Markdown for LLM tool output:
 

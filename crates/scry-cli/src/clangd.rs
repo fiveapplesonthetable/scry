@@ -1,4 +1,4 @@
-//! Minimal LSP client for clangd integration (ROADMAP #3).
+//! Minimal LSP client for clangd integration.
 //!
 //! Why hand-rolled rather than pulling in `lsp-server` / `tower-lsp`:
 //! we need a very small subset of LSP (initialize, didOpen,

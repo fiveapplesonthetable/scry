@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// CMake build-directory marker — `cmake` writes this file during
 /// configuration, so its presence reliably identifies a CMake
 /// out-dir (not a source dir).
-pub const CMAKE_BUILD_MARKER: &str = "CMakeCache.txt";
+const CMAKE_BUILD_MARKER: &str = "CMakeCache.txt";
 
 /// Locate compile_commands.json inside a CMake build directory.
 /// Returns `Ok(None)` when the dir is a CMake build dir but the

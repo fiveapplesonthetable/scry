@@ -1,8 +1,9 @@
 //! scry-store: on-disk index format for symbols, files, and roots.
 //!
-//! Phase 1: a simple bincode-serialized store plus an FST over symbol names
-//! for prefix/fuzzy lookup. Phase 4 replaces this with a custom mmap'd
-//! columnar layout; the public API stays.
+//! mmap'd columnar layout backed by packed sidecars (`files_packed.bin`,
+//! `precision_packed`-format `clang_usrs.bin` / `scip_index.bin`, packed
+//! trigram postings) plus bincode for `symbols.bin` / `refs.bin` and an
+//! FST over symbol names for prefix / fuzzy lookup.
 //!
 //! # Unsafe policy
 //!
@@ -37,7 +38,6 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub mod trigram;
-pub mod embed;
 pub mod modgraph;
 pub mod precision_packed;
 pub mod clang_usrs;
@@ -390,8 +390,11 @@ pub struct RefRecord {
     pub col: u32,
     pub scope_path: Vec<String>,
     pub lang: FileKind,
-    /// Set during Phase 1 of resolution: a probable definition (by name match
-    /// alone for now). Phase 2+ refines via scope/imports.
+    /// Resolved definition id (matches `SymbolRecord::id`) when the
+    /// resolver could confidently attribute this ref to one specific
+    /// def via name + scope + import narrowing. `None` for refs whose
+    /// name matched multiple defs and no scope or import edge
+    /// disambiguated.
     pub resolved_to: Option<u64>,
 }
 
@@ -664,15 +667,6 @@ impl StorePaths {
     /// `scry compact`. Absent sidecar simply means no tombstones —
     /// the common case on a fresh index.
     pub fn tombstones(&self) -> PathBuf { self.root.join("tombstones.bin") }
-    /// Per-chunk metadata: bincode-encoded `Vec<ChunkEntry>` describing
-    /// each ~100-line window the embedder broke the corpus into.
-    /// Produced by `scry build-embeddings`; queried by `scry ask`.
-    /// Sized at ~24 bytes/chunk × ~3 M chunks ≈ 72 MB on full corpus.
-    pub fn chunks(&self) -> PathBuf { self.root.join("chunks.bin") }
-    /// Packed f32 embeddings, one row per chunk_idx. Row size is
-    /// `manifest.embedding_dim * 4` bytes. With dim=64 and ~3 M chunks
-    /// the file is ~768 MB — the heaviest sidecar but bounded.
-    pub fn embeddings(&self) -> PathBuf { self.root.join("embeddings.bin") }
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,8 +1228,7 @@ impl StoreWriter {
 
 /// Copy precision-sidecar files from the live index dir into the
 /// staging dir before the atomic swap. The sidecars are written by
-/// `scry build-symbols` / `scry clang-index` / `scry scip-import` and
-/// must survive a re-run of `scry index`.
+/// `scry build-symbols` and must survive a re-run of `scry index`.
 fn carry_over_sidecars(live_dir: &Path, staging_dir: &Path) -> Result<()> {
     // Keep this list narrow + explicit. Adding "everything not
     // produced by the indexer" would carry over corrupt artifacts
@@ -1431,19 +1424,13 @@ impl PartialOrd for TrigramHeapItem {
 /// Delta+varint is the same compression Code Search / livegrep use; gives
 /// ~3-5× shrink vs. raw u32 for typical posting lists in source-code
 /// corpora where file_ids are densely packed.
-/// Public wrapper so the standalone `scry build-trigrams` utility can drive
-/// the same k-way merge as the regular finalize_streaming path. Same input
-/// format (sorted (trigram, file_id) chunk files), same output (trigrams.fst
-/// + trigram_postings.bin with delta+varint posting lists).
-pub fn kway_merge_trigrams_to_fst_public(
-    chunk_paths: &[PathBuf],
-    fst_path: &Path,
-    postings_path: &Path,
-) -> Result<()> {
-    kway_merge_trigrams_to_fst(chunk_paths, fst_path, postings_path)
-}
-
-fn kway_merge_trigrams_to_fst(
+/// K-way merge per-chunk sorted (trigram, file_id) tuples into
+/// `trigrams.fst` + `trigram_postings.bin`. Public so the
+/// `build-trigrams` partial-rebuild subcommand (in `scry-cli`) can
+/// drive the same merge as the inline `finalize_streaming` path —
+/// same input format (sorted `(trigram, file_id)` chunk files),
+/// same output (FST + delta+varint posting lists).
+pub fn kway_merge_trigrams_to_fst(
     chunk_paths: &[PathBuf],
     fst_path: &Path,
     postings_path: &Path,
@@ -1814,21 +1801,6 @@ pub struct StoreReader {
     /// `scry compact` rebuilds the index without tombstoned records
     /// and clears the bitmap.
     pub tombstones_mmap: Option<memmap2::Mmap>,
-    /// Per-chunk metadata (file_id + line range). Indexed parallel to
-    /// `embeddings_mmap`. Loaded eagerly because the Vec is small
-    /// (~70 MB on full corpus) and every `scry ask` query walks all
-    /// of it. Present only when `scry build-embeddings` has run.
-    pub chunks: Option<Vec<embed::ChunkEntry>>,
-    /// Packed f32 chunk embeddings. Header (first 8 bytes):
-    /// `dim: u32 LE`, `count: u32 LE`. Body: `count` rows × `dim` × f32.
-    /// mmap'd; cosine search walks it sequentially per query.
-    pub embeddings_mmap: Option<memmap2::Mmap>,
-    /// Dimension of each chunk embedding, parsed from the header of
-    /// embeddings.bin. Zero when no embedding sidecar exists.
-    pub embedding_dim: u32,
-    /// Number of chunks in the embedding sidecar. Matches chunks.len()
-    /// when both are present.
-    pub embedding_count: u32,
     /// Build-system module graph + reachability bitmap.
     ///
     /// Lazy: the `module_graph.json` sidecar is 256MB on AOSP, and
@@ -1870,17 +1842,14 @@ pub struct StoreReader {
     /// `resolve_file_id`. The bincode `Vec<FileEntry>` that earlier
     /// versions held in RAM has been retired.
     pub files_packed: files_packed::FilesPacked,
-    /// Lazily-decoded precision sidecars. Both are bincode'd
-    /// `Vec<…Record>` with `String` paths interned per-record, so
-    /// the first decode + HashMap build is the expensive bit (on
-    /// AOSP-scale SCIP: ~17 s for 14 M records). Caching here means
-    /// every subsequent `apply_precision_filter` call inside the
-    /// same process reuses the in-memory index — `serve` / `mcp`
-    /// pay the cost once at first query and then strict-precision
-    /// queries are O(refs) without the decode tax. CLI invocations
-    /// still pay the open per process; the packed-mmap follow-up
-    /// (`scip_index_packed.bin` / `clang_usrs_packed.bin`) is what
-    /// removes the cost there too.
+    /// Lazily-opened precision sidecars. Both back onto the
+    /// [`precision_packed`] mmap format, so `open` is microseconds
+    /// (header parse + a few mmap calls) — caching here means every
+    /// subsequent `apply_precision_filter` call inside the same
+    /// process reuses the same `PrecisionPacked` instance and its
+    /// lazy `abs_path → path_id` index. Daemon callers (`serve` /
+    /// `mcp`) build that index once at first query; CLI callers
+    /// pay it per process.
     pub(crate) scip_index_cell: std::sync::OnceLock<Option<scip_index::ScipIndex>>,
     pub(crate) clang_usrs_cell: std::sync::OnceLock<Option<clang_usrs::ClangUsrIndex>>,
 }
@@ -2020,24 +1989,7 @@ impl StoreReader {
         let tombstones_mmap = if paths.tombstones().exists() {
             Some(safe_mmap(&paths.tombstones())?)
         } else { None };
-        // Embedding sidecar (chunks + embeddings). Optional. Loaded
-        // eagerly for chunks (small) and mmap'd for embeddings.bin.
-        // Header (8 bytes) of embeddings.bin: dim u32 LE, count u32 LE.
-        let (chunks, embeddings_mmap, embedding_dim, embedding_count) = if
-            paths.chunks().exists() && paths.embeddings().exists()
-        {
-            let ch: Vec<embed::ChunkEntry> = read_bincode(&paths.chunks())?;
-            let mm = safe_mmap(&paths.embeddings())?;
-            let (d, c) = if mm.len() >= 8 {
-                let d = u32::from_le_bytes(mm[0..4].try_into().unwrap_or([0;4]));
-                let c = u32::from_le_bytes(mm[4..8].try_into().unwrap_or([0;4]));
-                (d, c)
-            } else { (0, 0) };
-            (Some(ch), Some(mm), d, c)
-        } else {
-            (None, None, 0u32, 0u32)
-        };
-        tick!("digests+tomb+embed");
+        tick!("digests+tomb");
         // Build-system module graph sidecar is loaded LAZILY (see
         // doc on module_graph_cell): parsing the 256MB AOSP graph
         // takes 10–30s cold and almost no queries actually need it,
@@ -2054,7 +2006,6 @@ impl StoreReader {
             file_refs_mmap, file_refs_offsets_mmap,
             ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
-            chunks, embeddings_mmap, embedding_dim, embedding_count,
             module_graph_cell: std::sync::OnceLock::new(),
             display_paths_cell: std::sync::OnceLock::new(),
             path_to_file_id_cell: std::sync::OnceLock::new(),
@@ -2325,64 +2276,6 @@ impl StoreReader {
             }
             Some(graph)
         }).as_ref()
-    }
-
-    /// Read the embedding for a chunk index. Returns None when the
-    /// sidecar is absent, the index is out of range, or the body
-    /// is truncated. The returned slice borrows the mmap directly
-    /// — no copy.
-    pub fn chunk_embedding(&self, chunk_idx: u32) -> Option<&[f32]> {
-        let mm = self.embeddings_mmap.as_ref()?;
-        let dim = self.embedding_dim as usize;
-        if dim == 0 { return None; }
-        let row_bytes = dim * 4;
-        let off = 8 + (chunk_idx as usize) * row_bytes;
-        if off + row_bytes > mm.len() { return None; }
-        let slice = &mm[off..off + row_bytes];
-        // SAFETY: the embeddings file is a contiguous run of f32 LE
-        // values written by build-embeddings; the bytes here are a
-        // valid multiple of 4 (checked above) and f32 has no invalid
-        // bit patterns. The mmap lives at least as long as &self,
-        // which the lifetime of the returned slice is tied to.
-        let (head, body, tail) = unsafe { slice.align_to::<f32>() };
-        if !head.is_empty() || !tail.is_empty() { return None; }
-        Some(body)
-    }
-
-    /// Rank chunks by cosine similarity against a unit-norm query
-    /// vector. Brute force — O(N) but small constants because the
-    /// embedding sidecar is contiguous mmap'd f32 and the kernel
-    /// is a tight dot-product loop. Filters tombstoned file_ids.
-    /// Returns `(chunk_idx, similarity)` sorted DESC, top `limit`.
-    pub fn semantic_rank(&self, query_vec: &[f32], limit: usize) -> Vec<(u32, f32)> {
-        let mm = match self.embeddings_mmap.as_ref() { Some(m) => m, None => return Vec::new() };
-        let chunks = match self.chunks.as_ref() { Some(c) => c, None => return Vec::new() };
-        let dim = self.embedding_dim as usize;
-        let n = self.embedding_count as usize;
-        if dim == 0 || n == 0 || query_vec.len() != dim { return Vec::new(); }
-        let row_bytes = dim * 4;
-        let body_start = 8;
-        let body_end = body_start + n * row_bytes;
-        if mm.len() < body_end { return Vec::new(); }
-        // SAFETY: same as chunk_embedding — the body is `n * dim`
-        // contiguous f32 LE values; the slice lives as long as `mm`.
-        let body = &mm[body_start..body_end];
-        let (head, floats, tail) = unsafe { body.align_to::<f32>() };
-        if !head.is_empty() || !tail.is_empty() { return Vec::new(); }
-        // Score each chunk; skip tombstoned file_ids.
-        let mut scored: Vec<(u32, f32)> = Vec::with_capacity(limit * 4);
-        for i in 0..n {
-            if i >= chunks.len() { break; }
-            let entry = &chunks[i];
-            if self.is_tombstoned(entry.file_id) { continue; }
-            let row = &floats[i * dim..(i + 1) * dim];
-            let sim = embed::cosine_unit(query_vec, row);
-            scored.push((i as u32, sim));
-        }
-        // Top-K by descending similarity.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        scored
     }
 
     /// Read the blake3 digest for a file_id, if the file_digests sidecar

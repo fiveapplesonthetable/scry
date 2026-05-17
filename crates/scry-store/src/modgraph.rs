@@ -167,7 +167,8 @@ impl ModuleGraph {
     /// the input. `resolve_file_id` maps an input file path (as the
     /// adapter recorded it) to the scry index's u32 file_id; if the
     /// adapter's path doesn't resolve, the attribution is dropped.
-    pub fn from_json_v1(
+    #[cfg(test)]
+    pub(crate) fn from_json_v1(
         v: ModuleGraphJsonV1,
         total_files: usize,
         resolve_file_id: impl FnMut(&str) -> Option<u32>,
@@ -235,7 +236,8 @@ impl ModuleGraph {
 
     /// Test-fixture constructor. Skips JSON parsing; useful for unit
     /// tests of the reachability + filter paths.
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         modules: Vec<Module>,
         deps: &[(u32, u32)],
         file_attr: Vec<Option<u32>>,
@@ -303,7 +305,8 @@ impl ModuleGraph {
     /// `ref` to drop cross-module name-matches that the build graph
     /// proves can't actually link. A file with no module attribution
     /// always passes (we can't prove unreachability without data).
-    pub fn caller_can_reach_callee(
+    #[cfg(test)]
+    pub(crate) fn caller_can_reach_callee(
         &self,
         caller_file_id: u32,
         callee_file_id: u32,
@@ -519,13 +522,6 @@ pub enum ReachBacking {
 }
 
 impl ReachCache<'_> {
-    /// Public wrapper around `try_load` so callers outside this
-    /// module can reuse the heap-copying load path (test fixtures,
-    /// callers that need owned data).
-    pub fn try_load_public(&self, n_modules: usize, stride: usize) -> Option<Vec<u64>> {
-        self.try_load(n_modules, stride)
-    }
-
     /// Zero-copy load: mmap the on-disk cache and return a
     /// `ReachBacking::Mmapped` view if the header validates.
     /// This is the steady-state fast path on AOSP scale — the
@@ -560,7 +556,7 @@ impl ReachCache<'_> {
         // mmap aligns the file to a page boundary, so &bytes[0..]
         // is page-aligned, but &bytes[61..] is not aligned for u64.
         // Reject mmap zero-copy in this case and let the caller
-        // fall back to the heap-copying path (try_load_public).
+        // fall back to the heap-copying `try_load` path.
         // This matches the cache file format we already write
         // (header len 61) — every modgraph_reach.bin in the wild
         // has this misalignment, so the mmap path returns None

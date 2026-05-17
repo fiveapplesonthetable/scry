@@ -1,9 +1,9 @@
 //! `scry finalize` — one-shot post-index sidecar pipeline.
 //!
 //! Composes the individual `scry build-*` sub-commands plus the
-//! per-language indexer importers (clang USRs, SCIP) into one
-//! discoverable CI hook. Each stage reports its own timing and
-//! propagates errors via `?` so the caller can fail-fast.
+//! per-language indexer importers (clang USR sidecar, SCIP import)
+//! into one discoverable CI hook. Each stage reports its own timing
+//! and propagates errors via `?` so the caller can fail-fast.
 //!
 //! Also home to `pick_single_auto_discovered` — the walker that
 //! finds `compile_commands.json` / `*.scip` artifacts inside the
@@ -83,7 +83,7 @@ pub(crate) fn cmd_finalize(
     if let Some(scip_path) = scip.as_ref() {
         let dir2 = dir.clone();
         let sp = scip_path.clone();
-        stage("scip-import", || scry_scip::import_scip(&sp, &dir2, None))?;
+        stage("SCIP import", || scry_scip::import_scip(&sp, &dir2, None))?;
     }
 
     if let Some(cc_path) = clang_compile_commands.as_ref() {
@@ -91,14 +91,14 @@ pub(crate) fn cmd_finalize(
         let cc = cc_path.clone();
         let root = clang_root.clone();
         let workers_for_clang = workers;
-        stage("clang-index", || scry_clang::build_clang_usrs(
+        stage("clang USR sidecar", || scry_clang::build_clang_usrs(
             &cc, &dir2, root.as_deref(), workers_for_clang, 4 * 1024 * 1024,
         ))?;
     }
 
     // Auto-discover compile_commands.json and .scip artifacts inside
-    // each indexed root and stage them as clang-index / scip-import
-    // runs. This is the Kythe-style "indexer composition" path: scry
+    // each indexed root and stage them as clang / SCIP runs.
+    // This is the Kythe-style "indexer composition" path: scry
     // consumes existing compiler-backed indexer output as the resolver
     // of record when present, and falls back to tree-sitter for the
     // rest. Skipped when the user already passed --clang-compile-
@@ -128,7 +128,7 @@ pub(crate) fn cmd_finalize(
             let cc = picked.clone();
             let root = clang_root.clone();
             let workers_for_clang = workers;
-            let stage_name = format!("clang-index (auto: {})", cc.display());
+            let stage_name = format!("clang USR sidecar (auto: {})", cc.display());
             // Soft-fail: a missing libclang shouldn't break the whole
             // finalize run for users who happen to have a cc.json in
             // a root. Explicit --clang-compile-commands stays strict
@@ -138,7 +138,7 @@ pub(crate) fn cmd_finalize(
             ));
             if let Err(e) = res {
                 eprintln!(
-                    "[finalize] WARN: auto clang-index failed; \
+                    "[finalize] WARN: auto clang USR sidecar failed; \
                      continuing without clang USR sidecar: {e}"
                 );
             }
@@ -150,11 +150,11 @@ pub(crate) fn cmd_finalize(
         )? {
             let dir2 = dir.clone();
             let sp = picked.clone();
-            let stage_name = format!("scip-import (auto: {})", sp.display());
+            let stage_name = format!("SCIP import (auto: {})", sp.display());
             let res = stage(&stage_name, || scry_scip::import_scip(&sp, &dir2, None));
             if let Err(e) = res {
                 eprintln!(
-                    "[finalize] WARN: auto scip-import failed; \
+                    "[finalize] WARN: auto SCIP import failed; \
                      continuing without SCIP sidecar: {e}"
                 );
             }

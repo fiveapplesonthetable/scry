@@ -3286,11 +3286,10 @@ pub(crate) fn apply_precision_filter(
     const WINDOW: u32 = 64;
     let defs = r.lookup_exact(name);
 
-    // Cached lazy accessors. First call per process decodes the
-    // sidecar (~17 s on AOSP-scale SCIP); subsequent calls borrow
-    // the in-memory index. Daemon (`serve`/`mcp`) pays the cost
-    // once at startup, CLI pays it per process until the packed-
-    // mmap follow-up lands.
+    // Cached lazy accessors. Open is microseconds (header parse +
+    // mmap calls); the lazy `abs_path → path_id` index is built on
+    // first lookup. Daemon (`serve` / `mcp`) pays both once at
+    // startup, CLI pays per process.
     let cusr_opt: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
         r.clang_usrs()
     } else {
@@ -3306,9 +3305,11 @@ pub(crate) fn apply_precision_filter(
         anyhow::bail!(
             "precision query but no precision sidecars at {} (looked for \
              clang_usrs.bin and scip_index.bin). Run \
-             `scry clang-index --compile-commands FILE --index DIR` or \
-             `scry scip-import --scip FILE.scip --index DIR` first, or \
-             pass `--lexical` to opt into tree-sitter name match.",
+             `scry build-symbols --build-gn DIR` (or `--build-kbuild` / \
+             `--build-cmake` for the equivalent compile_commands.json \
+             producer) and / or `scry build-symbols --scip FILE.scip` \
+             against `--index DIR` first, or pass `--lexical` to opt \
+             into tree-sitter name match.",
             r.paths.clang_usrs().parent().map(|p| p.display().to_string())
                 .unwrap_or_default(),
         );
@@ -6884,7 +6885,7 @@ pub(crate) fn cmd_build_trigrams(
         .collect();
     let staged_fst = tmp.join("trigrams.fst");
     let staged_postings = tmp.join("trigram_postings.bin");
-    scry_store::kway_merge_trigrams_to_fst_public(&chunk_paths, &staged_fst, &staged_postings)?;
+    scry_store::kway_merge_trigrams_to_fst(&chunk_paths, &staged_fst, &staged_postings)?;
     eprintln!("[trigrams] k-way merge done in {} ms", t_merge.elapsed().as_millis());
 
     // Move staged files into the index dir, replacing any existing.
@@ -7535,9 +7536,9 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "lexical": {"type": "boolean", "default": false,
                     "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever their sidecars are present, dropping name-collision false positives across C/C++/ObjC + Java/Kotlin/Rust/Go/TS/Python. Set true to see raw name-match results (debugging / want-everything mode)."},
                 "clang_precise": {"type": "boolean", "default": true,
-                    "description": "Filter refs by clang USR identity (C/C++/ObjC). DEFAULTS TO TRUE: auto-engages whenever the clang_usrs.bin sidecar is present (`scry clang-index ...` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
+                    "description": "Filter refs by clang USR identity (C/C++/ObjC). DEFAULTS TO TRUE: auto-engages whenever the clang_usrs.bin sidecar is present (`scry build-symbols --build-{gn,kbuild,cmake} DIR` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
                 "scip_precise": {"type": "boolean", "default": true,
-                    "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer: Java / Kotlin / Rust / Go / TS / Python). DEFAULTS TO TRUE: auto-engages whenever the scip_index.bin sidecar is present (`scry scip-import ...` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
+                    "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer: Java / Kotlin / Rust / Go / TS / Python). DEFAULTS TO TRUE: auto-engages whenever the scip_index.bin sidecar is present (`scry build-symbols --scip FILE.scip` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
                 "scope": {"type": "string",
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
                 "def_in": {"type": "string",

@@ -143,7 +143,7 @@ export function pet(a: Animal): string { return a.speak(); }
         .output().expect("spawn scry finalize");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
-    assert!(stderr.contains("scip-import (auto:"),
+    assert!(stderr.contains("SCIP import (auto:"),
         "auto scip-import should fire on the discovered .scip; got:\n{stderr}");
 
     let status = health_status(&idx, "scip_index");
@@ -401,7 +401,7 @@ repositories { mavenCentral() }
         .output().expect("spawn scry finalize");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
-    assert!(stderr.contains("scip-import (auto:"),
+    assert!(stderr.contains("SCIP import (auto:"),
         "auto scip-import should fire; got:\n{stderr}");
 
     let status = health_status(&idx, "scip_index");
@@ -574,7 +574,7 @@ fun pet(a: Animal): String {
         .output().expect("spawn scry finalize");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
-    assert!(stderr.contains("scip-import (auto:"),
+    assert!(stderr.contains("SCIP import (auto:"),
         "auto scip-import should fire; got:\n{stderr}");
 
     let status = health_status(&idx, "scip_index");
@@ -651,7 +651,7 @@ pub fn pet<S: Speak>(s: &S) -> &'static str { s.speak() }
         .output().expect("spawn scry finalize");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
-    assert!(stderr.contains("scip-import (auto:"),
+    assert!(stderr.contains("SCIP import (auto:"),
         "auto scip-import should fire; got:\n{stderr}");
 
     let status = health_status(&idx, "scip_index");
@@ -722,7 +722,7 @@ func Pet(a Animal) string { return a.Speak() }
         .output().expect("spawn scry finalize");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
-    assert!(stderr.contains("scip-import (auto:"),
+    assert!(stderr.contains("SCIP import (auto:"),
         "auto scip-import should fire; got:\n{stderr}");
 
     let status = health_status(&idx, "scip_index");
@@ -797,7 +797,7 @@ def pet(a: Animal) -> str:
         .output().expect("spawn scry finalize");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
-    assert!(stderr.contains("scip-import (auto:"),
+    assert!(stderr.contains("SCIP import (auto:"),
         "auto scip-import should fire; got:\n{stderr}");
 
     let status = health_status(&idx, "scip_index");

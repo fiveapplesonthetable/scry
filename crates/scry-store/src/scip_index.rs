@@ -1,146 +1,39 @@
-//! Reader for the `scip_index.bin` sidecar produced by
-//! `scry scip-import`. Mirrors the shape of [`super::clang_usrs`] —
-//! both wire SCIP-style symbol-identity into scry's query path, but
+//! Reader for the `scip_index.bin` sidecar produced by the SCIP
+//! importer. Mirrors the shape of [`super::clang_usrs`] — both wire
+//! SCIP-style symbol-identity into scry's query path, but
 //! `scip_index` is fed by external SCIP tools (scip-java, gopls,
 //! rust-analyzer, …) while `clang_usrs` is produced by the in-tree
-//! `scry clang-index` helper for C/C++/ObjC.
+//! libclang walker for C / C++ / ObjC.
 //!
 //! On-disk layout is owned by [`crate::precision_packed`]; this
-//! module is a thin wrapper that supplies the SCIP-flavoured method
-//! names (`symbol_for`, `symbol_for_window`, `symbol_count`, …).
+//! module invokes [`crate::precision_sidecar_wrapper!`] to attach
+//! the SCIP-flavoured method names (`symbol_for`,
+//! `symbol_for_window`, `symbol_count`, `iter_symbols`).
 
-use crate::precision_packed::{self, PrecisionPacked, Record};
-use anyhow::Result;
-use std::path::Path;
-
-/// One occurrence (decl, ref, or write/read access) at an exact
-/// source location. Writer-side carrier; the on-disk format interns
-/// `symbol_table[symbol_id]` into a single blob.
-#[derive(Debug, Clone)]
-pub struct ScipRecord {
-    /// Absolute path the SCIP indexer recorded (resolved against the
-    /// SCIP file's `project_root` at import time).
-    pub abs_path: String,
-    /// Byte offset within the file. Computed at import from
-    /// `(line, col)` by reading the source — matches tree-sitter's
-    /// `byte_start` for occurrences on the same identifier.
-    pub byte_offset: u32,
-    /// Index into the writer's `symbol_table`.
-    pub symbol_id: u32,
-    /// Low 8 bits of SCIP's `symbol_roles` bitmap:
-    /// `0x01` = Definition, `0x02` = Import, `0x04` = WriteAccess,
-    /// `0x08` = ReadAccess, `0x10` = Generated, `0x20` = Test,
-    /// `0x40` = ForwardDefinition. 0 = pure reference.
-    pub role: u8,
-}
-
-/// Mmap'd SCIP sidecar. All accessors borrow from the mmap.
-#[derive(Debug)]
-pub struct ScipIndex {
-    packed: PrecisionPacked,
-}
-
-impl ScipIndex {
-    /// Open `scip_index.bin`; missing → `Ok(None)`.
-    pub fn open(path: &Path) -> Result<Option<Self>> {
-        Ok(PrecisionPacked::open(path, precision_packed::MAGIC_SCIP)?
-            .map(|packed| Self { packed }))
-    }
-
-    pub fn symbol_for(&self, abs_path: &str, byte_offset: u32) -> Option<&str> {
-        self.packed.symbol_at(abs_path, byte_offset)
-    }
-
-    /// Windowed lookup — same shape as
-    /// [`super::clang_usrs::ClangUsrIndex::usr_for_window`]; see
-    /// that doc for why the window is needed (parser cursor vs
-    /// identifier-start alignment).
-    pub fn symbol_for_window(
-        &self,
-        abs_path: &str,
-        byte_offset: u32,
-        window: u32,
-    ) -> Option<&str> {
-        self.packed.symbol_for_window(abs_path, byte_offset, window)
-    }
-
-    pub fn len(&self) -> usize { self.packed.record_count() }
-    pub fn is_empty(&self) -> bool { self.packed.is_empty() }
-    pub fn symbol_count(&self) -> usize { self.packed.symbol_count() }
-
-    /// Iterate the interned SCIP symbol table (string at id 0, 1, …).
-    /// Used by `scry sidecar-inspect` for sample output.
-    pub fn iter_symbols(&self) -> impl Iterator<Item = &str> {
-        (0..self.packed.symbol_count() as u32)
-            .filter_map(|i| self.packed.symbol(i))
-    }
-
-    /// Stream every `(abs_path, byte_offset, symbol, role)` row in the
-    /// sidecar. Used by `scry scip-import --append` to seed the
-    /// rebuild with the existing rows. Path order matches on-disk
-    /// (sorted by path_id then byte_offset), so callers get
-    /// per-path runs together.
-    pub fn iter_records(&self) -> impl Iterator<Item = (&str, u32, &str, u8)> {
-        (0..self.packed.path_count() as u32).flat_map(move |pid| {
-            let path = self.packed.path_of(pid).unwrap_or("");
-            let (start, count) = self.packed.path_records_range(pid).unwrap_or((0, 0));
-            (start..start + count).filter_map(move |rid| {
-                let (bo, sid, role) = self.packed.record(rid)?;
-                let sym = self.packed.symbol(sid)?;
-                Some((path, bo, sym, role))
-            })
-        })
-    }
-
-    /// Sibling of [`super::clang_usrs::ClangUsrIndex::precompute_by_file_ids`].
-    /// See that doc for rationale — same fast-path for the SCIP
-    /// sidecar's lookup loop inside `apply_precision_filter`.
-    pub fn precompute_by_file_ids<'a>(
-        &'a self,
-        paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
-        file_count: usize,
-    ) -> ByFileSymbolLookup<'a> {
-        ByFileSymbolLookup {
-            inner: self.packed.precompute_by_file_ids(paths_by_file_id, file_count),
-        }
-    }
-}
-
-/// Per-query precomputed lookup keyed by `file_id` for the SCIP
-/// sidecar. Mirror of `clang_usrs::ByFileLookup`.
-pub struct ByFileSymbolLookup<'a> {
-    inner: precision_packed::ByFileLookup<'a>,
-}
-
-impl<'a> ByFileSymbolLookup<'a> {
-    pub fn symbol_for_window(
-        &self,
-        file_id: u32,
-        byte_offset: u32,
-        window: u32,
-    ) -> Option<&'a str> {
-        self.inner.symbol_for_window(file_id, byte_offset, window)
-    }
-}
-
-/// Write the sidecar in packed format. Writer side keeps owned
-/// `String`s in `symbol_table` and indexes them by `symbol_id`; we
-/// expand each record to a borrowed (path, symbol) pair for
-/// [`precision_packed::write`] to intern.
-pub fn write(path: &Path, symbol_table: &[String], records: &[ScipRecord]) -> Result<()> {
-    let pp_records: Vec<Record<'_>> = records
-        .iter()
-        .map(|r| Record {
-            abs_path: r.abs_path.as_str(),
-            byte_offset: r.byte_offset,
-            symbol: symbol_table
-                .get(r.symbol_id as usize)
-                .map(String::as_str)
-                .unwrap_or(""),
-            kind: r.role,
-        })
-        .collect();
-    precision_packed::write(path, precision_packed::MAGIC_SCIP, &pp_records)
+crate::precision_sidecar_wrapper! {
+    index = ScipIndex,
+    lookup = ByFileSymbolLookup,
+    record = ScipRecord,
+    record_doc = "One occurrence (decl, ref, or write/read access) at an exact source \
+                   location. Writer-side carrier; the on-disk format interns \
+                   `symbol_table[symbol_id]` into a single blob. `abs_path` is the \
+                   absolute path the SCIP indexer recorded (resolved against the \
+                   SCIP file's `project_root` at import time). `byte_offset` is \
+                   computed at import from `(line, col)` by reading the source — \
+                   matches tree-sitter's `byte_start` for occurrences on the same \
+                   identifier.",
+    symid = symbol_id,
+    kind = role,
+    kind_doc = "Low 8 bits of SCIP's `symbol_roles` bitmap: `0x01` = Definition, \
+                 `0x02` = Import, `0x04` = WriteAccess, `0x08` = ReadAccess, \
+                 `0x10` = Generated, `0x20` = Test, `0x40` = ForwardDefinition. \
+                 0 = pure reference.",
+    lookup_fn = symbol_for_window,
+    exact_fn = symbol_for,
+    count_fn = symbol_count,
+    iter_fn = iter_symbols,
+    table_arg = symbol_table,
+    magic = precision_packed::MAGIC_SCIP,
 }
 
 #[cfg(test)]

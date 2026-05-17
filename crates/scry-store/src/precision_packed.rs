@@ -486,6 +486,191 @@ pub fn write(
     Ok(())
 }
 
+/// Generate a typed wrapper around [`PrecisionPacked`] with
+/// language-flavoured method names. Each producer (`scry-clang`,
+/// `scry-scip`) calls this once to get the type + write helper it
+/// exposes; downstream callers keep their domain-specific naming
+/// (`usr_for_window` vs `symbol_for_window`, `usr_count` vs
+/// `symbol_count`) at no extra runtime cost.
+///
+/// Arguments:
+///   `$index`      — wrapper type name (`ClangUsrIndex` / `ScipIndex`)
+///   `$lookup`     — per-file lookup type name (`ByFileLookup` / `ByFileSymbolLookup`)
+///   `$record`     — writer-side input struct name (`UsrRecord` / `ScipRecord`)
+///   `$record_doc` — doc string for the input record struct
+///   `$symid`      — field on `$record` carrying the symbol-table index
+///                   (`usr_id` / `symbol_id`)
+///   `$kind`       — field on `$record` carrying the per-record kind byte
+///                   (`kind` / `role`)
+///   `$kind_doc`   — doc string for that field
+///   `$lookup_fn`  — public name of the per-file accessor on `$index` /
+///                   `$lookup` (`usr_for_window` / `symbol_for_window`)
+///   `$exact_fn`   — public name of the exact-offset accessor on `$index`
+///                   (`usr_for` / `symbol_for`)
+///   `$count_fn`   — public name of the symbol-table size accessor
+///                   (`usr_count` / `symbol_count`)
+///   `$iter_fn`    — public name of the symbol-table iterator
+///                   (`iter_usrs` / `iter_symbols`)
+///   `$table_arg`  — name of the symbol-table arg on `write`
+///                   (`usr_table` / `symbol_table`)
+///   `$magic`      — magic constant from [`crate`]
+#[macro_export]
+macro_rules! precision_sidecar_wrapper {
+    (
+        index = $index:ident,
+        lookup = $lookup:ident,
+        record = $record:ident,
+        record_doc = $record_doc:expr,
+        symid = $symid:ident,
+        kind = $kind:ident,
+        kind_doc = $kind_doc:expr,
+        lookup_fn = $lookup_fn:ident,
+        exact_fn = $exact_fn:ident,
+        count_fn = $count_fn:ident,
+        iter_fn = $iter_fn:ident,
+        table_arg = $table_arg:ident,
+        magic = $magic:path,
+    ) => {
+        use $crate::precision_packed::{self, PrecisionPacked, Record};
+        use anyhow::Result;
+        use std::path::Path;
+
+        #[doc = $record_doc]
+        #[derive(Debug, Clone)]
+        pub struct $record {
+            pub abs_path: String,
+            pub byte_offset: u32,
+            pub $symid: u32,
+            #[doc = $kind_doc]
+            pub $kind: u8,
+        }
+
+        /// Mmap'd precision sidecar. All accessors borrow from the
+        /// mmap, so per-query cost is the algorithmic cost only.
+        #[derive(Debug)]
+        pub struct $index {
+            packed: PrecisionPacked,
+        }
+
+        impl $index {
+            /// Open the sidecar. Returns `Ok(None)` if the file is
+            /// absent, an error if it's present but malformed / has
+            /// the wrong magic.
+            pub fn open(path: &Path) -> Result<Option<Self>> {
+                Ok(PrecisionPacked::open(path, $magic)?
+                    .map(|packed| Self { packed }))
+            }
+
+            /// Exact lookup at `(abs_path, byte_offset)`. None if no
+            /// record covers that site.
+            pub fn $exact_fn(&self, abs_path: &str, byte_offset: u32) -> Option<&str> {
+                self.packed.symbol_at(abs_path, byte_offset)
+            }
+
+            /// Windowed lookup — returns the CLOSEST record within
+            /// `±window` of `byte_offset`, or None. Used when the
+            /// query and the producing indexer disagree on whether a
+            /// cursor points at keyword vs identifier start.
+            pub fn $lookup_fn(
+                &self,
+                abs_path: &str,
+                byte_offset: u32,
+                window: u32,
+            ) -> Option<&str> {
+                self.packed.symbol_for_window(abs_path, byte_offset, window)
+            }
+
+            pub fn len(&self) -> usize { self.packed.record_count() }
+            pub fn is_empty(&self) -> bool { self.packed.is_empty() }
+            pub fn $count_fn(&self) -> usize { self.packed.symbol_count() }
+
+            /// Iterate the interned symbol table (string at id 0, 1,
+            /// …). Used by `scry sidecar-inspect` for sample output.
+            pub fn $iter_fn(&self) -> impl Iterator<Item = &str> {
+                (0..self.packed.symbol_count() as u32)
+                    .filter_map(|i| self.packed.symbol(i))
+            }
+
+            /// Stream every `(abs_path, byte_offset, symbol, kind)`
+            /// row in the sidecar. Path order matches on-disk (sorted
+            /// by path_id then byte_offset), so callers get per-path
+            /// runs together.
+            pub fn iter_records(&self) -> impl Iterator<Item = (&str, u32, &str, u8)> {
+                (0..self.packed.path_count() as u32).flat_map(move |pid| {
+                    let path = self.packed.path_of(pid).unwrap_or("");
+                    let (start, count) = self.packed
+                        .path_records_range(pid).unwrap_or((0, 0));
+                    (start..start + count).filter_map(move |rid| {
+                        let (bo, sid, k) = self.packed.record(rid)?;
+                        let sym = self.packed.symbol(sid)?;
+                        Some((path, bo, sym, k))
+                    })
+                })
+            }
+
+            /// Build a [`$lookup`] indexed by scry's `FileEntry::id`,
+            /// so per-ref lookups in a query loop become a
+            /// `Vec::get(file_id)` + binary search instead of a
+            /// `HashMap<String, …>::get(&display_path)` per ref.
+            /// `paths_by_file_id` must yield each `(file_id, abs_path)`
+            /// pair at most once.
+            pub fn precompute_by_file_ids<'a>(
+                &'a self,
+                paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
+                file_count: usize,
+            ) -> $lookup<'a> {
+                $lookup {
+                    inner: self.packed
+                        .precompute_by_file_ids(paths_by_file_id, file_count),
+                }
+            }
+        }
+
+        /// Per-query precomputed lookup keyed by `file_id`. Built by
+        /// [`$index::precompute_by_file_ids`] and consulted per ref
+        /// inside the precision filter.
+        pub struct $lookup<'a> {
+            inner: precision_packed::ByFileLookup<'a>,
+        }
+
+        impl<'a> $lookup<'a> {
+            /// Same window semantics as [`$index::$lookup_fn`].
+            pub fn $lookup_fn(
+                &self,
+                file_id: u32,
+                byte_offset: u32,
+                window: u32,
+            ) -> Option<&'a str> {
+                self.inner.symbol_for_window(file_id, byte_offset, window)
+            }
+        }
+
+        /// Write the sidecar in packed format. Writer side keeps
+        /// owned `String`s in `$table_arg` and indexes them by id;
+        /// we expand each record to a borrowed (path, symbol) pair
+        /// for [`precision_packed::write`] to intern.
+        pub fn write(
+            path: &Path,
+            $table_arg: &[String],
+            records: &[$record],
+        ) -> Result<()> {
+            let pp_records: Vec<Record<'_>> = records
+                .iter()
+                .map(|r| Record {
+                    abs_path: r.abs_path.as_str(),
+                    byte_offset: r.byte_offset,
+                    symbol: $table_arg
+                        .get(r.$symid as usize)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    kind: r.$kind,
+                })
+                .collect();
+            precision_packed::write(path, $magic, &pp_records)
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

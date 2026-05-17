@@ -3051,7 +3051,7 @@ int kick(const Widget& w) { return w.poke(41); }
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(),
         "finalize failed: stderr={stderr}");
-    assert!(stderr.contains("clang-index (auto:"),
+    assert!(stderr.contains("clang USR sidecar (auto:"),
         "finalize stderr should log the auto clang-index stage; got:\n{stderr}");
     assert!(stderr.contains("compile_commands.json"),
         "finalize stderr should name the discovered compile_commands.json; \
@@ -3061,7 +3061,7 @@ int kick(const Widget& w) { return w.poke(41); }
          got:\n{stderr}");
 
     // Distinguish "libclang worked" from "libclang unavailable, soft-failed".
-    let libclang_failed = stderr.contains("auto clang-index failed");
+    let libclang_failed = stderr.contains("auto clang USR sidecar failed");
     let health_out = Command::new(scry_bin())
         .args(["health", "--index"]).arg(&idx).arg("--json")
         .output().expect("spawn health");
@@ -3158,7 +3158,7 @@ int Widget::poke(int x) const { return x + 1; }
     let stderr_noflag = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(),
         "finalize (no flag) failed: {stderr_noflag}");
-    assert!(!stderr_noflag.contains("clang-index (auto:"),
+    assert!(!stderr_noflag.contains("clang USR sidecar (auto:"),
         "without --build-out, auto clang-index should NOT fire \
          (cc.json is outside indexed roots); got:\n{stderr_noflag}");
 
@@ -3171,7 +3171,7 @@ int Widget::poke(int x) const { return x + 1; }
     let stderr_with = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(),
         "finalize --build-out failed: {stderr_with}");
-    assert!(stderr_with.contains("clang-index (auto:"),
+    assert!(stderr_with.contains("clang USR sidecar (auto:"),
         "--build-out should make auto clang-index fire; got:\n{stderr_with}");
     assert!(stderr_with.contains(&out.display().to_string()),
         "--build-out auto stage should name the build-out path; got:\n{stderr_with}");

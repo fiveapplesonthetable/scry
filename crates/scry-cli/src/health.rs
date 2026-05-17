@@ -61,8 +61,6 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         ("ref_resolutions.bin",  paths.ref_resolutions()),
         ("file_digests.bin",     paths.file_digests()),
         ("tombstones.bin",       paths.tombstones()),
-        ("chunks.bin",           paths.chunks()),
-        ("embeddings.bin",       paths.embeddings()),
         // Precision sidecars (v0.1.12+). Each has its own structured
         // status line below; this just reports raw file presence.
         ("module_graph.json",    paths.module_graph_json()),
@@ -130,7 +128,7 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
     };
     checks.push(Check { name: "module_graph", status: mg_status, required: false, ok: true });
     let cu_status = match scry_store::clang_usrs::ClangUsrIndex::open(&paths.clang_usrs()) {
-        Ok(None) => "absent (run `scry clang-index`)".to_string(),
+        Ok(None) => "absent (run `scry build-symbols --build-{gn,kbuild,cmake} DIR`)".to_string(),
         Ok(Some(c)) => format!(
             "v1, {} USRs, {} records", c.usr_count(), c.len(),
         ),
@@ -138,7 +136,7 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
     };
     checks.push(Check { name: "clang_usrs", status: cu_status, required: false, ok: true });
     let si_status = match scry_store::scip_index::ScipIndex::open(&paths.scip_index()) {
-        Ok(None) => "absent (run `scry scip-import`)".to_string(),
+        Ok(None) => "absent (run `scry build-symbols --scip FILE.scip`)".to_string(),
         Ok(Some(s)) => format!(
             "v1, {} symbols, {} records", s.symbol_count(), s.len(),
         ),

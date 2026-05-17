@@ -1,9 +1,10 @@
-//! scry-walker: gitignore-aware, per-profile parallel walker over source roots.
-//!
-//! Phase 0: walk roots, classify files into FileKind, return counts.
+//! scry-walker: gitignore-aware, per-profile parallel walker over
+//! source roots. Walks each configured root, classifies every file
+//! into a [`FileKind`], and hands the `(path, kind)` pairs to the
+//! caller. Downstream crates (`scry-lang`, `scry-store`) own the
+//! parser and store sides; this crate stops at file classification.
 
 #![forbid(unsafe_code)]
-//! Later phases will hand each (path, kind) to language-specific parsers.
 
 use anyhow::{anyhow, Result};
 use ignore::{WalkBuilder, WalkState};

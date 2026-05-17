@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// GN build directory marker. `args.gn` is GN's per-build config
 /// file — every GN build dir has one.
-pub const GN_BUILD_MARKER: &str = "args.gn";
+const GN_BUILD_MARKER: &str = "args.gn";
 
 /// Locate the compile_commands.json inside a GN build directory.
 /// Returns `Ok(None)` if the directory looks like a GN build dir

@@ -1,136 +1,31 @@
 //! Reader for the `clang_usrs.bin` sidecar produced by
-//! `scry-clang-index`. Optional; missing → `ClangUsrIndex::open` returns
-//! `Ok(None)`. Present → mmaps the packed sidecar (see
+//! `scry-clang-index`. Optional; missing → `ClangUsrIndex::open`
+//! returns `Ok(None)`. Present → mmaps the packed sidecar (see
 //! [`crate::precision_packed`] for the on-disk layout) and exposes
 //! `(abs_path, byte_offset)` lookups.
 //!
-//! The on-disk shape is owned by `precision_packed`; this module only
-//! adds the USR-flavoured public API names (`usr_for`,
-//! `usr_for_window`, `usr_count`, …) so callers keep their
-//! C/C++/ObjC-specific naming.
+//! The on-disk shape is owned by `precision_packed`; this module
+//! invokes [`crate::precision_sidecar_wrapper!`] to attach the
+//! USR-flavoured public API names (`usr_for`, `usr_for_window`,
+//! `usr_count`, `iter_usrs`) so callers keep their C / C++ / ObjC
+//! naming.
 
-use crate::precision_packed::{self, PrecisionPacked, Record};
-use anyhow::Result;
-use std::path::Path;
-
-/// One symbol decl / ref / call site, keyed by absolute path +
-/// byte offset within the file. Writer-side carrier — the on-disk
-/// shape interns `usr_table[usr_id]` into a single symbol blob.
-#[derive(Debug, Clone)]
-pub struct UsrRecord {
-    pub abs_path: String,
-    pub byte_offset: u32,
-    pub usr_id: u32,
-    /// 0 = decl, 1 = ref, 2 = call.
-    pub kind: u8,
-}
-
-/// Mmap'd USR sidecar. All accessors borrow from the mmap, so per-
-/// query cost is the algorithmic cost only.
-#[derive(Debug)]
-pub struct ClangUsrIndex {
-    packed: PrecisionPacked,
-}
-
-impl ClangUsrIndex {
-    /// Open the sidecar at `<index_dir>/clang_usrs.bin`. Returns
-    /// `Ok(None)` if the file is absent.
-    pub fn open(path: &Path) -> Result<Option<Self>> {
-        Ok(PrecisionPacked::open(path, precision_packed::MAGIC_CLANG_USR)?
-            .map(|packed| Self { packed }))
-    }
-
-    /// Look up the USR for a (path, offset) pair. Returns None if no
-    /// clang record covers that exact site.
-    pub fn usr_for(&self, abs_path: &str, byte_offset: u32) -> Option<&str> {
-        self.packed.symbol_at(abs_path, byte_offset)
-    }
-
-    /// Look up the USR for a site within ±`window` bytes of
-    /// `byte_offset`. Use this when the query and clang's cursor
-    /// disagree on whether to point at the keyword vs identifier
-    /// (e.g. tree-sitter struct decl byte_start = identifier, clang
-    /// CXCursor_StructDecl = keyword). Returns the USR of the
-    /// CLOSEST record within the window, or None if none.
-    pub fn usr_for_window(
-        &self,
-        abs_path: &str,
-        byte_offset: u32,
-        window: u32,
-    ) -> Option<&str> {
-        self.packed.symbol_for_window(abs_path, byte_offset, window)
-    }
-
-    pub fn len(&self) -> usize { self.packed.record_count() }
-    pub fn is_empty(&self) -> bool { self.packed.is_empty() }
-    pub fn usr_count(&self) -> usize { self.packed.symbol_count() }
-
-    /// Iterate the interned USR table (string at id 0, 1, …). Used by
-    /// `scry sidecar-inspect` to show a sample.
-    pub fn iter_usrs(&self) -> impl Iterator<Item = &str> {
-        (0..self.packed.symbol_count() as u32)
-            .filter_map(|i| self.packed.symbol(i))
-    }
-
-    /// Build a [`ByFileLookup`] indexed by scry's `FileEntry::id`, so
-    /// per-ref lookups in a query loop become a `Vec::get(file_id)` +
-    /// binary search instead of `HashMap<String, …>::get(&display_path)`
-    /// per ref. `paths_by_file_id` must yield each `(file_id, abs_path)`
-    /// pair at most once.
-    ///
-    /// Designed for `apply_precision_filter`: the caller walks
-    /// `StoreReader::files` once, materialises `display_path` once per
-    /// file, then drives 2k–100k+ per-ref lookups against the result.
-    pub fn precompute_by_file_ids<'a>(
-        &'a self,
-        paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
-        file_count: usize,
-    ) -> ByFileLookup<'a> {
-        ByFileLookup {
-            inner: self.packed.precompute_by_file_ids(paths_by_file_id, file_count),
-        }
-    }
-}
-
-/// Per-query precomputed lookup keyed by `file_id`. Built once by
-/// [`ClangUsrIndex::precompute_by_file_ids`] and consulted per ref
-/// inside the precision filter. Borrows from the parent
-/// `ClangUsrIndex` so no record / table data is cloned.
-pub struct ByFileLookup<'a> {
-    inner: precision_packed::ByFileLookup<'a>,
-}
-
-impl<'a> ByFileLookup<'a> {
-    /// Same window semantics as [`ClangUsrIndex::usr_for_window`].
-    /// Returns `None` if no record falls inside `[byte_offset±window]`.
-    pub fn usr_for_window(
-        &self,
-        file_id: u32,
-        byte_offset: u32,
-        window: u32,
-    ) -> Option<&'a str> {
-        self.inner.symbol_for_window(file_id, byte_offset, window)
-    }
-}
-
-/// Write the sidecar in packed format. The writer side keeps owned
-/// `String`s in `usr_table` and indexes them by `usr_id`; we expand
-/// each record to a borrowed (path, symbol) pair for
-/// [`precision_packed::write`] to intern.
-pub fn write(path: &Path, usr_table: &[String], records: &[UsrRecord]) -> Result<()> {
-    let pp_records: Vec<Record<'_>> = records
-        .iter()
-        .map(|r| Record {
-            abs_path: r.abs_path.as_str(),
-            byte_offset: r.byte_offset,
-            symbol: usr_table
-                .get(r.usr_id as usize)
-                .map(String::as_str)
-                .unwrap_or(""),
-            kind: r.kind,
-        })
-        .collect();
-    precision_packed::write(path, precision_packed::MAGIC_CLANG_USR, &pp_records)
+crate::precision_sidecar_wrapper! {
+    index = ClangUsrIndex,
+    lookup = ByFileLookup,
+    record = UsrRecord,
+    record_doc = "One symbol decl / ref / call site, keyed by absolute path + byte \
+                   offset within the file. Writer-side carrier — the on-disk shape \
+                   interns `usr_table[usr_id]` into a single symbol blob.",
+    symid = usr_id,
+    kind = kind,
+    kind_doc = "0 = decl, 1 = ref, 2 = call.",
+    lookup_fn = usr_for_window,
+    exact_fn = usr_for,
+    count_fn = usr_count,
+    iter_fn = iter_usrs,
+    table_arg = usr_table,
+    magic = precision_packed::MAGIC_CLANG_USR,
 }
 
 #[cfg(test)]

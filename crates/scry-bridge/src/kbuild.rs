@@ -29,11 +29,11 @@ use std::path::{Path, PathBuf};
 
 /// Kernel build directory marker. Every Kbuild out dir has a
 /// generated `.config` file at the top.
-pub const KBUILD_MARKER: &str = ".config";
+const KBUILD_MARKER: &str = ".config";
 
 /// Kernel source root marker. The kernel source root has both a
 /// top-level `Makefile` and `Kconfig` (and `scripts/`).
-pub const KSOURCE_MARKERS: &[&str] = &["Makefile", "Kconfig"];
+const KSOURCE_MARKERS: &[&str] = &["Makefile", "Kconfig"];
 
 /// Locate compile_commands.json inside a kernel build directory.
 /// Returns `Ok(None)` if it's a kernel out dir (`.config` present)

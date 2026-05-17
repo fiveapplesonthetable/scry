@@ -15,8 +15,7 @@
 //! ships Kythe extractors), the canonical path is `scry build-symbols
 //! --build-kzip PATH.kzip` — the compiler wrappers capture the exact
 //! inputs every compile sees, and scry just ingests the resulting
-//! kzip. That replaces the previous Soong-specific bridge that
-//! reverse-engineered ninja files.
+//! kzip.
 
 #![forbid(unsafe_code)]
 

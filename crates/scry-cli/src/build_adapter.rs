@@ -4,14 +4,19 @@
 //!
 //! ## Supported build systems
 //!
-//! - **`cargo`** — Rust workspaces (Cargo.toml). Fully implemented; tested
-//!   end-to-end via dogfooding on scry's own workspace.
-//! - **`soong`** — AOSP Soong (`m json-module-graph` output). Skeleton
-//!   parser; needs validation against a real AOSP build environment.
-//! - **`kernel`** — Linux Kbuild (Makefile fragments + `.config`). Not
-//!   yet implemented; queued for a follow-up slice.
-//! - **`gn`** — GN/ninja projects (`gn gen --ide=json` output). Not yet
-//!   implemented; queued.
+//! - **`cargo`** — Rust workspaces (Cargo.toml). One module per
+//!   workspace member; dep edges follow `[dependencies]`.
+//! - **`soong`** — AOSP Soong (`m json-module-graph` output). One
+//!   module per Soong module; dep edges follow the union of
+//!   `Static_libs`, `Shared_libs`, etc.
+//! - **`kernel`** — Linux Kbuild. One module per top-level subsystem
+//!   directory (drivers/, fs/, kernel/, …); permissive reachability
+//!   (every subsystem reaches every other, since static-kernel
+//!   non-static symbols are callable across the linkage domain).
+//! - **`gn`** — GN/ninja projects (`gn gen --ide=json` output). One
+//!   module per GN target; dep edges follow the `deps` arrays.
+//! - **`bazel`** — Bazel workspaces (`bazel query --output=streamed_proto`
+//!   or text equivalent). One module per `*_library` target.
 //!
 //! Adapters all emit the same canonical schema documented in
 //! `scry_store::modgraph::ModuleGraphJsonV1`. Once the file exists in
@@ -51,7 +56,7 @@ pub struct OutFile {
 /// Build a v1 module-graph file by reading the build system's native
 /// metadata at `root`. Returns the populated structure; the caller
 /// writes it to `module_graph.json` in the index dir.
-pub fn build_modgraph(kind: &str, root: &Path) -> Result<OutGraphV1> {
+pub(crate) fn build_modgraph(kind: &str, root: &Path) -> Result<OutGraphV1> {
     match kind {
         "cargo" => cargo::build(root),
         "soong" => soong::build(root),
@@ -250,18 +255,16 @@ mod cargo {
 // ---------------------------------------------------------------------
 // kernel (Linux Kbuild)
 //
-// First-pass scope: each top-level subdir under the kernel source root
+// Scope: each top-level subdir under the kernel source root
 // (drivers/, fs/, kernel/, mm/, net/, ipc/, security/, sound/, …) is a
 // module. Reachability is permissive (all-to-all within the kernel
 // linkage domain) because real EXPORT_SYMBOL-aware reachability needs
-// per-file symbol-export parsing — queued for a v0.1.13 follow-up.
+// per-file symbol-export parsing.
 //
 // Even with permissive reachability, this delivers value: every
 // indexed file gets a meaningful module name (matching `drivers/net`,
 // `fs/btrfs`, `arch/x86`, …) that scry can surface in `--reachable`
-// diagnostics and that downstream tooling can use. When a follow-up
-// slice adds EXPORT_SYMBOL parsing + obj-m attribution, the file
-// attribution layer doesn't need to change — only the dep edges.
+// diagnostics and that downstream tooling can use.
 // ---------------------------------------------------------------------
 
 mod kernel {
@@ -320,8 +323,7 @@ mod kernel {
         // symbols are callable from any other. This produces a fully
         // connected graph minus self-loops; `--reachable` becomes a
         // useful filter only when external (non-kernel) callers exist
-        // in the same index. Real EXPORT_SYMBOL semantics ship in a
-        // follow-up (v0.1.13) along with obj-m awareness.
+        // in the same index.
         let mut deps: Vec<[u32; 2]> = Vec::new();
         for i in 0..modules.len() {
             for j in 0..modules.len() {

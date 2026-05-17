@@ -80,6 +80,59 @@ pub fn resolve_indexer_binary(name: &str) -> std::path::PathBuf {
     PathBuf::from(name)
 }
 
+/// Extract every srcjar into a per-compilation scratch dir and
+/// return the absolute paths of every extracted `.java` file. Used by
+/// the Java and Kotlin indexers to fold Soong's AIDL stubs + KAPT
+/// generated sources into the same javac/kotlinc invocation that
+/// processes the user's hand-written source — exactly mirroring what
+/// Soong's build pipeline does. Re-running on the same target dir is
+/// idempotent.
+///
+/// Shells out to `unzip -q -o` rather than pulling in a zip crate;
+/// the binary is universally present and the per-srcjar cost is
+/// dominated by I/O anyway.
+pub fn extract_srcjars(
+    srcjars: &[std::path::PathBuf],
+    target_dir: &std::path::Path,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use anyhow::Context as _;
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if srcjars.is_empty() { return Ok(out); }
+    std::fs::create_dir_all(target_dir)
+        .with_context(|| format!("create srcjar dir {}", target_dir.display()))?;
+    for jar in srcjars {
+        if !jar.is_file() { continue; }
+        let status = std::process::Command::new("unzip")
+            .arg("-q").arg("-o")
+            .arg(jar)
+            .arg("-d").arg(target_dir)
+            .status()
+            .with_context(|| format!("spawn unzip for {}", jar.display()))?;
+        if !status.success() {
+            // Soft-fail per jar — a corrupt/empty srcjar shouldn't
+            // poison the whole compilation. Other srcjars + the
+            // user's hand-written sources may still produce useful
+            // semanticdb output.
+            eprintln!("[scry-bridge] unzip {} exited with {}",
+                      jar.display(), status);
+            continue;
+        }
+    }
+    // Walk the extracted tree for .java files.
+    for entry in ignore::WalkBuilder::new(target_dir)
+        .standard_filters(false)
+        .build()
+        .flatten()
+    {
+        if entry.file_type().is_some_and(|t| t.is_file())
+            && entry.path().extension().is_some_and(|e| e == "java")
+        {
+            out.push(entry.into_path());
+        }
+    }
+    Ok(out)
+}
+
 pub mod cmake;
 pub mod gn;
 pub mod java_indexer;
@@ -154,6 +207,17 @@ pub struct Compilation {
     /// don't fit the structured slots above. We round-trip them
     /// verbatim so the indexer sees the same view the build did.
     pub extra_args: Vec<String>,
+    /// Absolute paths to generated-source jars that should be
+    /// extracted and compiled as part of THIS compilation. AIDL
+    /// stubs (`gen/aidl/aidl0.srcjar`), AutoValue/Hilt KAPT outputs
+    /// (`kapt/kapt-sources.jar`), and other annotation-processor
+    /// outputs live here. The indexer extracts each one into a
+    /// per-compilation scratch dir and appends its `.java` files to
+    /// the source argfile so javac/kotlinc resolves the generated
+    /// symbols (e.g. `IUwbAdapterStateCallbacks`, `Hilt_MainActivity`)
+    /// at compile time, matching what Soong's build does.
+    #[serde(default)]
+    pub generated_srcjars: Vec<std::path::PathBuf>,
 }
 
 /// Trait implemented by build systems that can enumerate their

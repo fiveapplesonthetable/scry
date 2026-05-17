@@ -212,6 +212,20 @@ impl JavacRule {
         let extra_args = self.bindings.get("javacFlags")
             .map(|s| forward_javac_flags(s, source_root))
             .unwrap_or_default();
+        let (mut generated_srcjars, sibling_classpath) =
+            collect_sibling_codegen(&self.output, self.bindings.get("srcJars"), source_root);
+        // Append sibling-output jars (busybox/R.jar, aapt2/*.jar)
+        // to the existing classpath token stream.
+        let mut classpath = classpath;
+        if !sibling_classpath.is_empty() {
+            // If we already have a `-classpath J1:J2` pair, extend
+            // its value; otherwise add a fresh pair.
+            extend_classpath_tokens(&mut classpath, &sibling_classpath);
+        }
+        // Dedup srcjars (some modules list the same gen/aidl srcjar
+        // through both `srcJars` and our sibling auto-discovery).
+        generated_srcjars.sort();
+        generated_srcjars.dedup();
         Ok(Compilation {
             module,
             language,
@@ -222,8 +236,107 @@ impl JavacRule {
             defines: Vec::new(),
             java_version: self.bindings.get("javaVersion").cloned(),
             extra_args,
+            generated_srcjars,
         })
     }
+}
+
+/// Walk the sibling output dirs of a javac/kotlin rule's output to
+/// recover the generated-srcjar + classpath jars Soong produced for
+/// other build-graph steps (AIDL stub generation, AAPT2/R class
+/// generation, KAPT annotation processing). Without these, modules
+/// that depend on `IFooCallback`/`R`/`Hilt_X` symbols compile with
+/// "unresolved reference" because the upstream codegen output never
+/// reaches javac's view.
+///
+/// Returns `(srcjars, classpath_jars)`. Both are absolute paths;
+/// neither is added to the Compilation by this fn — the caller owns
+/// the merge into the compilation's source/classpath slots.
+pub(crate) fn collect_sibling_codegen(
+    output: &str,
+    src_jars_binding: Option<&String>,
+    source_root: &Path,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut srcjars: Vec<PathBuf> = Vec::new();
+    let mut cp_jars: Vec<PathBuf> = Vec::new();
+
+    // 1. Soong's `srcJars` binding — explicit list of generated-source
+    //    jars (mostly AIDL: `gen/aidl/aidl0.srcjar`).
+    if let Some(binding) = src_jars_binding {
+        for tok in binding.split_whitespace() {
+            if tok.is_empty() { continue; }
+            let abs = source_root.join(tok);
+            if abs.exists() { srcjars.push(abs); }
+        }
+    }
+
+    // 2. Sibling outputs the build emits per-variant. Output is
+    //    `out/soong/.intermediates/<mod>/<variant>/{javac,kotlin}/X.jar`.
+    //    Walk up two levels to the variant root and probe.
+    let out_abs = source_root.join(output);
+    let Some(rule_dir) = out_abs.parent() else { return (srcjars, cp_jars) };
+    let Some(variant_dir) = rule_dir.parent() else { return (srcjars, cp_jars) };
+
+    //    `kapt/kapt-sources.jar` — KAPT-generated Java stubs for
+    //    annotation-processed types (Hilt_X, AutoValue_X, Dagger
+    //    factory classes). Compiled in-line with the user's sources.
+    let kapt_src = variant_dir.join("kapt").join("kapt-sources.jar");
+    if kapt_src.is_file() { srcjars.push(kapt_src); }
+
+    //    `busybox/R.jar` — AAPT2-compiled Android resource class jar
+    //    (the `R.X` references used in views/themes). Goes on
+    //    classpath, not into sources.
+    let r_jar = variant_dir.join("busybox").join("R.jar");
+    if r_jar.is_file() { cp_jars.push(r_jar); }
+
+    //    `aapt2/R.jar` — alternative location used by some modules.
+    let r_jar2 = variant_dir.join("aapt2").join("R.jar");
+    if r_jar2.is_file() { cp_jars.push(r_jar2); }
+
+    //    `turbine-apt/` and `aconfig/` — generated header / flag
+    //    class jars used downstream. Add when present.
+    for sub in &["turbine-apt", "aconfig", "merged_aconfig_files"] {
+        let dir = variant_dir.join(sub);
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            for entry in read.flatten() {
+                let p = entry.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // Pick compiled class jars (skip `-sources.jar` which
+                // would duplicate kapt-sources content) and srcjars.
+                if name.ends_with(".srcjar") {
+                    srcjars.push(p);
+                } else if name.ends_with(".jar")
+                          && !name.ends_with("-sources.jar")
+                          && !name.ends_with("-javadoc.jar")
+                {
+                    cp_jars.push(p);
+                }
+            }
+        }
+    }
+
+    (srcjars, cp_jars)
+}
+
+/// Append a list of absolute jar paths to the existing classpath
+/// token stream. If the stream already has a `-classpath J1:J2` pair,
+/// extend its value with `:J3:J4`; otherwise add a fresh pair.
+pub(crate) fn extend_classpath_tokens(tokens: &mut Vec<String>, extra: &[PathBuf]) {
+    if extra.is_empty() { return; }
+    let extra_joined: String = extra.iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    let mut i = 0;
+    while i < tokens.len() {
+        if matches!(tokens[i].as_str(), "-classpath" | "-cp") && i + 1 < tokens.len() {
+            tokens[i + 1] = format!("{}:{extra_joined}", tokens[i + 1]);
+            return;
+        }
+        i += 1;
+    }
+    tokens.push("-classpath".to_string());
+    tokens.push(extra_joined);
 }
 
 /// Filter Soong's `javacFlags` for forwarding to javac, with paths
@@ -370,6 +483,12 @@ impl KotlincRule {
 
         let language = Language::Kotlin;
         let module = module_name_from_kotlin_output(&self.output);
+        let (mut generated_srcjars, sibling_classpath) =
+            collect_sibling_codegen(&self.output, self.bindings.get("srcJars"), source_root);
+        let mut classpath = classpath;
+        extend_classpath_tokens(&mut classpath, &sibling_classpath);
+        generated_srcjars.sort();
+        generated_srcjars.dedup();
         Ok(Compilation {
             module,
             language,
@@ -382,6 +501,7 @@ impl KotlincRule {
             extra_args: self.bindings.get("kotlincFlags")
                 .map(|s| forward_kotlinc_flags(s, source_root))
                 .unwrap_or_default(),
+            generated_srcjars,
         })
     }
 }

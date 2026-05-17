@@ -216,10 +216,26 @@ fn run_one(compilation: &Compilation, cfg: &KotlinIndexerConfig) -> CompilationO
         cmd.arg(tok);
     }
 
+    // Extract generated-source jars (AIDL stubs, KAPT-generated
+    // factories like Hilt_X) and append their .java files to the
+    // source list. kotlinc compiles .java alongside .kt natively.
+    let srcjar_sources = match crate::extract_srcjars(
+        &compilation.generated_srcjars,
+        &per_target.join("srcjars-extracted"),
+    ) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("[scry-bridge] {}: srcjar extract failed: {e:#}",
+                      compilation.module);
+            Vec::new()
+        }
+    };
+
     // Sources via @argfile to dodge ARG_MAX on big Kotlin modules.
     let argfile = per_target.join("sources.args");
-    let args_body: String = abs_sources.iter()
-        .map(|p| p.display().to_string())
+    let original = abs_sources.iter().map(|p| p.display().to_string());
+    let extracted = srcjar_sources.iter().map(|p| p.display().to_string());
+    let args_body: String = original.chain(extracted)
         .collect::<Vec<_>>().join("\n");
     if std::fs::write(&argfile, args_body).is_err() {
         return CompilationOutcome {

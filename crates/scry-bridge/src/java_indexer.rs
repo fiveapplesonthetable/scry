@@ -251,10 +251,30 @@ fn run_one(compilation: &Compilation, cfg: &JavaIndexerConfig) -> CompilationOut
         cmd.arg(tok);
     }
 
+    // Extract generated-source jars (AIDL stubs, KAPT-generated
+    // factories like Hilt_X) and append their .java files to the
+    // source list. Without this, modules whose source code references
+    // AIDL interfaces or Hilt-injected supertypes fail with
+    // "unresolved reference".
+    let srcjar_sources = match crate::extract_srcjars(
+        &compilation.generated_srcjars,
+        &per_target.join("srcjars-extracted"),
+    ) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("[scry-bridge] {}: srcjar extract failed: {e:#}",
+                      compilation.module);
+            Vec::new()
+        }
+    };
+
     // Sources from an @argfile to dodge ARG_MAX (~2MB Linux default).
     let argfile = per_target.join("sources.args");
-    let args_body: String = compilation.sources.iter()
-        .map(|s| compilation.source_root.join(s).display().to_string())
+    let original_sources = compilation.sources.iter()
+        .map(|s| compilation.source_root.join(s).display().to_string());
+    let extracted_sources = srcjar_sources.iter()
+        .map(|p| p.display().to_string());
+    let args_body: String = original_sources.chain(extracted_sources)
         .collect::<Vec<_>>().join("\n");
     if std::fs::write(&argfile, args_body).is_err() {
         return CompilationOutcome {

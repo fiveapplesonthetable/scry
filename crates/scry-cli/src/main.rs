@@ -2430,6 +2430,15 @@ fn cmd_def(
             None => false,
         });
     }
+    // v0.1.50 — collapse Package symbols by (name, lang) to one entry
+    // per unique package. Each Java/Kotlin file emits its own
+    // package_declaration → without dedup, `def android.os` returns
+    // 352 visibly-identical rows. JSON mode preserves all entries for
+    // programmatic consumers; only the human-readable + markdown
+    // paths collapse.
+    if !json {
+        dedupe_package_symbols(&mut filtered);
+    }
     rank_symbols(&mut filtered, &r);
     if md {
         print_results_md(&r, &filtered, limit, budget);
@@ -3918,6 +3927,22 @@ fn cmd_tldr(path: String, index: Option<PathBuf>, json: bool) -> Result<()> {
 /// Sort symbol hits by descending desirability. Composes the kind/lang/
 /// scope heuristic from SymbolRecord::rank_score with a path-shape signal
 /// the store can't see (path depth, presence of `test/` segments — a test
+/// v0.1.50 — collapse Package symbols (and other duplicate-by-name
+/// kinds) so `def some.package` doesn't return one row per Java file
+/// in the package. Keeps the FIRST occurrence per (kind=Package,
+/// name, lang) bucket — that one is enough to tell the user the
+/// package exists; deeper exploration goes via `--in some/package/`.
+/// Operates only on Package; other kinds (classes, methods) are
+/// genuinely distinct per file even when same-named.
+fn dedupe_package_symbols(syms: &mut Vec<SymbolRecord>) {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, FileKind)> = HashSet::new();
+    syms.retain(|s| {
+        if !matches!(s.kind, SymbolKind::Package) { return true; }
+        seen.insert((s.name.clone(), s.lang))
+    });
+}
+
 /// fixture is rarely the canonical hit).
 ///
 /// Stable: ties resolve by (path, line, col) so the output is reproducible

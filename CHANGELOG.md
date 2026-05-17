@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.50] — 2026-05-17
+
+`scry def` dedupes Package symbols in human-readable output.
+
+v0.1.36's Package emission means each Java/Kotlin file emits
+its own `package_declaration` → without dedup, `def android.os`
+returned **352 visibly-identical rows** (one per file in the
+package). v0.1.50 collapses them to one entry per unique
+`(name, lang)` Package symbol.
+
+```
+# Before
+$ scry def android.os --limit 5
+.../AggregateBatteryConsumer.java:17:9  (pkg java)  android.os
+.../AppZygote.java:17:9                 (pkg java)  android.os
+.../ArtModuleServiceManager.java:16:9   (pkg java)  android.os
+.../AsyncResult.java:17:9               (pkg java)  android.os
+.../AsyncTask.java:17:9                 (pkg java)  android.os
+352 results (showing 5)
+
+# After
+$ scry def android.os --limit 5
+.../BinderProxy.java:17:9               (pkg java)  android.os
+1 results (showing 1)
+```
+
+JSON output (`--json`) is **unchanged** — programmatic
+consumers still see all 352 entries. Only the human-readable
++ markdown paths collapse. Non-Package kinds (classes,
+methods) are unchanged because same-named items in different
+files are genuinely distinct.
+
 ## [0.1.49] — 2026-05-17
 
 `--strict` on `scry uses`. CLI + JSON-RPC + MCP parity in

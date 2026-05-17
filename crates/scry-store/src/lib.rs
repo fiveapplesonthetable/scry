@@ -1783,6 +1783,25 @@ pub struct StoreReader {
     /// Access via [`StoreReader::module_graph`] — that's the only
     /// reader allowed to touch the cell.
     pub(crate) module_graph_cell: std::sync::OnceLock<Option<modgraph::ModuleGraph>>,
+    /// Per-`FileEntry::id` `display_path` cache. Built lazily on
+    /// the first query that needs path-shape rendering. Hot loops
+    /// in `cmd_def` / `cmd_outline` / `apply_precision_filter`
+    /// used to call `FileEntry::display_path(&roots)` per record,
+    /// each allocating a fresh `String` (PathBuf::push +
+    /// Display::to_string). On the 1M-file production index that
+    /// allocator pressure dominates every ranked query. Cached
+    /// once, lookups become a `Vec::get` and the rest of the
+    /// query pipeline borrows from the cache.
+    ///
+    /// Access via [`StoreReader::display_path_cached`].
+    pub(crate) display_paths_cell: std::sync::OnceLock<Vec<String>>,
+    /// Lazy `display_path → file_id` reverse map. Built on first
+    /// call to [`StoreReader::resolve_file_id`]. Without this the
+    /// resolver linear-scanned `files` (~1M entries) per call,
+    /// allocating a fresh display_path per file to compare against
+    /// — ~600 ms on the production AOSP+Linux index. After the
+    /// cache, exact-path resolution is one HashMap probe.
+    pub(crate) path_to_file_id_cell: std::sync::OnceLock<HashMap<String, u32>>,
 }
 
 impl StoreReader {
@@ -1925,7 +1944,59 @@ impl StoreReader {
             file_digests_mmap, tombstones_mmap,
             chunks, embeddings_mmap, embedding_dim, embedding_count,
             module_graph_cell: std::sync::OnceLock::new(),
+            display_paths_cell: std::sync::OnceLock::new(),
+            path_to_file_id_cell: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Cached `FileEntry::display_path` lookup keyed by `file_id`.
+    /// Builds the full path vec on first call (one `display_path`
+    /// per file, ~70 MB for the AOSP+Linux index); subsequent
+    /// lookups are a `Vec::get`. See `display_paths_cell` doc for
+    /// the rationale.
+    pub fn display_path_cached(&self, file_id: u32) -> Option<&str> {
+        let v = self.display_paths_cell.get_or_init(|| {
+            self.files.iter()
+                .map(|fe| fe.display_path(&self.roots))
+                .collect()
+        });
+        v.get(file_id as usize).map(String::as_str)
+    }
+
+    /// Resolve a path string (exact or suffix-tail match) to a
+    /// `FileEntry::id`. Exact matches go through a single HashMap
+    /// probe built lazily on the first call. Suffix matches still
+    /// linear-scan but use the cached display_path vec, so each
+    /// match is just a `str::ends_with` instead of a re-alloc.
+    pub fn resolve_file_id(&self, arg: &str) -> Option<u32> {
+        let arg = arg.trim();
+        let paths = self.display_paths_cell.get_or_init(|| {
+            self.files.iter()
+                .map(|fe| fe.display_path(&self.roots))
+                .collect()
+        });
+        // Exact-path cache. Built once per StoreReader.
+        let exact_map = self.path_to_file_id_cell.get_or_init(|| {
+            let mut m: HashMap<String, u32> = HashMap::with_capacity(paths.len());
+            for (i, p) in paths.iter().enumerate() {
+                m.insert(p.clone(), i as u32);
+            }
+            m
+        });
+        if let Some(&id) = exact_map.get(arg) { return Some(id); }
+        // Suffix fallback for unanchored / relative inputs. Linear
+        // but allocation-free (paths already cached as String).
+        let suf_pat = format!("/{}", arg.trim_start_matches('/'));
+        let arg_rel = arg.trim_start_matches('/');
+        let mut best: Option<(usize, u32)> = None;
+        for (i, p) in paths.iter().enumerate() {
+            if p.ends_with(suf_pat.as_str()) || p == arg_rel {
+                if best.map_or(true, |(len, _)| p.len() < len) {
+                    best = Some((p.len(), i as u32));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// Lazy accessor for the build-system module graph. First call

@@ -126,6 +126,54 @@ impl ScipIndex {
     pub fn len(&self) -> usize { self.sidecar.records.len() }
     pub fn is_empty(&self) -> bool { self.sidecar.records.is_empty() }
     pub fn symbol_count(&self) -> usize { self.sidecar.symbol_table.len() }
+
+    /// Sibling of [`super::clang_usrs::ClangUsrIndex::precompute_by_file_ids`].
+    /// See that doc for rationale — same fast-path for the SCIP
+    /// sidecar's lookup loop inside `apply_precision_filter`.
+    pub fn precompute_by_file_ids<'a>(
+        &'a self,
+        paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
+        file_count: usize,
+    ) -> ByFileSymbolLookup<'a> {
+        let mut entries: Vec<Option<&[(u32, u32)]>> = vec![None; file_count];
+        for (fid, path) in paths_by_file_id {
+            if (fid as usize) >= entries.len() { continue; }
+            if let Some(v) = self.by_path.get(path) {
+                entries[fid as usize] = Some(v.as_slice());
+            }
+        }
+        ByFileSymbolLookup { entries, symbol_table: &self.sidecar.symbol_table }
+    }
+}
+
+/// Per-query precomputed lookup keyed by `file_id` for the SCIP
+/// sidecar. Mirror of `clang_usrs::ByFileLookup`.
+pub struct ByFileSymbolLookup<'a> {
+    entries: Vec<Option<&'a [(u32, u32)]>>,
+    symbol_table: &'a [String],
+}
+
+impl<'a> ByFileSymbolLookup<'a> {
+    pub fn symbol_for_window(
+        &self,
+        file_id: u32,
+        byte_offset: u32,
+        window: u32,
+    ) -> Option<&'a str> {
+        let entries = (*self.entries.get(file_id as usize)?)?;
+        let lo = byte_offset.saturating_sub(window);
+        let hi = byte_offset.saturating_add(window);
+        let start = entries.partition_point(|(o, _)| *o < lo);
+        let mut best: Option<(u32, u32)> = None;
+        for (o, id) in entries.iter().skip(start) {
+            if *o > hi { break; }
+            let d = o.abs_diff(byte_offset);
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, *id));
+            }
+        }
+        best.and_then(|(_, id)| self.symbol_table.get(id as usize).map(String::as_str))
+    }
 }
 
 #[cfg(test)]

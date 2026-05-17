@@ -125,6 +125,69 @@ impl ClangUsrIndex {
     pub fn len(&self) -> usize { self.sidecar.records.len() }
     pub fn is_empty(&self) -> bool { self.sidecar.records.is_empty() }
     pub fn usr_count(&self) -> usize { self.sidecar.usr_table.len() }
+
+    /// Build a [`ByFileLookup`] indexed by scry's `FileEntry::id`, so
+    /// per-ref lookups in a query loop become a `Vec::get(file_id)` +
+    /// binary search instead of `HashMap<String, …>::get(&display_path)`
+    /// per ref. `paths_by_file_id` must yield each `(file_id, abs_path)`
+    /// pair at most once.
+    ///
+    /// Designed for `apply_precision_filter`: the caller walks
+    /// `StoreReader::files` once, materialises `display_path` once per
+    /// file, then drives 2k–100k+ per-ref lookups against the result.
+    /// Eliminates both the per-ref `display_path` allocation and the
+    /// per-ref HashMap hash+strcmp.
+    pub fn precompute_by_file_ids<'a>(
+        &'a self,
+        paths_by_file_id: impl Iterator<Item = (u32, &'a str)>,
+        file_count: usize,
+    ) -> ByFileLookup<'a> {
+        let mut entries: Vec<Option<&[(u32, u32)]>> = vec![None; file_count];
+        for (fid, path) in paths_by_file_id {
+            if (fid as usize) >= entries.len() { continue; }
+            if let Some(v) = self.by_path.get(path) {
+                entries[fid as usize] = Some(v.as_slice());
+            }
+        }
+        ByFileLookup { entries, usr_table: &self.sidecar.usr_table }
+    }
+}
+
+/// Per-query precomputed lookup keyed by `file_id`. Built once by
+/// [`ClangUsrIndex::precompute_by_file_ids`] and consulted per ref
+/// inside the precision filter. Borrows from the parent
+/// `ClangUsrIndex` so no record / table data is cloned.
+pub struct ByFileLookup<'a> {
+    /// Indexed by scry's `FileEntry::id`. `None` means the file
+    /// isn't in the clang sidecar (e.g. headers we didn't parse,
+    /// non-C-family files).
+    entries: Vec<Option<&'a [(u32, u32)]>>,
+    usr_table: &'a [String],
+}
+
+impl<'a> ByFileLookup<'a> {
+    /// Same window semantics as [`ClangUsrIndex::usr_for_window`].
+    /// Returns `None` if no record falls inside `[byte_offset±window]`.
+    pub fn usr_for_window(
+        &self,
+        file_id: u32,
+        byte_offset: u32,
+        window: u32,
+    ) -> Option<&'a str> {
+        let entries = (*self.entries.get(file_id as usize)?)?;
+        let lo = byte_offset.saturating_sub(window);
+        let hi = byte_offset.saturating_add(window);
+        let start = entries.partition_point(|(o, _)| *o < lo);
+        let mut best: Option<(u32, u32)> = None;
+        for (o, id) in entries.iter().skip(start) {
+            if *o > hi { break; }
+            let d = o.abs_diff(byte_offset);
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, *id));
+            }
+        }
+        best.and_then(|(_, id)| self.usr_table.get(id as usize).map(String::as_str))
+    }
 }
 
 #[cfg(test)]

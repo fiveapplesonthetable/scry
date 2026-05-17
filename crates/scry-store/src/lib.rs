@@ -1869,6 +1869,19 @@ pub struct StoreReader {
     /// `resolve_file_id`. The bincode `Vec<FileEntry>` that earlier
     /// versions held in RAM has been retired.
     pub files_packed: files_packed::FilesPacked,
+    /// Lazily-decoded precision sidecars. Both are bincode'd
+    /// `Vec<…Record>` with `String` paths interned per-record, so
+    /// the first decode + HashMap build is the expensive bit (on
+    /// AOSP-scale SCIP: ~17 s for 14 M records). Caching here means
+    /// every subsequent `apply_precision_filter` call inside the
+    /// same process reuses the in-memory index — `serve` / `mcp`
+    /// pay the cost once at first query and then strict-precision
+    /// queries are O(refs) without the decode tax. CLI invocations
+    /// still pay the open per process; the packed-mmap follow-up
+    /// (`scip_index_packed.bin` / `clang_usrs_packed.bin`) is what
+    /// removes the cost there too.
+    pub(crate) scip_index_cell: std::sync::OnceLock<Option<scip_index::ScipIndex>>,
+    pub(crate) clang_usrs_cell: std::sync::OnceLock<Option<clang_usrs::ClangUsrIndex>>,
 }
 
 impl StoreReader {
@@ -2044,8 +2057,30 @@ impl StoreReader {
             module_graph_cell: std::sync::OnceLock::new(),
             display_paths_cell: std::sync::OnceLock::new(),
             path_to_file_id_cell: std::sync::OnceLock::new(),
+            scip_index_cell: std::sync::OnceLock::new(),
+            clang_usrs_cell: std::sync::OnceLock::new(),
             files_packed,
         })
+    }
+
+    /// Lazy accessor for the SCIP precision sidecar. First call
+    /// pays the full decode + HashMap build (~17 s for 14 M records
+    /// on the AOSP-scale `scip_index.bin`); subsequent calls borrow
+    /// the cached index. Returns `None` if the sidecar isn't on
+    /// disk for this index.
+    pub fn scip_index(&self) -> Option<&scip_index::ScipIndex> {
+        self.scip_index_cell
+            .get_or_init(|| scip_index::ScipIndex::open(&self.paths.scip_index()).ok().flatten())
+            .as_ref()
+    }
+
+    /// Lazy accessor for the clang USR precision sidecar. Same
+    /// shape as [`scip_index`]: open + record-table build happens
+    /// once per process at first call.
+    pub fn clang_usrs(&self) -> Option<&clang_usrs::ClangUsrIndex> {
+        self.clang_usrs_cell
+            .get_or_init(|| clang_usrs::ClangUsrIndex::open(&self.paths.clang_usrs()).ok().flatten())
+            .as_ref()
     }
 
     /// Number of files in the index.

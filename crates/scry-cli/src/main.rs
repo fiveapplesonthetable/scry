@@ -3489,13 +3489,18 @@ pub(crate) fn apply_precision_filter(
     const WINDOW: u32 = 64;
     let defs = r.lookup_exact(name);
 
-    let cusr_opt: Option<scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
-        scry_store::clang_usrs::ClangUsrIndex::open(&r.paths.clang_usrs())?
+    // Cached lazy accessors. First call per process decodes the
+    // sidecar (~17 s on AOSP-scale SCIP); subsequent calls borrow
+    // the in-memory index. Daemon (`serve`/`mcp`) pays the cost
+    // once at startup, CLI pays it per process until the packed-
+    // mmap follow-up lands.
+    let cusr_opt: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
+        r.clang_usrs()
     } else {
         None
     };
-    let sidx_opt: Option<scry_store::scip_index::ScipIndex> = if scip_precise {
-        scry_store::scip_index::ScipIndex::open(&r.paths.scip_index())?
+    let sidx_opt: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
+        r.scip_index()
     } else {
         None
     };
@@ -3526,7 +3531,7 @@ pub(crate) fn apply_precision_filter(
     }
     // Drive the sidecar precompute step from the same cache so each
     // sidecar's per-file lookup table is also file_id-indexed.
-    let cusr_lookup = cusr_opt.as_ref().map(|cusr| {
+    let cusr_lookup = cusr_opt.map(|cusr| {
         cusr.precompute_by_file_ids(
             path_by_id.iter().enumerate().filter_map(|(i, slot)| {
                 slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
@@ -3534,7 +3539,7 @@ pub(crate) fn apply_precision_filter(
             n_files,
         )
     });
-    let sidx_lookup = sidx_opt.as_ref().map(|sidx| {
+    let sidx_lookup = sidx_opt.map(|sidx| {
         sidx.precompute_by_file_ids(
             path_by_id.iter().enumerate().filter_map(|(i, slot)| {
                 slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
@@ -9254,26 +9259,27 @@ fn serve_ref(
     } else {
         None
     };
-    // Open the clang USR sidecar once (lazy: only if --clang-precise).
-    // Same alignment-window as the CLI path.
+    // Cached lazy accessors. The StoreReader OnceLock caches keep
+    // both sidecars in RAM after the first daemon query, so per-
+    // request decode cost is paid once at startup.
     const PRECISE_WINDOW: u32 = 64;
-    let cusr: Option<scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
-        scry_store::clang_usrs::ClangUsrIndex::open(&r.paths.clang_usrs()).ok().flatten()
+    let cusr: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
+        r.clang_usrs()
     } else {
         None
     };
-    let def_usrs: Option<std::collections::HashSet<String>> = cusr.as_ref().map(|c| {
+    let def_usrs: Option<std::collections::HashSet<String>> = cusr.map(|c| {
         r.lookup_exact(name).iter().filter_map(|s| {
             let p = r.display_path_cached(s.file_id)?;
             c.usr_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
         }).collect()
     });
-    let sidx: Option<scry_store::scip_index::ScipIndex> = if scip_precise {
-        scry_store::scip_index::ScipIndex::open(&r.paths.scip_index()).ok().flatten()
+    let sidx: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
+        r.scip_index()
     } else {
         None
     };
-    let def_scip: Option<std::collections::HashSet<String>> = sidx.as_ref().map(|c| {
+    let def_scip: Option<std::collections::HashSet<String>> = sidx.map(|c| {
         r.lookup_exact(name).iter().filter_map(|s| {
             let p = r.display_path_cached(s.file_id)?;
             c.symbol_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
@@ -9331,7 +9337,7 @@ fn serve_ref(
         }
         // Clang USR identity filter (Path B). Sites without a clang
         // record pass through (non-C/C++ or uncovered TU).
-        if let (Some(c), Some(usrs)) = (cusr.as_ref(), def_usrs.as_ref()) {
+        if let (Some(c), Some(usrs)) = (cusr, def_usrs.as_ref()) {
             if !usrs.is_empty() {
                 if let Some(p) = r.display_path_cached(rr.file_id) {
                     if let Some(u) = c.usr_for_window(p, rr.byte_start, PRECISE_WINDOW) {
@@ -9341,7 +9347,7 @@ fn serve_ref(
             }
         }
         // SCIP symbol identity filter (Path C).
-        if let (Some(c), Some(syms)) = (sidx.as_ref(), def_scip.as_ref()) {
+        if let (Some(c), Some(syms)) = (sidx, def_scip.as_ref()) {
             if !syms.is_empty() {
                 if let Some(p) = r.display_path_cached(rr.file_id) {
                     if let Some(s) = c.symbol_for_window(p, rr.byte_start, PRECISE_WINDOW) {

@@ -7,6 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.42] — 2026-05-17
+
+Daemon / JSON-RPC / MCP parity for v0.1.41's `refs-resolved`
+stats. `serve_stats` now emits the same `refs_resolved` +
+`refs_resolved_pct` fields as the CLI's `--json` output (both
+null when the build-resolutions sidecar isn't present).
+
+MCP `stats` tool description now calls out the resolution
+coverage — agents can use this as a quick "how good is the
+resolver" probe before running detailed queries.
+
+No client-side breaking change: the new fields are additive.
+
 ## [0.1.41] — 2026-05-17
 
 `scry stats` now shows Layer 2 resolution sidecar coverage.

@@ -7616,9 +7616,13 @@ fn mcp_tools_list_result() -> serde_json::Value {
         ),
         tool(
             "stats",
-            "Index metadata (size, files, freshness, scry_version). \
-             No arguments. Useful as a first probe before harder \
-             queries.",
+            "Index metadata: size, file/symbol/ref counts, freshness, \
+             scry_version, and Layer 2 resolution coverage \
+             (`refs_resolved` + `refs_resolved_pct`, both null when \
+             the build-resolutions sidecar isn't present). No \
+             arguments. Useful as a first probe before harder \
+             queries — the resolution percentage tells you how much \
+             of the call-graph the resolver has nailed down.",
             serde_json::json!({
                 "type": "object", "properties": serde_json::json!({}),
             }),
@@ -9306,6 +9310,13 @@ fn serve_ask(r: &StoreReader, query: &str, in_: Option<&str>, limit: usize) -> s
 }
 
 fn serve_stats(r: &StoreReader) -> serde_json::Value {
+    // Mirror cmd_stats's v0.1.41 additions so MCP clients and CLI
+    // see the same resolution-coverage fields.
+    let refs_resolved = r.count_resolved_refs();
+    let refs_resolved_pct = refs_resolved.map(|n| {
+        if r.manifest.stats.refs == 0 { 0.0 }
+        else { (n as f64) * 100.0 / (r.manifest.stats.refs as f64) }
+    });
     serde_json::json!({
         "scry_version": r.manifest.scry_version,
         "indexed_at": r.manifest.indexed_at,
@@ -9315,6 +9326,8 @@ fn serve_stats(r: &StoreReader) -> serde_json::Value {
         "files_total": r.manifest.stats.files_total,
         "symbols": r.manifest.stats.symbols,
         "refs": r.manifest.stats.refs,
+        "refs_resolved": refs_resolved,
+        "refs_resolved_pct": refs_resolved_pct,
         "bytes_total": r.manifest.stats.bytes_total,
         "elapsed_ms": r.manifest.stats.elapsed_ms,
     })

@@ -7637,6 +7637,10 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "BFS depth for the subclass leg of the impact set."},
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Build-graph reachability filter on callers leg only."},
+                "def_in": {"type": "string",
+                    "description": "Narrow the callers portion by def-site path (same as `ref --def-in`). Doesn't affect the subclass walk."},
+                "strict": {"type": "boolean", "default": false,
+                    "description": "Drop callers whose Layer 2 resolution didn't land on a specific def."},
             })),
         ),
         tool(
@@ -8452,7 +8456,9 @@ fn serve_one_request<W: std::io::Write>(
                 .map(|n| n as usize).unwrap_or(2);
             let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_impact(reader, arg_str("name"), in_, depth, reachable, limit)
+            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
+            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_impact(reader, arg_str("name"), in_, depth, reachable, def_in, strict, limit)
         }
         "callgraph" => {
             let depth = args.get("depth")
@@ -9059,12 +9065,15 @@ fn serve_callgraph(
 /// subclasses + files_touched summary. Same algorithm as
 /// [`cmd_impact`]; result shape mirrors the CLI's `--json` output
 /// so an LLM can consume either uniformly.
+#[allow(clippy::too_many_arguments)]
 fn serve_impact(
     r: &StoreReader,
     name: &str,
     in_: Option<&str>,
     subclass_depth: usize,
     reachable: bool,
+    def_in: Option<&str>,
+    strict: bool,
     limit: usize,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
@@ -9072,6 +9081,23 @@ fn serve_impact(
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .filter(|rr| prefix.is_empty() || file_in_prefix(r, rr.file_id, prefix))
         .collect();
+    // v0.1.46 — same root-level narrowing as cmd_impact.
+    if let Some(def_path) = def_in {
+        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(name)
+            .iter()
+            .filter(|s| r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(def_path)))
+            .map(|s| s.id)
+            .collect();
+        if !target_ids.is_empty() {
+            callers.retain(|rr| match rr.resolved_to {
+                Some(id) => target_ids.contains(&id),
+                None => !strict,
+            });
+        }
+    } else if strict {
+        callers.retain(|rr| rr.resolved_to.is_some());
+    }
     if reachable {
         if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(name);

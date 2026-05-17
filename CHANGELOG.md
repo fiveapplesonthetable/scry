@@ -7,6 +7,24 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.46] — 2026-05-17
+
+Daemon / JSON-RPC / MCP parity for v0.1.45's impact
+`--def-in PATH` and `--strict` flags.
+
+`serve_impact` accepts the matching `def_in: string` and
+`strict: bool` JSON-RPC args, applies the same narrowing to
+its callers leg, and emits the same result shape. The
+subclass leg is unchanged (subclasses are about the type,
+not the method).
+
+MCP `impact` tool advertises both parameters in its input
+schema. Additive change — no client-side break.
+
+This completes the `--def-in` + `--strict` story across all
+four resolver-using commands (ref, callers, callgraph,
+impact) on both CLI and daemon paths.
+
 ## [0.1.45] — 2026-05-17
 
 `--def-in PATH` and `--strict` on `scry impact`.

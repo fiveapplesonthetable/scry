@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.48] — 2026-05-17
+
+Better diagnostic when `--def-in PATH` returns 0 hits that
+resolve to the target def. The old message said "pass --strict
+to drop unresolved" — but `--strict` would just return 0 hits,
+which doesn't help the user.
+
+The new diagnostic explains the root cause:
+
+```
+$ scry callers close --def-in PerfettoTrace.java
+[scry] --def-in "PerfettoTrace.java": 65503 → 36120 refs
+       (0 resolved to a def in scope, all 36120 permissively kept).
+       The over-include is the best the heuristic resolver can do —
+       receiver-type inference would be needed to confidently attribute
+       callers to a specific override of "close". Try
+       `scry callers close --format by-def` to see which defs
+       the callers actually resolve to.
+```
+
+Three real causes of 0-resolved that the new wording covers:
+1. The def has no callers in the corpus.
+2. Java method dispatch is inherently ambiguous without
+   receiver-type inference — `obj.foo()` often resolves to an
+   interface or parent class method, not the override.
+3. The build-resolutions sidecar is stale (rebuild fixes it).
+
+Pointer to `--format by-def` is the actionable next step:
+the histogram shows where the callers DO resolve, which
+usually reveals which interface/parent class the calls are
+being attributed to.
+
 ## [0.1.47] — 2026-05-17
 
 E2E test guarding the daemon's `format: "by-def"` histogram

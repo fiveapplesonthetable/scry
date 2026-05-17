@@ -3108,6 +3108,28 @@ fn cmd_ref(
                      ({} resolved to a def in scope; unresolved dropped)",
                     before, kept.len(), resolved_kept,
                 );
+            } else if resolved_kept == 0 {
+                // v0.1.48 — special-case the "0 resolved" diagnostic.
+                // The generic message ("pass --strict to drop unresolved")
+                // is misleading here — strict would just return 0 hits,
+                // which doesn't help the user. The real issue is one of:
+                //   (a) the def has no callers in the corpus,
+                //   (b) the resolver couldn't attribute any caller to it
+                //       (typical for Java method dispatch without
+                //        receiver-type inference — `obj.foo()` calls
+                //        often resolve to an interface or parent class
+                //        method, not the override),
+                //   (c) the build-resolutions sidecar is stale.
+                eprintln!(
+                    "[scry] --def-in {def_path:?}: {} → {} refs (0 resolved to a \
+                     def in scope, all {} permissively kept). The over-include \
+                     is the best the heuristic resolver can do — receiver-type \
+                     inference would be needed to confidently attribute callers \
+                     to a specific override of {name:?}. Try \
+                     `scry callers {name} --format by-def` to see which defs \
+                     the callers actually resolve to.",
+                    before, kept.len(), unresolved,
+                );
             } else {
                 eprintln!(
                     "[scry] --def-in {def_path:?}: {} → {} refs ({} resolved to a \

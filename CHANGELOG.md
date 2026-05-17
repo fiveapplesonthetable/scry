@@ -7,6 +7,42 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.31] — 2026-05-17
+
+Same-class preference across files in
+`cmd_build_resolutions::resolve_one`.
+
+The C++ narrowing path already preferred candidates whose
+`scope_path` is a prefix of the ref's `scope_path` (same /
+enclosing namespace). This release generalizes that rule to all
+languages, after the same-file preference but before
+language-specific package narrowing.
+
+**Behavior:**
+- Ref scope `[Outer, Inner]` + candidate scope `[Outer, Inner]`
+  → same class, prefer.
+- Ref scope `[Outer, Inner]` + candidate scope `[Outer]`
+  → implicit-this from inner class to parent, prefer.
+- Ref scope `[Foo]` + candidate scope `[Bar]` → no match.
+- Multiple candidates qualify → fall through to existing rules
+  (still truthful-unresolved for ambiguous method calls).
+
+**Why this matters:**
+- Same-file preference (v0.1.27) catches self-calls within one
+  file but misses partial classes, generated code, and
+  inner-class implicit-this calls across files.
+- Same-class preference closes that gap. On AOSP+Linux this
+  fires on every Java inner-class method that calls an outer
+  class's method (a very common pattern).
+
+2 new unit tests:
+- `resolve_one_same_class_preference_across_files`
+- `resolve_one_same_class_prefix_fires_for_inner_class`
+
+**To take effect on the live index:** run
+`scry build-resolutions --index DIR`. ~3 min on AOSP+Linux
+(parallel, v0.1.27).
+
 ## [0.1.30] — 2026-05-17
 
 Human-readable resolved-def annotations in `scry ref` / `scry callers`.

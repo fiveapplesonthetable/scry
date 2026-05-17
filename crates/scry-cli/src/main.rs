@@ -5861,6 +5861,25 @@ fn resolve_one(
         }
     }
 
+    // Same-class preference (v0.1.31). A method call inside class chain
+    // [..., ClassC] should prefer a candidate defined in the same class
+    // chain (cand.scope_path is a prefix of OR equal to ref.scope_path).
+    // Catches sibling-method calls within a class even when the def and
+    // call are in different files (partial classes, generated code,
+    // implicit-this from inner classes). Complements same-file preference
+    // by extending across files. The C++ same-namespace rule does the
+    // same shape for C++; this generalizes it across all languages.
+    if !rr.scope_path.is_empty() {
+        let same_class: Vec<&&ResolveDef> = pool.iter()
+            .filter(|c| !c.scope_path.is_empty()
+                        && rr.scope_path.starts_with(&c.scope_path))
+            .collect();
+        if same_class.len() == 1 {
+            *narrowed += 1;
+            return same_class[0].id;
+        }
+    }
+
     // Java / Kotlin share the same package-narrowing shape: same package
     // → explicit import → wildcard import → implicit-import fallback.
     // The implicit-import fallback differs per language (`java.lang` for
@@ -9428,6 +9447,57 @@ mod tests {
 
     /// Kotlin same-package narrowing mirrors Java: a file's package
     /// matches one candidate → that one wins.
+    /// Same-class preference (v0.1.31). A call to `foo()` inside
+    /// class chain [Outer, Inner] should prefer a candidate defined
+    /// in [Outer, Inner] (or any prefix like [Outer]) even when in a
+    /// different file. Generalizes the C++ same-namespace rule to
+    /// all languages, covering partial classes / generated code /
+    /// implicit-this from inner classes.
+    #[test]
+    fn resolve_one_same_class_preference_across_files() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("helper".into(), vec![
+            // Same class but different file (file_id 7 vs ref file 5).
+            ResolveDef { id: 99, file_id: 7, lang: FileKind::Java,
+                         pkg: Some("com.example".into()),
+                         scope_path: vec!["Foo".into()] },
+            // Unrelated class.
+            ResolveDef { id: 11, file_id: 8, lang: FileKind::Java,
+                         pkg: Some("com.other".into()),
+                         scope_path: vec!["Bar".into()] },
+        ]);
+        let r = mk_ref_scoped("helper", FileKind::Java, 5, &["Foo"]);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        assert_eq!(got, 99, "should prefer same-class def even in different file");
+        assert_eq!(n, 1);
+    }
+
+    /// Same-class preference must also fire for implicit-this calls
+    /// from an inner class: ref scope [Outer, Inner] should find a
+    /// candidate in [Outer] (parent class) when the inner class doesn't
+    /// define the method itself.
+    #[test]
+    fn resolve_one_same_class_prefix_fires_for_inner_class() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("parentMethod".into(), vec![
+            // Outer class method — should be visible to its inner class.
+            ResolveDef { id: 42, file_id: 5, lang: FileKind::Java,
+                         pkg: Some("com.example".into()),
+                         scope_path: vec!["Outer".into()] },
+            // Different class.
+            ResolveDef { id: 99, file_id: 9, lang: FileKind::Java,
+                         pkg: Some("com.other".into()),
+                         scope_path: vec!["Unrelated".into()] },
+        ]);
+        // ref scope = [Outer, Inner] — call from inside the inner class.
+        let r = mk_ref_scoped("parentMethod", FileKind::Java, 5, &["Outer", "Inner"]);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        assert_eq!(got, 42, "implicit-this from inner class should reach parent's methods");
+        assert_eq!(n, 1);
+    }
+
     /// Import-aware class narrowing (v0.1.28). Java file imports
     /// `android.os.PerfettoTrace`; an ambiguous `close()` call there
     /// should resolve to PerfettoTrace.Session.close because that's

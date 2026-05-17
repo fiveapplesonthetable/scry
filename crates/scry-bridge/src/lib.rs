@@ -30,7 +30,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cmake;
+pub mod gn;
 pub mod java_indexer;
+pub mod kbuild;
 pub mod kotlin_indexer;
 pub mod polyglot;
 pub mod soong;

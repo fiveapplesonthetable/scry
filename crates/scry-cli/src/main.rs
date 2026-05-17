@@ -986,6 +986,87 @@ enum Cmd {
         #[arg(long)]
         skip_java: bool,
     },
+    /// `scry build-precision` — unified Kythe-class precision pipeline.
+    ///
+    /// One command, one explicit `--build-{soong,gn,kbuild,cmake,cargo}`
+    /// flag, builds whatever precision sidecars apply:
+    ///   - Soong  → SCIP for Java + Kotlin via the Soong bridge.
+    ///   - GN     → clang USRs from `compile_commands.json`.
+    ///   - Kbuild → same (kernel C), via the kernel's
+    ///              `scripts/clang-tools/gen_compile_commands.py`.
+    ///   - CMake  → same; `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+    ///   - Cargo  → polyglot pass only (Rust via rust-analyzer scip).
+    ///
+    /// `--with-polyglot` also runs the polyglot pass (Rust/Go/TS/Python)
+    /// over the source root regardless of the build type, so a Soong
+    /// project that also has Python tooling gets both passes.
+    BuildPrecision {
+        /// Source root.
+        #[arg(long, value_name = "PATH")]
+        source_root: PathBuf,
+        /// Soong out dir (typically `<source>/out/soong`). Mutually
+        /// exclusive with the other --build-* flags.
+        #[arg(long, value_name = "PATH", group = "build")]
+        build_soong: Option<PathBuf>,
+        /// GN build out dir (the one containing `args.gn`).
+        #[arg(long, value_name = "PATH", group = "build")]
+        build_gn: Option<PathBuf>,
+        /// Path to the `gn` binary. Defaults to `gn` on PATH.
+        #[arg(long, value_name = "PATH")]
+        gn_binary: Option<PathBuf>,
+        /// Linux kernel build out dir (the one containing `.config`).
+        #[arg(long, value_name = "PATH", group = "build")]
+        build_kbuild: Option<PathBuf>,
+        /// CMake build out dir (the one containing `CMakeCache.txt`).
+        #[arg(long, value_name = "PATH", group = "build")]
+        build_cmake: Option<PathBuf>,
+        /// Path to the `cmake` binary. Defaults to `cmake` on PATH.
+        #[arg(long, value_name = "PATH")]
+        cmake_binary: Option<PathBuf>,
+        /// Cargo workspace — runs polyglot pass only.
+        #[arg(long, group = "build")]
+        build_cargo: bool,
+        /// Existing scry index dir.
+        #[arg(long, value_name = "DIR")]
+        index: Option<PathBuf>,
+        /// Also run polyglot pass (Rust / Go / TS / Python). Implied
+        /// when --build-cargo is set.
+        #[arg(long)]
+        with_polyglot: bool,
+        /// Skip Rust during the polyglot pass.
+        #[arg(long)]
+        no_rust: bool,
+        /// Skip Go during the polyglot pass.
+        #[arg(long)]
+        no_go: bool,
+        /// Skip TypeScript during the polyglot pass.
+        #[arg(long)]
+        no_typescript: bool,
+        /// Skip Python during the polyglot pass.
+        #[arg(long)]
+        no_python: bool,
+        /// Workers for clang-index. 0 = auto (one per CPU).
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
+        /// Targetroot for the JVM pipeline (Soong only).
+        #[arg(long, value_name = "PATH")]
+        targetroot: Option<PathBuf>,
+        /// Per-target `.scip` files (polyglot only).
+        #[arg(long, value_name = "PATH")]
+        scip_out_dir: Option<PathBuf>,
+        /// Override the rust-analyzer binary used by the polyglot pass.
+        #[arg(long, value_name = "PATH")]
+        rust_analyzer: Option<PathBuf>,
+        /// Override the scip-go binary used by the polyglot pass.
+        #[arg(long, value_name = "PATH")]
+        scip_go: Option<PathBuf>,
+        /// Override the scip-typescript binary used by the polyglot pass.
+        #[arg(long, value_name = "PATH")]
+        scip_typescript: Option<PathBuf>,
+        /// Override the scip-python binary used by the polyglot pass.
+        #[arg(long, value_name = "PATH")]
+        scip_python: Option<PathBuf>,
+    },
     /// `scry build-polyglot-scip` — Rust + Go + TypeScript + Python.
     ///
     /// Walks the source root for native project markers
@@ -1462,6 +1543,28 @@ fn main() -> Result<()> {
                 scip_typescript, scip_python, no_rust, no_go, no_typescript,
                 no_python, only_root, max_targets,
             ),
+        Cmd::BuildPrecision { source_root, build_soong, build_gn, gn_binary,
+                              build_kbuild, build_cmake, cmake_binary, build_cargo,
+                              index, with_polyglot, no_rust, no_go, no_typescript,
+                              no_python, workers, targetroot, scip_out_dir,
+                              rust_analyzer, scip_go, scip_typescript, scip_python } => {
+            let build = match (build_soong, build_gn, build_kbuild, build_cmake, build_cargo) {
+                (Some(d), None, None, None, false) => bridge_subcmds::PrecisionBuild::Soong { build_dir: d },
+                (None, Some(d), None, None, false) => bridge_subcmds::PrecisionBuild::Gn { build_dir: d, gn_binary },
+                (None, None, Some(d), None, false) => bridge_subcmds::PrecisionBuild::Kbuild { build_dir: d },
+                (None, None, None, Some(d), false) => bridge_subcmds::PrecisionBuild::Cmake { build_dir: d, cmake_binary },
+                (None, None, None, None, true)     => bridge_subcmds::PrecisionBuild::Cargo,
+                _ => anyhow::bail!(
+                    "build-precision requires exactly one --build-{{soong,gn,kbuild,cmake,cargo}} flag"
+                ),
+            };
+            bridge_subcmds::cmd_build_precision(
+                source_root, build, index, with_polyglot,
+                no_rust, no_go, no_typescript, no_python,
+                workers, targetroot, scip_out_dir,
+                rust_analyzer, scip_go, scip_typescript, scip_python,
+            )
+        }
         Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => precision_subcmds::cmd_scip_lookup(index, &path, offset),

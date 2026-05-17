@@ -66,9 +66,17 @@ impl PolyglotKind {
 }
 
 /// Walk `source_root` for project markers of every kind. Honors
-/// `.gitignore` because vendored copies of indexed projects (e.g.
-/// `external/rust/crates/...` in AOSP) appear under `out/` and would
-/// otherwise double-index. Output is sorted+deduped per kind.
+/// `.gitignore`: vendored copies under `out/` would otherwise
+/// double-index.
+///
+/// **Cargo workspace dedup**: when a `Cargo.toml` declares
+/// `[workspace]`, every nested `Cargo.toml` under it is a workspace
+/// MEMBER, not an independent root. rust-analyzer scip on a member
+/// emits paths relative to the workspace anyway, so indexing
+/// members separately produces 0-doc shards (rust-analyzer dedups
+/// against the workspace root it discovers). The walk filters
+/// workspace members out by reading each `Cargo.toml` and skipping
+/// any whose closest ancestor `Cargo.toml` contains `[workspace]`.
 pub fn discover(
     source_root: &Path,
     kinds: &[PolyglotKind],
@@ -76,10 +84,10 @@ pub fn discover(
     let mut out: Vec<PolyglotTarget> = Vec::new();
     for kind in kinds {
         let Some(marker) = kind.root_marker() else {
-            // Python — point the indexer at source_root itself.
             out.push(PolyglotTarget { kind: *kind, root: source_root.to_path_buf() });
             continue;
         };
+        let mut raw: Vec<PathBuf> = Vec::new();
         for entry in WalkBuilder::new(source_root)
             .standard_filters(true)
             .build()
@@ -89,17 +97,48 @@ pub fn discover(
                 && entry.file_name().to_string_lossy() == marker
             {
                 if let Some(dir) = entry.path().parent() {
-                    out.push(PolyglotTarget {
-                        kind: *kind,
-                        root: dir.to_path_buf(),
-                    });
+                    raw.push(dir.to_path_buf());
                 }
             }
+        }
+        let filtered = match kind {
+            PolyglotKind::Rust => dedup_cargo_workspace_members(raw),
+            _ => raw,
+        };
+        for dir in filtered {
+            out.push(PolyglotTarget { kind: *kind, root: dir });
         }
     }
     out.sort_by(|a, b| (a.kind as u8, &a.root).cmp(&(b.kind as u8, &b.root)));
     out.dedup_by(|a, b| a.kind == b.kind && a.root == b.root);
     Ok(out)
+}
+
+/// Given a flat list of directories holding `Cargo.toml`, drop the
+/// ones whose closest ancestor `Cargo.toml` declares `[workspace]`.
+/// The workspace root indexes its members in one rust-analyzer pass,
+/// so emitting them separately produces 0-doc shards.
+fn dedup_cargo_workspace_members(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let workspace_roots: std::collections::HashSet<PathBuf> = roots.iter()
+        .filter(|r| {
+            std::fs::read_to_string(r.join("Cargo.toml"))
+                .map(|s| s.contains("[workspace]"))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    roots.into_iter()
+        .filter(|r| {
+            // Keep if r IS a workspace root, OR no ancestor of r is.
+            if workspace_roots.contains(r) { return true; }
+            let mut cur = r.parent();
+            while let Some(p) = cur {
+                if workspace_roots.contains(p) { return false; }
+                cur = p.parent();
+            }
+            true
+        })
+        .collect()
 }
 
 /// Configuration for the polyglot indexer dispatch. Each binary
@@ -249,6 +288,41 @@ mod tests {
         let go_count = targets.iter().filter(|t| t.kind == PolyglotKind::Go).count();
         assert_eq!(rust_count, 1);
         assert_eq!(go_count, 1);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn discover_dedups_cargo_workspace_members() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scry-bridge-polyglot-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("crates/a")).unwrap();
+        std::fs::create_dir_all(tmp.join("crates/b")).unwrap();
+        // Workspace root + 2 members.
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            b"[workspace]\nmembers = [\"crates/*\"]\n",
+        ).unwrap();
+        std::fs::write(tmp.join("crates/a/Cargo.toml"), b"[package]\nname='a'\n").unwrap();
+        std::fs::write(tmp.join("crates/b/Cargo.toml"), b"[package]\nname='b'\n").unwrap();
+        let targets = discover(&tmp, &[PolyglotKind::Rust]).unwrap();
+        assert_eq!(targets.len(), 1, "members must dedup to the workspace root");
+        assert_eq!(targets[0].root, tmp);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn discover_keeps_independent_cargo_roots() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scry-bridge-polyglot-ind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        std::fs::create_dir_all(tmp.join("b")).unwrap();
+        // Two independent packages, no workspace umbrella.
+        std::fs::write(tmp.join("a/Cargo.toml"), b"[package]\nname='a'\n").unwrap();
+        std::fs::write(tmp.join("b/Cargo.toml"), b"[package]\nname='b'\n").unwrap();
+        let targets = discover(&tmp, &[PolyglotKind::Rust]).unwrap();
+        assert_eq!(targets.len(), 2);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

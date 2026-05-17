@@ -1152,55 +1152,7 @@ public class Binder {
     assert!(!any_binder,
             "tombstoned Binder.java symbols must not appear in def results: {hits:?}");
 
-    // 11. Semantic retrieval — build-embeddings + ask + verify the
-    // query routes to the right file. Re-index first so the tombstone
-    // doesn't bias the chunk set.
-    let out = Command::new(scry_bin())
-        .args(["index"]).arg(&src)
-        .arg("-o").arg(&idx)
-        .args(["--workers", "2"])
-        .output().expect("re-index for embeddings test");
-    assert!(out.status.success(),
-            "re-index failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let out = Command::new(scry_bin())
-        .args(["build-embeddings", "--index"]).arg(&idx)
-        .args(["--dim", "32", "--chunk-lines", "20", "--chunk-overlap", "5"])
-        .output().expect("scry build-embeddings");
-    assert!(out.status.success(),
-            "build-embeddings failed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(idx.join("chunks.bin").exists(), "chunks.bin must exist");
-    assert!(idx.join("embeddings.bin").exists(), "embeddings.bin must exist");
-
-    let out = Command::new(scry_bin())
-        .args(["ask", "transact binder", "--index"]).arg(&idx)
-        .args(["--json", "--limit", "3"])
-        .output().expect("scry ask");
-    assert!(out.status.success(),
-            "scry ask failed: {}", String::from_utf8_lossy(&out.stderr));
-    let hits: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
-        .lines().filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    assert!(!hits.is_empty(), "ask should return at least one chunk");
-    // The query has both "transact" and "binder" tokens — the highest-
-    // ranked chunk should come from a file containing those words.
-    // Binder.java or Activity.java (which calls b.transact()) are the
-    // expected top hits.
-    let top_path = hits[0]["path"].as_str().unwrap_or("");
-    assert!(
-        top_path.contains("Binder.java") || top_path.contains("Activity.java")
-        || top_path.contains("IBinder.cpp"),
-        "top ask hit should be a binder-related file, got {top_path}; full hits={hits:?}"
-    );
-    // Every hit must carry the expected envelope shape.
-    for h in &hits {
-        assert!(h["score"].as_f64().is_some(), "missing score: {h}");
-        assert!(h["start_line"].as_u64().is_some(), "missing start_line: {h}");
-        assert!(h["end_line"].as_u64().is_some(), "missing end_line: {h}");
-    }
-
-    // 12. `scry callers --precise` clangd integration. Two cases:
+    // 11. `scry callers --precise` clangd integration. Two cases:
     //  - clangd not on PATH (the common one in CI / fresh dev hosts):
     //    the command must exit non-zero with an actionable message
     //    instead of segfaulting or hanging.
@@ -1846,19 +1798,6 @@ public class Puppy extends Dog { public void yip() {} }
     let names: Vec<&str> = trans.iter().filter_map(|v| v["name"].as_str()).collect();
     assert!(names.contains(&"Dog") && names.contains(&"Puppy"),
             "depth=2 subclasses of Animal should include Dog and Puppy; got {names:?}");
-
-    // CLI: `implementations` is an alias.
-    let out = Command::new(scry_bin())
-        .args(["implementations", "Animal", "--index"]).arg(&idx)
-        .args(["--json"]).output().expect("spawn scry implementations");
-    assert!(out.status.success());
-    let impls: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
-        .lines().filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    let names: Vec<&str> = impls.iter().filter_map(|v| v["name"].as_str()).collect();
-    assert!(names.contains(&"Dog"),
-            "implementations alias should match subclasses; got {names:?}");
 
     // JSON-RPC: subclasses tool over stdio.
     use std::io::Write;
@@ -3015,18 +2954,7 @@ public class Cat extends Animal {}
     let mut sorted = path_lines.clone(); sorted.sort();
     assert_eq!(path_lines, sorted, "paths must be sorted ascending: {path_lines:?}");
 
-    // (3) `implementations` alias must accept the same flags.
-    let out = Command::new(scry_bin())
-        .args(["implementations", "Animal", "--index"]).arg(&idx)
-        .args(["--format", "count"])
-        .output().expect("spawn implementations count");
-    assert!(out.status.success(),
-        "implementations count failed: {}", String::from_utf8_lossy(&out.stderr));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.lines().next().unwrap_or("").ends_with(" subclasses"),
-        "implementations should share the subclasses count shape; got {stdout:?}");
-
-    // (4) Daemon parity: serve_subclasses with format=paths / count.
+    // (3) Daemon parity: serve_subclasses with format=paths / count.
     let mut child = Command::new(scry_bin())
         .args(["serve", "--index"]).arg(&idx)
         .stdin(std::process::Stdio::piped())

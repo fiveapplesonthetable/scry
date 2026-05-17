@@ -2,46 +2,45 @@
 
 End-to-end view of how scry turns a source tree into a queryable
 symbol graph at Kythe-grade precision. Each stage names the crate
-that owns it; cross-references for ground truth.
+that owns it.
 
 ## One-line summary
 
 ```
-   source tree + build system
-            │
-            ▼
+   source tree
+        │
+        ▼
    ┌────────────────────────┐
-   │ scry index             │  ← walk + tree-sitter, fast path
+   │ scry index             │   tree-sitter walk + mmap'd sidecars
    └────────────────────────┘
-            │  files.bin, file_symbols.bin, names.fst,
-            │  trigram postings, modgraph.bin
-            ▼
+        │  files_packed.bin, names.fst, file_symbols.bin,
+        │  trigram postings, modgraph.bin, ref_resolutions.bin
+        ▼
    ┌────────────────────────┐
-   │ scry build-symbols     │  ← invoke build system per TU,
-   │   --build-{soong,gn,   │    collect structured symbol IDs
-   │    kbuild,cmake,cargo} │
+   │ scry build-symbols     │   precision sidecar producer
+   │   --build-kzip         │     (Kythe — AOSP via build_kzip.bash,
+   │   --build-{gn,kbuild,  │      Bazel, anything Kythe-integrated)
+   │    cmake}              │     (compile_commands.json → libclang)
+   │   --build-cargo        │     (rust-analyzer scip)
+   │   --with-polyglot      │     (Rust / Go / TS / Python alongside)
+   │   --scip FILE          │     (escape hatch: pre-built .scip)
    └────────────────────────┘
-            │  clang_usrs.bin (libclang USRs)
-            │  scip_index.bin (merged SCIP)
-            ▼
+        │  clang_usrs.bin   (packed mmap, USR per site)
+        │  scip_index.bin   (packed mmap, SCIP symbol per site)
+        ▼
    ┌────────────────────────┐
-   │ scry build-resolutions │  ← attribute lexical refs to
-   └────────────────────────┘    file_ids using sidecars + layer-2
-            │  ref_resolutions.bin
-            ▼
-   ┌────────────────────────┐
-   │ scry def / callers /   │  ← query layer, strict precision by
-   │   ref / impact /       │    default, sidecar-aware
-   │   callgraph            │
+   │ scry def / callers /   │   query layer, strict precision by
+   │   ref / impact /       │   default, sidecar-aware. --lexical
+   │   callgraph / uses     │   opts out of the precision filter.
    └────────────────────────┘
 ```
 
-## Stage 1 — `scry index` (fast path)
+## Stage 1 — `scry index`
 
-Owner: `crates/scry-cli/src/main.rs::cmd_index` + `scry-walker` +
-`scry-lang`.
+Owner: `scry-cli::cmd_index` + `scry-walker` + `scry-lang`.
 
-Walks the source tree, picks tree-sitter grammars by extension, emits:
+Walks the source tree, picks tree-sitter grammars by extension, emits
+every sidecar the query layer needs:
 
 - `files_packed.bin` — mmap'd file table (path interning, lazy access).
 - `file_symbols.bin` + `file_symbols_offsets.bin` — per-file symbol
@@ -49,142 +48,142 @@ Walks the source tree, picks tree-sitter grammars by extension, emits:
 - `names.fst` + `name_postings.bin` — name → file_id postings, FST-
   compressed.
 - `name_trigrams.fst` + `name_trigram_postings.bin` — trigram index
-  for fuzzy/substring queries.
+  for fuzzy / substring queries.
 - `modgraph.bin` — module dependency graph built from per-file
-  imports (currently Java/Kotlin; pluggable per language).
+  imports.
+- `ref_resolutions.bin` — per-ref unresolved → candidate file_ids,
+  using same-package + imports + inheritance (layer-2 attribution).
 - `manifest.json` — corpus stats + binding hashes.
 
-No build system involvement. Pure lexical extraction; tree-sitter
-gives byte-accurate token positions but no type information.
+No build system involvement. Pure lexical extraction; tree-sitter gives
+byte-accurate token positions but no type information. `scry index`
+runs every phase end-to-end with per-phase progress on stderr — users
+never need to invoke the individual sidecar builders.
 
-## Stage 2 — `scry build-symbols` (build-aware sidecars)
+## Stage 2 — `scry build-symbols`
 
-Owner: `crates/scry-cli/src/main.rs::cmd_build_symbols` +
-`scry-clang` + `scry-scip` + `scry-bridge`.
+Owner: `scry-cli::cmd_build_symbols` + `scry-clang` + `scry-scip` +
+`scry-bridge`.
 
-Single command, one explicit `--build-{soong,gn,kbuild,cmake,cargo}`
-flag, optional `--with-polyglot`. The flag tells scry which build
-system's intermediate representation to consume. Outputs go alongside
-the stage-1 sidecars in the index dir.
+Routes to a producer based on one explicit `--build-*` flag. Outputs
+go alongside the stage-1 sidecars in the index dir; readers mmap them
+and the query layer applies the precision filter automatically.
 
-### 2a. C / C++ / ObjC (Path B — libclang USRs)
+### 2a. Kythe-integrated builds — `--build-kzip PATH`
 
-Trigger: `--build-{gn,kbuild,cmake}`, or any `compile_commands.json`
-discovered under the source tree.
+The canonical path for AOSP (and any other build wrapping its
+compilers with Kythe extractors: Bazel, Gradle via plugins, custom
+pipelines).
+
+```
+build_kzip.bash (Soong)        any Kythe-aware build
+   │                                   │
+   ▼  every javac/kotlinc/clang/rustc invocation runs through
+   │  a Kythe extractor that records the EXACT compiler input
+   │  (post-rewrite sources, full classpath, every flag) into
+   │  a per-compile .kzip (zip-of-protobuf-and-files)
+   │
+   ▼  Soong's merge_zips packs every per-compile .kzip into ONE all.kzip
+   │
+   ▼  scry build-symbols --build-kzip PATH/all.kzip
+   │      decomposes the kzip, invokes the matching SCIP indexer per
+   │      language (scip-java for JVM, kythe→scip for C++, …), feeds
+   │      the resulting SCIP into the existing scip-import path
+   │
+   ▼  packed sidecars
+   clang_usrs.bin
+   scip_index.bin
+```
+
+The Kythe extractors see what the compiler sees: post-rewrite sources
+from protologsrc / jarjar / AAPT2 / hiddenAPI / AIDL / KAPT,
+variant-selected source sets, every javac shard, every flag. Soong's
+action graph lives inside the kzip; scry doesn't reason about it
+separately.
+
+For AOSP, kzip is produced via:
+
+```
+cd ~/dev/aosp
+XREF_CORPUS=android.googlesource.com/platform/superproject \
+DIST_DIR=/path/to/output \
+TARGET_PRODUCT=aosp_cf_x86_64_phone \
+build/soong/build_kzip.bash
+# → /path/to/output/<KZIP_NAME>.kzip
+```
+
+The script invokes Soong's `xref_{cxx,java,kotlin,rust}` phony
+targets, which run with Kythe extractors wrapping each compile, then
+calls `merge_zips` to pack everything into one all.kzip.
+
+### 2b. compile_commands-based builds — `--build-{gn,kbuild,cmake}`
+
+For builds that already emit a `compile_commands.json`:
 
 ```
 compile_commands.json
        │
-       ▼ libclang (in-process, per-TU, rayon-parallel)
-       │   - tolerance flags (-Wno-unknown-warning-option, -Wno-error)
-       │   - gcc-only flag filter (-fno-allow-store-data-races, …)
-       │   - relative-path rewrite (-I, -isystem, -include, …)
-       │   - source-file de-duplication (kernel's relative-path quirk)
+       ▼  scry-clang (in-process libclang, rayon-parallel)
+       │     - tolerance flags (-Wno-unknown-warning-option, -Wno-error)
+       │     - gcc-only flag filter (-fno-allow-store-data-races, …)
+       │     - relative-path rewrite (-I, -isystem, -include, …)
+       │     - source-file de-duplication
        │
-       ▼ CXCursor visitor → (path, byte_offset, USR, kind) tuples
-       │
-       ▼ scry_store::clang_usrs::write
-   clang_usrs.bin   (packed: header + records + sym/path tables)
+       ▼  CXCursor visitor → (path, byte_offset, USR, kind) tuples
+       ▼  scry_store::clang_usrs::write
+   clang_usrs.bin   (packed; same layout as scip_index.bin, different magic)
 ```
 
 USR = libclang's Unified Symbol Resolution string
 (`c:@F@ActivityManager#bindService#`). Stable across TUs and compile
 flags; identifies the same declaration site uniquely.
 
-### 2b. Java / Kotlin (Path C — SCIP via Soong bridge)
+- `--build-gn DIR` expects `args.gn` in the build dir; runs
+  `gn gen --export-compile-commands` if `compile_commands.json` is
+  missing.
+- `--build-kbuild DIR` runs Linux's
+  `scripts/clang-tools/gen_compile_commands.py` against the kernel's
+  out dir.
+- `--build-cmake DIR` expects `CMakeCache.txt` in the build dir; rerun
+  `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` if compile_commands.json
+  is missing.
 
-Trigger: `--build-soong <out>`.
+### 2c. Polyglot / Cargo — `--build-cargo` / `--with-polyglot`
 
-```
-out/soong/build.<target>.NN.ninja  (sharded ninja files)
-       │
-       ▼ scry-bridge: extract g.java.javac / g.java.kotlinc rules
-       │   - rule-name classifier (ignores split-srcJars, jarjar, …)
-       │   - variant selector (pick the one whose .rsp files exist)
-       │   - ninja variable expansion (cross-shard)
-       │   - javacFlags / kotlincFlags forwarder
-       │   - sibling-output classpath augmentation (R.jar, aconfig)
-       │   - srcjar extraction (AIDL stubs, KAPT factories)
-       │
-       ▼ Compilation { sources, classpath, bootclasspath, flags }
-       │
-       ▼ semanticdb-javac / semanticdb-kotlinc plugin (per TU)
-       │   - emits .semanticdb files alongside .class files
-       │
-       ▼ scip-java index-semanticdb (corpus-wide merge)
-       │   - reads every .semanticdb under <root>
-       │   - emits merged SCIP protobuf (merged_jvm.scip)
-       │
-       ▼ scry scip-import
-       │   - decode protobuf, walk documents/occurrences
-       │   - translate (line, col) → byte_offset by reading source
-       │   - intern symbols into a single table
-       │
-       ▼ scry_store::scip_index::write
-   scip_index.bin   (packed: same shape as clang_usrs.bin,
-                     different magic: SCRYSP01 vs SCRYUP01)
-```
+For Rust / Go / TypeScript / Python projects:
 
-The 4-stage chain (plugin → .semanticdb → scip-java merge → packed
-import) is how Java/Kotlin's type-resolved symbol identity reaches
-scry's query path. Each step is independently restartable and the
-intermediates are kept on disk so partial runs are usable.
+- `--build-cargo` drives rust-analyzer scip over a Cargo workspace.
+- `--with-polyglot` (composes with any other `--build-*` flag) drives
+  rust-analyzer, gopls, scip-typescript, scip-python over the
+  matching subtrees of `--source-root`.
 
-### 2c. Polyglot (Path C, other languages)
+Per-language SCIP is imported into the same `scip_index.bin` via the
+internal scip-import path.
 
-Trigger: `--with-polyglot` (implied for `--build-cargo`).
+### 2d. Escape hatch — `--scip FILE`
 
-Per-language indexer → SCIP → `scry scip-import --append` into the
-same `scip_index.bin`:
+Already have a `.scip` file from somewhere? Import directly. Same
+internal path the other producers fan into.
 
-- Rust → `rust-analyzer scip` (in-tree workspaces)
-- Go → `gopls scip` (per Go module)
-- TypeScript → `scip-typescript` (per `tsconfig.json`)
-- Python → `scip-python` (per project root)
-
-Each language is independent. The `--append` mode of scip-import
-seeds the rebuild from the existing sidecar via `iter_symbols` /
-`iter_records` so per-language runs compose without redundant decode.
-
-## Stage 3 — `scry build-resolutions` (layer-2 attribution)
-
-Owner: `crates/scry-cli/src/main.rs::cmd_build_resolutions`.
-
-Bridges the gap between tree-sitter's per-file lexical refs and the
-file-level resolution scry's query layer needs. For each ref, the
-resolver uses:
-
-1. The file's own scope (declarations in the same package).
-2. Imports / use clauses (parsed once per file).
-3. Inheritance edges from the modgraph (a method ref on subclass
-   may resolve to the parent class's file).
-4. Same-name fallback (a last-resort same-name match in the same
-   compilation unit's classpath).
-
-No compiler-grade type inference. The structured-symbol filter from
-stage 2 (clang USRs / SCIP symbols) is what closes the precision gap
-where the heuristic would otherwise overreach.
-
-Output: `ref_resolutions.bin` — a per-file_id map of unresolved
-references → candidate file_ids.
-
-## Stage 4 — query
+## Stage 3 — query
 
 Every query type (`def`, `callers`, `ref`, `impact`, `callgraph`,
-`grep`) consults a layered pipeline at query time:
+`uses`, `subclasses`, `grep`) consults a layered pipeline at query
+time:
 
-1. **Trigram / FST filter** — narrow to candidate files (~100µs).
+1. **Trigram / FST filter** — narrow candidate files (~100 µs).
 2. **File symbol scan** — read per-file symbol slabs, match by kind +
-   name (~100µs–10ms depending on result set).
-3. **Resolution lookup** — for callers/refs, traverse the
-   `ref_resolutions.bin` map.
+   name (~100 µs–10 ms depending on result size).
+3. **Resolution lookup** — for callers/refs, traverse
+   `ref_resolutions.bin`.
 4. **Precision filter** — if a sidecar covers the file, require the
    USR / SCIP symbol of each hit to match the definition's USR /
-   symbol. `--lexical` (off by default) skips this step.
+   symbol. `--lexical` opts out.
 
-Stage 4.4 is what makes scry's strict precision Kythe-grade. The
-sidecars are mmap'd once per `StoreReader` (cached via `OnceLock`);
-per-query cost is the algorithmic cost only, no decode tax.
+Sidecars are mmap'd once per `StoreReader` (cached via `OnceLock`);
+per-query cost is the algorithmic cost only, no decode tax. On
+AOSP-scale data, expect cold strict queries in 0.3–0.6 s wall, warm
+queries through `scry serve` in single-digit ms.
 
 ## Performance ceiling
 
@@ -192,42 +191,26 @@ The whole pipeline is built around making query-time work cheap and
 amortising indexing cost across periodic background runs:
 
 - Stage 1 walks the corpus in O(N) per file; one-time cost on the
-  initial run, incremental on subsequent runs via `files.bin` mtime
-  comparisons.
-- Stage 2 paths run in parallel; libclang scales linearly with TU
-  count; scip-java/-kotlin are bounded by the build system's own
-  intermediates.
-- Stage 3 is bounded by the size of the cross-file ref set;
-  re-resolution today is global per run (incremental delta is on
-  the roadmap).
-- Stage 4 reads only the per-query slice of the sidecars
-  (`precompute_by_file_ids` + bisect-on-records); 0.5 s wall for an
-  AOSP-wide `callers` query against the 14 M-record SCIP sidecar.
+  initial run, incremental on subsequent runs via mtime comparisons.
+- Stage 2's kzip path runs once per build cycle. The kzip itself is
+  produced by Soong's own xref targets; scry's ingest is bounded by
+  the per-language SCIP indexer's runtime.
+- Stage 3 reads only the per-query slice of the sidecars
+  (`precompute_by_file_ids` + bisect-on-records); sub-second wall on
+  the 14M+ records of an AOSP-scale SCIP sidecar.
 
 See `docs/BENCHMARKS.md` for live numbers on the AOSP + Linux +
 Perfetto corpora.
-
-## Restartability + caching
-
-- Stage 2 sidecars are atomically renamed; the previous `.bin`
-  survives a crashed run.
-- `carry_over_sidecars` preserves `clang_usrs.bin` / `scip_index.bin`
-  across a `scry index` rerun, so the fast-path rebuild doesn't
-  invalidate Kythe-grade precision.
-- `scry build-symbols --build-soong --append` (the default for
-  per-language polyglot SCIP imports) merges into the existing
-  sidecar via `ScipIndex::iter_records` rather than re-decoding the
-  whole file.
 
 ## File-level pointers
 
 | Stage | Crate / module |
 |-------|----------------|
-| 1     | `scry-cli/src/main.rs::cmd_index` + `scry-walker`, `scry-lang` |
-| 2a    | `scry-clang/src/lib.rs::build_clang_usrs` |
-| 2b    | `scry-bridge/src/soong.rs`, `scry-scip/src/lib.rs::import_scip` |
-| 2c    | `scry-bridge/src/{rust,go,typescript,python}.rs`, `scry-scip` |
-| 3     | `scry-cli/src/main.rs::cmd_build_resolutions` |
-| 4     | `scry-cli/src/main.rs::apply_precision_filter` |
-| Sidecar reader | `scry-store/src/{clang_usrs,scip_index,precision_packed}.rs` |
-| Sidecar writer | `scry-store/src/precision_packed.rs::write` |
+| 1     | `scry-cli::cmd_index` + `scry-walker`, `scry-lang` |
+| 2a    | `scry-bridge::kzip` (planned) + `scry-scip` |
+| 2b    | `scry-bridge::{gn,kbuild,cmake}` + `scry-clang` |
+| 2c    | `scry-bridge::polyglot` + `scry-scip` |
+| 2d    | `scry-scip::import_scip` |
+| 3     | `scry-cli::apply_precision_filter` |
+| Sidecar reader | `scry-store::{clang_usrs,scip_index,precision_packed}` |
+| Sidecar writer | `scry-store::precision_packed::write` |

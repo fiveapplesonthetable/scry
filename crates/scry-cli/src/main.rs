@@ -2,12 +2,10 @@
 
 #![forbid(unsafe_code)]
 
-mod bridge_subcmds;
 mod build_adapter;
 mod clangd;
 mod finalize;
 mod health;
-mod precision_subcmds;
 
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
 // keeps a high-water-mark — fine for short jobs, disastrous for our pattern
@@ -348,6 +346,10 @@ enum Cmd {
     /// `build-modgraph` for each `--build-<kind> ROOT` flag passed,
     /// plus `scip-import` for each `--scip FILE` flag passed.
     /// Reports per-stage timings.
+    ///
+    /// Hidden — `scry index` runs every finalize stage end-to-end.
+    /// Call this directly only when partial rebuilds are needed.
+    #[clap(hide = true)]
     Finalize {
         #[arg(long, value_name = "DIR")]
         index: Option<PathBuf>,
@@ -573,30 +575,6 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Find implementations of an interface (Java/Kotlin idiom).
-    /// Alias for `subclasses`; symmetric LSP analogue.
-    Implementations {
-        name: String,
-        #[arg(long)]
-        index: Option<PathBuf>,
-        #[arg(long, value_name = "SUBSTR")]
-        in_: Option<String>,
-        /// Drop implementations whose file path contains SUBSTR (v0.1.55).
-        #[arg(long, value_name = "SUBSTR")]
-        not_in: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        depth: usize,
-        /// No-op — see `scry subclasses --lexical`.
-        #[arg(long, hide = true)]
-        lexical: bool,
-        /// See `scry subclasses --format`.
-        #[arg(long, value_name = "FORMAT")]
-        format: Option<String>,
-        #[arg(long, default_value = "100")]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
     /// Prefix-match symbol names.
     Prefix {
         prefix: String,
@@ -799,33 +777,6 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Replay recent queries from ~/.scry/queries.log. Useful as a
-    /// thin memory primitive for LLM agents that want to know "what
-    /// did I already search for this session" without re-running the
-    /// queries.
-    Recall {
-        /// Cap the number of entries returned. Default: 20.
-        #[arg(long, default_value = "20")]
-        last: usize,
-        /// Only entries whose cmd matches (def, grep, callers, ...).
-        #[arg(long)]
-        cmd: Option<String>,
-        /// Only entries whose query string contains this substring.
-        #[arg(long)]
-        grep: Option<String>,
-        /// Override the log location (default: $SCRY_LOG, then
-        /// $HOME/.scry/queries.log).
-        #[arg(long)]
-        log: Option<PathBuf>,
-        /// Deduplicate consecutive identical (cmd, query) entries.
-        /// Useful when a session re-runs the same query many times;
-        /// off by default so the count reflects actual activity.
-        #[arg(long)]
-        dedup: bool,
-        /// Machine-readable output: one JSON object per line.
-        #[arg(long)]
-        json: bool,
-    },
     /// MCP (Model Context Protocol) server. Stdio JSON-RPC 2.0 over
     /// the standard MCP request/response shape; one MCP tool per scry
     /// command (def/ref/callers/prefix/fuzzy/grep/outline/coverage/
@@ -890,6 +841,7 @@ enum Cmd {
     ///            implementation; validate against your AOSP output.
     ///   kernel — Linux Kbuild. Not yet implemented (queued v0.1.12).
     ///   gn     — GN/ninja (perfetto / Chromium). Not yet implemented.
+    #[clap(hide = true)]
     BuildModgraph {
         /// Build system to read from.
         #[arg(long, value_name = "KIND")]
@@ -901,125 +853,26 @@ enum Cmd {
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
     },
-    /// Generate the clang USR sidecar at `<index>/clang_usrs.bin`
-    /// from a compile_commands.json. Per-TU libclang parse, USR
-    /// interning, system-header filtering. Path B precision.
-    ClangIndex {
-        /// Path to compile_commands.json (Bazel, CMake, Soong, GN,
-        /// or anything Bear-wrapped emits this).
-        #[arg(long, value_name = "PATH")]
-        compile_commands: PathBuf,
-        /// Existing scry index dir; sidecar lands here.
-        #[arg(long, value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Only index TUs whose source is under this prefix.
-        #[arg(long, value_name = "PATH")]
-        root: Option<PathBuf>,
-        /// Parallel parse workers (0 = num_cpus).
-        #[arg(long, default_value_t = 0)]
-        workers: usize,
-        /// Skip TUs whose source exceeds this size (bytes). 0 = no cap.
-        #[arg(long, default_value_t = 4 * 1024 * 1024)]
-        max_file_bytes: u64,
-    },
-    /// Report stats from the optional clang USR sidecar at
-    /// `<index>/clang_usrs.bin` (produced by `scry clang-index`).
-    /// Useful for verifying that Path B precision is wired up
-    /// before issuing `--clang-usr` queries.
-    ClangStats {
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
-    /// `scry build-jvm-scip` — Soong-native Java + Kotlin SCIP pipeline.
-    ///
-    /// Walks AOSP's Soong intermediates and replays each javac /
-    /// kotlinc invocation with the appropriate SemanticDB compiler
-    /// plugin attached. Both languages emit per-source `.semanticdb`
-    /// files into a shared targetroot; a single
-    /// `scip-java index-semanticdb` merge pass produces one SCIP
-    /// index that imports into the scry sidecar at
-    /// `<index>/scip_index.bin`.
-    ///
-    /// This is the bridge that makes strict-precise queries work on
-    /// AOSP Java/Kotlin code without depending on Gradle / Maven —
-    /// neither of which Soong uses.
-    BuildJvmScip {
-        /// AOSP source root (the parent of `out/soong/`).
-        #[arg(long, value_name = "PATH")]
-        source_root: PathBuf,
-        /// Soong build dir. Defaults to `<source_root>/out/soong`.
-        #[arg(long, value_name = "PATH")]
-        soong_build_dir: Option<PathBuf>,
-        /// Existing scry index dir; sidecar lands at <index>/scip_index.bin.
-        #[arg(long, value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Override the javac binary. AOSP ships its own at
-        /// `prebuilts/jdk/jdk21/linux-x86/bin/javac` — pass that
-        /// for byte-exact reproducibility with the build.
-        #[arg(long, value_name = "PATH")]
-        javac: Option<PathBuf>,
-        /// Override the `scip-java` binary used in the merge step.
-        #[arg(long, value_name = "PATH")]
-        scip_java: Option<PathBuf>,
-        /// Override the path to the semanticdb-javac plugin jar.
-        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
-        /// when not set.
-        #[arg(long, value_name = "PATH")]
-        semanticdb_javac_jar: Option<PathBuf>,
-        /// Override the kotlinc launcher. Must load the embeddable
-        /// jar (see install_indexers.sh's `kotlinc-embeddable`).
-        #[arg(long, value_name = "PATH")]
-        kotlinc: Option<PathBuf>,
-        /// Override the path to the semanticdb-kotlinc plugin jar.
-        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
-        /// when not set.
-        #[arg(long, value_name = "PATH")]
-        semanticdb_kotlinc_jar: Option<PathBuf>,
-        /// Where the per-compilation .semanticdb shards land.
-        /// Defaults to `$SCRY_TMP_DIR/scry-semanticdb`
-        /// (i.e. `/mnt/agent/tmp/scry-semanticdb` unless overridden).
-        #[arg(long, value_name = "PATH")]
-        targetroot: Option<PathBuf>,
-        /// Filter compilations by substring of the module name.
-        /// Useful for incremental testing — e.g.
-        /// `--only-module libcore` runs just the libcore modules.
-        #[arg(long, value_name = "SUBSTR")]
-        only_module: Option<String>,
-        /// Cap the number of compilations processed. Combine with
-        /// `--only-module` to test the pipeline on a small slice
-        /// before running the full AOSP set.
-        #[arg(long, value_name = "N")]
-        max_compilations: Option<usize>,
-        /// Skip Kotlin compilations.
-        #[arg(long)]
-        skip_kotlin: bool,
-        /// Skip Java compilations.
-        #[arg(long)]
-        skip_java: bool,
-    },
     /// `scry build-symbols` — Kythe-class symbol-identity sidecars.
     ///
-    /// One command, one explicit `--build-{soong,gn,kbuild,cmake,cargo}`
+    /// One command, one explicit `--build-{gn,kbuild,cmake,cargo,kzip}`
     /// flag, produces the matching sidecars:
-    ///   - Soong  → SCIP for Java + Kotlin via the Soong bridge.
     ///   - GN     → clang USRs from `compile_commands.json`.
     ///   - Kbuild → same (kernel C), via the kernel's
     ///              `scripts/clang-tools/gen_compile_commands.py`.
     ///   - CMake  → same; `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
     ///   - Cargo  → polyglot pass only (Rust via rust-analyzer scip).
+    ///   - Kzip   → ingest an `all.kzip` produced by a Kythe extractor
+    ///              (e.g. AOSP via `build/soong/build_kzip.bash`).
     ///
+    /// `--scip FILE` imports a pre-built SCIP index into the sidecar.
     /// `--with-polyglot` also runs the polyglot pass (Rust / Go /
     /// TypeScript / Python) over the source root regardless of the
-    /// build type, so a Soong tree that also has Python tooling gets
-    /// both passes.
+    /// build type.
     BuildSymbols {
         /// Source root.
         #[arg(long, value_name = "PATH")]
         source_root: PathBuf,
-        /// Soong out dir (typically `<source>/out/soong`). Mutually
-        /// exclusive with the other --build-* flags.
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_soong: Option<PathBuf>,
         /// GN build out dir (the one containing `args.gn`).
         #[arg(long, value_name = "PATH", group = "build")]
         build_gn: Option<PathBuf>,
@@ -1038,6 +891,15 @@ enum Cmd {
         /// Cargo workspace — runs polyglot pass only.
         #[arg(long, group = "build")]
         build_cargo: bool,
+        /// Path to an `all.kzip` produced by a Kythe extractor (AOSP
+        /// via `build/soong/build_kzip.bash`, Bazel via the equivalent,
+        /// any custom Kythe pipeline). Stubbed for now.
+        #[arg(long, value_name = "PATH", group = "build")]
+        build_kzip: Option<PathBuf>,
+        /// Escape hatch: import a pre-built `.scip` file directly into
+        /// the sidecar instead of running an indexer.
+        #[arg(long, value_name = "PATH")]
+        scip: Option<PathBuf>,
         /// Existing scry index dir.
         #[arg(long, value_name = "DIR")]
         index: Option<PathBuf>,
@@ -1060,165 +922,9 @@ enum Cmd {
         /// Workers for clang-index. 0 = auto (one per CPU).
         #[arg(long, default_value_t = 0)]
         workers: usize,
-        /// Targetroot for the JVM pipeline (Soong only).
-        #[arg(long, value_name = "PATH")]
-        targetroot: Option<PathBuf>,
         /// Per-target `.scip` files (polyglot only).
         #[arg(long, value_name = "PATH")]
         scip_out_dir: Option<PathBuf>,
-        /// Override the javac binary used by the JVM pipeline (Soong only).
-        /// AOSP ships its own at `prebuilts/jdk/jdk21/linux-x86/bin/javac` —
-        /// pass that for byte-exact reproducibility with the build.
-        #[arg(long, value_name = "PATH")]
-        javac: Option<PathBuf>,
-        /// Override the `scip-java` binary used in the JVM merge step.
-        #[arg(long, value_name = "PATH")]
-        scip_java: Option<PathBuf>,
-        /// Override the path to the semanticdb-javac plugin jar.
-        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
-        /// when not set.
-        #[arg(long, value_name = "PATH")]
-        semanticdb_javac_jar: Option<PathBuf>,
-        /// Override the kotlinc launcher (Soong only). Must load the
-        /// embeddable jar — see install_indexers.sh's `kotlinc-embeddable`.
-        #[arg(long, value_name = "PATH")]
-        kotlinc: Option<PathBuf>,
-        /// Override the path to the semanticdb-kotlinc plugin jar.
-        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
-        /// when not set.
-        #[arg(long, value_name = "PATH")]
-        semanticdb_kotlinc_jar: Option<PathBuf>,
-        /// Filter Soong compilations by substring of the module name.
-        /// Useful for incremental testing.
-        #[arg(long, value_name = "SUBSTR")]
-        only_module: Option<String>,
-        /// Cap the number of Soong compilations processed.
-        #[arg(long, value_name = "N")]
-        max_compilations: Option<usize>,
-        /// Skip Kotlin compilations on the Soong path.
-        #[arg(long)]
-        skip_kotlin: bool,
-        /// Skip Java compilations on the Soong path.
-        #[arg(long)]
-        skip_java: bool,
-        /// Override the rust-analyzer binary used by the polyglot pass.
-        #[arg(long, value_name = "PATH")]
-        rust_analyzer: Option<PathBuf>,
-        /// Override the scip-go binary used by the polyglot pass.
-        #[arg(long, value_name = "PATH")]
-        scip_go: Option<PathBuf>,
-        /// Override the scip-typescript binary used by the polyglot pass.
-        #[arg(long, value_name = "PATH")]
-        scip_typescript: Option<PathBuf>,
-        /// Override the scip-python binary used by the polyglot pass.
-        #[arg(long, value_name = "PATH")]
-        scip_python: Option<PathBuf>,
-        /// Filter polyglot targets by substring of their root path.
-        #[arg(long, value_name = "SUBSTR")]
-        only_root: Option<String>,
-        /// Cap the number of polyglot targets processed.
-        #[arg(long, value_name = "N")]
-        max_targets: Option<usize>,
-    },
-    /// `scry build-polyglot-scip` — Rust + Go + TypeScript + Python.
-    ///
-    /// Walks the source root for native project markers
-    /// (`Cargo.toml`, `go.mod`, `tsconfig.json`, or `.py` files) and
-    /// runs the corresponding indexer per project. Each indexer's
-    /// `.scip` output lands in the scry sidecar via APPEND-mode
-    /// import, so this command composes cleanly with
-    /// `build-jvm-scip` and `clang-index` (which already wrote
-    /// SCIP / clang USR sidecars).
-    BuildPolyglotScip {
-        /// Source root to walk for project markers.
-        #[arg(long, value_name = "PATH")]
-        source_root: PathBuf,
-        /// Existing scry index dir; sidecar lands at <index>/scip_index.bin.
-        #[arg(long, value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Per-target `.scip` files land here. Defaults to
-        /// `$SCRY_TMP_DIR/scry-polyglot-scip`
-        /// (i.e. `/mnt/agent/tmp/scry-polyglot-scip` unless overridden).
-        #[arg(long, value_name = "PATH")]
-        scip_out_dir: Option<PathBuf>,
-        /// Override the rust-analyzer binary.
-        #[arg(long, value_name = "PATH")]
-        rust_analyzer: Option<PathBuf>,
-        /// Override the scip-go binary.
-        #[arg(long, value_name = "PATH")]
-        scip_go: Option<PathBuf>,
-        /// Override the scip-typescript binary.
-        #[arg(long, value_name = "PATH")]
-        scip_typescript: Option<PathBuf>,
-        /// Override the scip-python binary.
-        #[arg(long, value_name = "PATH")]
-        scip_python: Option<PathBuf>,
-        /// Skip Rust.
-        #[arg(long)]
-        no_rust: bool,
-        /// Skip Go.
-        #[arg(long)]
-        no_go: bool,
-        /// Skip TypeScript.
-        #[arg(long)]
-        no_typescript: bool,
-        /// Skip Python.
-        #[arg(long)]
-        no_python: bool,
-        /// Filter project roots by substring.
-        #[arg(long, value_name = "SUBSTR")]
-        only_root: Option<String>,
-        /// Cap the number of targets processed.
-        #[arg(long, value_name = "N")]
-        max_targets: Option<usize>,
-    },
-    /// Import a SCIP index (https://github.com/sourcegraph/scip)
-    /// produced by scip-java / scip-kotlin / gopls / rust-analyzer /
-    /// scip-typescript / etc., into the scry sidecar
-    /// `<index>/scip_index.bin`. Powers `--scip-precise` queries.
-    ScipImport {
-        /// Path to the SCIP index file (protobuf, typically named
-        /// `index.scip` or `*.scip`).
-        #[arg(long, value_name = "PATH")]
-        scip: PathBuf,
-        /// Existing scry index dir; sidecar lands here.
-        #[arg(long, value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Override the SCIP index's `project_root` for path
-        /// resolution. Use when the SCIP file was generated under
-        /// a different working tree (CI vs local).
-        #[arg(long, value_name = "PATH")]
-        root: Option<PathBuf>,
-    },
-    /// Report stats from the optional SCIP sidecar at
-    /// `<index>/scip_index.bin` (produced by `scry scip-import`).
-    ScipStats {
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
-    /// Look up the SCIP symbol ID for a (path, byte_offset) pair
-    /// against the sidecar. Empty stdout when no record covers
-    /// the site.
-    ScipLookup {
-        #[arg(long)]
-        index: Option<PathBuf>,
-        #[arg(long)]
-        path: String,
-        #[arg(long)]
-        offset: u32,
-    },
-    /// Look up the clang USR for a (path, byte_offset) pair against
-    /// the sidecar. Returns the empty string if no record covers
-    /// that exact site.
-    ClangLookup {
-        #[arg(long)]
-        index: Option<PathBuf>,
-        /// Absolute source path (matches what clang saw).
-        #[arg(long)]
-        path: String,
-        /// Byte offset of the cursor location within the file.
-        #[arg(long)]
-        offset: u32,
     },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
@@ -1231,20 +937,12 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Which Soong module declares PATH as one of its sources?
-    /// Looks up the file's basename across Soong Import refs.
-    ModuleOf {
-        path: String,
-        #[arg(long)]
-        index: Option<PathBuf>,
-        #[arg(long, default_value = "10")]
-        limit: usize,
-    },
     /// Build (or rebuild) the trigram index for an existing index dir.
     /// Use this when the original `scry index` run didn't pass
     /// --build-trigrams. Walks every file in the index's files_packed.bin,
     /// extracts trigrams, writes trigrams.fst + trigram_postings.bin
     /// alongside the existing index — no re-parsing needed.
+    #[clap(hide = true)]
     BuildTrigrams {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1262,6 +960,7 @@ enum Cmd {
     /// (~10 ms vs several seconds). Walks the existing symbols.bin /
     /// refs.bin, recording each record's byte offset into the corresponding
     /// _offsets.bin sidecar. No re-indexing required.
+    #[clap(hide = true)]
     BuildOffsets {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1270,6 +969,7 @@ enum Cmd {
     /// file_symbols_offsets.bin) for an existing index. Makes `outline`
     /// O(symbols-in-file) instead of O(total-symbols). Walks the lazy
     /// symbol vec once, grouping by file_id; no re-parsing needed.
+    #[clap(hide = true)]
     BuildFileSymbols {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1280,6 +980,7 @@ enum Cmd {
     /// body are found by intersecting "refs in NAME's file" with
     /// "byte range of NAME's body". Without this sidecar, `uses`
     /// must linearly scan all 63M refs.
+    #[clap(hide = true)]
     BuildFileRefs {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1290,6 +991,7 @@ enum Cmd {
     /// (Java today: same package + explicit imports; same fallback to
     /// name-match for everything else). Writes ref_resolutions.bin;
     /// the reader honors it automatically on get_ref.
+    #[clap(hide = true)]
     BuildResolutions {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1300,6 +1002,7 @@ enum Cmd {
     /// changed between two builds — without it, only full reindex
     /// works. Walks every indexed file once, hashes in parallel via
     /// rayon. Cheap: ~25 s for the full AOSP+Linux corpus.
+    #[clap(hide = true)]
     BuildDigests {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -1380,54 +1083,6 @@ enum Cmd {
         /// deduplicated.
         #[arg(long)]
         accumulate: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compute and store per-chunk text embeddings (chunks.bin +
-    /// embeddings.bin). Default model is a deterministic hash-based
-    /// bag-of-tokens embedding (no model download, no extra deps);
-    /// good enough for vocabulary-overlap retrieval which catches
-    /// most "how do I X" code-search questions. Powers `scry ask`.
-    ///
-    /// Storage: ~70 MB chunks + (chunk_count × dim × 4) bytes for
-    /// embeddings. At default dim=64 and ~3 M chunks that's ~770 MB.
-    BuildEmbeddings {
-        #[arg(long)]
-        index: Option<PathBuf>,
-        /// Vector dimension. Trade-off: higher = better discrimination,
-        /// more storage. Default 64 (good for code-search vocabulary
-        /// overlap; ~770 MB on full corpus).
-        #[arg(long, default_value = "64")]
-        dim: usize,
-        /// Chunk size in lines. Standard RAG sizing for code is
-        /// 50–150; default 100.
-        #[arg(long, default_value = "100")]
-        chunk_lines: usize,
-        /// Overlap between consecutive chunks, in lines. Catches
-        /// definitions that straddle chunk boundaries.
-        #[arg(long, default_value = "20")]
-        chunk_overlap: usize,
-        /// Parallelism for the embedding pass. Default = num_cpus.
-        #[arg(long, default_value = "0")]
-        workers: usize,
-    },
-    /// Semantic retrieval: find code chunks whose embedded text is
-    /// most similar to QUERY. Useful for "how do I parse TOML in this
-    /// codebase" — questions where you don't know the identifier name
-    /// to grep for. Requires `scry build-embeddings` to have run.
-    Ask {
-        query: String,
-        #[arg(long)]
-        index: Option<PathBuf>,
-        /// Substring path filter, same semantics as elsewhere.
-        #[arg(long = "in")]
-        in_: Option<String>,
-        /// Drop chunks whose file path contains SUBSTR (v0.1.55).
-        #[arg(long, value_name = "SUBSTR")]
-        not_in: Option<String>,
-        /// Number of top-K chunks to return.
-        #[arg(long, default_value = "10")]
-        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -1575,61 +1230,15 @@ fn main() -> Result<()> {
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
-        Cmd::ClangIndex { compile_commands, index, root, workers, max_file_bytes } =>
-            precision_subcmds::cmd_clang_index(compile_commands, index, root, workers, max_file_bytes),
-        Cmd::ClangStats { index } => precision_subcmds::cmd_clang_stats(index),
-        Cmd::ClangLookup { index, path, offset } => precision_subcmds::cmd_clang_lookup(index, &path, offset),
-        Cmd::BuildJvmScip { source_root, soong_build_dir, index, javac, scip_java,
-                            semanticdb_javac_jar, kotlinc, semanticdb_kotlinc_jar,
-                            targetroot, only_module, max_compilations,
-                            skip_kotlin, skip_java } => bridge_subcmds::cmd_build_jvm_scip(
-            source_root, soong_build_dir, index, javac, scip_java,
-            semanticdb_javac_jar, kotlinc, semanticdb_kotlinc_jar,
-            targetroot, only_module, max_compilations,
-            skip_kotlin, skip_java,
+        Cmd::BuildSymbols {
+            source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
+            build_cargo, build_kzip, scip, index, with_polyglot,
+            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir,
+        } => cmd_build_symbols(
+            source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
+            build_cargo, build_kzip, scip, index, with_polyglot,
+            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir,
         ),
-        Cmd::BuildPolyglotScip { source_root, index, scip_out_dir, rust_analyzer,
-                                  scip_go, scip_typescript, scip_python,
-                                  no_rust, no_go, no_typescript, no_python,
-                                  only_root, max_targets } =>
-            bridge_subcmds::cmd_build_polyglot_scip(
-                source_root, index, scip_out_dir, rust_analyzer, scip_go,
-                scip_typescript, scip_python, no_rust, no_go, no_typescript,
-                no_python, only_root, max_targets,
-            ),
-        Cmd::BuildSymbols { source_root, build_soong, build_gn, gn_binary,
-                            build_kbuild, build_cmake, cmake_binary, build_cargo,
-                            index, with_polyglot, no_rust, no_go, no_typescript,
-                            no_python, workers, targetroot, scip_out_dir,
-                            javac, scip_java, semanticdb_javac_jar,
-                            kotlinc, semanticdb_kotlinc_jar,
-                            only_module, max_compilations, skip_kotlin, skip_java,
-                            rust_analyzer, scip_go, scip_typescript, scip_python,
-                            only_root, max_targets } => {
-            let build = match (build_soong, build_gn, build_kbuild, build_cmake, build_cargo) {
-                (Some(d), None, None, None, false) => bridge_subcmds::BuildKind::Soong { build_dir: d },
-                (None, Some(d), None, None, false) => bridge_subcmds::BuildKind::Gn { build_dir: d, gn_binary },
-                (None, None, Some(d), None, false) => bridge_subcmds::BuildKind::Kbuild { build_dir: d },
-                (None, None, None, Some(d), false) => bridge_subcmds::BuildKind::Cmake { build_dir: d, cmake_binary },
-                (None, None, None, None, true)     => bridge_subcmds::BuildKind::Cargo,
-                _ => anyhow::bail!(
-                    "build-symbols requires exactly one --build-{{soong,gn,kbuild,cmake,cargo}} flag"
-                ),
-            };
-            bridge_subcmds::cmd_build_symbols(bridge_subcmds::BuildSymbolsArgs {
-                source_root, build, index, with_polyglot,
-                no_rust, no_go, no_typescript, no_python,
-                workers, targetroot, scip_out_dir,
-                javac, scip_java, semanticdb_javac_jar,
-                kotlinc, semanticdb_kotlinc_jar,
-                only_module, max_compilations, skip_kotlin, skip_java,
-                rust_analyzer, scip_go, scip_typescript, scip_python,
-                only_root, max_targets,
-            })
-        }
-        Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
-        Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),
-        Cmd::ScipLookup { index, path, offset } => precision_subcmds::cmd_scip_lookup(index, &path, offset),
         Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
             cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
         Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json } =>
@@ -1645,13 +1254,8 @@ fn main() -> Result<()> {
         ),
         Cmd::Subclasses { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
             cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
-        Cmd::Implementations { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
-            cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
-        Cmd::Recall { last, cmd, grep, log, dedup, json } =>
-            cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
             cmd_diff(since, in_, verbose, limit, index, json),
-        Cmd::ModuleOf { path, index, limit } => cmd_module_of(path, index, limit),
         Cmd::Health { index, json } => health::cmd_health(index, json),
         Cmd::Owner { path, index, include_deep, accumulate, json } =>
             cmd_owner(path, index, include_deep, accumulate, json),
@@ -1667,13 +1271,196 @@ fn main() -> Result<()> {
         Cmd::IndexDiff { roots, index, profile, verbose, workers, json } =>
             cmd_index_diff(roots, index, profile, verbose, workers, json),
         Cmd::Tombstone { path, index } => cmd_tombstone(path, index),
-        Cmd::BuildEmbeddings { index, dim, chunk_lines, chunk_overlap, workers } =>
-            cmd_build_embeddings(index, dim, chunk_lines, chunk_overlap, workers),
-        Cmd::Ask { query, index, in_, not_in, limit, json } =>
-            cmd_ask(query, index, in_, not_in, limit, json),
         Cmd::Completions { shell } => cmd_completions(shell),
         Cmd::Man => cmd_man(),
     }
+}
+
+/// `scry build-symbols` — Kythe-class symbol-identity sidecars.
+///
+/// Takes one explicit `--build-{gn,kbuild,cmake,cargo,kzip}` flag,
+/// or `--scip FILE` to import a pre-built SCIP index. Optional
+/// `--with-polyglot` runs the Rust/Go/TS/Python polyglot pass over
+/// the source root.
+#[allow(clippy::too_many_arguments)]
+fn cmd_build_symbols(
+    source_root: PathBuf,
+    build_gn: Option<PathBuf>,
+    gn_binary: Option<PathBuf>,
+    build_kbuild: Option<PathBuf>,
+    build_cmake: Option<PathBuf>,
+    cmake_binary: Option<PathBuf>,
+    build_cargo: bool,
+    build_kzip: Option<PathBuf>,
+    scip: Option<PathBuf>,
+    index: Option<PathBuf>,
+    with_polyglot: bool,
+    no_rust: bool,
+    no_go: bool,
+    no_typescript: bool,
+    no_python: bool,
+    workers: usize,
+    scip_out_dir: Option<PathBuf>,
+) -> Result<()> {
+    use scry_bridge::{cmake, gn, kbuild, polyglot};
+    let t_total = Instant::now();
+    let index_dir = index.clone().unwrap_or_else(default_index_dir);
+    let n_build_flags = build_gn.is_some() as u32
+        + build_kbuild.is_some() as u32
+        + build_cmake.is_some() as u32
+        + build_kzip.is_some() as u32
+        + build_cargo as u32;
+    if n_build_flags > 1 {
+        anyhow::bail!(
+            "build-symbols accepts at most one --build-{{gn,kbuild,cmake,cargo,kzip}} flag"
+        );
+    }
+
+    if let Some(build_dir) = build_gn.as_ref() {
+        eprintln!("[build-symbols] gn build_dir: {}", build_dir.display());
+        let cc = match gn::locate_compile_commands(build_dir)? {
+            Some(cc) => {
+                eprintln!("[build-symbols] gn: reusing existing {}", cc.display());
+                cc
+            }
+            None => {
+                let bin = gn_binary.unwrap_or_else(|| PathBuf::from("gn"));
+                eprintln!(
+                    "[build-symbols] gn: regenerating compile_commands.json via `{} gen --export-compile-commands {}`",
+                    bin.display(), build_dir.display(),
+                );
+                gn::regenerate_compile_commands(&bin, &source_root, build_dir)?
+            }
+        };
+        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
+    } else if let Some(build_dir) = build_kbuild.as_ref() {
+        eprintln!("[build-symbols] kbuild build_dir: {}", build_dir.display());
+        if !kbuild::looks_like_kernel_source(&source_root) {
+            anyhow::bail!(
+                "{} doesn't look like a Linux kernel source tree \
+                 (expected Makefile + Kconfig + scripts/ at top level)",
+                source_root.display(),
+            );
+        }
+        let cc = match kbuild::locate_compile_commands(build_dir)? {
+            Some(cc) => {
+                eprintln!("[build-symbols] kbuild: reusing existing {}", cc.display());
+                cc
+            }
+            None => {
+                eprintln!(
+                    "[build-symbols] kbuild: regenerating compile_commands.json via gen_compile_commands.py"
+                );
+                kbuild::regenerate_compile_commands(&source_root, build_dir)?
+            }
+        };
+        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
+    } else if let Some(build_dir) = build_cmake.as_ref() {
+        eprintln!("[build-symbols] cmake build_dir: {}", build_dir.display());
+        let cc = match cmake::locate_compile_commands(build_dir)? {
+            Some(cc) => {
+                eprintln!("[build-symbols] cmake: reusing existing {}", cc.display());
+                cc
+            }
+            None => {
+                let bin = cmake_binary.unwrap_or_else(|| PathBuf::from("cmake"));
+                eprintln!(
+                    "[build-symbols] cmake: regenerating compile_commands.json via {}",
+                    bin.display(),
+                );
+                cmake::regenerate_compile_commands(&bin, build_dir)?
+            }
+        };
+        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
+    } else if build_cargo {
+        // No C-family step; polyglot pass handles Rust via rust-analyzer scip.
+        eprintln!(
+            "[build-symbols] cargo: skipping C-family step, polyglot pass will handle Rust"
+        );
+    } else if build_kzip.is_some() {
+        anyhow::bail!(
+            "--build-kzip ingest will land in v0.1.67; pass the all.kzip to \
+             scip-java --kzip directly for now"
+        );
+    }
+
+    if let Some(scip_path) = scip.as_ref() {
+        let t = Instant::now();
+        scry_scip::import_scip(scip_path, &index_dir, Some(source_root.as_path()))
+            .with_context(|| format!("import scip {}", scip_path.display()))?;
+        eprintln!(
+            "[build-symbols] imported scip {} in {:.2}s",
+            scip_path.display(), t.elapsed().as_secs_f64(),
+        );
+    }
+
+    // Cargo always needs the polyglot pass since it's pure-Rust.
+    if with_polyglot || build_cargo {
+        let mut kinds: Vec<polyglot::PolyglotKind> = Vec::new();
+        if !no_rust       { kinds.push(polyglot::PolyglotKind::Rust); }
+        if !no_go         { kinds.push(polyglot::PolyglotKind::Go); }
+        if !no_typescript { kinds.push(polyglot::PolyglotKind::TypeScript); }
+        if !no_python     { kinds.push(polyglot::PolyglotKind::Python); }
+        if kinds.is_empty() {
+            anyhow::bail!("polyglot pass requested but every language was disabled");
+        }
+        eprintln!(
+            "[build-symbols] polyglot pass over {} ({})",
+            source_root.display(),
+            kinds.iter().map(|k| k.label()).collect::<Vec<_>>().join(", "),
+        );
+        let targets = polyglot::discover(&source_root, &kinds)
+            .context("discover polyglot project roots")?;
+        if targets.is_empty() {
+            eprintln!("[build-symbols] polyglot: no targets discovered");
+        } else {
+            let mut cfg = polyglot::PolyglotConfig::default();
+            if let Some(p) = scip_out_dir { cfg.scip_out_dir = p; }
+            let report = polyglot::run(&targets, &cfg).context("polyglot dispatch")?;
+            eprintln!(
+                "[build-symbols] polyglot: {} OK, {} failed ({} .scip files)",
+                report.ok, report.failed, report.scip_files.len(),
+            );
+            if report.failed > 0 {
+                anyhow::bail!(
+                    "{} of {} polyglot targets failed to index",
+                    report.failed, report.ok + report.failed,
+                );
+            }
+            for shard in &report.scip_files {
+                scry_scip::import_scip_with_mode(
+                    shard, &index_dir, Some(source_root.as_path()), true,
+                ).with_context(|| format!("import polyglot scip {}", shard.display()))?;
+            }
+        }
+    }
+
+    eprintln!(
+        "[build-symbols] ALL STAGES OK in {:.2}s",
+        t_total.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+
+/// Run libclang USR extraction over `compile_commands.json`. Shared
+/// by the gn / kbuild / cmake arms of `cmd_build_symbols`.
+fn run_clang_on_cc(
+    compile_commands: &Path,
+    source_root: &Path,
+    index_dir: &Path,
+    workers: usize,
+) -> Result<()> {
+    let t = Instant::now();
+    scry_clang::build_clang_usrs(
+        compile_commands, index_dir, Some(source_root), workers,
+        4 * 1024 * 1024,
+    )?;
+    eprintln!(
+        "[build-symbols] clang USRs landed in {} in {:.2}s",
+        index_dir.join("clang_usrs.bin").display(),
+        t.elapsed().as_secs_f64(),
+    );
+    Ok(())
 }
 
 /// Emit a shell-completion script for `shell` to stdout. Wraps
@@ -3274,8 +3061,8 @@ fn cmd_impact(
     Ok(())
 }
 
-/// `scry subclasses NAME` / `scry implementations NAME` — type-hierarchy
-/// lookup. `depth = 0` returns direct children; higher walks transitively.
+/// `scry subclasses NAME` — type-hierarchy lookup. `depth = 0`
+/// returns direct children; higher walks transitively.
 /// Output is one-line-per-child in the same scheme as `scry def`, or
 /// JSON when --json is set.
 fn cmd_subclasses(
@@ -3997,7 +3784,7 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
 
 /// Symbol-set analogue of `print_refs_paths`: deduped sorted file
 /// paths for a Vec<SymbolRecord> (used by `--format paths` on
-/// `subclasses` / `implementations`). Same JSON + human shape.
+/// `subclasses`). Same JSON + human shape.
 fn print_symbols_paths(reader: &StoreReader, syms: &[SymbolRecord], limit: usize, json: bool) {
     use std::collections::BTreeSet;
     let mut paths: BTreeSet<String> = BTreeSet::new();
@@ -6522,184 +6309,6 @@ fn cmd_callers_precise(
 }
 
 // ---------------------------------------------------------------------------
-// build-embeddings (chunk every file, embed each chunk, write sidecars)
-// ---------------------------------------------------------------------------
-//
-// Two outputs:
-//   chunks.bin       bincode-encoded Vec<ChunkEntry> (file_id + line range)
-//   embeddings.bin   8-byte header (dim u32 LE, count u32 LE) then
-//                    `count` rows × `dim` × f32 LE
-//
-// The embedding model is the deterministic FNV-1a hashing trick in
-// scry-store::embed — no model download, no external deps, identical
-// across machines. Quality-wise: catches vocabulary overlap (the
-// dominant signal for code search). A future feature-flagged
-// transformer model can replace `embed_text` without changing the
-// sidecar format.
-fn cmd_build_embeddings(
-    index: Option<PathBuf>,
-    dim: usize,
-    chunk_lines: usize,
-    chunk_overlap: usize,
-    workers: usize,
-) -> Result<()> {
-    use rayon::prelude::*;
-    use scry_store::embed;
-    let index_dir = index.unwrap_or_else(default_index_dir);
-    if workers > 0 {
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
-    }
-    let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = StoreReader::open(&index_dir)
-        .with_context(|| format!("open index at {}", index_dir.display()))?;
-    let n_files = r.file_count();
-    eprintln!("[embed] {} files; dim={}, chunk={}+{}overlap",
-        n_files, dim, chunk_lines, chunk_overlap);
-
-    let t = Instant::now();
-    // Per-file: read source, chunk, embed each chunk. Returns a Vec
-    // of (ChunkEntry, embedding) which we'll flatten + sort by
-    // file_id + start_line for stable on-disk ordering.
-    let per_file: Vec<Vec<(embed::ChunkEntry, Vec<f32>)>> = r.par_iter_files().map(|fe| {
-        let path = fe.display_path();
-        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => return Vec::new() };
-        let src = match std::str::from_utf8(&bytes) { Ok(s) => s, Err(_) => return Vec::new() };
-        let mut out = Vec::new();
-        for (start, end, body) in embed::chunk_lines(src, chunk_lines, chunk_overlap) {
-            let v = embed::embed_text(body, dim);
-            out.push((embed::ChunkEntry { file_id: fe.id, start_line: start, end_line: end }, v));
-        }
-        out
-    }).collect();
-
-    let mut all: Vec<(embed::ChunkEntry, Vec<f32>)> = per_file.into_iter().flatten().collect();
-    // Stable sort: (file_id ASC, start_line ASC) so consumers can
-    // binary-search by file_id or scan by file order.
-    all.sort_by_key(|a| (a.0.file_id, a.0.start_line));
-    eprintln!("[embed] computed {} chunks in {} ms", all.len(), t.elapsed().as_millis());
-
-    // Write chunks.bin (bincode Vec<ChunkEntry>).
-    {
-        let chunks_only: Vec<embed::ChunkEntry> = all.iter().map(|(c, _)| c.clone()).collect();
-        let tmp = paths.chunks().with_extension("bin.tmp");
-        let f = std::fs::File::create(&tmp)?;
-        bincode::serialize_into(std::io::BufWriter::new(f), &chunks_only)
-            .map_err(|e| anyhow::anyhow!("bincode encode chunks: {e}"))?;
-        std::fs::rename(&tmp, paths.chunks())?;
-    }
-
-    // Write embeddings.bin (header + packed f32).
-    {
-        use std::io::Write;
-        let tmp = paths.embeddings().with_extension("bin.tmp");
-        let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
-        f.write_all(&(dim as u32).to_le_bytes())?;
-        f.write_all(&(all.len() as u32).to_le_bytes())?;
-        for (_, v) in &all {
-            for x in v {
-                f.write_all(&x.to_le_bytes())?;
-            }
-        }
-        f.flush()?;
-        drop(f);
-        std::fs::rename(&tmp, paths.embeddings())?;
-    }
-    let total_bytes = std::fs::metadata(paths.embeddings()).map(|m| m.len()).unwrap_or(0);
-    eprintln!("[embed] DONE. {} chunks × {} dim → {} ({} ms)",
-        all.len(), dim, human_bytes(total_bytes), t.elapsed().as_millis());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// ask (semantic retrieval — embed query, cosine-rank chunks)
-// ---------------------------------------------------------------------------
-
-fn cmd_ask(
-    query: String,
-    index: Option<PathBuf>,
-    in_: Option<String>,
-    not_in: Option<String>,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let t = Instant::now();
-    let r = open_index(index)?;
-    if r.embeddings_mmap.is_none() || r.chunks.is_none() {
-        anyhow::bail!(
-            "index has no embedding sidecar — run `scry build-embeddings` first"
-        );
-    }
-    let dim = r.embedding_dim as usize;
-    // Embed query with the same kernel + dim used at build-time.
-    let q_vec = scry_store::embed::embed_text(&query, dim);
-
-    // Over-fetch from the ranker so the path filters can drop some
-    // without starving the result count.
-    let any_filter = in_.is_some() || not_in.is_some();
-    let cap = limit.saturating_mul(if any_filter { 8 } else { 1 }).max(limit);
-    let ranked = r.semantic_rank(&q_vec, cap);
-
-    let mut shown = 0usize;
-    let mut hits: Vec<serde_json::Value> = Vec::new();
-    for (chunk_idx, sim) in ranked {
-        let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
-            Some(e) => e, None => continue,
-        };
-        let fe = match r.file_view(entry.file_id) { Some(f) => f, None => continue };
-        let path = fe.display_path();
-        if !path_matches(&path, in_.as_deref(), not_in.as_deref()) { continue; }
-        // Read a slice of the file to show context (best-effort).
-        let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
-        if json {
-            hits.push(serde_json::json!({
-                "path": path,
-                "lang": fe.kind.as_str(),
-                "start_line": entry.start_line,
-                "end_line": entry.end_line,
-                "score": sim,
-                "snippet": snippet,
-            }));
-        } else {
-            println!("{}:{}-{}  (score={:.3})  ({})",
-                path, entry.start_line, entry.end_line, sim, fe.kind.as_str());
-            if !snippet.is_empty() {
-                // First 2 non-blank lines of the chunk as a tiny preview.
-                for line in snippet.lines().filter(|l| !l.trim().is_empty()).take(2) {
-                    println!("    {}", line.trim_end());
-                }
-            }
-        }
-        shown += 1;
-        if shown >= limit { break; }
-    }
-    if json {
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        for h in &hits {
-            writeln!(out, "{}", h)?;
-        }
-    }
-    log_query(&r, "ask", &query, shown, shown, t);
-    Ok(())
-}
-
-/// Read the chunk's byte range from disk for snippet display.
-/// Best-effort: returns an empty string on any IO error so the
-/// caller never crashes on a missing file.
-fn chunk_snippet(path: &str, start_line: u32, end_line: u32) -> String {
-    let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return String::new() };
-    let src = match std::str::from_utf8(&bytes) { Ok(s) => s, Err(_) => return String::new() };
-    let lines: Vec<&str> = src.lines().collect();
-    let s = (start_line as usize).saturating_sub(1).min(lines.len());
-    let e = (end_line as usize).min(lines.len());
-    if s >= e { return String::new(); }
-    // Cap snippet size so large chunks don't blow out token budgets.
-    let take = (e - s).min(8);
-    lines[s..s + take].join("\n")
-}
-
-// ---------------------------------------------------------------------------
 // compact (rewrite the index dropping tombstoned records)
 // ---------------------------------------------------------------------------
 //
@@ -7420,36 +7029,6 @@ fn locate_match(bytes: &[u8], start: usize, end: usize) -> (u32, u32, String) {
     (line, col, snippet)
 }
 
-// ---------------------------------------------------------------------------
-// serve (JSON-RPC over stdin)
-// ---------------------------------------------------------------------------
-
-fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<()> {
-    let r = open_index(index)?;
-    // Heuristic: in Soong .bp files, a src is recorded by basename (relative
-    // to the .bp's package). So we look up refs whose name matches the
-    // basename, restrict to lang=Soong + kind=import.
-    let pb = Path::new(&path);
-    let basename = pb.file_name().and_then(|s| s.to_str()).unwrap_or(&path);
-    let refs = r.lookup_refs_exact(basename);
-    let mut out: Vec<RefRecord> = refs.into_iter()
-        .filter(|rr| matches!(rr.lang, FileKind::Soong))
-        .collect();
-    out.dedup_by(|a, b| a.scope_path == b.scope_path);
-    if out.is_empty() {
-        eprintln!("(no Soong module references basename {})", basename);
-        return Ok(());
-    }
-    for rr in out.iter().take(limit) {
-        let bp_path = r.display_path_cached(rr.file_id).unwrap_or("");
-        let module_name = rr.scope_path.get(1).cloned().unwrap_or_default();
-        let module_type = rr.scope_path.first().cloned().unwrap_or_default();
-        println!("{} ({})  declared in {}", module_name, module_type, bp_path);
-    }
-    eprintln!("\n{} module(s)", out.len());
-    Ok(())
-}
-
 // `cmd_health` lives in crate::health.
 
 // ---------------------------------------------------------------------------
@@ -7758,154 +7337,6 @@ fn git_changed_files(root: &Path, since: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// One parsed entry from the `~/.scry/queries.log` ops log. The fields
-/// mirror what `log_query_with_files` writes — keep in sync.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct RecallEntry {
-    ts: u64,
-    cmd: String,
-    query: String,
-    hits: u64,
-    shown: u64,
-    files_total: u64,
-    #[serde(default)]
-    candidate_files: Option<u64>,
-    elapsed_ms: u64,
-    index: String,
-}
-
-/// Read and parse an ops log. Returns entries in *file order* (oldest
-/// first); callers reverse + take(last) to get the most-recent window.
-/// Malformed lines are silently skipped so a partial-write at the tail
-/// (the indexer was SIGKILL'd mid-line) doesn't break recall.
-fn parse_recall_log<R: std::io::BufRead>(rd: R) -> Vec<RecallEntry> {
-    let mut out = Vec::new();
-    for line in rd.lines().map_while(std::result::Result::ok) {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if let Ok(e) = serde_json::from_str::<RecallEntry>(line) {
-            out.push(e);
-        }
-    }
-    out
-}
-
-/// Human-friendly relative-time formatter. Returns strings like
-/// "3m ago" / "1h ago" / "2d ago" / "now". Output is at most a few
-/// characters so it stays terminal-friendly in a column.
-fn format_relative_time(now_ts: u64, then_ts: u64) -> String {
-    if then_ts > now_ts {
-        // Clock-skew or future timestamp; just say "now".
-        return "now".to_string();
-    }
-    let delta = now_ts - then_ts;
-    match delta {
-        0..=4          => "now".to_string(),
-        5..=59         => format!("{}s ago", delta),
-        60..=3599      => format!("{}m ago", delta / 60),
-        3600..=86_399  => format!("{}h ago", delta / 3600),
-        _              => format!("{}d ago", delta / 86_400),
-    }
-}
-
-/// `scry recall` — replay the recent ops log. Filters by --cmd and
-/// --grep; optionally dedupes consecutive (cmd, query) repeats so
-/// "ran the same def 50 times in this session" collapses to one line.
-fn cmd_recall(
-    last: usize,
-    cmd: Option<String>,
-    grep: Option<String>,
-    log: Option<PathBuf>,
-    dedup: bool,
-    json: bool,
-) -> Result<()> {
-    let path = log.or_else(query_log_path).ok_or_else(|| {
-        anyhow::anyhow!("no ops log path (set SCRY_LOG or $HOME, or pass --log)")
-    })?;
-    let f = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            // Empty log is not an error — the agent might just be in
-            // a fresh session. Print an empty result and exit 0.
-            if e.kind() == std::io::ErrorKind::NotFound {
-                if !json {
-                    eprintln!("(no ops log at {} — no queries yet)", path.display());
-                }
-                return Ok(());
-            }
-            return Err(anyhow::anyhow!("open {}: {e}", path.display()));
-        }
-    };
-    let entries = parse_recall_log(std::io::BufReader::new(f));
-    let total = entries.len();
-
-    // Apply filters (cmd, grep), then dedup, then take the last `last`
-    // entries in *reverse* (newest first).
-    let filtered: Vec<RecallEntry> = entries.into_iter()
-        .filter(|e| cmd.as_deref().map(|c| e.cmd == c).unwrap_or(true))
-        .filter(|e| grep.as_deref().map(|g| e.query.contains(g)).unwrap_or(true))
-        .collect();
-    let mut deduped: Vec<RecallEntry> = if dedup {
-        let mut out: Vec<RecallEntry> = Vec::with_capacity(filtered.len());
-        for e in filtered {
-            match out.last() {
-                Some(prev) if prev.cmd == e.cmd && prev.query == e.query => {
-                    // Same key as the previous entry — overwrite so the
-                    // *latest* timestamp/hits/elapsed wins.
-                    *out.last_mut().unwrap() = e;
-                }
-                _ => out.push(e),
-            }
-        }
-        out
-    } else {
-        filtered
-    };
-    // Newest first.
-    deduped.reverse();
-    deduped.truncate(last);
-
-    let now = now_unix_secs();
-    if json {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        use std::io::Write;
-        for e in &deduped {
-            writeln!(out, "{}", serde_json::to_string(e)?)?;
-        }
-    } else {
-        if deduped.is_empty() {
-            println!("(no matching queries — log has {total} entries total)");
-            return Ok(());
-        }
-        println!("recent queries (last {} of {total} total):", deduped.len());
-        for e in &deduped {
-            let cand = e.candidate_files
-                .map(|c| format!(" ({c} cand)"))
-                .unwrap_or_default();
-            println!(
-                "  {:9}  {:<8}  {:<40}  {} hits in {}ms{}",
-                format_relative_time(now, e.ts),
-                e.cmd,
-                truncate_query_for_display(&e.query, 40),
-                e.hits,
-                e.elapsed_ms,
-                cand,
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Truncate a query string for the recall display column. Long regex
-/// or path patterns get a `…` suffix so the layout doesn't break.
-fn truncate_query_for_display(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { return s.to_string(); }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 /// Entry point for the `mcp` subcommand. MCP — Model Context Protocol
 /// — is a stdio JSON-RPC 2.0 protocol used by Claude Desktop, Cursor,
 /// and other agent runtimes to call out to external tools. scry's MCP
@@ -8169,21 +7600,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
             })),
         ),
         tool(
-            "implementations",
-            "Implementations of an interface — alias for `subclasses` \
-             with Java/Kotlin-flavored naming. LSP \
-             implementationProvider/implementationsForType.",
-            obj(&["name"], serde_json::json!({
-                "name":  {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-                "depth": {"type": "integer", "minimum": 0, "default": 0},
-                "format": {"type": "string", "enum": ["count", "paths"],
-                    "description": "See `subclasses.format`."},
-            })),
-        ),
-        tool(
             "uses",
             "Outgoing edges from NAME's body — what does NAME call \
              or reference? Symmetric to `callers`. Returns up to \
@@ -8370,22 +7786,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "type": "object", "properties": serde_json::json!({}),
             }),
         ),
-        tool(
-            "ask",
-            "Semantic retrieval: find code chunks whose content is \
-             most similar to a natural-language query. Use when you \
-             DON'T know an identifier name to grep / def for (e.g. \
-             'how is process priority computed?'). Requires `scry \
-             build-embeddings` to have run on the index; returns a \
-             tool-level error otherwise.",
-            obj(&["query"], serde_json::json!({
-                "query": {"type": "string",
-                    "description": "Natural-language description of what you're looking for."},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-            })),
-        ),
     ];
     serde_json::json!({ "tools": tools })
 }
@@ -8489,7 +7889,6 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "ref"      => &["name"],
         "callers"  => &["name"],
         "subclasses"      => &["name"],
-        "implementations" => &["name"],
         "impact"          => &["name"],
         "callgraph"       => &["name"],
         "uses"            => &["name"],
@@ -8500,7 +7899,6 @@ fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
         "tldr"     => &["path"],
         "coverage" => &["path"],
         "stats"    => &[],
-        "ask"      => &["query"],
         _ => return None,
     })
 }
@@ -8575,8 +7973,6 @@ pub(crate) fn cmd_build_modgraph(kind: &str, root: &Path, output: &Path) -> Resu
     );
     Ok(())
 }
-
-// `cmd_clang_*` and `cmd_scip_*` live in crate::precision_subcmds.
 
 /// Run the warm pass and print a one-line summary. Standalone
 /// `scry warm --index DIR` entrypoint; the daemon paths call
@@ -8946,7 +8342,7 @@ fn serve_one_request<W: std::io::Write>(
             let format = args.get("format").and_then(serde_json::Value::as_str);
             serve_ref(reader, arg_str("name"), lang, Some("call"), in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
         }
-        "subclasses" | "implementations" => {
+        "subclasses" => {
             let depth = args.get("depth")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(0);
@@ -9010,7 +8406,6 @@ fn serve_one_request<W: std::io::Write>(
         "coverage" => serve_coverage(reader, arg_str("path"),
             args.get("by_kind").and_then(serde_json::Value::as_bool).unwrap_or(false)),
         "stats"   => serve_stats(reader),
-        "ask"     => serve_ask(reader, arg_str("query"), in_, not_in, limit),
         other     => {
             let resp = serde_json::json!({
                 "id": id, "error": format!("unknown cmd: {other}"),
@@ -9749,8 +9144,8 @@ fn serve_impact(
     })
 }
 
-/// `subclasses` / `implementations` JSON-RPC handler. Direct (depth=0)
-/// or transitive (depth>0) subtypes; --in prefix narrows to a subtree.
+/// `subclasses` JSON-RPC handler. Direct (depth=0) or transitive
+/// (depth>0) subtypes; --in prefix narrows to a subtree.
 fn serve_subclasses(
     r: &StoreReader,
     name: &str,
@@ -10075,46 +9470,6 @@ fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Val
         "symbols_total": by_lang.values().map(|b| b.symbols).sum::<u64>(),
         "by_lang": by_lang_json,
     })
-}
-
-/// JSON-RPC semantic-retrieval handler. Returns an empty array (not
-/// an error) when the index lacks the embedding sidecar — agents can
-/// detect by length zero + a `stats` query that reports the dim is 0.
-fn serve_ask(
-    r: &StoreReader,
-    query: &str,
-    in_: Option<&str>,
-    not_in: Option<&str>,
-    limit: usize,
-) -> serde_json::Value {
-    if r.embeddings_mmap.is_none() || r.chunks.is_none() {
-        return serde_json::json!({"error": "no embedding sidecar — run `scry build-embeddings`"});
-    }
-    let dim = r.embedding_dim as usize;
-    let q_vec = scry_store::embed::embed_text(query, dim);
-    let any_filter = in_.is_some() || not_in.is_some();
-    let cap = limit.saturating_mul(if any_filter { 8 } else { 1 }).max(limit);
-    let ranked = r.semantic_rank(&q_vec, cap);
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
-    for (chunk_idx, sim) in ranked {
-        let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
-            Some(e) => e, None => continue,
-        };
-        let fe = match r.file_view(entry.file_id) { Some(f) => f, None => continue };
-        let path = fe.display_path();
-        if !path_matches(&path, in_, not_in) { continue; }
-        let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
-        out.push(serde_json::json!({
-            "path": path,
-            "lang": fe.kind.as_str(),
-            "start_line": entry.start_line,
-            "end_line": entry.end_line,
-            "score": sim,
-            "snippet": snippet,
-        }));
-        if out.len() >= limit { break; }
-    }
-    serde_json::Value::Array(out)
 }
 
 fn serve_stats(r: &StoreReader) -> serde_json::Value {
@@ -11022,71 +10377,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Recall: ops-log parser + relative-time formatter.
-    // ------------------------------------------------------------------
-
-    /// Parser tolerates a partial-write at the tail (incomplete final
-    /// line from a SIGKILL'd writer) and silently drops it instead of
-    /// erroring out — recall should always return something useful.
-    #[test]
-    fn parse_recall_log_skips_malformed_tail() {
-        let buf = b"{\"ts\":1,\"cmd\":\"def\",\"query\":\"Foo\",\"hits\":1,\"shown\":1,\"files_total\":100,\"candidate_files\":null,\"elapsed_ms\":10,\"index\":\"/i\"}\n{partial-write-no-newline";
-        let entries = parse_recall_log(&buf[..]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].cmd, "def");
-        assert_eq!(entries[0].query, "Foo");
-    }
-
-    /// Multi-entry log: all entries parse, order preserved.
-    #[test]
-    fn parse_recall_log_multi_entry() {
-        let buf = b"{\"ts\":1,\"cmd\":\"def\",\"query\":\"Foo\",\"hits\":1,\"shown\":1,\"files_total\":1,\"candidate_files\":null,\"elapsed_ms\":5,\"index\":\"/i\"}\n\
-                    {\"ts\":2,\"cmd\":\"grep\",\"query\":\"bar\",\"hits\":7,\"shown\":7,\"files_total\":1,\"candidate_files\":15,\"elapsed_ms\":42,\"index\":\"/i\"}\n";
-        let entries = parse_recall_log(&buf[..]);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].ts, 1);
-        assert_eq!(entries[1].cmd, "grep");
-        assert_eq!(entries[1].candidate_files, Some(15));
-    }
-
-    /// candidate_files is optional in the log shape; missing or null
-    /// should both parse cleanly as None.
-    #[test]
-    fn parse_recall_log_optional_candidate_files() {
-        let buf = b"{\"ts\":1,\"cmd\":\"def\",\"query\":\"X\",\"hits\":1,\"shown\":1,\"files_total\":1,\"elapsed_ms\":5,\"index\":\"/i\"}\n";
-        let entries = parse_recall_log(&buf[..]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].candidate_files, None);
-    }
-
-    /// Relative-time covers the boundaries: 0 (now), seconds, minutes,
-    /// hours, days. The clock-skew case (then > now) collapses to
-    /// "now" rather than producing a negative string.
-    #[test]
-    fn format_relative_time_buckets() {
-        let now: u64 = 1_000_000;
-        assert_eq!(format_relative_time(now, now), "now");
-        assert_eq!(format_relative_time(now, now - 2), "now");        // ≤4 s
-        assert_eq!(format_relative_time(now, now - 10), "10s ago");
-        assert_eq!(format_relative_time(now, now - 120), "2m ago");   // 120 s
-        assert_eq!(format_relative_time(now, now - 3600 * 2), "2h ago");
-        assert_eq!(format_relative_time(now, now - 86_400 * 3), "3d ago");
-        // Future timestamp (clock skew) collapses to "now".
-        assert_eq!(format_relative_time(now, now + 1000), "now");
-    }
-
-    /// Display truncation never panics on multi-byte UTF-8 (the unicode
-    /// `…` ellipsis must land on a char boundary).
-    #[test]
-    fn truncate_query_for_display_handles_utf8() {
-        let q = "αβγδεζηθικλμνξοπρστυφχψω"; // 24 chars, 48 bytes
-        let out = truncate_query_for_display(q, 10);
-        assert!(out.ends_with('…'));
-        // 9 chars + the ellipsis = 10 visible.
-        assert_eq!(out.chars().count(), 10);
-    }
-
-    // ------------------------------------------------------------------
     // MCP arg validation — pin the per-tool required-arg map and the
     // empty-string-rejection rule. These tests run without a real
     // StoreReader because mcp_required_args_for + mcp_validate_required_args
@@ -11125,7 +10415,6 @@ mod tests {
         assert_eq!(mcp_required_args_for("outline"),  Some(&["path"][..]));
         assert_eq!(mcp_required_args_for("coverage"), Some(&["path"][..]));
         assert_eq!(mcp_required_args_for("stats"),    Some(&[][..]));
-        assert_eq!(mcp_required_args_for("ask"),      Some(&["query"][..]));
         assert_eq!(mcp_required_args_for("nonexistent"), None);
     }
 
@@ -11188,10 +10477,6 @@ mod tests {
     /// must place the BARE message string into content[0].text — NOT
     /// the JSON-stringified `{"error": "..."}`. An LLM consuming the
     /// content shouldn't have to json.parse again to read the hint.
-    ///
-    /// This pins the fix for the double-encoding bug found during
-    /// the v0.1.1 LLM-self-test against `ask` on an embedding-less
-    /// index.
     #[test]
     fn mcp_tool_error_unwraps_serve_error_envelope() {
         // mcp_tool_error itself produces the envelope shape that
@@ -11200,7 +10485,7 @@ mod tests {
         // the bare message into text. Test the contract via the
         // public helper + a constructed Value matching what serve
         // emits.
-        let serve_result = serde_json::json!({"error": "no embedding sidecar — run `scry build-embeddings`"});
+        let serve_result = serde_json::json!({"error": "missing sidecar — run `scry build-resolutions`"});
         // Simulate the unwrap that mcp_tools_call performs.
         let err_val = serve_result.as_object().and_then(|m| m.get("error"))
             .expect("serve emits {error: <string>}");
@@ -11211,9 +10496,9 @@ mod tests {
         // The bare message: no leading {"error":, no escaped quotes.
         assert!(!text.starts_with('{'),
                 "tool-error text must be the bare message, not a JSON literal; got: {text}");
-        assert!(text.contains("embedding sidecar"),
+        assert!(text.contains("missing sidecar"),
                 "tool-error text must preserve the hint; got: {text}");
-        assert!(text.contains("build-embeddings"),
+        assert!(text.contains("build-resolutions"),
                 "tool-error text must include the actionable hint; got: {text}");
     }
 

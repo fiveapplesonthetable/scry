@@ -1,18 +1,11 @@
-//! GN (Chromium/Fuchsia/Perfetto) → [`Compilation`] bridge.
+//! GN (Chromium / Fuchsia / Perfetto) — `compile_commands.json` locator.
 //!
-//! GN doesn't have a per-language compilation manifest like Soong's
-//! ninja shards; it has ONE `compile_commands.json` for C-family
-//! code (when `gn gen --export-compile-commands` was passed) plus
-//! a `args.gn` file that describes the build configuration. Non-C
-//! languages in a GN project live in subdirectories that the
-//! [`crate::polyglot`] bridge already handles.
-//!
-//! So the GN bridge here is narrow: it locates / generates the
-//! compile_commands.json, exposes it as a [`Compilation`] stream
-//! (one record per TU), and lets the existing `scry clang-index`
-//! pipeline consume it directly. The orchestrator pairs that with
-//! a `polyglot::discover` over the source root for any Python /
-//! Rust / Go / TS that lives alongside.
+//! GN has one `compile_commands.json` for C-family code (when
+//! `gn gen --export-compile-commands` was passed) plus an `args.gn`
+//! file that identifies the build directory. The downstream consumer
+//! (libclang via `scry-clang`) walks the compile_commands.json
+//! directly. Non-C-family languages in a GN project live in
+//! subdirectories that [`crate::polyglot`] handles.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};

@@ -2,9 +2,7 @@
 //! they walk the source tree for native project roots and run the
 //! corresponding indexer in-place.
 //!
-//! Unlike [`crate::java_indexer`] / [`crate::kotlin_indexer`] (which
-//! replay each compiler invocation Soong recorded), these indexers
-//! take the project root as their unit of work. Each indexer:
+//! Each indexer takes the project root as its unit of work:
 //!
 //!   1. Discover roots — Cargo.toml for Rust, go.mod for Go,
 //!      tsconfig.json for TypeScript, the path itself for Python.

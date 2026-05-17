@@ -1,62 +1,32 @@
 # Build-aware indexing
 
-This file has two halves. The first is the **user-facing quick start**:
-how to make scry consume compiler-backed indexer artifacts
-(`compile_commands.json`, `*.scip`) for each major language + build
-system. The second is the original v0.1.12 **design narrative** that
-shaped the precision sidecars — kept for historical context.
+`scry build-symbols` produces the Kythe-class symbol-identity sidecars
+(`clang_usrs.bin` and `scip_index.bin`) for an existing scry index.
+Strict-precision queries (`callers`, `ref`, `impact`, `callgraph`,
+`uses`) read these sidecars automatically; `--lexical` opts out.
 
-For language-by-language SCIP producer commands (one-liners per tool),
-see [`SCIP_PRODUCERS.md`](SCIP_PRODUCERS.md). This file focuses on
-**how to point scry at the artifacts those tools produce.**
+For SCIP-producer command lines (one-liners per tool), see
+[`SCIP_PRODUCERS.md`](SCIP_PRODUCERS.md). This file is about wiring
+the producer outputs into scry.
 
----
+## One flag per build system
 
-## Quick start
-
-### Install every indexer in one shot
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/master/scripts/install_indexers.sh)
-```
-
-What it does (idempotent):
-- Installs `libclang`, `JDK`, `Go`, `node`, `npm` via the system
-  package manager (apt-get / dnf / brew).
-- Installs `scip-typescript`, `scip-python` via npm.
-- Installs `rust-analyzer` via `rustup component add`.
-- Installs `scip-go` via `go install`.
-- Downloads the `scip-java` launcher (GitHub release).
-- Downloads `gradle 8.10.2` + `sbt 1.10.5` and builds
-  `semanticdb-kotlinc` from source, publishing it to
-  `~/.m2/repository` (scip-kotlin isn't on Maven Central —
-  `sbt publishM2` is the only install path).
-- Installs a `kotlinc-embeddable` launcher under
-  `/mnt/agent/tools/bin` that the Kotlin SCIP bridge requires
-  (Sourcegraph's plugin was built against the shaded
-  embeddable jar; stock `kotlinc` 2.0+ dropped that shading and
-  the plugin crashes when loaded by the default launcher).
-
-### The one command per build system
-
-`scry build-symbols` produces the Kythe-class symbol-identity
-sidecars (`clang_usrs.bin` and `scip_index.bin`) for an existing
-scry index. Pick ONE explicit build-system flag:
+`scry build-symbols` takes exactly one `--build-*` flag. Pick the one
+that matches the build:
 
 ```bash
-# AOSP / Soong — Java + Kotlin via SCIP, plus auto-extracted
-# clang USRs from out/soong/development/ide/compdb/compile_commands.json.
-scry build-symbols --source-root /path/to/aosp \
-                   --build-soong /path/to/aosp/out/soong \
+# Kythe-integrated build (AOSP via Soong, Bazel, anything that ships
+# Kythe extractors). One `all.kzip` covers C++/Java/Kotlin/Rust/Go.
+scry build-symbols --source-root /path/to/repo \
+                   --build-kzip   /path/to/all.kzip \
                    --index /path/to/scry-index
 
-# Chromium / Perfetto / Fuchsia — GN.
+# GN (Chromium / Fuchsia / Perfetto).
 scry build-symbols --source-root /path/to/chromium \
                    --build-gn /path/to/chromium/out/Default \
                    --index /path/to/scry-index
 
-# Linux kernel — Kbuild. scry shells out to the kernel's bundled
-# scripts/clang-tools/gen_compile_commands.py if no compdb exists.
+# Linux kernel.
 scry build-symbols --source-root /path/to/linux \
                    --build-kbuild /path/to/linux \
                    --index /path/to/scry-index
@@ -66,474 +36,147 @@ scry build-symbols --source-root /path/to/proj \
                    --build-cmake /path/to/proj/build \
                    --index /path/to/scry-index
 
-# Cargo workspace (Rust-only). Runs rust-analyzer scip on the
-# workspace root.
+# Cargo workspace.
 scry build-symbols --source-root /path/to/repo \
                    --build-cargo \
                    --index /path/to/scry-index
+
+# Already have a .scip from somewhere else? Import directly.
+scry build-symbols --source-root /path/to/repo \
+                   --scip /path/to/file.scip \
+                   --index /path/to/scry-index
 ```
 
-The build-system flags are mutually exclusive. The directory passed
-to `--build-{soong,gn,kbuild,cmake}` is always the BUILD OUT dir
-(the one containing `out/soong/.intermediates`, `args.gn`,
-`.config`, or `CMakeCache.txt`) — never the source root.
+Flags are mutually exclusive except for `--with-polyglot`, which
+composes with any `--build-*` to also walk for Rust / Go / TS /
+Python projects under `--source-root` and run rust-analyzer / gopls /
+scip-typescript / scip-python on each.
 
-Add `--with-polyglot` to also walk the source tree for Rust /
-Go / TypeScript / Python project markers and run rust-analyzer
-scip / scip-go / scip-typescript / scip-python on each project
-root, importing each `.scip` into the same sidecar.
+## AOSP / Soong → kzip
 
-After it finishes, every query auto-engages the precision filter
-unless you pass `--lexical`.
+AOSP ships Kythe extractors wired into Soong. One command produces
+`all.kzip` covering C++/Java/Kotlin/Rust:
 
-### Indexer binary configuration
+```bash
+cd ~/dev/aosp
+. build/envsetup.sh
+lunch aosp_cf_x86_64_phone-trunk_staging-userdebug
 
-`scry build-symbols` looks up each per-language indexer binary by
-name. Resolution order, highest priority first:
+XREF_CORPUS=android.googlesource.com/platform/superproject \
+DIST_DIR=/mnt/agent/scry-kzip \
+KZIP_NAME=aosp_cf_x86_64_phone \
+OUT_DIR=/mnt/agent/aosp-out \
+GOCACHE=/mnt/agent/tmp/go-build-cache \
+build/soong/build_kzip.bash
+```
 
-1. Explicit `--<name>` flag (`--javac /opt/jdk/bin/javac`,
-   `--scip-java /opt/sg/bin/scip-java`, `--kotlinc <path>`,
-   `--rust-analyzer <path>`, `--scip-go <path>`,
-   `--scip-typescript <path>`, `--scip-python <path>`,
-   `--semanticdb-javac-jar <path>`, `--semanticdb-kotlinc-jar <path>`,
-   `--gn-binary <path>`, `--cmake-binary <path>`).
-2. Per-binary env var `SCRY_INDEXER_<NAME>` (uppercased, dashes →
-   underscores). Examples:
-   - `SCRY_INDEXER_JAVAC=/path/to/javac`
-   - `SCRY_INDEXER_SCIP_JAVA=/path/to/scip-java`
-   - `SCRY_INDEXER_KOTLINC_EMBEDDABLE=/path/to/kotlinc-embeddable`
-   - `SCRY_INDEXER_RUST_ANALYZER=/path/to/rust-analyzer`
-   - `SCRY_INDEXER_SCIP_GO=/path/to/scip-go`
-   - `SCRY_INDEXER_SCIP_TYPESCRIPT=/path/to/scip-typescript`
-   - `SCRY_INDEXER_SCIP_PYTHON=/path/to/scip-python`
+`OUT_DIR` and `GOCACHE` point at a large disk because Soong's
+intermediates and the Go extractor cache fill tens of GB. `KZIP_NAME`
+controls the output filename (`$DIST_DIR/$KZIP_NAME.kzip`); a UUID is
+used if unset.
+
+Then:
+
+```bash
+scry build-symbols --source-root /home/zim/dev/aosp \
+                   --build-kzip   /mnt/agent/scry-kzip/aosp_cf_x86_64_phone.kzip \
+                   --index /mnt/agent/scry-index
+```
+
+## compile_commands.json builds
+
+`--build-gn`, `--build-kbuild`, and `--build-cmake` all locate (and
+regenerate when missing) a `compile_commands.json`, then hand it to
+libclang in-process:
+
+| Flag             | Looks for           | Regenerates via                                              |
+|------------------|---------------------|--------------------------------------------------------------|
+| `--build-gn DIR` | `args.gn` in DIR    | `gn gen --export-compile-commands DIR`                       |
+| `--build-kbuild DIR` | `.config` in DIR | `scripts/clang-tools/gen_compile_commands.py`               |
+| `--build-cmake DIR`  | `CMakeCache.txt` | `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON …`                |
+
+The directory passed is always the BUILD OUT dir, not the source
+root. Override the `gn` / `cmake` binary with `--gn-binary` /
+`--cmake-binary` if it's not on PATH.
+
+## Polyglot (Rust / Go / TS / Python)
+
+Add `--with-polyglot` to any `--build-*` invocation, or use
+`--build-cargo` for a Rust-only workspace. Per-language project
+markers picked up by the walker:
+
+| Language    | Marker                       | Indexer            |
+|-------------|------------------------------|--------------------|
+| Rust        | `Cargo.toml` at workspace    | `rust-analyzer scip` |
+| Go          | `go.mod`                     | `gopls scip`       |
+| TypeScript  | `tsconfig.json`              | `scip-typescript`  |
+| Python      | `pyproject.toml` / `setup.py`| `scip-python`      |
+
+Each per-target `.scip` is imported into the shared `scip_index.bin`.
+
+Skip individual languages with `--no-rust` / `--no-go` /
+`--no-typescript` / `--no-python`.
+
+## Indexer binary lookup
+
+Per-language indexers are resolved by name, in priority order:
+
+1. Explicit `--<name>` flag (`--gn-binary`, `--cmake-binary`,
+   `--rust-analyzer`, …).
+2. `SCRY_INDEXER_<NAME>` env var (uppercased, dashes → underscores):
+   `SCRY_INDEXER_RUST_ANALYZER=/path`, etc.
 3. First match on `$PATH`.
 
-If none of those resolves to a real file, the bare name is passed
-to `std::process::Command::new`, which surfaces the kernel's
-`No such file or directory` error so the operator sees which binary
-is missing.
+Missing → the bare name is invoked and the kernel's
+`No such file or directory` surfaces which binary is needed.
 
-### Scratch dir
+## Install every indexer in one shot
 
-Every per-compilation `.semanticdb` shard, extracted srcjar dir,
-per-target `.scip`, and per-shard classes/ dir lands under
-`$SCRY_TMP_DIR/scry-*`. The default is `/mnt/agent/tmp`, NOT
-`/tmp` — AOSP-scale runs emit 30+ GB of intermediates and `/tmp`
-is often a small tmpfs that would fill in seconds. Override with
-`SCRY_TMP_DIR=/some/large/volume` if your layout differs.
-
-### Auto-discovery
-
-`scry finalize` auto-discovers two kinds of artifacts inside each
-indexed source root:
-
-| Artifact                  | Consumed by              | Used for                                  |
-|---------------------------|--------------------------|-------------------------------------------|
-| `compile_commands.json`   | `scry clang-index`       | C / C++ / ObjC (libclang USRs)            |
-| `*.scip`                  | `scry scip-import`       | Java, Kotlin, Rust, TypeScript, Go, Python (SCIP-producer outputs) |
-
-Each artifact type is matched at most once per index. If multiple
-candidates are found, `scry finalize` warns and skips — pass an
-explicit flag (`--clang-compile-commands` / `--scip`) to disambiguate.
-
-The source-root walker honors `.gitignore`. Most build systems write
-their outputs to gitignored directories (`out/`, `build/`, `target/`,
-`.gradle/`), so a normal walk can't see them. Use `--build-out PATH`
-(repeatable) to point at one or more build-output dirs that should be
-walked without the gitignore filter.
-
-### AOSP / Soong (C / C++)
-
-```bash
-# 1. Generate the compdb. SOONG_GEN_COMPDB=1 makes Soong emit
-#    out/soong/development/ide/compdb/compile_commands.json during
-#    the build.
-SOONG_GEN_COMPDB=1 m nothing      # or any other build target
-
-# 2. Index and finalize, pointing --build-out at the compdb dir.
-scry index /path/to/aosp -o /path/to/scry-index
-scry finalize \
-  --index /path/to/scry-index \
-  --build-out /path/to/aosp/out/soong/development/ide/compdb \
-  --build-soong /path/to/aosp        # also builds module_graph.json
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/master/scripts/install_indexers.sh)
 ```
 
-Auto-discovery picks up `compile_commands.json` from the build-out
-path and runs `scry clang-index` on it. `--build-soong` separately
-builds the Soong module graph so `--reachable` queries work.
+What it does (idempotent):
 
-### CMake (C / C++)
+- System packages: `libclang`, JDK, Go, Node, npm.
+- `scip-typescript`, `scip-python` via npm.
+- `rust-analyzer` via `rustup component add`.
+- `gopls` (which ships `scip` output mode) via `go install`.
+- `scip-java` launcher (GitHub release).
 
-Out-of-tree build with the compdb in `build/`:
+For Kythe extraction on AOSP, the extractor binaries are already
+present in the AOSP tree (`prebuilts/build-tools/linux-x86/bin/`
+plus `prebuilts/build-tools/common/framework/javac_extractor.jar`) —
+no install required, `build_kzip.bash` invokes them.
 
-```bash
-cmake -B build -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build build
+## Scratch dir
 
-scry index . -o ../scry-index
-scry finalize --index ../scry-index --build-out build
-```
+Per-target `.scip` shards and any per-compilation scratch land under
+`$SCRY_TMP_DIR/scry-*`. Default `/mnt/agent/tmp`. Override with
+`SCRY_TMP_DIR=/some/large/volume`.
 
-Or in-tree build (compdb lives in source root, source-root walker
-finds it without `--build-out`):
-
-```bash
-cmake . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build .
-scry index . -o ../scry-index
-scry finalize --index ../scry-index    # no flag needed
-```
-
-### Make / autotools (C / C++)
-
-Use [`bear`](https://github.com/rizsotto/Bear) to wrap the build and
-emit a compdb:
-
-```bash
-bear -- make all
-scry index . -o ../scry-index
-scry finalize --index ../scry-index     # bear writes ./compile_commands.json
-```
-
-### Java (Gradle / Maven / Bazel) via scip-java
-
-```bash
-coursier launch com.sourcegraph:scip-java_2.13:0.10.0 -- \
-  index --build-tool gradle              # writes index.scip in cwd
-
-scry index . -o ../scry-index
-scry finalize --index ../scry-index      # picks up ./index.scip
-```
-
-### Kotlin via scip-kotlin
-
-```bash
-scip-kotlin --output index.scip src/
-scry index . -o ../scry-index
-scry finalize --index ../scry-index
-```
-
-### Rust via rust-analyzer
-
-```bash
-rust-analyzer scip .                     # writes index.scip
-scry index . -o ../scry-index
-scry finalize --index ../scry-index --build-out target
-# --build-out target catches the .scip if rust-analyzer wrote it under target/
-```
-
-### TypeScript / JavaScript via scip-typescript
-
-```bash
-npm i -D @sourcegraph/scip-typescript
-npx scip-typescript index                # writes index.scip
-scry index . -o ../scry-index
-scry finalize --index ../scry-index
-```
-
-### Go via scip-go / gopls
-
-```bash
-gopls scip ./...                         # writes index.scip
-scry index . -o ../scry-index
-scry finalize --index ../scry-index
-```
-
-### Python via scip-python
-
-```bash
-npx @sourcegraph/scip-python index .
-scry index . -o ../scry-index
-scry finalize --index ../scry-index
-```
-
-### Verifying the sidecar landed
-
-After `scry finalize`, run:
+## Verifying
 
 ```bash
 scry health --index /path/to/scry-index
 ```
 
-Look for the `clang_usrs` and `scip_index` rows: `v1, N USRs, M
-records` means the sidecar built and parsed; `absent (run ...)` means
-the artifact wasn't found.
+Reports which sidecars are present, their record counts, and sample
+symbols. A working AOSP setup looks like:
 
-Then queries auto-engage the precision filter:
+```
+clang_usrs.bin: N USRs / N records
+scip_index.bin: 17M+ occurrences / 1.5M+ unique symbols
+```
+
+Run a strict-precision query to confirm:
 
 ```bash
-scry callers Foo --index /path/to/scry-index   # auto-uses both sidecars
-scry ref Bar    --index /path/to/scry-index    # same
+scry callers bindService --index /path/to/scry-index --limit 5
+# [scry] precise (scip_index): 1981 → 37 refs (1880 uncovered TU)
+# 37 hits in 0.55s
 ```
 
-`--clang-precise` and `--scip-precise` flags explicitly opt in
-to one filter; absent flags use both when available.
-
----
-
-## Design notes (archived)
-
-Below is the original v0.1.12 design narrative that shaped this work.
-Kept for historical context — the **Quick start** above reflects what
-actually shipped.
-
-# scry v0.1.12 design: `--build soong` (build-boundary-aware)
-
-Status: **DESIGN** (v0.1.11 ships first; this work begins after).
-
-The goal is to give scry **Kythe-class precision** for "real
-callers of X on the AOSP build I ship", at scry's existing
-**13-min-index / sub-100 ms-query** speed envelope. The trade
-is one new on-disk sidecar and a heavier indexer pass that runs
-once per Soong configuration — not a per-TU compiler
-instrumentation cycle on every query.
-
-## The problem this fixes
-
-Today, `scry callers IActivityManager.startActivity` returns
-every name-matched call site in the indexed tree — including:
-
-- references in vendor modules that don't link against the
-  framework (false positive: never executed in this build),
-- references inside `#ifdef` branches the compiler skipped,
-- references in modules without visibility into the definition's
-  APEX (false positive: would fail to link),
-- the same `.cpp` compiled into 4 module variants seen as one
-  set, not four.
-
-The "right" tool today is Kythe (cs.android.com is Kythe-powered).
-Kythe is in maintenance mode but functional; the upstream code
-lives at `github.com/kythe/kythe` and we have a local clone at
-`/mnt/agent/kythe-source` for study.
-
-scry will not reimplement Kythe. scry will adopt the **two
-ideas** Kythe gets right and skip the rest:
-
-1. Per-TU semantic extraction with **stable, mangling-aware
-   symbol keys** (Kythe USRs / clang USRs).
-2. A separate **build-graph join** that filters references to
-   the ones that are real on a given configuration.
-
-The rest of Kythe — the schema, the indexers across N languages,
-the verifier framework, the protobuf RPC layer — is out of scope.
-scry stays a single static binary.
-
-## The user-facing surface
-
-```
-$ scry index --build soong \
-    /home/zim/dev/aosp /mnt/agent/dev/linux \
-    -o /mnt/agent/scry-index \
-    --compile-commands out/soong/development/ide/compdb/compile_commands.json \
-    --module-graph    out/soong/module-graph.json
-```
-
-`--build soong` opts into the precise-index pipeline. The two
-new flags point at Soong outputs the user produces themselves:
-
-- `compile_commands.json` from `SOONG_GEN_COMPDB=1 m` — one TU
-  per entry, with exact compile flags.
-- `module-graph.json` from `m json-module-graph` — every Soong
-  module's deps, visibility, partition, APEX, variants.
-
-Without `--build soong`, scry behaves exactly as v0.1.11 today.
-The build-aware index is **additive** (new sidecar files), so
-v0.1.11 readers continue to work against a v0.1.12 index — they
-just see the name-matched view, not the precise one.
-
-Query path stays identical:
-
-```
-$ scry callers IActivityManager.startActivity --precise
-... only real callers (per the indexed build config), with
-    file:line:col and the owning Soong module name attached
-```
-
-`--precise` flips the resolution mode. Without it, the existing
-name-match path runs (same speed, same false positives as
-v0.1.11). With it, the reachability filter runs on top of the
-name-match candidate set.
-
-## On-disk format (additive sidecars)
-
-Three new files in the index dir:
-
-- **`usrs.fst`** — FST mapping `clang::USR` (canonical symbol
-  key, mangling-aware) → ordinal into the USR table.
-- **`usr_refs.bin`** — for each USR ordinal, the list of
-  `(file_id, byte_off, kind, variant_hash)` references. Same
-  varint+delta encoding as `refs.bin`.
-- **`module_graph.bin`** — packed Soong module graph. Per
-  module: name, deps (link-time + header-lib), partition,
-  visibility, APEX. Reachability bitmap precomputed at finalize
-  so query path is O(1) "is module A reachable from module B".
-
-Plus one column on `FileEntry`:
-
-- **`file_module: Option<u32>`** — index into the module table
-  for "the Soong module this file belongs to". `None` for files
-  not owned by any Soong module (e.g. Linux kernel sources,
-  generated outputs).
-
-Size budget on AOSP: USR table ~5 M entries × 32 B avg = ~160 MB
-sidecar; reachability bitmap ~50 k modules × 50 k bits / 8 = ~300
-MB. Total +500 MB on a 9.5 GB index — acceptable.
-
-## Indexer pipeline
-
-`scry index --build soong` runs the existing tree-sitter passes
-**plus** three new ones:
-
-### 1. Parse `module-graph.json`
-
-Straight JSON → packed binary. Build the per-module reachability
-closure (BFS over deps) once at index time, store as bitmap.
-Estimated cost: 30 s on AOSP scale.
-
-### 2. Per-TU clang index extraction
-
-Read `compile_commands.json`. For each TU entry, invoke a clang
-indexer with the exact flags from the compdb entry. Two paths:
-
-- **Path 1 (lower risk, ship first)**: shell out to a small
-  helper binary `scry-clang-index` that uses libclang (via the
-  `clang-rs` crate) to walk the TU's AST and emit one line per
-  reference: `USR\tfile\tbyte_off\tkind\tvariant_hash`. scry
-  reads its stdout. Helper binary keeps libclang FFI isolated.
-- **Path 2 (later)**: clang `IndexAction` plugin loaded once
-  per worker, kept resident — skips fork/exec per TU. Win if the
-  per-TU clang startup proves dominant.
-
-`variant_hash` = blake3 of the sorted compile-flag list. Two TUs
-with the same source file but different `-D` defines get
-distinct `variant_hash`es and stay separate in `usr_refs.bin`.
-
-Throughput target: 1000 TU/min × 64 workers = 64 k TU/min. AOSP
-generic_arm64-userdebug is ~120 k TUs; ~2 min on the 72-core
-host. The walker phase doesn't change; this runs alongside it.
-
-### 3. Per-file owning-module attribution
-
-For each indexed file, walk up the Soong module graph to find
-the module that owns it (Soong knows: every `srcs` glob is
-attributed). Populate `file_module`. Sub-second.
-
-## Query path: `--precise` mode
-
-```
-fn precise_callers(usr: USR, from_module: Module) -> Vec<Hit>:
-  candidates = usr_refs.get(usr)              # all USR-matched refs
-  for c in candidates:
-    c_module = files[c.file_id].module
-    if reachability[c_module][from_module]:    # bitmap intersect
-      emit c
-```
-
-Three lookups: USR → posting list, file_id → module, bitmap
-intersect. Sub-millisecond per hit. Same memory model as v0.1.11
-(mmap + decode). No regression on warm-query latency.
-
-## Languages covered
-
-Phase 1 (v0.1.12): **C / C++ only**. That's where the build
-boundaries actually bite hardest, and clang USRs are mature.
-Java/Kotlin/Rust callers still go through the name-match path.
-
-Phase 2 (v0.1.13+): Java via `scip-java`, Kotlin via
-`scip-kotlin`, Rust via `rust-analyzer`'s index. All output the
-SCIP format; scry adds one more importer per language. (SCIP is
-the Sourcegraph successor to Kythe-the-format; it's actively
-maintained.)
-
-This phasing matters: getting C++ right is 80% of the value on
-AOSP because the false-positive rate is worst there. Java
-heuristics already cover the same-package + import cases
-correctly most of the time.
-
-## What we copy from Kythe
-
-After `/mnt/agent/kythe-source` finishes downloading, the
-specific pieces to study:
-
-- `kythe/cxx/extractor/` — how it wraps `clang::FrontendAction`
-  to capture compile invocations + all transitively-included
-  files. Especially `cxx_extractor.cc`. We need this pattern
-  for the per-TU helper.
-- `kythe/cxx/indexer/cxx/IndexerASTHooks.{h,cc}` — the visitor
-  that emits references. We only need the subset for "this is a
-  call / use of USR X at location Y"; we ignore Kythe's full
-  graph schema.
-- `kythe/proto/storage.proto` and `kythe/proto/xref.proto` —
-  reference for the on-the-wire shape. We don't adopt protobuf;
-  our binary format is simpler.
-
-## What we explicitly do NOT copy
-
-- Kythe's graph schema (anchor → node → edge with N edge kinds).
-  We have one kind: "ref(USR, file, off, variant)". Anything
-  fancier costs query-time joins we don't need.
-- Kythe's verifier framework. We rely on round-trip tests over a
-  small fixture (a 5-file AOSP-shaped synthetic tree with a
-  known-correct set of `--precise` hits).
-- Kythe's xref service / protobuf RPC. scry's existing
-  JSON-RPC + MCP surface gets one new arg (`precise: true`)
-  per query, nothing else.
-- Kythe's indexer-as-builder design (run extraction during the
-  actual Soong build). scry runs the extraction once per Soong
-  config from the already-built compdb, post-hoc. Loses the
-  "every CI build also produces an index" property; gains the
-  "you don't need to modify the build" property. Worth it for an
-  external tool.
-
-## Why "100× faster than Kythe" is realistic
-
-Kythe's full pipeline on a large monorepo is *as expensive as a
-full build* (Kythe docs). For scry, we skip:
-
-- Per-TU re-extraction of header content (Kythe captures every
-  transitively-included file; we just record refs into them).
-- The graph schema's edge tables (one ref kind, not 40).
-- The protobuf serialization layer (binary varint+delta
-  postings, mmapped).
-- Re-invocation of the build (we read the compdb after the build
-  already ran once).
-- N-language indexers (C++ only in phase 1).
-
-Estimated v0.1.12 indexer cost: existing 13 min + 2 min for the
-clang USR pass + 30 s for module-graph reachability = ~16 min
-total. Vs. Kythe-on-Chromium-scale runs measured at hours.
-
-## Risks / open questions
-
-1. **`clang-rs` FFI surface**: pulling in libclang as a build
-   dep adds weight and pins us to a specific clang version.
-   Mitigation: ship `scry-clang-index` as a separate binary;
-   `scry` core stays pure-Rust. Users opt in to `--build soong`.
-2. **Soong compdb stability**: SOONG_GEN_COMPDB has changed
-   shape across AOSP releases. Need to test against the live
-   tree at `/home/zim/dev/aosp`.
-3. **Visibility rules**: Soong visibility is a non-trivial
-   language (regex globs, package qualifiers, `:any`, APEX-
-   scoped). v0.1.12 phase 1 implements link-time deps only;
-   visibility/APEX boundaries come in a follow-up if the link
-   filter proves insufficient.
-4. **Variant explosion**: AOSP `generic_arm64-userdebug` has
-   ~120 k TUs; `--all-variants` (`cf_x86_64_phone`,
-   `aosp_cf_arm64_phone`, …) could 5× that. v0.1.12 indexes one
-   config at a time; cross-config queries return per-config
-   hits separately.
-
-## Sequencing
-
-1. v0.1.11 ships (in progress) — fuzzy + CI grep + progress + fail log.
-2. v0.1.12 milestone opens. First slice:
-   - Soong `module-graph.json` parser + reachability bitmap.
-   - `file_module` column on `FileEntry`.
-   - `--precise` flag on `callers` / `ref` filters EXISTING
-     name-match candidates by module reachability. **No clang
-     USRs yet — this alone removes most cross-module false
-     positives on AOSP.**
-3. v0.1.12 main slice:
-   - `scry-clang-index` helper binary (libclang FFI).
-   - `usrs.fst` + `usr_refs.bin` writers.
-   - `--precise` route through USR lookups when available.
-4. v0.1.13+: scip-java, scip-kotlin, rust-analyzer integration.
+The `1981 → 37` line shows the precision filter dropping 95% of
+lexical candidates that aren't the type-resolved callers of
+`bindService`. Without sidecars, `--lexical` would return all 1981.

@@ -1,4 +1,4 @@
-//! Linux Kbuild → [`Compilation`] bridge.
+//! Linux Kbuild — `compile_commands.json` locator / regenerator.
 //!
 //! The Linux kernel doesn't have a per-module compilation manifest;
 //! Kbuild drops one `.cmd` file per object next to it inside the

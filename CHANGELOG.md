@@ -7,25 +7,56 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+**Soong bridge replaced by Kythe kzip ingest.** The ~1100-line
+ninja-reverse-engineering bridge for AOSP Soong is gone. Replaced by
+`scry build-symbols --build-kzip PATH.kzip`, which ingests the
+`all.kzip` produced by `build/soong/build_kzip.bash` (or any other
+Kythe-integrated build: Bazel, custom pipelines). The kzip captures
+the exact inputs every compile sees — post-rewrite sources from
+protologsrc/jarjar/AAPT2/AIDL/KAPT, full classpath, every flag —
+so the bridge no longer needs to reverse-engineer Soong's action
+graph. Deleted: `crates/scry-bridge/src/soong.rs`,
+`crates/scry-bridge/src/java_indexer.rs`,
+`crates/scry-bridge/src/kotlin_indexer.rs`,
+`crates/scry-bridge/examples/extract_soong.rs`,
+`crates/scry-cli/src/bridge_subcmds.rs`, plus the
+`Compilation` / `Language` / `BuildSystem` types and
+`extract_srcjars` helper in the bridge crate's lib.rs.
+
+**Removed standalone commands** (consolidated into
+`scry build-symbols` with `--build-*` flags or removed outright):
+
+- `clang-index`, `build-jvm-scip`, `build-polyglot-scip`,
+  `scip-import` → `scry build-symbols --build-kzip / --build-gn /
+  --build-kbuild / --build-cmake / --build-cargo / --with-polyglot /
+  --scip FILE`.
+- `clang-stats`, `scip-stats`, `clang-lookup`, `scip-lookup` →
+  folded into `scry health`.
+- `recall` (query log replay), `ask` + `build-embeddings` (semantic
+  retrieval with a non-useful hash embedding default), `module-of`
+  (Soong-specific path-to-module lookup), `implementations` (exact
+  alias for `subclasses`) — removed.
+
+**Hidden from --help** (still callable, but no longer cluttering the
+main surface): `finalize`, `build-modgraph`, `build-trigrams`,
+`build-offsets`, `build-file-symbols`, `build-file-refs`,
+`build-resolutions`, `build-digests`, `compact`, `tombstone`,
+`index-diff`. Users run `scry index`, which now invokes all of these
+end-to-end with per-phase progress on stderr.
+
 **Precision sidecar packed format.** `clang_usrs.bin` and
-`scip_index.bin` are now mmap-backed packed files sharing one layout
+`scip_index.bin` are mmap-backed packed files sharing one layout
 (records sorted by `(path_id, byte_offset)`, interned symbol/path
 tables, ~12 bytes per record). Cold open of the AOSP-scale SCIP
 sidecar (14 M records, was 1.9 GB on disk) drops from ~17 s to
 sub-millisecond; on-disk size drops to ~285 MB. Both readers reject
-old bincode-format sidecars with a `bad magic` error — sidecars must
-be regenerated once via `scry clang-index` / `scry scip-import` after
-upgrading.
+old bincode-format sidecars with a `bad magic` error — regenerate
+once via `scry build-symbols` after upgrading.
 
-**Soong bridge rule-name classifier.** The bridge now extracts the
-ninja rule name from build headers and only classifies a rule as
-`g.java.javac` / `g.java.kotlinc` if the rule name matches exactly.
-The previous path-only classifier caught
-`g.java.javac-split-srcJars` (a multi-output srcjars merge whose
-first output happens to live under `…/javac/srcjarsNN.jar`); for
-sharded modules like `framework-minus-apex` that misclassification
-could mask the real javac rules and leave the SCIP sidecar with no
-records for files in those modules.
+**CLI: `--lexical` accepted on `subclasses`.** No-op (the command
+walks tree-sitter `InheritFrom` refs and doesn't use the precision
+filter), but accepting the flag lets scripts pass it uniformly across
+query commands.
 
 ## [0.1.64] — 2026-05-17
 

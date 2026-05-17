@@ -1,4 +1,4 @@
-//! CMake → [`Compilation`] bridge.
+//! CMake — `compile_commands.json` locator / regenerator.
 //!
 //! CMake's `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` produces a
 //! `compile_commands.json` in the build directory. From scry's

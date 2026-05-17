@@ -325,6 +325,20 @@ pub(crate) fn cmd_build_polyglot_scip(
         report.ok, report.failed, report.scip_files.len(),
         t.elapsed().as_secs_f64(),
     );
+    // Refuse to claim success when any indexer failed. Without this
+    // a missing scip-python or rust-analyzer toolchain bug silently
+    // ships an incomplete sidecar tagged "ALL STAGES OK". Per-target
+    // stderr was already surfaced by polyglot_run.
+    if report.failed > 0 {
+        anyhow::bail!(
+            "{} of {} polyglot targets failed to index — sidecar would \
+             be incomplete; refusing to claim success. Pass \
+             --no-{{rust,go,typescript,python}} to skip a language, \
+             or --{{rust-analyzer,scip-go,scip-typescript,scip-python}} \
+             to point at a working binary.",
+            report.failed, report.ok + report.failed,
+        );
+    }
 
     // Import each .scip in append mode. Collect every failure and
     // bail at the end with the full list — silently swallowing

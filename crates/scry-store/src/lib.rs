@@ -1071,6 +1071,10 @@ impl StoreWriter {
         }
 
         if final_dir.exists() {
+            // See `carry_over_sidecars` — preserve scip_index.bin /
+            // clang_usrs.bin across the atomic swap so `scry index`
+            // doesn't wipe what `scry build-symbols` just wrote.
+            carry_over_sidecars(&final_dir, &tmp)?;
             let old = final_dir.with_extension("old");
             if old.exists() {
                 std::fs::remove_dir_all(&old).ok();
@@ -1127,6 +1131,13 @@ impl StoreWriter {
         mf.flush()?;
 
         if final_dir.exists() {
+            // Preserve precision sidecars across the atomic swap.
+            // `scry build-symbols` writes scip_index.bin / clang_usrs.bin
+            // into the same dir but is independent of the main index
+            // pipeline. Without this carry-over, every re-run of
+            // `scry index` silently wipes the sidecar and turns
+            // precision queries into "no precision sidecars" errors.
+            carry_over_sidecars(&final_dir, &tmp)?;
             let old = final_dir.with_extension("old");
             if old.exists() {
                 std::fs::remove_dir_all(&old).ok();
@@ -1142,6 +1153,30 @@ impl StoreWriter {
         }
         Ok(())
     }
+}
+
+/// Copy precision-sidecar files from the live index dir into the
+/// staging dir before the atomic swap. The sidecars are written by
+/// `scry build-symbols` / `scry clang-index` / `scry scip-import` and
+/// must survive a re-run of `scry index`.
+fn carry_over_sidecars(live_dir: &Path, staging_dir: &Path) -> Result<()> {
+    // Keep this list narrow + explicit. Adding "everything not
+    // produced by the indexer" would carry over corrupt artifacts
+    // from older runs. New sidecars get added here as they ship.
+    const SIDECARS: &[&str] = &[
+        "scip_index.bin",
+        "clang_usrs.bin",
+    ];
+    for name in SIDECARS {
+        let src = live_dir.join(name);
+        if !src.exists() { continue; }
+        let dst = staging_dir.join(name);
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!(
+                "carry over sidecar {} → {}", src.display(), dst.display(),
+            ))?;
+    }
+    Ok(())
 }
 
 /// Build a FST + posting list for a stream of (name, idx) tuples.

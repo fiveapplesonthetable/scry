@@ -221,6 +221,15 @@ fn run_one(target: &PolyglotTarget, cfg: &PolyglotConfig) -> Option<PathBuf> {
              .arg(&target.root)
              .arg("--output").arg(&out_path)
              .current_dir(&target.root);
+            // rust-analyzer shells out to `cargo metadata` and `rustc
+            // --print=cfg`. When a user installs rustup, both bins live
+            // alongside rust-analyzer in the toolchain bin dir — but
+            // that dir is only on PATH if rustup's shim layer
+            // (`~/.cargo/bin/`) sits on the user's PATH. Bridge it
+            // by prepending rust-analyzer's parent to the subprocess
+            // PATH so the sibling cargo/rustc are reachable
+            // regardless of how the parent shell was set up.
+            prepend_to_path(&mut c, cfg.rust_analyzer.parent());
             c
         }
         PolyglotKind::Go => {
@@ -229,6 +238,8 @@ fn run_one(target: &PolyglotTarget, cfg: &PolyglotConfig) -> Option<PathBuf> {
             c.arg("--module-root").arg(".")
              .arg("--output").arg(&out_path)
              .current_dir(&target.root);
+            // scip-go shells out to `go list`; same PATH hygiene.
+            prepend_to_path(&mut c, cfg.scip_go.parent());
             c
         }
         PolyglotKind::TypeScript => {
@@ -237,6 +248,7 @@ fn run_one(target: &PolyglotTarget, cfg: &PolyglotConfig) -> Option<PathBuf> {
             c.arg("index")
              .arg("--output").arg(&out_path)
              .current_dir(&target.root);
+            prepend_to_path(&mut c, cfg.scip_typescript.parent());
             c
         }
         PolyglotKind::Python => {
@@ -247,6 +259,7 @@ fn run_one(target: &PolyglotTarget, cfg: &PolyglotConfig) -> Option<PathBuf> {
              .arg("--project-name").arg(&slug)
              .arg(".")
              .current_dir(&target.root);
+            prepend_to_path(&mut c, cfg.scip_python.parent());
             c
         }
     };
@@ -259,14 +272,42 @@ fn run_one(target: &PolyglotTarget, cfg: &PolyglotConfig) -> Option<PathBuf> {
         }
     };
     if !output.status.success() || !out_path.exists() {
+        // Indexers buffer progress chatter ("Generating SCIP
+        // start…") to stderr early and only emit the real cause
+        // near the end. Surface the last 3 non-empty stderr lines
+        // so the operator sees the actual error instead of the
+        // banner. Operators can always re-run with stderr capture
+        // for full forensics.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().next().unwrap_or("");
-        eprintln!("[scry-bridge] {} {}: indexer failed (exit {}): {first}",
+        let tail: Vec<&str> = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev().take(3).collect();
+        let tail = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+        eprintln!("[scry-bridge] {} {}: indexer failed (exit {}): {tail}",
                   target.kind.label(), target.root.display(),
                   output.status.code().unwrap_or(-1));
         return None;
     }
     Some(out_path)
+}
+
+/// Prepend a directory to the `PATH` environment variable for the
+/// child process. No-op when `dir` is None or empty. Used to make
+/// indexers' own toolchain neighbours (cargo next to rust-analyzer,
+/// go next to scip-go, etc.) reachable from the child regardless of
+/// how the parent shell was configured.
+fn prepend_to_path(cmd: &mut Command, dir: Option<&Path>) {
+    let Some(dir) = dir else { return };
+    if dir.as_os_str().is_empty() { return; }
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut new_path = std::ffi::OsString::new();
+    new_path.push(dir);
+    if !existing.is_empty() {
+        new_path.push(":");
+        new_path.push(&existing);
+    }
+    cmd.env("PATH", new_path);
 }
 
 #[cfg(test)]

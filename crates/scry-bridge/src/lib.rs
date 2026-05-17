@@ -43,25 +43,32 @@ pub fn scry_tmp_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/mnt/agent/tmp")
 }
 
-/// Resolve an indexer binary by name. Falls back through the install
-/// script's `${PREFIX}/bin` (default `$HOME/.local/bin`), the standard
-/// `/usr/local/bin`, and the `$SCRY_INDEXER_BIN_DIR` override before
-/// giving up. Returns the bare name as a last resort so the spawn
-/// error remains identifiable; callers should set up their own
-/// `--scip-java`/`--rust-analyzer`/... CLI overrides for fully
-/// non-standard installs.
+/// Resolve an indexer binary by name. Two sources, in priority
+/// order — no heuristics, no hardcoded distro paths, no `npm config`
+/// probing. If the operator's environment isn't set up, the caller
+/// gets a clean "binary not found" error and a pointer at the CLI
+/// override.
 ///
-/// Order:
-///   1. `$SCRY_INDEXER_BIN_DIR/<name>` if set and the file exists.
-///   2. The first match found via `$PATH`.
-///   3. `$HOME/.local/bin/<name>` (the install script's default).
-///   4. `/usr/local/bin/<name>` (system-wide install).
-///   5. The bare `<name>` (so the spawn error names the binary).
+///   1. `$SCRY_INDEXER_<NAME>` — per-binary override (e.g.
+///      `SCRY_INDEXER_SCIP_JAVA=/opt/sg/bin/scip-java`). Dashes in
+///      `name` map to underscores. Lets operators pin one indexer
+///      without touching PATH.
+///   2. The first match on `$PATH`.
+///
+/// If neither resolves, the bare `name` is returned so the eventual
+/// spawn error mentions the binary. Every CLI command that takes
+/// an indexer binary also exposes an explicit `--<name>` flag with
+/// higher priority than this resolver — that's the canonical way to
+/// override.
 pub fn resolve_indexer_binary(name: &str) -> std::path::PathBuf {
     use std::path::PathBuf;
     let exists = |p: &PathBuf| p.is_file();
-    if let Some(dir) = std::env::var_os("SCRY_INDEXER_BIN_DIR") {
-        let p = PathBuf::from(dir).join(name);
+    let env_key = format!(
+        "SCRY_INDEXER_{}",
+        name.to_ascii_uppercase().replace('-', "_"),
+    );
+    if let Some(val) = std::env::var_os(&env_key) {
+        let p = PathBuf::from(val);
         if exists(&p) { return p; }
     }
     if let Some(paths) = std::env::var_os("PATH") {
@@ -70,12 +77,6 @@ pub fn resolve_indexer_binary(name: &str) -> std::path::PathBuf {
             if exists(&p) { return p; }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".local/bin").join(name);
-        if exists(&p) { return p; }
-    }
-    let p = PathBuf::from("/usr/local/bin").join(name);
-    if exists(&p) { return p; }
     PathBuf::from(name)
 }
 

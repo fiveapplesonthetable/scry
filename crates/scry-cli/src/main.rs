@@ -2476,6 +2476,18 @@ fn cmd_def(
     } else {
         print_results(&r, &filtered, limit, json);
     }
+    // v0.1.52 — fuzzy "did you mean" hint on 0 hits. Only fires when
+    // NO filter was passed; with --in/--not-in/--lang/--kind set, a
+    // 0 hit means "filtered out", not "name unknown", so the fuzzy
+    // suggestion would mislead.
+    if filtered.is_empty()
+        && in_.is_none() && not_in.is_none()
+        && lang.is_none() && kind.is_none()
+    {
+        if let Some(hint) = suggest_similar(&r, &name) {
+            eprintln!("[scry] {hint}");
+        }
+    }
     log_query(&r, "def", &name, filtered.len(), filtered.len().min(limit), t);
     Ok(())
 }
@@ -3407,6 +3419,18 @@ fn cmd_ref(
             print_refs(&r, &filtered, limit, json);
         }
     }
+    // v0.1.52 — fuzzy "did you mean" hint on 0 hits. Same gating as
+    // cmd_def: only fire when no filter narrowed the search, otherwise
+    // a 0-result is "filtered away" not "name unknown".
+    if filtered.is_empty()
+        && in_.is_none() && not_in.is_none()
+        && lang.is_none()
+        && scope.is_none() && def_in.is_none()
+    {
+        if let Some(hint) = suggest_similar(&r, &name) {
+            eprintln!("[scry] {hint}");
+        }
+    }
     log_query(&r, label, &name, filtered.len(), filtered.len().min(limit), t);
     Ok(())
 }
@@ -4076,6 +4100,30 @@ fn path_matches(path: &str, in_: Option<&str>, not_in: Option<&str>) -> bool {
         if !p.is_empty() && path.contains(p) { return false; }
     }
     true
+}
+
+/// When a `def`/`ref`/`callers` lookup returns 0 hits, run a
+/// distance-2 fuzzy match against the symbol FST and surface the
+/// top 3 distinct names as a "Did you mean: …" stderr hint. Tiny
+/// (~ms on a 31M-symbol index) and catches the common typo case
+/// without users needing to know about `scry fuzzy`. Returns None
+/// for very short names (high false-positive rate) or no matches.
+fn suggest_similar(reader: &StoreReader, name: &str) -> Option<String> {
+    if name.len() < 3 { return None; }
+    let hits = reader.lookup_fuzzy_ranked(name, 2, 8);
+    if hits.is_empty() { return None; }
+    // Keep top-3 distinct names in the rank order fuzzy returned them.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for (s, _d) in hits {
+        if seen.insert(s.name.clone()) {
+            names.push(s.name);
+            if names.len() >= 3 { break; }
+        }
+    }
+    if names.is_empty() { return None; }
+    Some(format!("Did you mean: {}? (run `scry fuzzy {name}` for the full list.)",
+                 names.join(", ")))
 }
 
 /// Markdown formatter: one section per result, optional code snippet. Stops

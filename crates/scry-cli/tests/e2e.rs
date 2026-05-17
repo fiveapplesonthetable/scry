@@ -2603,3 +2603,55 @@ public class ServiceTest {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.52 — fuzzy "Did you mean" hint on 0-result def/callers.
+/// Catches the common-typo case without users needing to know about
+/// `scry fuzzy`. Hint goes to stderr; stdout stays canonical.
+#[test]
+fn fuzzy_hint_on_zero_results() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-fuzzy-hint-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+    // One def whose name is similar-but-not-equal to the typo we'll query.
+    std::fs::write(src.join("A.java"), r#"package a;
+public class A {
+    public void bindService() {}
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Typo: bindServce (missing 'i'). Expect 0 hits + a Did-you-mean
+    // line on stderr that mentions bindService.
+    let out = Command::new(scry_bin())
+        .args(["def", "bindServce", "--index"]).arg(&idx).args(["--limit", "5"])
+        .output().expect("spawn def typo");
+    assert!(out.status.success(),
+        "def typo failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Did you mean"),
+        "stderr should carry a Did-you-mean line; got: {stderr}");
+    assert!(stderr.contains("bindService"),
+        "stderr should mention bindService as the suggestion; got: {stderr}");
+
+    // Sanity: with --in filtering the search down to 0, the hint must
+    // NOT fire (0 = filtered, not typo). Otherwise we'd mislead users.
+    let out = Command::new(scry_bin())
+        .args(["def", "bindService", "--index"]).arg(&idx)
+        .args(["--in", "/nonexistent_dir/"])
+        .output().expect("spawn def filtered");
+    assert!(out.status.success(),
+        "def filtered failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("Did you mean"),
+        "filtered 0-result must NOT trigger the typo hint; got: {stderr}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

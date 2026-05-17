@@ -7,6 +7,37 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.52] — 2026-05-17
+
+`scry def` and `scry callers` / `scry ref` now emit a "Did you
+mean: …?" hint on stderr when a lookup returns 0 hits. Catches
+the common-typo case without users needing to know about
+`scry fuzzy`.
+
+```
+$ scry def Activty
+0 results (showing 0)
+[scry] Did you mean: MainActivty, Active, Activate? (run `scry fuzzy Activty` for the full list.)
+
+$ scry callers bindServce --format count
+0 callers
+[scry] Did you mean: bindService? (run `scry fuzzy bindServce` for the full list.)
+```
+
+Distance-bound: Levenshtein ≤ 2. Top 3 distinct names in the
+order fuzzy ranked them. ~ms cost on a 31M-symbol index — only
+fires when results are empty so the hot path is unchanged.
+
+Gating: the hint only fires when NO filter narrowed the search
+(`--in`, `--not-in`, `--lang`, `--kind`, `--scope`, `--def-in`
+all absent). With a filter set, a 0-result means "filtered out",
+not "name unknown" — suggesting alternatives there would mislead
+the user. The pinned e2e test covers this branch explicitly.
+
+E2E test: `fuzzy_hint_on_zero_results` (typo path emits the
+hint mentioning the real symbol; filtered 0-result does NOT
+trigger the hint).
+
 ## [0.1.51] — 2026-05-17
 
 `--not-in SUBSTR` path filter — symmetric to `--in`. Drops

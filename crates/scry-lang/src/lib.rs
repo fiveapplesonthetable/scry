@@ -442,22 +442,6 @@ fn extract_refs_with(
                         Ok(s) if !s.is_empty() => s.to_string(),
                         _ => continue,
                     };
-                    // v0.1.60 — static-receiver capture filter. The
-                    // `ref.static_recv` capture fires on the `object:`
-                    // child of a Java method_invocation (or Kotlin
-                    // navigation_expression). That node could be a
-                    // class (Foo.bar()), a local var (myObj.bar()), a
-                    // field, etc. — tree-sitter can't tell. Without
-                    // type info we use the Java/Kotlin naming convention
-                    // (PascalCase = class) as a 99%-accurate filter:
-                    // drop identifiers that don't start with an uppercase
-                    // ASCII letter. Catches `Foo.bar()` static-method
-                    // calls; rejects `myService.foo()`.
-                    if *cap_name == "ref.static_recv"
-                        && !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                    {
-                        continue;
-                    }
                     let pos = node.start_position();
                     out.push(RawRef {
                         name,
@@ -1581,13 +1565,6 @@ fn java_refs_spec() -> &'static RefSpec {
                 lang,
                 r#"
                 (method_invocation name: (identifier) @ref.call)
-                ; Static-receiver capture: in `Foo.bar()` the `object:` child
-                ; is the identifier `Foo`. Captured as a TypeUse ref so
-                ; `scry callers Foo` finds the static-call site. Filtered
-                ; downstream in extract_refs_with to PascalCase identifiers
-                ; only (Java naming convention rejects local-var receivers
-                ; like `myService.foo()` with ~99% accuracy without type info).
-                (method_invocation object: (identifier) @ref.static_recv)
                 (object_creation_expression type: (type_identifier) @ref.ctor)
                 (superclass (type_identifier) @ref.inherit)
                 (super_interfaces (type_list (type_identifier) @ref.inherit))
@@ -1610,7 +1587,6 @@ fn java_refs_spec() -> &'static RefSpec {
             query: q,
             capture_kinds: &[
                 ("ref.call", RefKind::Call),
-                ("ref.static_recv", RefKind::TypeUse),
                 ("ref.ctor", RefKind::Ctor),
                 ("ref.inherit", RefKind::InheritFrom),
                 ("ref.import", RefKind::Import),

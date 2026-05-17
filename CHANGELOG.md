@@ -7,46 +7,6 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.1.60] — 2026-05-17
-
-**First slice of the Kythe-gap arc.** Java static-receiver capture:
-`Foo.bar()` now emits a TypeUse ref to `Foo` in addition to the
-existing Call ref to `bar`. So `scry ref Foo` / `scry callers
-Foo` (with `--kind type`) catches static-method usage sites the
-previous tree-sitter query silently missed.
-
-```java
-// Caller.java
-Foo.staticBar();        // NEW: emits TypeUse ref to Foo
-myFoo.instanceBar();    // unchanged (filtered out — see below)
-```
-
-**Filter:** receivers are only captured when the identifier
-starts with an uppercase ASCII letter (Java class-naming
-convention: PascalCase). Without type info this is a ~99%-
-accurate way to separate `Foo.bar()` (class) from
-`myService.foo()` (variable/field). Tree-sitter can't tell the
-two apart structurally; the heuristic catches the common case
-without false positives on local-var receivers.
-
-**Why this matters for the Kythe arc:** sets up v0.1.62 — the
-resolver will pair adjacent TypeUse + Call refs into a
-"receiver.method" tuple and use the receiver class to narrow
-which `bar` overload the call targets. Today the same 50%
-unresolved ceiling exists because the resolver has no receiver
-context; this lays the data foundation for receiver-aware
-narrowing.
-
-Schema-additive: existing on-disk indices stay readable, and a
-re-index produces additional TypeUse refs without breaking
-anything. Kotlin equivalent (`navigation_expression` shape)
-queued for v0.1.61.
-
-E2E test: `java_static_receiver_capture` — positive case
-(`Foo.staticBar()` emits a Foo ref from the caller file),
-negative case (`myFoo.instanceBar()` does NOT emit a `myFoo`
-ref — the lowercase filter rejects it).
-
 ## [0.1.59] — 2026-05-17
 
 `scry health` now reports two more signals that were silently

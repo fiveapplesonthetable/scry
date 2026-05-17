@@ -7,6 +7,22 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.44] — 2026-05-17
+
+Daemon / JSON-RPC / MCP parity for v0.1.43's callgraph
+`--def-in PATH` and `--strict` flags.
+
+`serve_callgraph` accepts the matching `def_in: string` and
+`strict: bool` JSON-RPC args, applies the same root-level
+filter the CLI uses, and emits the same tree shape. Deeper
+recursive levels remain unnarrowed.
+
+MCP `callgraph` tool advertises both parameters in its input
+schema, with descriptions calling out the root-only behavior
+so agents understand the limitation.
+
+No client-side breaking change; additive parameters.
+
 ## [0.1.43] — 2026-05-17
 
 `--def-in PATH` and `--strict` on `scry callgraph`.

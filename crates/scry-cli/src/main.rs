@@ -7568,6 +7568,10 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "depth": {"type": "integer", "minimum": 1, "default": 3},
                 "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
                 "reachable": {"type": "boolean", "default": false},
+                "def_in": {"type": "string",
+                    "description": "Substring of the def-site file path for the ROOT callee. Same shape as `ref --def-in`. Narrows ONLY the topmost level — deeper recursive levels are not filtered because the walker doesn't track per-frame def context."},
+                "strict": {"type": "boolean", "default": false,
+                    "description": "Drop root-level callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include."},
             })),
         ),
         tool(
@@ -8412,7 +8416,9 @@ fn serve_one_request<W: std::io::Write>(
                 .map(|n| n as usize).unwrap_or(200);
             let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_callgraph(reader, arg_str("name"), in_, depth, max_nodes, reachable)
+            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
+            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_callgraph(reader, arg_str("name"), in_, depth, max_nodes, reachable, def_in, strict)
         }
         "uses" => {
             serve_uses(reader, arg_str("name"), in_, kind, limit)
@@ -8886,6 +8892,7 @@ fn serve_uses(
 /// `callgraph` JSON-RPC handler — returns the recursive callers
 /// tree. Same algorithm as [`cmd_callgraph`]; result shape mirrors
 /// the CLI's `--json` payload.
+#[allow(clippy::too_many_arguments)]
 fn serve_callgraph(
     r: &StoreReader,
     name: &str,
@@ -8893,6 +8900,8 @@ fn serve_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
+    def_in: Option<&str>,
+    strict: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     let callee_modules: Option<std::collections::HashSet<u32>> = if reachable {
@@ -8902,6 +8911,17 @@ fn serve_callgraph(
         })
     } else { None };
 
+    // Root-level --def-in target def-ids (v0.1.44). Daemon stays
+    // quiet on diagnostics; empty target set ⇒ no narrowing.
+    let root_def_target_ids: Option<std::collections::HashSet<u64>> =
+        def_in.map(|p| {
+            r.lookup_exact(name).iter()
+                .filter(|s| r.files.get(s.file_id as usize)
+                    .is_some_and(|fe| fe.display_path(&r.roots).contains(p)))
+                .map(|s| s.id)
+                .collect()
+        });
+
     #[derive(Debug, Default, serde::Serialize)]
     struct Node {
         call_sites: usize,
@@ -8909,12 +8929,15 @@ fn serve_callgraph(
         callers: std::collections::BTreeMap<String, Node>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand(
         r: &StoreReader,
         callee: &str,
         depth_left: usize,
         in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
+        root_def_target_ids: Option<&std::collections::HashSet<u64>>,
+        strict: bool,
         visited: &mut std::collections::HashSet<String>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
@@ -8936,6 +8959,19 @@ fn serve_callgraph(
                     }
                 }
             }
+            // Root-level --def-in / --strict filter (v0.1.44).
+            if let Some(tids) = root_def_target_ids {
+                if !tids.is_empty() {
+                    match rr.resolved_to {
+                        Some(id) if !tids.contains(&id) => continue,
+                        None if strict => continue,
+                        _ => {}
+                    }
+                }
+            }
+            if root_def_target_ids.is_none() && strict && rr.resolved_to.is_none() {
+                continue;
+            }
             let caller_name = r.enclosing_function(rr.file_id, rr.byte_start)
                 .map(|s| s.name)
                 .or_else(|| rr.scope_path.last().cloned());
@@ -8950,9 +8986,11 @@ fn serve_callgraph(
             *budget = budget.saturating_sub(1);
             if *budget == 0 { break; }
         }
+        // Recurse without root filter — narrowing only applies at the
+        // top level (same limitation as cmd_callgraph).
         for (caller_name, node) in &mut out {
             node.callers = expand(r, caller_name, depth_left - 1, in_prefix,
-                callee_modules, visited, budget);
+                callee_modules, None, strict, visited, budget);
         }
         visited.remove(callee);
         out
@@ -8960,7 +8998,8 @@ fn serve_callgraph(
 
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let tree = expand(r, name, depth, prefix, callee_modules.as_ref(), &mut visited, &mut budget);
+    let tree = expand(r, name, depth, prefix, callee_modules.as_ref(),
+                      root_def_target_ids.as_ref(), strict, &mut visited, &mut budget);
     serde_json::json!({
         "callee": name,
         "depth": depth,

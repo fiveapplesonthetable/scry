@@ -397,6 +397,12 @@ pub fn extract_refs(kind: FileKind, source: &[u8]) -> Result<Vec<RawRef>> {
 struct RefSpec {
     query: &'static Query,
     capture_kinds: &'static [(&'static str, RefKind)],
+    /// Optional post-processing hook run after the main capture loop.
+    /// Used for wildcard imports in Java/Kotlin: tree-sitter queries
+    /// can't combine `scoped_identifier` text with the trailing `*`
+    /// into one capture, so we walk the tree once more to find them
+    /// and synthesize Import refs with `name = "pkg.*"`.
+    wildcard_imports: Option<fn(&tree_sitter::Tree, &[u8], &mut Vec<RawRef>)>,
 }
 
 fn extract_refs_with(
@@ -453,6 +459,9 @@ fn extract_refs_with(
                     });
                 }
             }
+        }
+        if let Some(hook) = refs.wildcard_imports {
+            hook(&tree, source, &mut out);
         }
         Ok(out)
     })
@@ -1441,6 +1450,93 @@ fn yaml_spec() -> &'static LangSpec {
 // definition sites cleanly.
 // ===========================================================================
 
+/// Wildcard import hook for Java. Walks the parse tree for
+/// `import_declaration` nodes that contain an `asterisk` child,
+/// extracts the `scoped_identifier` (or `identifier`) sibling, and
+/// emits a synthetic Import ref with `name = "{path}.*"`. This is
+/// what lets the build-resolutions wildcard branch fire on real
+/// codebases — tree-sitter queries alone can't combine the
+/// scoped_identifier text with the trailing `*` into one capture.
+fn java_wildcard_imports(tree: &tree_sitter::Tree, source: &[u8], out: &mut Vec<RawRef>) {
+    java_kotlin_wildcard_imports_impl(
+        tree, source, out,
+        "import_declaration", &["scoped_identifier", "identifier"], "asterisk",
+    );
+}
+
+fn kotlin_wildcard_imports(tree: &tree_sitter::Tree, source: &[u8], out: &mut Vec<RawRef>) {
+    java_kotlin_wildcard_imports_impl(
+        tree, source, out,
+        // tree-sitter-kotlin-NG: top-level node is `import` containing
+        // `qualified_identifier`; wildcard is the `*` literal child.
+        "import", &["qualified_identifier"], "*",
+    );
+}
+
+fn java_kotlin_wildcard_imports_impl(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    out: &mut Vec<RawRef>,
+    import_node_kind: &str,
+    path_node_kinds: &[&str],
+    asterisk_kind: &str,
+) {
+    let root = tree.root_node();
+    let mut stack: Vec<tree_sitter::Node> = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == import_node_kind {
+            // Look for an asterisk child AND a path child.
+            let mut has_asterisk = false;
+            let mut path_node: Option<tree_sitter::Node> = None;
+            let mut w = node.walk();
+            for child in node.children(&mut w) {
+                if child.kind() == asterisk_kind {
+                    has_asterisk = true;
+                }
+                if path_node_kinds.contains(&child.kind()) {
+                    path_node = Some(child);
+                }
+            }
+            if has_asterisk {
+                if let Some(p) = path_node {
+                    if let Ok(path) = p.utf8_text(source) {
+                        if !path.is_empty() {
+                            // The main query already captured `path` (the
+                            // scoped_identifier) as an Import ref. Find
+                            // that ref by its byte_start and rewrite its
+                            // name to `path.*` so we don't duplicate.
+                            // If we can't find it (query missed it), emit
+                            // a fresh wildcard ref instead.
+                            let path_start = p.start_byte() as u32;
+                            let synthetic_name = format!("{path}.*");
+                            if let Some(existing) = out.iter_mut().find(|r| {
+                                r.kind == RefKind::Import && r.byte_start == path_start
+                            }) {
+                                existing.name = synthetic_name;
+                            } else {
+                                let pos = p.start_position();
+                                out.push(RawRef {
+                                    name: synthetic_name,
+                                    kind: RefKind::Import,
+                                    byte_start: path_start,
+                                    byte_end: p.end_byte() as u32,
+                                    line: (pos.row as u32).saturating_add(1),
+                                    col: (pos.column as u32).saturating_add(1),
+                                    scope_path: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut w = node.walk();
+        for child in node.children(&mut w) {
+            stack.push(child);
+        }
+    }
+}
+
 fn java_refs_spec() -> &'static RefSpec {
     static SPEC: OnceLock<RefSpec> = OnceLock::new();
     SPEC.get_or_init(|| {
@@ -1477,6 +1573,7 @@ fn java_refs_spec() -> &'static RefSpec {
                 ("ref.inherit", RefKind::InheritFrom),
                 ("ref.import", RefKind::Import),
             ],
+            wildcard_imports: Some(java_wildcard_imports),
         }
     })
 }
@@ -1512,6 +1609,7 @@ fn kotlin_refs_spec() -> &'static RefSpec {
                 ("ref.import", RefKind::Import),
                 ("ref.type", RefKind::TypeUse),
             ],
+            wildcard_imports: Some(kotlin_wildcard_imports),
         }
     })
 }
@@ -1537,6 +1635,7 @@ fn c_refs_spec() -> &'static RefSpec {
                 ("ref.call", RefKind::Call),
                 ("ref.import", RefKind::Import),
             ],
+            wildcard_imports: None,
         }
     })
 }
@@ -1577,6 +1676,7 @@ fn cpp_refs_spec() -> &'static RefSpec {
                 ("ref.import", RefKind::Import),
                 ("ref.using-ns", RefKind::UsingNamespace),
             ],
+            wildcard_imports: None,
         }
     })
 }
@@ -1607,6 +1707,7 @@ fn rust_refs_spec() -> &'static RefSpec {
                 ("ref.inherit", RefKind::InheritFrom),
                 ("ref.import", RefKind::Import),
             ],
+            wildcard_imports: None,
         }
     })
 }
@@ -1633,6 +1734,7 @@ fn go_refs_spec() -> &'static RefSpec {
                 ("ref.call", RefKind::Call),
                 ("ref.import", RefKind::Import),
             ],
+            wildcard_imports: None,
         }
     })
 }
@@ -1660,6 +1762,7 @@ fn python_refs_spec() -> &'static RefSpec {
                 ("ref.call", RefKind::Call),
                 ("ref.import", RefKind::Import),
             ],
+            wildcard_imports: None,
         }
     })
 }

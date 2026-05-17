@@ -7,6 +7,43 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.29] — 2026-05-17
+
+Wildcard imports (`import android.os.*;`) now captured.
+
+v0.1.28 fixed Java imports to store the full qualified path
+(`android.os.PerfettoTrace` instead of just `PerfettoTrace`)
+and added an import-aware narrowing rule in
+`cmd_build_resolutions`. But wildcard imports (`import
+android.os.*;`) were noted as still-unsupported — tree-sitter
+queries can't combine the scoped_identifier text with the
+trailing `*` into one capture.
+
+This release adds a custom post-processing pass:
+
+- New `wildcard_imports: Option<fn>` field on `RefSpec` —
+  optional walker hook run after the main capture loop.
+- `java_wildcard_imports` and `kotlin_wildcard_imports` walk
+  the tree for `import_declaration` / `import` nodes that
+  contain an `asterisk` / `*` child, find the path child, and
+  emit a synthetic Import ref with `name = "{path}.*"`.
+- Dedup logic: the main query already captures the
+  scoped_identifier portion of wildcard imports (as just
+  `android.os`). The hook finds that ref and REPLACES its name
+  with `android.os.*` rather than emitting a duplicate.
+- `process_import` in `cmd_build_resolutions` correctly splits
+  `android.os.*` into `(simple="*", pkg=Some("android.os"))`,
+  which the existing wildcard branch in `resolve_one` already
+  handles. No resolver code changes needed.
+
+New e2e test `java_wildcard_import_captured_with_dot_star_suffix`
+asserts the wildcard is searchable as `android.os.*` and that
+no duplicate bare `android.os` ref exists.
+
+**To take effect**, run a full `scry index` rebuild. The
+v0.1.28 rebuild does NOT include wildcards — wildcards are
+captured at parse time and require the v0.1.29 binary.
+
 ## [0.1.28] — 2026-05-17
 
 Real fix for the "wrong `close()` callers in precise mode" complaint.

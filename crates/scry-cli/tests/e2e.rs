@@ -2188,3 +2188,69 @@ public class Caller {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.28 — Java wildcard imports (`import android.os.*;`) must be
+/// captured with the synthetic `.*` suffix so the build-resolutions
+/// wildcard branch fires. Tree-sitter queries can't combine the
+/// scoped_identifier text with the asterisk in one capture; we use
+/// a post-processing walker hook.
+#[test]
+fn java_wildcard_import_captured_with_dot_star_suffix() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-java-wildcard-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("com/example")).unwrap();
+    std::fs::write(src.join("com/example/Caller.java"), r#"package com.example;
+import android.os.*;
+public class Caller {
+    public void run(PerfettoTrace.Session s) {
+        s.close();
+    }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // The wildcard import should be searchable as "android.os.*".
+    let out = Command::new(scry_bin())
+        .args(["ref", "android.os.*", "--kind", "import", "--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("spawn scry ref");
+    assert!(out.status.success(),
+            "scry ref failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(!lines.is_empty(),
+            "wildcard import should be captured as 'android.os.*'; got 0 hits — \
+             the wildcard hook regressed");
+    assert!(lines.iter().any(|v| v["name"].as_str() == Some("android.os.*")),
+            "expected name='android.os.*'; got {:?}",
+            lines.iter().map(|v| v["name"].clone()).collect::<Vec<_>>());
+
+    // The dedup logic should have REPLACED the bare "android.os"
+    // import ref (which the normal query would have captured from the
+    // scoped_identifier child) with the wildcard version. Looking up
+    // by the bare "android.os" path should miss.
+    let out = Command::new(scry_bin())
+        .args(["ref", "android.os", "--kind", "import", "--index"]).arg(&idx)
+        .args(["--json"])
+        .output().expect("spawn scry ref");
+    assert!(out.status.success());
+    let bare_hits: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(bare_hits.is_empty(),
+            "wildcard import should have replaced (not duplicated) the bare \
+             'android.os' ref; got {} hits", bare_hits.len());
+
+    std::fs::remove_dir_all(&base).ok();
+}

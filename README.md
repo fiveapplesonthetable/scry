@@ -79,6 +79,7 @@ cargo build --release                            # ~20 s cold, ~5 s incremental
 ./target/release/scry callers close --def-in PerfettoTrace.java    # narrow by callee location
 ./target/release/scry callers close --strict                       # only confidently-resolved hits
 ./target/release/scry callers close --format by-def --limit 10     # histogram: which def gets called most
+# (--def-in / --strict also work on ref, callgraph, and impact)
 ```
 
 Times above are warm-cache P50 on the live AOSP + Linux index

@@ -555,6 +555,13 @@ enum Cmd {
         /// Walk the hierarchy this many levels deep. 0 = direct only.
         #[arg(long, default_value_t = 0)]
         depth: usize,
+        /// Accepted as a no-op for consistency with ref/callers/impact —
+        /// `subclasses` walks tree-sitter `InheritFrom` refs from the
+        /// modgraph and does not consult the precision sidecars, so
+        /// `--lexical` has no effect here. Lets scripts pass the flag
+        /// uniformly across query subcommands.
+        #[arg(long, hide = true)]
+        lexical: bool,
         /// Compact output. `count` emits `N subclasses` only. `paths`
         /// emits deduped sorted file paths of the children — useful
         /// for "which files define a subtype of X?" agent queries.
@@ -579,6 +586,9 @@ enum Cmd {
         not_in: Option<String>,
         #[arg(long, default_value_t = 0)]
         depth: usize,
+        /// No-op — see `scry subclasses --lexical`.
+        #[arg(long, hide = true)]
+        lexical: bool,
         /// See `scry subclasses --format`.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
@@ -1633,9 +1643,9 @@ fn main() -> Result<()> {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, build_out, workers,
         ),
-        Cmd::Subclasses { name, index, in_, not_in, depth, format, limit, json } =>
+        Cmd::Subclasses { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
             cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
-        Cmd::Implementations { name, index, in_, not_in, depth, format, limit, json } =>
+        Cmd::Implementations { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
             cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),

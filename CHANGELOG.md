@@ -7,6 +7,39 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.56] — 2026-05-17
+
+`--format paths` on `scry ref` / `scry callers` — deduped sorted
+file paths only. Completes the `--format` trio (count, by-def,
+paths). Cheapest shape for the common LLM-agent question "which
+files reference X?".
+
+```
+$ scry callers bindService --format paths --limit 5
+/home/zim/dev/aosp/cts/.../ActivityManagerAppExitInfoTest.java
+/home/zim/dev/aosp/cts/.../BitmapTest.java
+/home/zim/dev/aosp/cts/.../CarOccupantConnectionManagerTest.java
+/home/zim/dev/aosp/cts/.../SignatureQueryServiceInstrumentationTest.java
+/home/zim/dev/aosp/cts/.../TunerTest.java
+
+5 unique files (from 1981 refs)
+
+$ scry callers bindService --format paths --json --limit 3
+["…/ActivityManagerAppExitInfoTest.java", "…/BitmapTest.java", "…/CarOccupantConnectionManagerTest.java"]
+```
+
+Daemon parity: `args.format: "paths"` on `ref` / `callers`
+JSON-RPC returns the same `["path", ...]` array shape. MCP
+schema's `format.enum` updated to `["by-def", "paths"]`.
+
+Dedup happens before `--limit`, so the cap counts unique files,
+not raw refs. Output is sorted ascending so consumers can binary-
+search / diff stably across runs.
+
+E2E test: `format_paths_cli_and_daemon` — CLI human + JSON shape,
+daemon parity, dedup correctness (a file with no refs to X must
+NOT appear in the output).
+
 ## [0.1.55] — 2026-05-17
 
 Finish the `--not-in` rollout — every command that accepts `--in`

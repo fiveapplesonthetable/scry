@@ -3161,8 +3161,8 @@ fn cmd_ref(
     strict: bool,
 ) -> Result<()> {
     if let Some(f) = format.as_deref() {
-        if !matches!(f, "count" | "by-def") {
-            anyhow::bail!("--format must be 'count' or 'by-def' (got '{f}')");
+        if !matches!(f, "count" | "by-def" | "paths") {
+            anyhow::bail!("--format must be 'count', 'by-def', or 'paths' (got '{f}')");
         }
     }
     // --json + --format=count is meaningless (count is a one-line
@@ -3488,6 +3488,13 @@ fn cmd_ref(
             // `onCreate` is dispatched across the corpus.
             print_refs_by_def(&r, &filtered, &name, limit, json);
         }
+        Some("paths") => {
+            // v0.1.56 — unique sorted file paths only. Common LLM-agent
+            // shape: "which files contain refs to X?" without the
+            // line/col/scope noise. JSON emits ["path1", "path2", ...];
+            // human format is one path per line.
+            print_refs_paths(&r, &filtered, limit, json);
+        }
         _ => {
             print_refs(&r, &filtered, limit, json);
         }
@@ -3589,6 +3596,37 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
         if total_groups == 1 { "" } else { "s" },
         shown_groups,
     );
+}
+
+/// Unique sorted file paths only. Replaces the per-ref output for the
+/// "which files reference X?" use case. JSON emits a flat array of
+/// strings; human format is one path per line so it can pipe straight
+/// into `xargs` / `vim`. Deduplication happens before --limit, so the
+/// cap counts unique files, not raw refs.
+fn print_refs_paths(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool) {
+    use std::collections::BTreeSet;
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for r in refs {
+        if let Some(fe) = reader.files.get(r.file_id as usize) {
+            paths.insert(fe.display_path(&reader.roots));
+            if paths.len() >= limit { break; }
+        }
+    }
+    if json {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let arr: Vec<&String> = paths.iter().collect();
+        let _ = writeln!(out, "{}", serde_json::to_string(&arr).unwrap());
+    } else {
+        for p in &paths {
+            println!("{p}");
+        }
+        eprintln!("\n{} unique file{} (from {} refs)",
+            paths.len(),
+            if paths.len() == 1 { "" } else { "s" },
+            refs.len());
+    }
 }
 
 fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
@@ -7823,8 +7861,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Substring of the def-site file path. Keeps only refs whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` disambiguates `close` when many unrelated classes also define `close`. Refs whose resolved_to is None pass through (over-include rather than silently drop). No-op without a build-resolutions sidecar."},
                 "strict": {"type": "boolean", "default": false,
                     "description": "Drop refs whose Layer 2 resolution didn't land on a specific def (resolved_to=None). With `def_in`, also drops the permissive over-include — only refs the resolver confidently attributed to the target survive. Without `def_in`, shows only refs that resolved to some specific def."},
-                "format": {"type": "string", "enum": ["by-def"],
-                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {path, line, col, scope, kind, id}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. Use this to see WHICH def the refs actually target. Without `format`, returns the per-ref JSONL stream."},
+                "format": {"type": "string", "enum": ["by-def", "paths"],
+                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {path, line, col, scope, kind, id}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files contain refs to X?`. Without `format`, returns the per-ref JSONL stream."},
             })),
         ),
         tool(
@@ -7854,8 +7892,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Substring of the def-site file path. Keeps only callers whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` cuts through cases where many classes share a method name like `close`. Callers whose resolved_to is None pass through. No-op without a build-resolutions sidecar."},
                 "strict": {"type": "boolean", "default": false,
                     "description": "Drop callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include — only callers the resolver confidently attributed survive. Trades recall for precision."},
-                "format": {"type": "string", "enum": ["by-def"],
-                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {...}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. Use this to see WHICH def the callers actually target — invaluable for polymorphic names like `close`, `onCreate`, `transact`."},
+                "format": {"type": "string", "enum": ["by-def", "paths"],
+                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {...}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last — invaluable for polymorphic names like `close`, `onCreate`, `transact`. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files call X?`."},
             })),
         ),
         tool(
@@ -9083,12 +9121,15 @@ fn serve_ref(
         }).collect()
     });
     let by_def = format == Some("by-def");
-    // by-def needs to see ALL surviving refs to build the histogram
-    // correctly; the default JSONL path caps at `limit` for cost.
+    let paths_only = format == Some("paths");
+    // by-def + paths both need to see ALL surviving refs to build their
+    // shape correctly (histogram / dedup respectively); the default JSONL
+    // path caps at `limit` for cost.
     let mut out = Vec::new();
     let mut by_def_keep: Vec<RefRecord> = Vec::new();
+    let mut paths_keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for rr in r.lookup_refs_exact(name).into_iter() {
-        if !by_def && out.len() >= limit { break; }
+        if !by_def && !paths_only && out.len() >= limit { break; }
         if let Some(l) = lang {
             if !rr.lang.as_str().eq_ignore_ascii_case(l) { continue; }
         }
@@ -9154,12 +9195,22 @@ fn serve_ref(
         }
         if by_def {
             by_def_keep.push(rr);
+        } else if paths_only {
+            if let Some(fe) = r.files.get(rr.file_id as usize) {
+                paths_keep.insert(fe.display_path(&r.roots));
+                if paths_keep.len() >= limit { break; }
+            }
         } else {
             out.push(ref_to_json(r, &rr));
         }
     }
     if by_def {
         return serve_ref_by_def_histogram(r, name, &by_def_keep, limit);
+    }
+    if paths_only {
+        let arr: Vec<serde_json::Value> = paths_keep.into_iter()
+            .map(serde_json::Value::String).collect();
+        return serde_json::Value::Array(arr);
     }
     serde_json::Value::Array(out)
 }

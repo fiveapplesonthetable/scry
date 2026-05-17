@@ -256,6 +256,33 @@ $ scry ref BatteryStats --format count
 Mutually exclusive with `--json`. Useful as a cheap probe
 before deciding whether to spend tokens on the full list.
 
+### `--format paths` (v0.1.56)
+
+Cheap "which files reference X?" shape: deduped sorted file
+paths only, no line/col/scope noise. Pipes straight into
+`xargs`, `vim`, or `git`.
+
+```sh
+$ scry callers bindService --format paths --limit 5
+/home/zim/dev/aosp/cts/.../ActivityManagerAppExitInfoTest.java
+/home/zim/dev/aosp/cts/.../BitmapTest.java
+/home/zim/dev/aosp/cts/.../CarOccupantConnectionManagerTest.java
+/home/zim/dev/aosp/cts/.../SignatureQueryServiceInstrumentationTest.java
+/home/zim/dev/aosp/cts/.../TunerTest.java
+
+5 unique files (from 1981 refs)
+
+# JSON shape: a single sorted array of strings
+$ scry callers bindService --format paths --json --limit 3
+["…/ActivityManagerAppExitInfoTest.java", "…/BitmapTest.java", "…/CarOccupantConnectionManagerTest.java"]
+```
+
+Dedup happens before `--limit`, so the cap counts unique files
+(not raw refs). Output is sorted ascending so diffs across runs
+stay stable. Works on `scry ref` and `scry callers`; same
+`args.format: "paths"` shape on the daemon and MCP `ref` /
+`callers` tools.
+
 ---
 
 ## Path-prefix completion: `scry prefix`

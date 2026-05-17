@@ -2675,3 +2675,125 @@ public class A {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.56 — `--format paths` for ref/callers (CLI + daemon). Cheap
+/// "which files reference X?" shape: deduped sorted file paths only.
+/// Pins:
+///   - CLI human format: one path per line on stdout, summary on stderr
+///   - CLI JSON format: a single sorted array of strings
+///   - Daemon parity: same JSON array shape via JSON-RPC
+#[test]
+fn format_paths_cli_and_daemon() {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-fmt-paths-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("a")).unwrap();
+    std::fs::create_dir_all(src.join("b")).unwrap();
+    // Two distinct files calling open() multiple times — exercises
+    // the dedup path. A third file with no call to open() must NOT
+    // appear in the paths output.
+    std::fs::write(src.join("a/A.java"), r#"package a;
+public class A {
+    public void open() {}
+    public void use1() { open(); }
+    public void use2() { open(); open(); }
+}
+"#).unwrap();
+    std::fs::write(src.join("b/B.java"), r#"package b;
+import a.A;
+public class B {
+    public void run() { new A().open(); }
+}
+"#).unwrap();
+    std::fs::write(src.join("b/Idle.java"), r#"package b;
+public class Idle {
+    public void nothing() {}
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // (1) CLI human format: stdout is the path list, one per line.
+    let out = Command::new(scry_bin())
+        .args(["callers", "open", "--index"]).arg(&idx)
+        .args(["--format", "paths", "--limit", "20"])
+        .output().expect("spawn callers paths");
+    assert!(out.status.success(),
+        "callers paths failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Both call-site files present, no duplicates, Idle.java absent.
+    let has_a = lines.iter().any(|l| l.ends_with("/a/A.java"));
+    let has_b = lines.iter().any(|l| l.ends_with("/b/B.java"));
+    let has_idle = lines.iter().any(|l| l.ends_with("/b/Idle.java"));
+    assert!(has_a, "expected A.java in path list: {lines:?}");
+    assert!(has_b, "expected B.java in path list: {lines:?}");
+    assert!(!has_idle, "Idle.java has no calls, should be absent: {lines:?}");
+    let total_seen = lines.iter().filter(|l| l.contains("/a/A.java") || l.contains("/b/B.java")).count();
+    assert_eq!(total_seen, 2, "expected 2 deduped entries, got {total_seen}: {lines:?}");
+    // Summary on stderr should mention unique files + raw refs.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unique file") && stderr.contains("refs"),
+        "summary line missing: stderr={stderr}");
+
+    // (2) CLI JSON format: single sorted array of strings.
+    let out = Command::new(scry_bin())
+        .args(["callers", "open", "--index"]).arg(&idx)
+        .args(["--format", "paths", "--limit", "20", "--json"])
+        .output().expect("spawn callers paths --json");
+    assert!(out.status.success(),
+        "callers paths --json failed: {}", String::from_utf8_lossy(&out.stderr));
+    let arr: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(arr.len(), 2,
+        "expected 2 deduped paths in JSON, got {}: {arr:?}", arr.len());
+    assert!(arr.iter().any(|p| p.ends_with("/a/A.java")));
+    assert!(arr.iter().any(|p| p.ends_with("/b/B.java")));
+    // Sorted ascending so consumers can binary-search / diff stably.
+    let mut sorted = arr.clone();
+    sorted.sort();
+    assert_eq!(arr, sorted, "paths must be sorted ascending: {arr:?}");
+
+    // (3) Daemon parity: same array shape via JSON-RPC.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"callers","args":{{"name":"open","format":"paths","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"ref","args":{{"name":"open","format":"paths","limit":20}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(),
+        "serve failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 responses, got {lines:?}");
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let arr1 = r1["result"].as_array().unwrap();
+    let arr2 = r2["result"].as_array().unwrap();
+    // callers paths: A.java + B.java (both have call sites).
+    let strs1: Vec<&str> = arr1.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(strs1.iter().any(|p| p.ends_with("/a/A.java")),
+        "daemon callers paths missing A.java: {strs1:?}");
+    assert!(strs1.iter().any(|p| p.ends_with("/b/B.java")),
+        "daemon callers paths missing B.java: {strs1:?}");
+    // ref (any kind) paths must AT LEAST include the call-site files,
+    // and may also include Idle.java if it has Java-keyword refs.
+    let strs2: Vec<&str> = arr2.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(strs2.iter().any(|p| p.ends_with("/a/A.java")),
+        "daemon ref paths missing A.java: {strs2:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

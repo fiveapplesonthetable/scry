@@ -528,6 +528,12 @@ enum Cmd {
         /// Walk the hierarchy this many levels deep. 0 = direct only.
         #[arg(long, default_value_t = 0)]
         depth: usize,
+        /// Compact output. `count` emits `N subclasses` only. `paths`
+        /// emits deduped sorted file paths of the children — useful
+        /// for "which files define a subtype of X?" agent queries.
+        /// Mutually exclusive with --json (`paths` supports --json).
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -546,6 +552,9 @@ enum Cmd {
         not_in: Option<String>,
         #[arg(long, default_value_t = 0)]
         depth: usize,
+        /// See `scry subclasses --format`.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -1307,10 +1316,10 @@ fn main() -> Result<()> {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, workers,
         ),
-        Cmd::Subclasses { name, index, in_, not_in, depth, limit, json } =>
-            cmd_subclasses(name, index, in_, not_in, depth, limit, json),
-        Cmd::Implementations { name, index, in_, not_in, depth, limit, json } =>
-            cmd_subclasses(name, index, in_, not_in, depth, limit, json),
+        Cmd::Subclasses { name, index, in_, not_in, depth, format, limit, json } =>
+            cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
+        Cmd::Implementations { name, index, in_, not_in, depth, format, limit, json } =>
+            cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -2991,9 +3000,18 @@ fn cmd_subclasses(
     in_: Option<String>,
     not_in: Option<String>,
     depth: usize,
+    format: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
+    if let Some(f) = format.as_deref() {
+        if !matches!(f, "count" | "paths") {
+            anyhow::bail!("--format must be 'count' or 'paths' (got '{f}')");
+        }
+    }
+    if json && format.as_deref() == Some("count") {
+        anyhow::bail!("--json and --format=count are mutually exclusive");
+    }
     let t = Instant::now();
     let r = open_index(index)?;
     let results = if depth == 0 {
@@ -3010,7 +3028,18 @@ fn cmd_subclasses(
         })
         .collect();
     rank_symbols(&mut filtered, &r);
-    print_results(&r, &filtered, limit, json);
+    // v0.1.58 — --format count / paths (symmetric with ref/callers/uses).
+    match format.as_deref() {
+        Some("count") => {
+            println!("{} subclasses", filtered.len());
+        }
+        Some("paths") => {
+            print_symbols_paths(&r, &filtered, limit, json);
+        }
+        _ => {
+            print_results(&r, &filtered, limit, json);
+        }
+    }
     // v0.1.54 — fuzzy "Did you mean" hint when no subclasses found.
     // Gated on no filter narrowing the search: with --in set, an empty
     // result means "no subclass in that subtree", not "name unknown".
@@ -3019,7 +3048,7 @@ fn cmd_subclasses(
             eprintln!("[scry] {hint}");
         }
     }
-    if !json {
+    if !json && format.is_none() {
         eprintln!(
             "[scry] cmd=subclasses q={:?} depth={} hits={} shown={} elapsed={}ms",
             name, depth, filtered.len(),
@@ -3602,6 +3631,35 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
         if total_groups == 1 { "" } else { "s" },
         shown_groups,
     );
+}
+
+/// Symbol-set analogue of `print_refs_paths`: deduped sorted file
+/// paths for a Vec<SymbolRecord> (used by `--format paths` on
+/// `subclasses` / `implementations`). Same JSON + human shape.
+fn print_symbols_paths(reader: &StoreReader, syms: &[SymbolRecord], limit: usize, json: bool) {
+    use std::collections::BTreeSet;
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for s in syms {
+        if let Some(fe) = reader.files.get(s.file_id as usize) {
+            paths.insert(fe.display_path(&reader.roots));
+            if paths.len() >= limit { break; }
+        }
+    }
+    if json {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let arr: Vec<&String> = paths.iter().collect();
+        let _ = writeln!(out, "{}", serde_json::to_string(&arr).unwrap());
+    } else {
+        for p in &paths {
+            println!("{p}");
+        }
+        eprintln!("\n{} unique file{} (from {} symbols)",
+            paths.len(),
+            if paths.len() == 1 { "" } else { "s" },
+            syms.len());
+    }
 }
 
 /// Unique sorted file paths only. Replaces the per-ref output for the
@@ -7936,6 +7994,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "limit": limit_prop,
                 "depth": {"type": "integer", "minimum": 0, "default": 0,
                     "description": "BFS depth. 0 = direct subclasses; 1 = grandchildren too; etc."},
+                "format": {"type": "string", "enum": ["count", "paths"],
+                    "description": "Optional. `count` returns `{count: N}`. `paths` returns a deduped sorted array of file paths — `which files define a subtype of X?`. Without `format`, returns per-symbol records."},
             })),
         ),
         tool(
@@ -7949,6 +8009,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "not_in": not_in_prop,
                 "limit": limit_prop,
                 "depth": {"type": "integer", "minimum": 0, "default": 0},
+                "format": {"type": "string", "enum": ["count", "paths"],
+                    "description": "See `subclasses.format`."},
             })),
         ),
         tool(
@@ -8826,7 +8888,8 @@ fn serve_one_request<W: std::io::Write>(
             let depth = args.get("depth")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(0);
-            serve_subclasses(reader, arg_str("name"), in_, not_in, depth, limit)
+            let format = args.get("format").and_then(serde_json::Value::as_str);
+            serve_subclasses(reader, arg_str("name"), in_, not_in, depth, format, limit)
         }
         "impact" => {
             let depth = args.get("subclass_depth")
@@ -9577,6 +9640,7 @@ fn serve_subclasses(
     in_: Option<&str>,
     not_in: Option<&str>,
     depth: usize,
+    format: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
     let results = if depth == 0 {
@@ -9584,11 +9648,32 @@ fn serve_subclasses(
     } else {
         r.subclasses_transitive(name, depth)
     };
+    let paths_only = format == Some("paths");
+    let count_only = format == Some("count");
     let mut out = Vec::new();
+    let mut paths_keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut count_total: usize = 0;
     for s in results.into_iter() {
-        if out.len() >= limit { break; }
+        if !paths_only && !count_only && out.len() >= limit { break; }
+        if paths_only && paths_keep.len() >= limit { break; }
         if !file_path_matches(r, s.file_id, in_, not_in) { continue; }
-        out.push(symbol_to_json(r, &s));
+        if paths_only {
+            if let Some(fe) = r.files.get(s.file_id as usize) {
+                paths_keep.insert(fe.display_path(&r.roots));
+            }
+        } else if count_only {
+            count_total += 1;
+        } else {
+            out.push(symbol_to_json(r, &s));
+        }
+    }
+    if paths_only {
+        let arr: Vec<serde_json::Value> = paths_keep.into_iter()
+            .map(serde_json::Value::String).collect();
+        return serde_json::Value::Array(arr);
+    }
+    if count_only {
+        return serde_json::json!({"count": count_total});
     }
     serde_json::Value::Array(out)
 }

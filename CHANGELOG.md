@@ -7,6 +7,43 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.58] — 2026-05-17
+
+`--format count` and `--format paths` on `scry subclasses` and
+`scry implementations`. Closes the `--format` rollout: every
+command that yields a stream now exposes the same compact-output
+trio (`count` / `paths` / per-record). Uniform surface for
+agents that need "how many" or "which files" before paying for
+per-record JSONL.
+
+```
+$ scry subclasses Activity --format count
+3210 subclasses
+
+$ scry subclasses Activity --format paths --limit 5
+.../FakeDefaultEnabledLauncherActivity.java
+.../GPUStressTestActivity.java
+.../NotesAppActivity.java
+.../DaggerActivity.java
+.../TestActivity.java
+
+5 unique files (from 3210 symbols)
+
+$ scry implementations Iterable --format paths --json --limit 3
+["…/IterableBase.java", "…/UberspectImplTestCase.java", "…/Zer.java"]
+```
+
+Daemon parity: `args.format: "paths"` returns `["...", ...]`;
+`args.format: "count"` returns `{count: N}`. MCP `subclasses`
+and `implementations` schemas pick up `format.enum`.
+
+Internal: new `print_symbols_paths` helper mirrors
+`print_refs_paths` for symbol-record outputs (used here, available
+for any future `--format paths` on symbol-yielding commands).
+
+E2E test: `subclasses_format_paths_and_count` — count exactness,
+path dedup + sort, `implementations` alias, daemon parity.
+
 ## [0.1.57] — 2026-05-17
 
 `--format paths` and `--format count` on `scry uses` — symmetric

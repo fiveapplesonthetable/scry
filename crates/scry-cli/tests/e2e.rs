@@ -2919,3 +2919,105 @@ public class Other { public void work() {} }
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.58 — `--format count` and `--format paths` on `scry subclasses`
+/// (and `scry implementations`, the LSP-shape alias). Symmetric with
+/// the ref/callers/uses shape from v0.1.56/v0.1.57.
+#[test]
+fn subclasses_format_paths_and_count() {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-sub-fmt-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+    // Parent in one file, two subclasses spread across two files.
+    std::fs::write(src.join("Animal.java"), r#"package zoo;
+public class Animal {}
+"#).unwrap();
+    std::fs::write(src.join("Dog.java"), r#"package zoo;
+public class Dog extends Animal {}
+"#).unwrap();
+    std::fs::write(src.join("Cat.java"), r#"package zoo;
+public class Cat extends Animal {}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // (1) CLI --format count: one "N subclasses" line.
+    let out = Command::new(scry_bin())
+        .args(["subclasses", "Animal", "--index"]).arg(&idx)
+        .args(["--format", "count"])
+        .output().expect("spawn subclasses count");
+    assert!(out.status.success(),
+        "subclasses count failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first = stdout.lines().next().unwrap_or("");
+    assert!(first.ends_with(" subclasses"),
+        "expected '<N> subclasses' stdout; got: {stdout:?}");
+    let n: usize = first.split_whitespace().next().unwrap().parse().unwrap();
+    assert_eq!(n, 2, "expected exactly 2 direct subclasses of Animal; got {n}");
+
+    // (2) CLI --format paths: deduped sorted file paths.
+    let out = Command::new(scry_bin())
+        .args(["subclasses", "Animal", "--index"]).arg(&idx)
+        .args(["--format", "paths", "--limit", "10"])
+        .output().expect("spawn subclasses paths");
+    assert!(out.status.success(),
+        "subclasses paths failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with('/')).collect();
+    assert_eq!(path_lines.len(), 2,
+        "expected 2 unique subclass files; got {path_lines:?}");
+    assert!(path_lines.iter().any(|p| p.ends_with("/Dog.java")),
+        "Dog.java missing: {path_lines:?}");
+    assert!(path_lines.iter().any(|p| p.ends_with("/Cat.java")),
+        "Cat.java missing: {path_lines:?}");
+    let mut sorted = path_lines.clone(); sorted.sort();
+    assert_eq!(path_lines, sorted, "paths must be sorted ascending: {path_lines:?}");
+
+    // (3) `implementations` alias must accept the same flags.
+    let out = Command::new(scry_bin())
+        .args(["implementations", "Animal", "--index"]).arg(&idx)
+        .args(["--format", "count"])
+        .output().expect("spawn implementations count");
+    assert!(out.status.success(),
+        "implementations count failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.lines().next().unwrap_or("").ends_with(" subclasses"),
+        "implementations should share the subclasses count shape; got {stdout:?}");
+
+    // (4) Daemon parity: serve_subclasses with format=paths / count.
+    let mut child = Command::new(scry_bin())
+        .args(["serve", "--index"]).arg(&idx)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("spawn serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"subclasses","args":{{"name":"Animal","format":"paths","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"subclasses","args":{{"name":"Animal","format":"count","limit":20}}}}"#).unwrap();
+    }
+    let out = child.wait_with_output().expect("serve wait");
+    assert!(out.status.success(),
+        "serve failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 responses, got {lines:?}");
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let arr1 = r1["result"].as_array().expect("daemon subclasses paths must be an array");
+    assert_eq!(arr1.len(), 2, "expected 2 daemon path entries; got {arr1:?}");
+    let count_obj = &r2["result"];
+    assert_eq!(count_obj["count"].as_u64(), Some(2),
+        "daemon subclasses count must be 2; got {count_obj:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

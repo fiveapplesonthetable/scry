@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bridge_subcmds;
 mod build_adapter;
 mod clangd;
 mod finalize;
@@ -919,6 +920,55 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// `scry build-java-scip` — Soong-native Java SCIP pipeline.
+    ///
+    /// Walks AOSP's Soong intermediates, replays each javac invocation
+    /// with the SemanticDB compiler plugin attached, merges the
+    /// per-source `.semanticdb` files into one SCIP index via
+    /// `scip-java index-semanticdb`, and imports the merged SCIP
+    /// into the scry sidecar at `<index>/scip_index.bin`.
+    ///
+    /// This is the bridge that makes strict-precise queries work on
+    /// AOSP Java/Kotlin code without depending on Gradle / Maven —
+    /// neither of which Soong uses.
+    BuildJavaScip {
+        /// AOSP source root (the parent of `out/soong/`).
+        #[arg(long, value_name = "PATH")]
+        source_root: PathBuf,
+        /// Soong build dir. Defaults to `<source_root>/out/soong`.
+        #[arg(long, value_name = "PATH")]
+        soong_build_dir: Option<PathBuf>,
+        /// Existing scry index dir; sidecar lands at <index>/scip_index.bin.
+        #[arg(long, value_name = "DIR")]
+        index: Option<PathBuf>,
+        /// Override the javac binary. AOSP ships its own at
+        /// `prebuilts/jdk/jdk21/linux-x86/bin/javac` — pass that
+        /// for byte-exact reproducibility with the build.
+        #[arg(long, value_name = "PATH")]
+        javac: Option<PathBuf>,
+        /// Override the `scip-java` binary used in the merge step.
+        #[arg(long, value_name = "PATH")]
+        scip_java: Option<PathBuf>,
+        /// Override the path to the semanticdb-javac plugin jar.
+        /// Auto-discovered under `~/.m2/repository/com/sourcegraph/`
+        /// when not set.
+        #[arg(long, value_name = "PATH")]
+        semanticdb_javac_jar: Option<PathBuf>,
+        /// Where the per-compilation .semanticdb shards land.
+        /// Defaults to `$TMPDIR/scry-semanticdb`.
+        #[arg(long, value_name = "PATH")]
+        targetroot: Option<PathBuf>,
+        /// Filter compilations by substring of the module name.
+        /// Useful for incremental testing — e.g.
+        /// `--only-module libcore` runs just the libcore modules.
+        #[arg(long, value_name = "SUBSTR")]
+        only_module: Option<String>,
+        /// Cap the number of compilations processed. Combine with
+        /// `--only-module` to test the pipeline on a small slice
+        /// before running the full AOSP set.
+        #[arg(long, value_name = "N")]
+        max_compilations: Option<usize>,
+    },
     /// Import a SCIP index (https://github.com/sourcegraph/scip)
     /// produced by scip-java / scip-kotlin / gopls / rust-analyzer /
     /// scip-typescript / etc., into the scry sidecar
@@ -1326,6 +1376,12 @@ fn main() -> Result<()> {
             precision_subcmds::cmd_clang_index(compile_commands, index, root, workers, max_file_bytes),
         Cmd::ClangStats { index } => precision_subcmds::cmd_clang_stats(index),
         Cmd::ClangLookup { index, path, offset } => precision_subcmds::cmd_clang_lookup(index, &path, offset),
+        Cmd::BuildJavaScip { source_root, soong_build_dir, index, javac, scip_java,
+                             semanticdb_javac_jar, targetroot, only_module,
+                             max_compilations } => bridge_subcmds::cmd_build_java_scip(
+            source_root, soong_build_dir, index, javac, scip_java,
+            semanticdb_javac_jar, targetroot, only_module, max_compilations,
+        ),
         Cmd::ScipImport { scip, index, root } => precision_subcmds::cmd_scip_import(scip, index, root),
         Cmd::ScipStats { index } => precision_subcmds::cmd_scip_stats(index),
         Cmd::ScipLookup { index, path, offset } => precision_subcmds::cmd_scip_lookup(index, &path, offset),

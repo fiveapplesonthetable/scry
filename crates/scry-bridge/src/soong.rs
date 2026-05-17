@@ -129,11 +129,11 @@ impl JavacRule {
             anyhow::bail!("rsp file {} contained no sources", rsp_path.display());
         }
 
-        let classpath = split_classpath(
+        let classpath = tokenize_javac_arg_line(
             self.bindings.get("classpath").map(String::as_str).unwrap_or(""),
             source_root,
         );
-        let bootclasspath = split_classpath(
+        let bootclasspath = tokenize_javac_arg_line(
             self.bindings.get("bootClasspath").map(String::as_str).unwrap_or(""),
             source_root,
         );
@@ -156,6 +156,7 @@ impl JavacRule {
             classpath,
             bootclasspath,
             defines: Vec::new(),
+            java_version: self.bindings.get("javaVersion").cloned(),
             extra_args: self.bindings.get("javacFlags")
                 .map(|s| s.split_whitespace().map(str::to_string).collect())
                 .unwrap_or_default(),
@@ -274,25 +275,60 @@ fn parse_binding(line: &str) -> Option<(&str, &str)> {
     Some((key, value))
 }
 
-/// Split a `-classpath J1:J2:…` binding into per-jar absolute paths.
-/// Returns an empty Vec when the binding is missing or empty. Empty
-/// segments (consecutive `::`) are skipped silently — they're a
-/// Soong artefact, not a real classpath entry.
-fn split_classpath(binding: &str, source_root: &Path) -> Vec<PathBuf> {
+/// Tokenize a Soong classpath / bootClasspath binding into a stream
+/// of javac-ready arguments, rewriting any embedded relative paths
+/// into absolute paths under `source_root`.
+///
+/// Examples (input → output tokens):
+///   - `-classpath a.jar:b.jar`           → `["-classpath", "<root>/a.jar:<root>/b.jar"]`
+///   - `--system=foo/system`              → `["--system=<root>/foo/system"]`
+///   - `-bootclasspath boot.jar`          → `["-bootclasspath", "<root>/boot.jar"]`
+///   - ``                                  → `[]`
+///
+/// We keep the original argument shape (one token per arg, two
+/// tokens for flag+value pairs) because javac is strict about
+/// `--release` / `--system=` / `-bootclasspath` mutual exclusion;
+/// merging them all into one bag would lose enough structure that
+/// we'd have to re-detect the form anyway.
+fn tokenize_javac_arg_line(binding: &str, source_root: &Path) -> Vec<String> {
     let trimmed = binding.trim();
-    // The binding usually starts with `-classpath ` or
-    // `--system none -classpath ` etc. Find the last `-classpath`
-    // token and take the next whitespace-delimited word as the
-    // colon-separated jar list.
-    let after_flag = match trimmed.find("-classpath ") {
-        Some(i) => trimmed[i + "-classpath ".len()..].trim_start(),
-        None => trimmed, // Be lenient — some bindings are bare.
-    };
-    let list = after_flag.split_whitespace().next().unwrap_or("");
+    if trimmed.is_empty() { return Vec::new(); }
+    let mut out: Vec<String> = Vec::new();
+    let mut tokens = trimmed.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        if tok == "-classpath" || tok == "-cp" || tok == "-bootclasspath" {
+            // Flag + colon-separated path-list value.
+            out.push(tok.to_string());
+            if let Some(value) = tokens.next() {
+                out.push(rewrite_path_list_to_absolute(value, source_root));
+            }
+        } else if let Some(eq) = tok.find('=') {
+            // `--system=PATH` or `--module-path=...` etc. Rewrite the
+            // value portion to absolute when it looks like a path.
+            let (k, v) = (&tok[..eq], &tok[eq + 1..]);
+            out.push(format!("{k}={}", rewrite_path_list_to_absolute(v, source_root)));
+        } else {
+            // Bare token (e.g. `--enable-preview` or a bare path value
+            // we already consumed via the previous flag branch — but
+            // be defensive).
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Rewrite each colon-separated entry in `list` to an absolute path
+/// under `source_root` when it's relative. Absolute paths and tokens
+/// without colons are returned unchanged.
+fn rewrite_path_list_to_absolute(list: &str, source_root: &Path) -> String {
     list.split(':')
-        .filter(|s| !s.is_empty())
-        .map(|s| source_root.join(s))
-        .collect()
+        .map(|s| if s.is_empty() || Path::new(s).is_absolute() {
+            s.to_string()
+        } else {
+            source_root.join(s).display().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Derive a stable module name from the javac rule's output path.
@@ -347,15 +383,35 @@ mod tests {
     }
 
     #[test]
-    fn split_classpath_extracts_jars() {
-        let cp = split_classpath("-classpath a.jar:b.jar:c.jar", Path::new("/root"));
-        assert_eq!(cp.len(), 3);
-        assert_eq!(cp[0], PathBuf::from("/root/a.jar"));
+    fn tokenize_classpath_flag_plus_jars() {
+        let cp = tokenize_javac_arg_line(
+            "-classpath a.jar:b.jar:c.jar", Path::new("/root"));
+        assert_eq!(cp, vec![
+            "-classpath".to_string(),
+            "/root/a.jar:/root/b.jar:/root/c.jar".to_string(),
+        ]);
     }
 
     #[test]
-    fn split_classpath_handles_empty_binding() {
-        assert!(split_classpath("", Path::new("/root")).is_empty());
+    fn tokenize_classpath_handles_empty_binding() {
+        assert!(tokenize_javac_arg_line("", Path::new("/root")).is_empty());
+    }
+
+    #[test]
+    fn tokenize_system_form_keeps_flag_intact() {
+        // AOSP libcore/art uses `--system=PATH` instead of `-bootclasspath JARS`.
+        let bcp = tokenize_javac_arg_line(
+            "--system=foo/bar/system-modules", Path::new("/aosp"));
+        assert_eq!(bcp, vec![
+            "--system=/aosp/foo/bar/system-modules".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn tokenize_preserves_absolute_paths() {
+        let cp = tokenize_javac_arg_line(
+            "-classpath /abs/a.jar:b.jar", Path::new("/root"));
+        assert_eq!(cp[1], "/abs/a.jar:/root/b.jar");
     }
 
     #[test]

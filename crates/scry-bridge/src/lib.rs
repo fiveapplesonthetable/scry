@@ -30,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod java_indexer;
 pub mod soong;
 
 /// Source language of a compilation unit. Determines which
@@ -71,14 +72,29 @@ pub struct Compilation {
     /// Order matters for Java / Kotlin (annotation processors observe
     /// compilation order); we preserve the build system's order.
     pub sources: Vec<String>,
-    /// Compile-time classpath / include-path. For Java this is jars;
-    /// for C/C++ it's `-I` directories pre-flattened to absolute paths.
-    pub classpath: Vec<std::path::PathBuf>,
-    /// Bootclasspath (Java/Kotlin only); empty for other languages.
-    pub bootclasspath: Vec<std::path::PathBuf>,
+    /// Compile-time classpath as javac-ready tokens, e.g.
+    /// `["-classpath", "/abs/a.jar:/abs/b.jar"]`. Stored as a token
+    /// stream — not a typed jar list — because Soong sometimes
+    /// emits flag forms we shouldn't second-guess (e.g.
+    /// `--module-path=...` for module-aware compilations).
+    /// Resolved to absolute paths so the indexer doesn't depend on
+    /// its own cwd.
+    pub classpath: Vec<String>,
+    /// Bootclasspath / system-modules tokens (Java/Kotlin only).
+    /// Same format as `classpath` — most modules use
+    /// `["-bootclasspath", "/abs/boot.jar"]` but AOSP libcore/art
+    /// modules use `["--system=/abs/system-modules-dir"]` which is
+    /// mutually exclusive with `--release`. We round-trip whatever
+    /// the build system specified.
+    pub bootclasspath: Vec<String>,
     /// Predefined macros / `-D` flags (C-family) or javac `-A`
     /// processor args (Java). Pre-split into `(key, value)`.
     pub defines: Vec<(String, Option<String>)>,
+    /// Source-level version the build system requested for this
+    /// compilation, e.g. `"21"`. The indexer maps this to javac's
+    /// `--release=N` when no `--system=` / `-bootclasspath` is
+    /// present. None ⇒ indexer falls back to its config default.
+    pub java_version: Option<String>,
     /// Raw extra args the build system passed to the compiler that
     /// don't fit the structured slots above. We round-trip them
     /// verbatim so the indexer sees the same view the build did.

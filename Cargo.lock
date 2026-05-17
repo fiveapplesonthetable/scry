@@ -580,6 +580,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "scry-bridge"
+version = "0.1.64"
+dependencies = [
+ "anyhow",
+ "ignore",
+ "memchr",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "scry-clang"
 version = "0.1.64"
 dependencies = [
@@ -611,6 +623,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "scry-aosp",
+ "scry-bridge",
  "scry-clang",
  "scry-lang",
  "scry-scip",

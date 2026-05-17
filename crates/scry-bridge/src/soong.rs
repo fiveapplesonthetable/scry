@@ -162,10 +162,20 @@ impl BuildSystem for Soong {
 /// [`JavacRule`] and [`KotlincRule`] so [`select_built_variant`]
 /// can dedup either kind by "the variant whose rsps exist".
 trait JvmRule {
-    /// Logical module name (variant stripped). Two rules with the
-    /// same `module_key()` represent the same logical module
-    /// compiled for different variants.
+    /// Logical module name with the variant directory stripped. Two
+    /// rules with the same `module_key()` represent the same logical
+    /// module compiled for different variants (e.g. `android_common`
+    /// vs `linux_glibc_common`).
     fn module_key(&self) -> String;
+    /// Path through the variant directory, i.e. the module key plus
+    /// the variant component (e.g.
+    /// `frameworks/base/framework-minus-apex/android_common`). Two
+    /// rules with the same `variant_key()` belong to the same variant
+    /// of the same module — common case is **shards** of one javac
+    /// compilation (output `framework.jar0`, `framework.jar1`, …),
+    /// which must all be kept; deduplication happens between
+    /// variant_keys, never within one.
+    fn variant_key(&self) -> String;
     /// Output jar path (`out/soong/.intermediates/<…>.jar`).
     fn output(&self) -> &str;
     /// Absolute paths to the sibling `.rsp` files this rule needs
@@ -176,6 +186,7 @@ trait JvmRule {
 
 impl JvmRule for JavacRule {
     fn module_key(&self) -> String { module_name_from_output(&self.output) }
+    fn variant_key(&self) -> String { variant_dir_from_output(&self.output, "/javac/") }
     fn output(&self) -> &str { &self.output }
     fn required_rsps(&self, source_root: &Path) -> Vec<PathBuf> {
         vec![source_root.join(format!("{}.rsp", self.output))]
@@ -184,6 +195,7 @@ impl JvmRule for JavacRule {
 
 impl JvmRule for KotlincRule {
     fn module_key(&self) -> String { module_name_from_kotlin_output(&self.output) }
+    fn variant_key(&self) -> String { variant_dir_from_output(&self.output, "/kotlin/") }
     fn output(&self) -> &str { &self.output }
     fn required_rsps(&self, source_root: &Path) -> Vec<PathBuf> {
         let mut paths = vec![source_root.join(format!("{}.rsp", self.output))];
@@ -194,43 +206,79 @@ impl JvmRule for KotlincRule {
     }
 }
 
-/// Among multi-variant duplicates of the same module, keep ONE rule
-/// — the one whose required `.rsp` files all exist on disk. Modules
-/// with no built variant get a single representative kept (so the
-/// downstream skip-with-clear-log path still fires); modules with
-/// exactly one variant pass through unchanged.
+/// Pick ONE variant per module — the one whose required `.rsp` files
+/// all exist on disk — and KEEP every rule of that variant. The
+/// "all rules" part matters: framework-minus-apex (and friends) split
+/// their javac into N shards under the same variant_dir (output
+/// `framework.jar0`, `framework.jar1`, …, `framework.jar59`) and the
+/// bridge needs every shard to recover full module coverage.
+///
+/// Modules with no built variant get a single representative variant
+/// kept (so the downstream skip-with-clear-log path still fires) —
+/// the representative's rules are passed through wholesale.
 fn select_built_variant<R: JvmRule>(rules: Vec<R>, source_root: &Path, _marker: &str)
     -> Vec<R>
 {
     use std::collections::HashMap;
-    let mut groups: HashMap<String, Vec<R>> = HashMap::new();
+    // First-level grouping: module_key (variant stripped). Each entry
+    // is potentially many variants of the same module.
+    let mut by_module: HashMap<String, Vec<R>> = HashMap::new();
     for rule in rules {
-        groups.entry(rule.module_key()).or_default().push(rule);
+        by_module.entry(rule.module_key()).or_default().push(rule);
     }
-    let mut out: Vec<R> = Vec::with_capacity(groups.len());
-    for (_module, variants) in groups {
-        if variants.len() == 1 {
-            out.extend(variants);
+    let mut out: Vec<R> = Vec::with_capacity(by_module.len());
+    for (_module, module_rules) in by_module {
+        // Second-level grouping: variant_key (full variant directory).
+        // Shards of the same variant share this key — they stay
+        // together as a single group and all flow through to `out`
+        // once the variant is picked.
+        let mut by_variant: HashMap<String, Vec<R>> = HashMap::new();
+        for rule in module_rules {
+            by_variant.entry(rule.variant_key()).or_default().push(rule);
+        }
+        if by_variant.len() == 1 {
+            // Single variant — keep all shards.
+            for (_, shards) in by_variant { out.extend(shards); }
             continue;
         }
-        // Pick the first variant whose required rsps all exist.
-        let mut picked: Option<R> = None;
-        let mut last_resort: Option<R> = None;
-        for r in variants {
-            let all_exist = r.required_rsps(source_root).iter().all(|p| p.is_file());
+        // Multiple variants — pick the one whose rules' rsps all
+        // exist (scored on the first rule of the variant; sharded
+        // rules within one variant either all have `.rsp` files or
+        // none do, since Soong emits the whole shard set together).
+        let mut picked: Option<Vec<R>> = None;
+        let mut last_resort: Option<Vec<R>> = None;
+        for (_, shards) in by_variant {
+            let representative = shards.first();
+            let all_exist = representative
+                .map(|r| r.required_rsps(source_root).iter().all(|p| p.is_file()))
+                .unwrap_or(false);
             if all_exist && picked.is_none() {
-                picked = Some(r);
+                picked = Some(shards);
             } else if last_resort.is_none() {
-                last_resort = Some(r);
+                last_resort = Some(shards);
             }
         }
-        if let Some(r) = picked.or(last_resort) {
-            out.push(r);
+        if let Some(shards) = picked.or(last_resort) {
+            out.extend(shards);
         }
     }
     // Re-sort by output for stable downstream processing.
     out.sort_by(|a, b| a.output().cmp(b.output()));
     out
+}
+
+/// Drop the `/javac/<file>` (or `/kotlin/<file>`) suffix of a Soong
+/// output to recover the variant directory. Used to group sharded
+/// rules — they share this prefix but differ only in the trailing
+/// filename (`framework.jar0` vs `framework.jar1`).
+fn variant_dir_from_output(output: &str, marker: &str) -> String {
+    let stripped = output
+        .strip_prefix("out/soong/.intermediates/")
+        .unwrap_or(output);
+    if let Some(idx) = stripped.rfind(marker) {
+        return stripped[..idx].to_string();
+    }
+    stripped.to_string()
 }
 
 /// A javac rule extracted from a single ninja shard. Intermediate
@@ -1152,6 +1200,102 @@ g.java.javac in.java
         assert!(shard.javac_rules[0].output.ends_with("/javac/core-libart.jar"));
         assert!(shard.kotlin_rules.is_empty());
         std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    #[test]
+    fn variant_dir_strips_javac_kotlin_suffix() {
+        assert_eq!(
+            variant_dir_from_output(
+                "out/soong/.intermediates/frameworks/base/framework-minus-apex/\
+                 android_common/javac/framework.jar0",
+                "/javac/",
+            ),
+            "frameworks/base/framework-minus-apex/android_common",
+        );
+        assert_eq!(
+            variant_dir_from_output(
+                "out/soong/.intermediates/frameworks/base/framework-minus-apex/\
+                 android_common/javac/framework.jar59",
+                "/javac/",
+            ),
+            "frameworks/base/framework-minus-apex/android_common",
+        );
+        assert_eq!(
+            variant_dir_from_output(
+                "out/soong/.intermediates/x/y/android_common/kotlin/y.jar",
+                "/kotlin/",
+            ),
+            "x/y/android_common",
+        );
+    }
+
+    #[test]
+    fn select_built_variant_keeps_all_shards_of_single_variant() {
+        // 3 shards of the SAME (module, variant) — must all survive.
+        let mk = |n: u32| -> JavacRule {
+            JavacRule {
+                output: format!(
+                    "out/soong/.intermediates/frameworks/base/framework-minus-apex/\
+                     android_common/javac/framework.jar{n}",
+                ),
+                bindings: HashMap::new(),
+            }
+        };
+        // Pre-create the .rsp siblings so `select_built_variant` considers
+        // the variant "built".
+        let tmp = crate::scry_tmp_dir().join(format!(
+            "scry-soong-shards-{}", std::process::id(),
+        ));
+        let intermediates = tmp.join(
+            "out/soong/.intermediates/frameworks/base/framework-minus-apex/\
+             android_common/javac");
+        std::fs::create_dir_all(&intermediates).unwrap();
+        for i in [0u32, 1, 2] {
+            std::fs::write(intermediates.join(format!("framework.jar{i}.rsp")), "").unwrap();
+        }
+        let rules: Vec<JavacRule> = (0..3).map(mk).collect();
+        let kept = select_built_variant(rules, &tmp, "/javac/");
+        assert_eq!(kept.len(), 3, "all shards must be kept: got {kept:?}");
+        let outs: Vec<&str> = kept.iter().map(|r| r.output.as_str()).collect();
+        assert!(outs.iter().any(|o| o.ends_with("framework.jar0")));
+        assert!(outs.iter().any(|o| o.ends_with("framework.jar1")));
+        assert!(outs.iter().any(|o| o.ends_with("framework.jar2")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn select_built_variant_dedups_variants_keeps_shards() {
+        // Two variants of the same module:
+        //   android_common (built — .rsp files exist): 3 shards
+        //   linux_glibc_common (NOT built): 1 rule
+        // Expect: keep the 3 android_common shards, drop linux_glibc_common.
+        let tmp = crate::scry_tmp_dir().join(format!(
+            "scry-soong-variant-dedup-{}", std::process::id(),
+        ));
+        let android_dir = tmp.join(
+            "out/soong/.intermediates/x/mymod/android_common/javac");
+        std::fs::create_dir_all(&android_dir).unwrap();
+        for i in [0u32, 1, 2] {
+            std::fs::write(android_dir.join(format!("mymod.jar{i}.rsp")), "").unwrap();
+        }
+        // NOTE: linux_glibc_common dir intentionally NOT created — its
+        // rsp will be missing.
+        let mut rules: Vec<JavacRule> = (0..3).map(|n| JavacRule {
+            output: format!(
+                "out/soong/.intermediates/x/mymod/android_common/javac/mymod.jar{n}",
+            ),
+            bindings: HashMap::new(),
+        }).collect();
+        rules.push(JavacRule {
+            output: "out/soong/.intermediates/x/mymod/linux_glibc_common/javac/mymod.jar"
+                .to_string(),
+            bindings: HashMap::new(),
+        });
+        let kept = select_built_variant(rules, &tmp, "/javac/");
+        assert_eq!(kept.len(), 3, "android_common's 3 shards: got {kept:?}");
+        assert!(kept.iter().all(|r| r.output.contains("/android_common/")),
+                "should drop linux_glibc_common variant: {kept:?}");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

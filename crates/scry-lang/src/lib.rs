@@ -1637,17 +1637,6 @@ fn kotlin_refs_spec() -> &'static RefSpec {
                 r#"
                 (call_expression (identifier) @ref.call)
                 (navigation_expression (identifier) @ref.field)
-                ; v0.1.61 — Kotlin static-receiver capture. Same shape as
-                ; the Java pattern in v0.1.60: a navigation_expression
-                ; whose receiver-child is a bare identifier could be a
-                ; class (Foo.bar — static-method / companion-object call),
-                ; a local var, or a field. PascalCase filter downstream
-                ; restricts to class-named receivers (~99% accurate by
-                ; Kotlin convention). Note this overlaps with @ref.field
-                ; above — by design, so the FieldAccess label is
-                ; preserved for backward compatibility and the new
-                ; TypeUse label adds the class-receiver shape on top.
-                (navigation_expression (identifier) @ref.static_recv)
                 (import (qualified_identifier) @ref.import)
                 (user_type (identifier) @ref.type)
                 "#,
@@ -1659,7 +1648,6 @@ fn kotlin_refs_spec() -> &'static RefSpec {
             capture_kinds: &[
                 ("ref.call", RefKind::Call),
                 ("ref.field", RefKind::FieldAccess),
-                ("ref.static_recv", RefKind::TypeUse),
                 ("ref.import", RefKind::Import),
                 ("ref.type", RefKind::TypeUse),
             ],

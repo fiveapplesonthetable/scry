@@ -3110,3 +3110,67 @@ public class Caller {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// v0.1.61 — Kotlin static-receiver capture, symmetric with the
+/// Java path in v0.1.60. `Foo.bar` navigation_expression with a
+/// class-named receiver emits an extra TypeUse ref to `Foo`
+/// (alongside the existing FieldAccess ref kept for backward
+/// compatibility). Same PascalCase filter: `myFoo.bar` does NOT
+/// emit a `myFoo` TypeUse.
+#[test]
+fn kotlin_static_receiver_capture() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-kt-static-recv-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("Caller.kt"), r#"package p
+class Caller {
+    fun doStuff() {
+        Foo.staticBar()
+        val myFoo = Foo()
+        myFoo.instanceBar()
+    }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn index");
+    assert!(out.status.success(),
+        "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Positive: `scry ref Foo` should include a TypeUse hit from
+    // Caller.kt (the static-receiver in Foo.staticBar()).
+    let out = Command::new(scry_bin())
+        .args(["ref", "Foo", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "50"])
+        .output().expect("spawn ref Foo");
+    assert!(out.status.success(),
+        "ref Foo failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let refs: Vec<serde_json::Value> = stdout.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap()).collect();
+    let foo_typeuse_hits: Vec<&serde_json::Value> = refs.iter()
+        .filter(|r| r["path"].as_str().is_some_and(|p| p.ends_with("/Caller.kt"))
+                    && r["name"].as_str() == Some("Foo")
+                    && r["ref_kind"].as_str() == Some("type"))
+        .collect();
+    assert!(!foo_typeuse_hits.is_empty(),
+        "expected at least one TypeUse ref to Foo from Caller.kt; got refs={refs:?}");
+
+    // Negative: lowercase `myFoo` must NOT have a TypeUse ref.
+    let out = Command::new(scry_bin())
+        .args(["ref", "myFoo", "--index"]).arg(&idx)
+        .args(["--json", "--limit", "50", "--kind", "type"])
+        .output().expect("spawn ref myFoo type");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let n_typeuse = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(n_typeuse, 0,
+        "expected 0 TypeUse refs to lowercase `myFoo`; got {n_typeuse}: {stdout:?}");
+
+    std::fs::remove_dir_all(&base).ok();
+}

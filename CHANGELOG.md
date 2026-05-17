@@ -7,6 +7,29 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.61] — 2026-05-17
+
+**Kytge-gap arc, slice 2/3.** Kotlin static-receiver capture,
+symmetric with v0.1.60's Java pattern. `Foo.bar`
+navigation_expression with a class-named receiver now emits a
+TypeUse ref to `Foo` alongside the existing FieldAccess ref
+(latter preserved for backward compatibility).
+
+Same PascalCase filter rejects local-var receivers
+(`myFoo.bar` → no `myFoo` TypeUse). With v0.1.60, the Kythe-gap
+arc has covered Java + Kotlin — the two highest-volume languages
+in the AOSP corpus, and the two where polymorphism most hurts
+the heuristic resolver.
+
+E2E test: `kotlin_static_receiver_capture` — positive
+(Foo.staticBar emits TypeUse ref to Foo), negative
+(myFoo.instanceBar does NOT emit myFoo TypeUse).
+
+Next: v0.1.62 — resolver narrowing that pairs the TypeUse ref
+with the immediately-following Call ref to pin the method
+dispatch. This is the slice that should actually move the
+49.6% resolved% number.
+
 ## [0.1.60] — 2026-05-17
 
 **First slice of the Kythe-gap arc.** Java static-receiver capture:

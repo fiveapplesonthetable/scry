@@ -136,8 +136,8 @@ hardware caveat at the bottom).
 - Combined: 1,009,166 files / 70.4 GB. The exact files-total comes
   from `scry stats` and is reproducible deterministically — the
   walker sorts by relpath before assigning file_id, so two runs
-  against the same checkout produce byte-identical files.bin /
-  symbols.bin.
+  against the same checkout produce byte-identical
+  files_packed.bin / symbols.bin.
 
 ### Build
 

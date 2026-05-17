@@ -536,7 +536,7 @@ A scry index is a directory of files. The required core files
 <index>/
   manifest.json         # version + roots + lang breakdown
   roots.bin             # list of indexed root paths
-  files.bin             # per-file metadata (path, kind, lang, digest)
+  files_packed.bin      # mmap'd packed file table (root_id, kind, size, relpath)
   symbols.bin           # per-symbol records (the def table)
   refs.bin              # per-ref records (the use table)
   names.fst             # FST: name → posting list in name_postings.bin

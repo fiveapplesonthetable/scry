@@ -27,7 +27,7 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
     let required_files: &[(&str, PathBuf)] = &[
         ("manifest.json", paths.manifest()),
         ("roots.bin",     paths.roots()),
-        ("files.bin",     paths.files()),
+        ("files_packed.bin", paths.files_packed()),
         ("symbols.bin",   paths.symbols()),
         ("refs.bin",      paths.refs()),
         ("names.fst",     paths.names_fst()),
@@ -95,7 +95,7 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
                 reader_ok = true;
                 reader_status = format!(
                     "open OK ({} files, {} symbols, {} refs)",
-                    r.files.len(), r.n_symbols(), r.n_refs(),
+                    r.file_count(), r.n_symbols(), r.n_refs(),
                 );
             } else {
                 reader_status = format!(

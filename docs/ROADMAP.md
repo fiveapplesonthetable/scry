@@ -222,12 +222,12 @@ Three pieces:
 1. **Per-file content digest in the file table.** Today each
    `FileEntry` carries `(id, root_id, relpath, kind, size)`. Add a
    `content_digest: [u8; 32]` (blake3 of file bytes). Bumps
-   `files.bin` by ~32 MB on the full corpus — negligible.
+   `files_packed.bin` by ~32 MB on the full corpus — negligible.
 
 2. **Incremental walker that diffs digest sets.** New subcommand
    `scry index --incremental`. The walker rebuilds the candidate
    file list, computes digests in parallel, compares against the
-   previous index's `files.bin`. Three sets:
+   previous index's `files_packed.bin`. Three sets:
    - **added**: in new walk, not in old. Parse + emit.
    - **removed**: in old, not in new. Tombstone.
    - **changed**: in both but digest differs. Tombstone old, parse new.
@@ -254,7 +254,7 @@ None. blake3 is already in.
 - Tombstones don't leak into query results (filter is enforced in
   every `serve_*` and CLI path).
 - A reindex from scratch produces a byte-identical
-  `files.bin` / `symbols.bin` pair compared to running an
+  `files_packed.bin` / `symbols.bin` pair compared to running an
   incremental that touched every file (modulo the tombstone
   bitmap).
 - `scry compact` reclaims tombstoned records and resets the
@@ -273,7 +273,7 @@ None. blake3 is already in.
 ### What could go wrong
 
 - **Concurrent reader sees a partial state.** Atomic rename of
-  `files.bin` + the rest is the standard answer. We already do
+  `files_packed.bin` + the rest is the standard answer. We already do
   this in finalize; extend to the incremental commit too.
 - **Tombstone bitmap drift.** If a tombstone is set but the
   compaction never runs, query results drop a record forever.

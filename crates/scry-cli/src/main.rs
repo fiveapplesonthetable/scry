@@ -1232,7 +1232,7 @@ enum Cmd {
     },
     /// Build (or rebuild) the trigram index for an existing index dir.
     /// Use this when the original `scry index` run didn't pass
-    /// --build-trigrams. Walks every file in the index's files.bin,
+    /// --build-trigrams. Walks every file in the index's files_packed.bin,
     /// extracts trigrams, writes trigrams.fst + trigram_postings.bin
     /// alongside the existing index — no re-parsing needed.
     BuildTrigrams {
@@ -2813,8 +2813,8 @@ fn cmd_def(
     let results = r.lookup_exact(&name);
     let mut filtered: Vec<SymbolRecord> = filter_results(results, lang.as_deref(), kind.as_deref());
     if in_.is_some() || not_in.is_some() {
-        filtered.retain(|s| match r.files.get(s.file_id as usize) {
-            Some(fe) => path_matches(&fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()),
+        filtered.retain(|s| match r.display_path_cached(s.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => false,
         });
     }
@@ -2895,8 +2895,8 @@ fn cmd_callgraph(
         def_in.as_deref().map(|p| {
             let ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
                 .iter()
-                .filter(|s| r.files.get(s.file_id as usize)
-                    .is_some_and(|fe| fe.display_path(&r.roots).contains(p)))
+                .filter(|s| r.display_path_cached(s.file_id)
+                    .is_some_and(|dp| dp.contains(p)))
                 .map(|s| s.id)
                 .collect();
             if ids.is_empty() {
@@ -2968,8 +2968,7 @@ fn cmd_callgraph(
         for rr in r.lookup_refs_exact(callee).into_iter() {
             if rr.kind != scry_store::RefKind::Call { continue; }
             if !in_prefix.is_empty() || !not_in_prefix.is_empty() {
-                let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
-                let p = fe.display_path(&r.roots);
+                let Some(p) = r.display_path_cached(rr.file_id) else { continue };
                 if !in_prefix.is_empty() && !p.contains(in_prefix) { continue; }
                 if !not_in_prefix.is_empty() && p.contains(not_in_prefix) { continue; }
             }
@@ -3016,9 +3015,7 @@ fn cmd_callgraph(
             let entry = out.entry(caller_name.clone()).or_default();
             entry.call_sites += 1;
             if entry.first_site.is_none() {
-                let path = r.files.get(rr.file_id as usize)
-                    .map(|fe| fe.display_path(&r.roots))
-                    .unwrap_or_default();
+                let path = r.file_display_path(rr.file_id).unwrap_or_default();
                 entry.first_site = Some((path, rr.line, rr.col));
             }
             *budget = budget.saturating_sub(1);
@@ -3137,10 +3134,8 @@ fn cmd_impact(
         &r, &name, raw_callers, clang_precise, scip_precise,
     )?;
     let mut callers: Vec<RefRecord> = callers_precise.into_iter()
-        .filter(|rr| match r.files.get(rr.file_id as usize) {
-            Some(fe) => path_matches(
-                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-            ),
+        .filter(|rr| match r.display_path_cached(rr.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => in_.is_none() && not_in.is_none(),
         })
         .collect();
@@ -3149,8 +3144,8 @@ fn cmd_impact(
     if let Some(def_path) = def_in.as_deref() {
         let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
             .iter()
-            .filter(|s| r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(def_path)))
+            .filter(|s| r.display_path_cached(s.file_id)
+                .is_some_and(|dp| dp.contains(def_path)))
             .map(|s| s.id)
             .collect();
         if target_ids.is_empty() {
@@ -3196,10 +3191,8 @@ fn cmd_impact(
     let subclasses: Vec<SymbolRecord> = r
         .subclasses_transitive(&name, subclass_depth)
         .into_iter()
-        .filter(|s| match r.files.get(s.file_id as usize) {
-            Some(fe) => path_matches(
-                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-            ),
+        .filter(|s| match r.display_path_cached(s.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => in_.is_none() && not_in.is_none(),
         })
         .collect();
@@ -3207,13 +3200,13 @@ fn cmd_impact(
     // Affected files: union of caller files + subclass files.
     let mut files_touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for rr in &callers {
-        if let Some(fe) = r.files.get(rr.file_id as usize) {
-            files_touched.insert(fe.display_path(&r.roots));
+        if let Some(p) = r.display_path_cached(rr.file_id) {
+            files_touched.insert(p.to_string());
         }
     }
     for s in &subclasses {
-        if let Some(fe) = r.files.get(s.file_id as usize) {
-            files_touched.insert(fe.display_path(&r.roots));
+        if let Some(p) = r.display_path_cached(s.file_id) {
+            files_touched.insert(p.to_string());
         }
     }
 
@@ -3250,9 +3243,7 @@ fn cmd_impact(
         if !callers.is_empty() {
             println!("\n== callers (showing {}) ==", callers.len().min(limit));
             for rr in callers.iter().take(limit) {
-                let path = r.files.get(rr.file_id as usize)
-                    .map(|fe| fe.display_path(&r.roots))
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let path = r.display_path_cached(rr.file_id).unwrap_or("<unknown>");
                 println!("  {path}:{}:{}  {}", rr.line, rr.col,
                     rr.scope_path.last().map_or("", String::as_str));
             }
@@ -3260,9 +3251,7 @@ fn cmd_impact(
         if !subclasses.is_empty() {
             println!("\n== subclasses (showing {}) ==", subclasses.len().min(limit));
             for s in subclasses.iter().take(limit) {
-                let path = r.files.get(s.file_id as usize)
-                    .map(|fe| fe.display_path(&r.roots))
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let path = r.display_path_cached(s.file_id).unwrap_or("<unknown>");
                 println!("  {path}:{}:{}  {}", s.line, s.col, s.name);
             }
         }
@@ -3305,10 +3294,8 @@ fn cmd_subclasses(
         r.subclasses_transitive(&name, depth)
     };
     let mut filtered: Vec<SymbolRecord> = results.into_iter()
-        .filter(|s| match r.files.get(s.file_id as usize) {
-            Some(fe) => path_matches(
-                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-            ),
+        .filter(|s| match r.display_path_cached(s.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => in_.is_none() && not_in.is_none(),
         })
         .collect();
@@ -3359,10 +3346,8 @@ fn cmd_prefix(
     let cap = limit.saturating_mul(8).max(limit);
     let mut results = r.lookup_prefix(&prefix, cap);
     if in_.is_some() || not_in.is_some() {
-        results.retain(|s| match r.files.get(s.file_id as usize) {
-            Some(fe) => path_matches(
-                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-            ),
+        results.retain(|s| match r.display_path_cached(s.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => false,
         });
     }
@@ -3391,10 +3376,8 @@ fn cmd_fuzzy(
     // substring test on the (typically small) ranked output.
     let mut scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(&substr, distance, limit);
     if in_.is_some() || not_in.is_some() {
-        scored.retain(|(s, _)| match r.files.get(s.file_id as usize) {
-            Some(fe) => path_matches(
-                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-            ),
+        scored.retain(|(s, _)| match r.display_path_cached(s.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => false,
         });
     }
@@ -3420,9 +3403,7 @@ fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bo
         return;
     }
     for (s, d) in scored {
-        let path = r.files.get(s.file_id as usize)
-            .map(|f| f.display_path(&r.roots))
-            .unwrap_or_default();
+        let path = r.display_path_cached(s.file_id).unwrap_or("");
         let scope = if s.scope_path.is_empty() {
             String::new()
         } else {
@@ -3536,9 +3517,10 @@ pub(crate) fn apply_precision_filter(
     // record. On AOSP+kernel scale this loop fires for 100k+ refs;
     // hoisting display_path turns the inner cost from "string alloc
     // + HashMap<String> hash + strcmp" into "Vec::get + bool check".
-    let mut path_by_id: Vec<Option<(String, bool)>> = vec![None; r.files.len()];
-    for fe in &r.files {
-        let p = fe.display_path(&r.roots);
+    let n_files = r.file_count();
+    let mut path_by_id: Vec<Option<(String, bool)>> = vec![None; n_files];
+    for fe in r.iter_files() {
+        let p = fe.display_path();
         let cf = is_c_family(&p);
         path_by_id[fe.id as usize] = Some((p, cf));
     }
@@ -3549,7 +3531,7 @@ pub(crate) fn apply_precision_filter(
             path_by_id.iter().enumerate().filter_map(|(i, slot)| {
                 slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
             }),
-            r.files.len(),
+            n_files,
         )
     });
     let sidx_lookup = sidx_opt.as_ref().map(|sidx| {
@@ -3557,7 +3539,7 @@ pub(crate) fn apply_precision_filter(
             path_by_id.iter().enumerate().filter_map(|(i, slot)| {
                 slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
             }),
-            r.files.len(),
+            n_files,
         )
     });
 
@@ -3704,10 +3686,8 @@ fn cmd_ref(
         .into_iter()
         .filter(|rr| {
             if in_.is_some() || not_in.is_some() {
-                match r.files.get(rr.file_id as usize) {
-                    Some(fe) => if !path_matches(
-                        &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-                    ) {
+                match r.display_path_cached(rr.file_id) {
+                    Some(p) => if !path_matches(p, in_.as_deref(), not_in.as_deref()) {
                         return false;
                     },
                     None => return false,
@@ -3745,8 +3725,8 @@ fn cmd_ref(
     let filtered = if let Some(def_path) = def_in.as_deref() {
         let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
             .iter()
-            .filter(|s| r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(def_path)))
+            .filter(|s| r.display_path_cached(s.file_id)
+                .is_some_and(|dp| dp.contains(def_path)))
             .map(|s| s.id)
             .collect();
         if target_ids.is_empty() {
@@ -3949,9 +3929,7 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
             groups.len().min(limit) + if unresolved > 0 { 1 } else { 0 });
         for (def_id, count) in groups.iter().take(limit) {
             let def_val = by_def_id.get(def_id).map(|s| {
-                let path = reader.files.get(s.file_id as usize)
-                    .map(|f| f.display_path(&reader.roots))
-                    .unwrap_or_default();
+                let path = reader.display_path_cached(s.file_id).unwrap_or("");
                 serde_json::json!({
                     "path": path,
                     "line": s.line,
@@ -3978,15 +3956,13 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
     for (def_id, count) in groups.iter().take(limit) {
         let annot = by_def_id.get(def_id)
             .map(|s| {
-                let path = reader.files.get(s.file_id as usize)
-                    .map(|f| f.display_path(&reader.roots))
-                    .unwrap_or_default();
+                let path = reader.display_path_cached(s.file_id).unwrap_or("");
                 let scope = if s.scope_path.is_empty() {
                     String::new()
                 } else {
                     format!(" [{}]", s.scope_path.join("::"))
                 };
-                format!("{}:{}{}", short_path_suffix(&path), s.line, scope)
+                format!("{}:{}{}", short_path_suffix(path), s.line, scope)
             })
             .unwrap_or_else(|| format!("def:{:x}", def_id));
         println!("{:>8}  → {}", count, annot);
@@ -4011,8 +3987,8 @@ fn print_symbols_paths(reader: &StoreReader, syms: &[SymbolRecord], limit: usize
     use std::collections::BTreeSet;
     let mut paths: BTreeSet<String> = BTreeSet::new();
     for s in syms {
-        if let Some(fe) = reader.files.get(s.file_id as usize) {
-            paths.insert(fe.display_path(&reader.roots));
+        if let Some(p) = reader.display_path_cached(s.file_id) {
+            paths.insert(p.to_string());
             if paths.len() >= limit { break; }
         }
     }
@@ -4042,8 +4018,8 @@ fn print_refs_paths(reader: &StoreReader, refs: &[RefRecord], limit: usize, json
     use std::collections::BTreeSet;
     let mut paths: BTreeSet<String> = BTreeSet::new();
     for r in refs {
-        if let Some(fe) = reader.files.get(r.file_id as usize) {
-            paths.insert(fe.display_path(&reader.roots));
+        if let Some(p) = reader.display_path_cached(r.file_id) {
+            paths.insert(p.to_string());
             if paths.len() >= limit { break; }
         }
     }
@@ -4179,10 +4155,10 @@ fn cmd_coverage(
         fn new() -> Self { Self { files: 0, bytes: 0, symbols: 0, by_kind: HashMap::new() } }
     }
     let mut by_lang: HashMap<FileKind, LangBucket> = HashMap::new();
-    let matching_ids: Vec<(u32, FileKind, u64)> = r.files.iter()
+    let matching_ids: Vec<(u32, FileKind, u64)> = r.iter_files()
         .filter(|fe| {
             if prefix.is_empty() { true }
-            else { fe.display_path(&r.roots).contains(prefix) }
+            else { fe.display_path().contains(prefix) }
         })
         .map(|fe| (fe.id, fe.kind, fe.size))
         .collect();
@@ -4312,9 +4288,9 @@ fn cmd_outline(
         Some(id) => id,
         None => anyhow::bail!("no indexed file matches '{}'", path),
     };
-    let fe = r.files.get(file_id as usize)
+    let fe = r.file_view(file_id)
         .ok_or_else(|| anyhow::anyhow!("file_id {} out of range", file_id))?;
-    let display = fe.display_path(&r.roots);
+    let display = fe.display_path();
     // For --with-snippets > 0 we need the file bytes once. Read up
     // front so we don't re-read per symbol; the file is in the page
     // cache from open_index's mmap path anyway, so this is cheap.
@@ -4421,9 +4397,9 @@ fn cmd_tldr(path: String, index: Option<PathBuf>, json: bool) -> Result<()> {
         Some(id) => id,
         None => anyhow::bail!("no indexed file matches '{}'", path),
     };
-    let fe = r.files.get(file_id as usize)
+    let fe = r.file_view(file_id)
         .ok_or_else(|| anyhow::anyhow!("file_id {} out of range", file_id))?;
-    let display = fe.display_path(&r.roots);
+    let display = fe.display_path();
 
     // Gather this file's symbols via the file_symbols sidecar (O(1)
     // per file) with a fallback to the linear scan.
@@ -4550,9 +4526,7 @@ fn rank_symbols(syms: &mut [SymbolRecord], r: &StoreReader) {
     // does O(N) allocations + O(N log N) borrow compares.
     let decorated: Vec<(String, i64)> = syms.iter()
         .map(|s| {
-            let p = r.files.get(s.file_id as usize)
-                .map(|f| f.display_path(&r.roots))
-                .unwrap_or_default();
+            let p = r.display_path_cached(s.file_id).unwrap_or("").to_string();
             let score = symbol_total_score(s, &p);
             (p, score)
         })
@@ -4737,9 +4711,8 @@ fn print_results_md(
     let cap = syms.len().min(limit);
     #[allow(clippy::explicit_counter_loop)]
     for s in syms.iter().take(cap) {
-        let file = reader.files.get(s.file_id as usize);
-        let path = file.map(|f| f.display_path(&reader.roots)).unwrap_or_default();
-        let snippet = read_snippet(&path, s.line, 8);
+        let path = reader.display_path_cached(s.file_id).unwrap_or("");
+        let snippet = read_snippet(path, s.line, 8);
         let scope_str = if s.scope_path.is_empty() {
             String::new()
         } else {
@@ -4956,10 +4929,7 @@ fn read_snippet(path: &str, line: u32, total_lines: u32) -> String {
 fn print_results(reader: &StoreReader, syms: &[SymbolRecord], limit: usize, json: bool) {
     if json {
         for s in syms.iter().take(limit) {
-            let file = reader.files.get(s.file_id as usize);
-            let path = file
-                .map(|f| f.display_path(&reader.roots))
-                .unwrap_or_default();
+            let path = reader.display_path_cached(s.file_id).unwrap_or("");
             let obj = serde_json::json!({
                 "id": s.id,
                 "name": s.name,
@@ -4976,10 +4946,7 @@ fn print_results(reader: &StoreReader, syms: &[SymbolRecord], limit: usize, json
         return;
     }
     for s in syms.iter().take(limit) {
-        let file = reader.files.get(s.file_id as usize);
-        let path = file
-            .map(|f| f.display_path(&reader.roots))
-            .unwrap_or_default();
+        let path = reader.display_path_cached(s.file_id).unwrap_or("");
         let scope = if s.scope_path.is_empty() {
             String::new()
         } else {
@@ -5017,8 +4984,7 @@ fn emit_narrow_hint(reader: &StoreReader, syms: &[SymbolRecord], limit: usize) {
     if std::env::var("SCRY_QUIET").map(|v| v == "1").unwrap_or(false) { return; }
     // Collect display paths of the shown rows.
     let paths: Vec<String> = syms.iter().take(limit)
-        .filter_map(|s| reader.files.get(s.file_id as usize)
-            .map(|f| f.display_path(&reader.roots)))
+        .filter_map(|s| reader.display_path_cached(s.file_id).map(str::to_string))
         .collect();
     if paths.len() < limit { return; }
     // Find the longest common path prefix (segment-wise) and shave
@@ -5046,8 +5012,7 @@ fn emit_narrow_hint(reader: &StoreReader, syms: &[SymbolRecord], limit: usize) {
 fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool) {
     if json {
         for r in refs.iter().take(limit) {
-            let file = reader.files.get(r.file_id as usize);
-            let path = file.map(|f| f.display_path(&reader.roots)).unwrap_or_default();
+            let path = reader.display_path_cached(r.file_id).unwrap_or("");
             let obj = serde_json::json!({
                 "name": r.name,
                 "ref_kind": r.kind.short(),
@@ -5063,8 +5028,7 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
         return;
     }
     for r in refs.iter().take(limit) {
-        let file = reader.files.get(r.file_id as usize);
-        let path = file.map(|f| f.display_path(&reader.roots)).unwrap_or_default();
+        let path = reader.display_path_cached(r.file_id).unwrap_or("");
         let scope = if r.scope_path.is_empty() {
             String::new()
         } else {
@@ -5097,15 +5061,13 @@ fn format_resolved_def(reader: &StoreReader, ref_name: &str, def_id: u64) -> Str
     let def = reader.lookup_exact(ref_name).into_iter().find(|s| s.id == def_id);
     match def {
         Some(s) => {
-            let path = reader.files.get(s.file_id as usize)
-                .map(|f| f.display_path(&reader.roots))
-                .unwrap_or_default();
+            let path = reader.display_path_cached(s.file_id).unwrap_or("");
             let scope = if s.scope_path.is_empty() {
                 String::new()
             } else {
                 format!(" [{}]", s.scope_path.join("::"))
             };
-            format!("  → {}:{}{}", short_path_suffix(&path), s.line, scope)
+            format!("  → {}:{}{}", short_path_suffix(path), s.line, scope)
         }
         None => format!("  → def:{:x}", def_id),
     }
@@ -5194,9 +5156,9 @@ fn cmd_grep(
                 }
                 println!("candidates: {} files post-intersection", e.candidates);
                 // Rough scan cost: average file size on this index × candidates.
-                let avg_bytes = if !r.files.is_empty() {
-                    let total: u64 = r.files.iter().map(|f| f.size).sum();
-                    total / r.files.len() as u64
+                let avg_bytes = if r.file_count() > 0 {
+                    let total: u64 = r.iter_files().map(|f| f.size).sum();
+                    total / r.file_count() as u64
                 } else { 0 };
                 let est_bytes = (e.candidates as u64).saturating_mul(avg_bytes);
                 println!("scan-cost:  ~{} estimated I/O ({} candidates × {} avg file size)",
@@ -5295,9 +5257,8 @@ fn cmd_grep(
         }
         cs
     };
-    let candidates: Vec<&FileEntry> = r
-        .files
-        .iter()
+    let candidates: Vec<scry_store::FileView<'_>> = r
+        .iter_files()
         .filter(|fe| {
             if let Some(ref tg) = trigram_candidates {
                 if !tg.contains(&fe.id) {
@@ -5315,7 +5276,7 @@ fn cmd_grep(
                 // root-relative subdir ("frameworks/base/") or an absolute
                 // one and have both work. --not-in (v0.1.55) drops paths
                 // containing SUBSTR — useful for `--not-in /tests/`.
-                let full = fe.display_path(&r.roots);
+                let full = fe.display_path();
                 if !prefix.is_empty() && !full.contains(prefix) {
                     return false;
                 }
@@ -5344,7 +5305,7 @@ fn cmd_grep(
     if total_files > 0 && total_files <= 8000 {
         let t_pf = Instant::now();
         candidates.par_iter().for_each(|fe| {
-            let path = fe.display_path(&r.roots);
+            let path = fe.display_path();
             scry_store::prefault_path(Path::new(&path));
         });
         eprintln!("[grep] prefaulted {} files in {} ms",
@@ -5357,7 +5318,7 @@ fn cmd_grep(
         if hit_count.load(Ordering::Relaxed) >= limit * 8 {
             return; // bound work after we have plenty of candidates
         }
-        let path = fe.display_path(&r.roots);
+        let path = fe.display_path();
         let mut local: Vec<Hit> = Vec::new();
         if let Some(re) = &re {
             // Regex path: need full bytes in memory for the regex
@@ -5414,8 +5375,7 @@ fn cmd_grep(
     match (json, format) {
         (true, _) => {
             for h in &hits {
-                let path = r.files.get(h.file_id as usize)
-                    .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+                let path = r.display_path_cached(h.file_id).unwrap_or("");
                 let obj = serde_json::json!({
                     "path": path,
                     "line": h.line,
@@ -5437,15 +5397,13 @@ fn cmd_grep(
         // pipe into awk / xargs.
         (false, Some("lines")) => {
             for h in &hits {
-                let path = r.files.get(h.file_id as usize)
-                    .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+                let path = r.display_path_cached(h.file_id).unwrap_or("");
                 println!("{}:{}:{}\t{}", path, h.line, h.col, h.snippet);
             }
         }
         _ => {
             for h in &hits {
-                let path = r.files.get(h.file_id as usize)
-                    .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+                let path = r.display_path_cached(h.file_id).unwrap_or("");
                 println!("{}:{}:{}: {}", path, h.line, h.col, h.snippet);
             }
             eprintln!("\n{} hits across {} files", hits.len(), total_files);
@@ -5544,7 +5502,7 @@ pub(crate) fn cmd_build_file_symbols(index: Option<PathBuf>) -> Result<()> {
     // available and we avoid loading the whole 10 GB symbols.bin into RAM.
     let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
-    let n_files = r.files.len();
+    let n_files = r.file_count();
     eprintln!("[fsyms] {} files, {} symbols — building reverse map", n_files, r.n_symbols());
 
     let t = Instant::now();
@@ -5606,7 +5564,7 @@ pub(crate) fn cmd_build_file_refs(index: Option<PathBuf>) -> Result<()> {
 
     let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
-    let n_files = r.files.len();
+    let n_files = r.file_count();
     eprintln!("[frefs] {} files, {} refs — building reverse map", n_files, r.n_refs());
 
     let t = Instant::now();
@@ -5685,10 +5643,8 @@ fn cmd_uses(
     let t = Instant::now();
     let r = open_index(index)?;
     let defs: Vec<SymbolRecord> = r.lookup_exact(&name).into_iter()
-        .filter(|s| match r.files.get(s.file_id as usize) {
-            Some(fe) => path_matches(
-                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
-            ),
+        .filter(|s| match r.display_path_cached(s.file_id) {
+            Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => in_.is_none() && not_in.is_none(),
         })
         .collect();
@@ -5774,9 +5730,7 @@ fn cmd_uses(
             } else {
                 let shown = out_refs.len().min(limit);
                 for rr in out_refs.iter().take(shown) {
-                    let path = r.files.get(rr.file_id as usize)
-                        .map(|fe| fe.display_path(&r.roots))
-                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let path = r.display_path_cached(rr.file_id).unwrap_or("<unknown>");
                     println!("{path}:{}:{}  ({} {})  {}",
                         rr.line, rr.col, rr.kind.short(), rr.lang.as_str(), rr.name);
                 }
@@ -5848,15 +5802,15 @@ fn cmd_build_digests(index: Option<PathBuf>, workers: usize) -> Result<()> {
     let paths = scry_store::StorePaths::new(index_dir.clone());
     let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
-    let n_files = r.files.len();
+    let n_files = r.file_count();
     eprintln!("[digests] {} files to hash", n_files);
 
     let t = Instant::now();
     // Compute (file_id, digest) in parallel and collect into a dense
     // Vec<[u8; 32]> sized to the file count.
     let mut digests: Vec<[u8; 32]> = vec![[0u8; 32]; n_files];
-    let pairs: Vec<(u32, [u8; 32])> = r.files.par_iter().map(|fe| {
-        let path = fe.display_path(&r.roots);
+    let pairs: Vec<(u32, [u8; 32])> = r.par_iter_files().map(|fe| {
+        let path = fe.display_path();
         match std::fs::read(&path) {
             Ok(bytes) => (fe.id, *blake3::hash(&bytes).as_bytes()),
             Err(_) => (fe.id, [0u8; 32]),  // unreadable → zero digest
@@ -5929,10 +5883,10 @@ fn cmd_index_diff(
     // Build a map: (root_id, relpath) → (old file_id, old digest) from
     // the existing index.
     let mut old_map: std::collections::HashMap<(u8, String), (u32, [u8; 32])> =
-        std::collections::HashMap::with_capacity(r.files.len());
-    for fe in &r.files {
+        std::collections::HashMap::with_capacity(r.file_count());
+    for fe in r.iter_files() {
         if let Some(d) = r.file_digest(fe.id) {
-            old_map.insert((fe.root_id, fe.relpath.clone()), (fe.id, d));
+            old_map.insert((fe.root_id, fe.relpath.to_string()), (fe.id, d));
         }
     }
     let t = Instant::now();
@@ -6094,10 +6048,10 @@ fn cmd_index_incremental(
     // Tombstoned files are excluded — they're conceptually "already
     // deleted" and shouldn't influence the new index's contents.
     let old_map: std::collections::HashMap<(u8, String), (u32, [u8; 32])> =
-        old.files.iter()
+        old.iter_files()
             .filter(|fe| !old.is_tombstoned(fe.id))
             .filter_map(|fe| old.file_digest(fe.id)
-                .map(|d| ((fe.root_id, fe.relpath.clone()), (fe.id, d))))
+                .map(|d| ((fe.root_id, fe.relpath.to_string()), (fe.id, d))))
             .collect();
 
     eprintln!("[incremental] old index: {} files (post-tombstone)", old_map.len());
@@ -6394,9 +6348,9 @@ fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
         .with_context(|| format!("open index at {}", index_dir.display()))?;
 
     let needle = path.to_string_lossy().to_string();
-    let matches: Vec<u32> = r.files.iter()
+    let matches: Vec<u32> = r.iter_files()
         .filter(|fe| {
-            let p = fe.display_path(&r.roots);
+            let p = fe.display_path();
             p == needle || p.contains(&needle)
         })
         .map(|fe| fe.id)
@@ -6477,8 +6431,7 @@ fn cmd_callers_precise(
         .find(|s| matches!(s.lang, FileKind::Cpp | FileKind::Header | FileKind::HeaderCpp))
         .or_else(|| candidates.first())
         .ok_or_else(|| anyhow::anyhow!("no definitions of '{name}' in the index"))?;
-    let def_path = r.files.get(def_site.file_id as usize)
-        .map(|f| f.display_path(&r.roots))
+    let def_path = r.file_display_path(def_site.file_id)
         .ok_or_else(|| anyhow::anyhow!("def file_id {} out of range", def_site.file_id))?;
     let def_path = PathBuf::from(def_path);
 
@@ -6512,15 +6465,15 @@ fn cmd_callers_precise(
     // back to scry's path display + lang.
     let in_prefix = in_.as_deref();
     let not_in_prefix = not_in.as_deref();
-    let by_path: std::collections::HashMap<String, &FileEntry> =
-        r.files.iter().map(|fe| (fe.display_path(&r.roots), fe)).collect();
+    let by_path: std::collections::HashMap<String, FileKind> =
+        r.iter_files().map(|fe| (fe.display_path(), fe.kind)).collect();
     let mut emitted = 0usize;
     if !json {
         for loc in &locs {
             let p = match loc.fs_path() { Some(p) => p, None => continue };
             let p_str = p.display().to_string();
             if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
-            let lang = by_path.get(&p_str).map(|fe| fe.kind.as_str()).unwrap_or("?");
+            let lang = by_path.get(&p_str).map(|k| k.as_str()).unwrap_or("?");
             println!("{}:{}:{}  (ref-precise {})  {}",
                 p_str, loc.line, loc.character, lang, name);
             emitted += 1;
@@ -6534,7 +6487,7 @@ fn cmd_callers_precise(
             let p = match loc.fs_path() { Some(p) => p, None => continue };
             let p_str = p.display().to_string();
             if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
-            let lang = by_path.get(&p_str).map(|fe| fe.kind.as_str()).unwrap_or("?");
+            let lang = by_path.get(&p_str).map(|k| k.as_str()).unwrap_or("?");
             let obj = serde_json::json!({
                 "name": name,
                 "ref_kind": "call",
@@ -6584,7 +6537,7 @@ fn cmd_build_embeddings(
     let paths = scry_store::StorePaths::new(index_dir.clone());
     let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
-    let n_files = r.files.len();
+    let n_files = r.file_count();
     eprintln!("[embed] {} files; dim={}, chunk={}+{}overlap",
         n_files, dim, chunk_lines, chunk_overlap);
 
@@ -6592,8 +6545,8 @@ fn cmd_build_embeddings(
     // Per-file: read source, chunk, embed each chunk. Returns a Vec
     // of (ChunkEntry, embedding) which we'll flatten + sort by
     // file_id + start_line for stable on-disk ordering.
-    let per_file: Vec<Vec<(embed::ChunkEntry, Vec<f32>)>> = r.files.par_iter().map(|fe| {
-        let path = fe.display_path(&r.roots);
+    let per_file: Vec<Vec<(embed::ChunkEntry, Vec<f32>)>> = r.par_iter_files().map(|fe| {
+        let path = fe.display_path();
         let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => return Vec::new() };
         let src = match std::str::from_utf8(&bytes) { Ok(s) => s, Err(_) => return Vec::new() };
         let mut out = Vec::new();
@@ -6677,8 +6630,8 @@ fn cmd_ask(
         let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
             Some(e) => e, None => continue,
         };
-        let fe = match r.files.get(entry.file_id as usize) { Some(f) => f, None => continue };
-        let path = fe.display_path(&r.roots);
+        let fe = match r.file_view(entry.file_id) { Some(f) => f, None => continue };
+        let path = fe.display_path();
         if !path_matches(&path, in_.as_deref(), not_in.as_deref()) { continue; }
         // Read a slice of the file to show context (best-effort).
         let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
@@ -6751,9 +6704,9 @@ fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     let paths = scry_store::StorePaths::new(index_dir.clone());
     let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open index at {}", index_dir.display()))?;
-    let n_files = r.files.len();
+    let n_files = r.file_count();
     let mut tombstoned = 0usize;
-    for fe in &r.files {
+    for fe in r.iter_files() {
         if r.is_tombstoned(fe.id) { tombstoned += 1; }
     }
     if tombstoned == 0 {
@@ -7218,7 +7171,7 @@ pub(crate) fn cmd_build_trigrams(
     eprintln!("[trigrams] target index: {}", index_dir.display());
     let r = StoreReader::open(&index_dir)
         .with_context(|| format!("open {}", index_dir.display()))?;
-    eprintln!("[trigrams] {} files in index", r.files.len());
+    eprintln!("[trigrams] {} files in index", r.file_count());
 
     // Per-batch sink + chunk staging dir. We piggyback on the index's
     // <index>.trigrams_tmp/ to keep artifacts off the live index dir until
@@ -7231,7 +7184,7 @@ pub(crate) fn cmd_build_trigrams(
     std::fs::create_dir_all(&tmp)?;
 
     let batch_size: usize = 5000;
-    let n_files = r.files.len();
+    let n_files = r.file_count();
     let total_batches = (n_files + batch_size - 1) / batch_size.max(1);
     let mut chunk_count: u32 = 0;
     let t_total = Instant::now();
@@ -7244,7 +7197,10 @@ pub(crate) fn cmd_build_trigrams(
     while start < n_files {
         let end = (start + batch_size).min(n_files);
         batch_no += 1;
-        let slice = &r.files[start..end];
+        // Materialise borrowed views for this batch into a Vec we can
+        // hand to rayon; `FileView` is Copy so this is cheap.
+        let slice: Vec<scry_store::FileView<'_>> =
+            (start as u32 .. end as u32).filter_map(|i| r.file_view(i)).collect();
         let sink: parking_lot::Mutex<Vec<(scry_store::trigram::Trigram, u32)>> =
             parking_lot::Mutex::new(Vec::with_capacity(slice.len() * 4096));
         let t_batch = Instant::now();
@@ -7253,7 +7209,7 @@ pub(crate) fn cmd_build_trigrams(
                 total_skipped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            let path = fe.display_path(&r.roots);
+            let path = fe.display_path();
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(_) => { total_failed.fetch_add(1, Ordering::Relaxed); return; }
@@ -7470,8 +7426,7 @@ fn cmd_module_of(path: String, index: Option<PathBuf>, limit: usize) -> Result<(
         return Ok(());
     }
     for rr in out.iter().take(limit) {
-        let file = r.files.get(rr.file_id as usize);
-        let bp_path = file.map(|f| f.display_path(&r.roots)).unwrap_or_default();
+        let bp_path = r.display_path_cached(rr.file_id).unwrap_or("");
         let module_name = rr.scope_path.get(1).cloned().unwrap_or_default();
         let module_type = rr.scope_path.first().cloned().unwrap_or_default();
         println!("{} ({})  declared in {}", module_name, module_type, bp_path);
@@ -7502,12 +7457,12 @@ fn cmd_owner(
     // Resolve the queried path against the indexed roots; we accept
     // both absolute paths and root-relative substrings.
     let needle = path.to_string_lossy().to_string();
-    let target_fe = r.files.iter().find(|fe| {
-        let p = fe.display_path(&r.roots);
+    let target_fe = r.iter_files().find(|fe| {
+        let p = fe.display_path();
         p == needle || p.contains(&needle)
     });
     let target_path = match target_fe {
-        Some(fe) => PathBuf::from(fe.display_path(&r.roots)),
+        Some(fe) => PathBuf::from(fe.display_path()),
         None => path.clone(),  // not in the index; still walk fs path
     };
 
@@ -7708,13 +7663,12 @@ fn cmd_diff(
 
     // Intersect with the file table. We index files by (root_id, relpath)
     // so the lookup is O(N) in the changed set, not O(N×M).
-    let mut hits: Vec<&FileEntry> = reader.files.iter()
-        .filter(|fe| changed.contains(&(fe.root_id, fe.relpath.clone())))
-        .filter(|fe| in_filter.is_empty()
-            || fe.display_path(&reader.roots).contains(&in_filter))
+    let mut hits: Vec<scry_store::FileView<'_>> = reader.iter_files()
+        .filter(|fe| changed.contains(&(fe.root_id, fe.relpath.to_string())))
+        .filter(|fe| in_filter.is_empty() || fe.display_path().contains(&in_filter))
         .collect();
     // Sort by path for a deterministic output ordering.
-    hits.sort_by(|a, b| a.relpath.cmp(&b.relpath));
+    hits.sort_by(|a, b| a.relpath.cmp(b.relpath));
     hits.truncate(limit);
 
     if json {
@@ -7724,7 +7678,7 @@ fn cmd_diff(
         for fe in &hits {
             let symbols: Vec<u32> = reader.symbols_for_file(fe.id).unwrap_or_default();
             let entry = serde_json::json!({
-                "path": fe.display_path(&reader.roots),
+                "path": fe.display_path(),
                 "lang": fe.kind.as_str(),
                 "symbol_count": symbols.len(),
                 "symbols": if verbose {
@@ -7747,7 +7701,7 @@ fn cmd_diff(
         for fe in &hits {
             let symbols: Vec<u32> = reader.symbols_for_file(fe.id).unwrap_or_default();
             println!("  {} ({}) — {} symbol{}",
-                     fe.display_path(&reader.roots),
+                     fe.display_path(),
                      fe.kind.as_str(),
                      symbols.len(),
                      if symbols.len() == 1 { "" } else { "s" });
@@ -9181,8 +9135,8 @@ fn truncate_array_to_budget(value: &mut serde_json::Value, budget: usize) {
 /// (root.path + relpath), so substrings like `frameworks/base/` —
 /// repo-root-relative — match via `contains`, not `starts_with`.
 fn file_path_matches(r: &StoreReader, file_id: u32, in_: Option<&str>, not_in: Option<&str>) -> bool {
-    match r.files.get(file_id as usize) {
-        Some(fe) => path_matches(&fe.display_path(&r.roots), in_, not_in),
+    match r.display_path_cached(file_id) {
+        Some(p) => path_matches(p, in_, not_in),
         None => in_.is_none() && not_in.is_none(),
     }
 }
@@ -9281,8 +9235,8 @@ fn serve_ref(
     // silently drop" policy; daemon stays quiet on diagnostics).
     let def_target_ids: Option<std::collections::HashSet<u64>> = def_in.map(|p| {
         r.lookup_exact(name).iter()
-            .filter(|s| r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)))
+            .filter(|s| r.display_path_cached(s.file_id)
+                .is_some_and(|dp| dp.contains(p)))
             .map(|s| s.id)
             .collect()
     });
@@ -9310,8 +9264,8 @@ fn serve_ref(
     };
     let def_usrs: Option<std::collections::HashSet<String>> = cusr.as_ref().map(|c| {
         r.lookup_exact(name).iter().filter_map(|s| {
-            let p = r.files.get(s.file_id as usize)?.display_path(&r.roots);
-            c.usr_for_window(&p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
+            let p = r.display_path_cached(s.file_id)?;
+            c.usr_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
         }).collect()
     });
     let sidx: Option<scry_store::scip_index::ScipIndex> = if scip_precise {
@@ -9321,8 +9275,8 @@ fn serve_ref(
     };
     let def_scip: Option<std::collections::HashSet<String>> = sidx.as_ref().map(|c| {
         r.lookup_exact(name).iter().filter_map(|s| {
-            let p = r.files.get(s.file_id as usize)?.display_path(&r.roots);
-            c.symbol_for_window(&p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
+            let p = r.display_path_cached(s.file_id)?;
+            c.symbol_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
         }).collect()
     });
     let by_def = format == Some("by-def");
@@ -9379,9 +9333,8 @@ fn serve_ref(
         // record pass through (non-C/C++ or uncovered TU).
         if let (Some(c), Some(usrs)) = (cusr.as_ref(), def_usrs.as_ref()) {
             if !usrs.is_empty() {
-                if let Some(fe) = r.files.get(rr.file_id as usize) {
-                    let p = fe.display_path(&r.roots);
-                    if let Some(u) = c.usr_for_window(&p, rr.byte_start, PRECISE_WINDOW) {
+                if let Some(p) = r.display_path_cached(rr.file_id) {
+                    if let Some(u) = c.usr_for_window(p, rr.byte_start, PRECISE_WINDOW) {
                         if !usrs.contains(u) { continue; }
                     }
                 }
@@ -9390,9 +9343,8 @@ fn serve_ref(
         // SCIP symbol identity filter (Path C).
         if let (Some(c), Some(syms)) = (sidx.as_ref(), def_scip.as_ref()) {
             if !syms.is_empty() {
-                if let Some(fe) = r.files.get(rr.file_id as usize) {
-                    let p = fe.display_path(&r.roots);
-                    if let Some(s) = c.symbol_for_window(&p, rr.byte_start, PRECISE_WINDOW) {
+                if let Some(p) = r.display_path_cached(rr.file_id) {
+                    if let Some(s) = c.symbol_for_window(p, rr.byte_start, PRECISE_WINDOW) {
                         if !syms.contains(s) { continue; }
                     }
                 }
@@ -9401,8 +9353,8 @@ fn serve_ref(
         if by_def {
             by_def_keep.push(rr);
         } else if paths_only {
-            if let Some(fe) = r.files.get(rr.file_id as usize) {
-                paths_keep.insert(fe.display_path(&r.roots));
+            if let Some(p) = r.display_path_cached(rr.file_id) {
+                paths_keep.insert(p.to_string());
                 if paths_keep.len() >= limit { break; }
             }
         } else {
@@ -9447,9 +9399,7 @@ fn serve_ref_by_def_histogram(
         groups.len().min(limit) + if unresolved > 0 { 1 } else { 0 });
     for (def_id, count) in groups.iter().take(limit) {
         let def_val = by_def_id.get(def_id).map(|s| {
-            let path = reader.files.get(s.file_id as usize)
-                .map(|f| f.display_path(&reader.roots))
-                .unwrap_or_default();
+            let path = reader.display_path_cached(s.file_id).unwrap_or("");
             serde_json::json!({
                 "path": path,
                 "line": s.line,
@@ -9517,8 +9467,8 @@ fn serve_uses(
             let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
             if seen.insert(key) {
                 if paths_only {
-                    if let Some(fe) = r.files.get(rr.file_id as usize) {
-                        paths_keep.insert(fe.display_path(&r.roots));
+                    if let Some(p) = r.display_path_cached(rr.file_id) {
+                        paths_keep.insert(p.to_string());
                     }
                 } else if count_only {
                     count_total += 1;
@@ -9570,8 +9520,8 @@ fn serve_callgraph(
     let root_def_target_ids: Option<std::collections::HashSet<u64>> =
         def_in.map(|p| {
             r.lookup_exact(name).iter()
-                .filter(|s| r.files.get(s.file_id as usize)
-                    .is_some_and(|fe| fe.display_path(&r.roots).contains(p)))
+                .filter(|s| r.display_path_cached(s.file_id)
+                    .is_some_and(|dp| dp.contains(p)))
                 .map(|s| s.id)
                 .collect()
         });
@@ -9619,8 +9569,7 @@ fn serve_callgraph(
         for rr in r.lookup_refs_exact(callee).into_iter() {
             if rr.kind != scry_store::RefKind::Call { continue; }
             if !in_prefix.is_empty() || !not_in_prefix.is_empty() {
-                let Some(fe) = r.files.get(rr.file_id as usize) else { continue };
-                let p = fe.display_path(&r.roots);
+                let Some(p) = r.display_path_cached(rr.file_id) else { continue };
                 if !in_prefix.is_empty() && !p.contains(in_prefix) { continue; }
                 if !not_in_prefix.is_empty() && p.contains(not_in_prefix) { continue; }
             }
@@ -9660,8 +9609,7 @@ fn serve_callgraph(
             let entry = out.entry(caller_name.clone()).or_default();
             entry.call_sites += 1;
             if entry.first_site.is_none() {
-                let path = r.files.get(rr.file_id as usize)
-                    .map(|fe| fe.display_path(&r.roots)).unwrap_or_default();
+                let path = r.file_display_path(rr.file_id).unwrap_or_default();
                 entry.first_site = Some((path, rr.line, rr.col));
             }
             *budget = budget.saturating_sub(1);
@@ -9729,8 +9677,8 @@ fn serve_impact(
     if let Some(def_path) = def_in {
         let target_ids: std::collections::HashSet<u64> = r.lookup_exact(name)
             .iter()
-            .filter(|s| r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(def_path)))
+            .filter(|s| r.display_path_cached(s.file_id)
+                .is_some_and(|dp| dp.contains(def_path)))
             .map(|s| s.id)
             .collect();
         if !target_ids.is_empty() {
@@ -9761,13 +9709,13 @@ fn serve_impact(
         .collect();
     let mut files_touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for rr in &callers {
-        if let Some(fe) = r.files.get(rr.file_id as usize) {
-            files_touched.insert(fe.display_path(&r.roots));
+        if let Some(p) = r.display_path_cached(rr.file_id) {
+            files_touched.insert(p.to_string());
         }
     }
     for s in &subclasses {
-        if let Some(fe) = r.files.get(s.file_id as usize) {
-            files_touched.insert(fe.display_path(&r.roots));
+        if let Some(p) = r.display_path_cached(s.file_id) {
+            files_touched.insert(p.to_string());
         }
     }
     serde_json::json!({
@@ -9811,8 +9759,8 @@ fn serve_subclasses(
         if paths_only && paths_keep.len() >= limit { break; }
         if !file_path_matches(r, s.file_id, in_, not_in) { continue; }
         if paths_only {
-            if let Some(fe) = r.files.get(s.file_id as usize) {
-                paths_keep.insert(fe.display_path(&r.roots));
+            if let Some(p) = r.display_path_cached(s.file_id) {
+                paths_keep.insert(p.to_string());
             }
         } else if count_only {
             count_total += 1;
@@ -9871,7 +9819,7 @@ fn serve_grep(
     // bad query (e.g. "the") from blocking the serve loop for seconds.
     const MAX_FILES_SCANNED: usize = 5000;
     let mut scanned = 0usize;
-    for fe in &r.files {
+    for fe in r.iter_files() {
         if out.len() >= limit { break; }
         if scanned >= MAX_FILES_SCANNED { break; }
         if let Some(ref tg) = candidates {
@@ -9884,11 +9832,11 @@ fn serve_grep(
             // Substring match — same semantics as file_path_matches and
             // CLI cmd_grep; absolute paths never start with a root-
             // relative subdir.
-            let p = fe.display_path(&r.roots);
+            let p = fe.display_path();
             if !path_matches(&p, in_, not_in) { continue; }
         }
         scanned += 1;
-        let path = fe.display_path(&r.roots);
+        let path = fe.display_path();
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(_) => continue,
@@ -9943,7 +9891,7 @@ fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value
         Some(id) => id,
         None => return serde_json::json!({"error": format!("no indexed file matches '{}'", path)}),
     };
-    let fe = match r.files.get(file_id as usize) {
+    let fe = match r.file_view(file_id) {
         Some(f) => f,
         None => return serde_json::json!({"error": "file_id out of range"}),
     };
@@ -9965,7 +9913,7 @@ fn serve_outline(r: &StoreReader, path: &str, limit: usize) -> serde_json::Value
     let take = if limit == 0 { found.len() } else { limit.min(found.len()) };
     let arr: Vec<_> = found.iter().take(take).map(|s| symbol_to_json(r, s)).collect();
     serde_json::json!({
-        "path": fe.display_path(&r.roots),
+        "path": fe.display_path(),
         "lang": fe.kind.as_str(),
         "symbols_total": found.len(),
         "symbols_shown": take,
@@ -9986,7 +9934,7 @@ fn serve_tldr(r: &StoreReader, path: &str) -> serde_json::Value {
         Some(id) => id,
         None => return serde_json::json!({"error": format!("no indexed file matches '{}'", path)}),
     };
-    let fe = match r.files.get(file_id as usize) {
+    let fe = match r.file_view(file_id) {
         Some(f) => f,
         None => return serde_json::json!({"error": "file_id out of range"}),
     };
@@ -10016,7 +9964,7 @@ fn serve_tldr(r: &StoreReader, path: &str) -> serde_json::Value {
             "line": s.line, "col": s.col, "scope": s.scope_path,
         }))
         .collect();
-    let display = fe.display_path(&r.roots);
+    let display = fe.display_path();
     let first_line = std::fs::read_to_string(&display).ok()
         .and_then(|src| src.lines().find(|l| !l.trim().is_empty())
             .map(|l| if l.len() > 200 { format!("{}…", &l[..200]) }
@@ -10041,8 +9989,8 @@ fn serve_tldr(r: &StoreReader, path: &str) -> serde_json::Value {
 /// "how many ctors").
 fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Value {
     use std::collections::HashMap;
-    let matching: Vec<(u32, FileKind, u64)> = r.files.iter()
-        .filter(|fe| path.is_empty() || fe.display_path(&r.roots).contains(path))
+    let matching: Vec<(u32, FileKind, u64)> = r.iter_files()
+        .filter(|fe| path.is_empty() || fe.display_path().contains(path))
         .map(|fe| (fe.id, fe.kind, fe.size))
         .collect();
     struct LangBucket {
@@ -10136,8 +10084,8 @@ fn serve_ask(
         let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
             Some(e) => e, None => continue,
         };
-        let fe = match r.files.get(entry.file_id as usize) { Some(f) => f, None => continue };
-        let path = fe.display_path(&r.roots);
+        let fe = match r.file_view(entry.file_id) { Some(f) => f, None => continue };
+        let path = fe.display_path();
         if !path_matches(&path, in_, not_in) { continue; }
         let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
         out.push(serde_json::json!({
@@ -10178,8 +10126,7 @@ fn serve_stats(r: &StoreReader) -> serde_json::Value {
 }
 
 fn symbol_to_json(r: &StoreReader, s: &SymbolRecord) -> serde_json::Value {
-    let path = r.files.get(s.file_id as usize)
-        .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+    let path = r.display_path_cached(s.file_id).unwrap_or("");
     serde_json::json!({
         "id": s.id,
         "name": s.name,
@@ -10194,8 +10141,7 @@ fn symbol_to_json(r: &StoreReader, s: &SymbolRecord) -> serde_json::Value {
 }
 
 fn ref_to_json(r: &StoreReader, rr: &RefRecord) -> serde_json::Value {
-    let path = r.files.get(rr.file_id as usize)
-        .map(|f| f.display_path(&r.roots)).unwrap_or_default();
+    let path = r.display_path_cached(rr.file_id).unwrap_or("");
     serde_json::json!({
         "name": rr.name,
         "ref_kind": rr.kind.short(),

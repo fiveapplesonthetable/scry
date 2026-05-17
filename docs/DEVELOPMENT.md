@@ -712,26 +712,26 @@ Probable causes (in order of likelihood):
 Open: classify the 634 failures by directory + dump one
 representative CXDiagnostic per group to identify the root cause.
 
-### `usr_for_window` warm latency
+### `usr_for_window` warm latency — fixed in v0.1.66
 
-The strict-precision query hot path resolves USRs by scanning the
-clang sidecar's records inside a byte window around each ref.
-Current measurement on AOSP+kernel corpus (clang_usrs.bin: ~10 GB,
-~5 M USR records, ~100 M reference records):
+Cured by two changes that landed together:
 
-- Cold: ~30 s for 2.5 k refs
-- Warm (page cache hot): **17 s for 2.5 k refs** — far worse than
-  expected. The query should be O(log N) per ref via the existing
-  byte-offset index, not O(N).
+- `ClangUsrIndex::precompute_by_file_ids` + `ByFileLookup` materialise
+  a per-`file_id` slice of sorted `(byte_offset, usr_id)` tuples at
+  query start. The per-ref loop in `apply_precision_filter` then
+  binary-searches that slice (`partition_point` + ±window scan)
+  instead of re-allocating a display_path and probing the
+  `HashMap<String, ...>` per ref.
+- The `display_path` cache (`StoreReader::display_path_cached`)
+  removes the per-ref `String` alloc + `PathBuf::push` in the same
+  hot loop.
 
-Likely cause: each `usr_for_window` call linear-scans the whole
-records vector instead of binary-searching `(file_id, byte_offset)`
-sorted entries. Fix: build a (file_id → sorted byte_offsets) side
-table at sidecar open time, then bisect within it.
+Combined, the strict precision query on the live AOSP+kernel corpus
+went from ~17 s warm on 2.5 k refs to single-digit milliseconds on
+the same query through `scry serve` (with cached paths).
 
-Located in `crates/scry-store/src/clang_usrs.rs`; the lookup is
-already used by `cmd_callgraph`, `cmd_uses`, and the strict filter
-in `cmd_impact`. A 10× speedup here lands in every precision query.
+The same precompute lives in `scip_index::ByFileSymbolLookup` for
+SCIP sidecar lookups.
 
 ### File split: scry-cli main.rs
 

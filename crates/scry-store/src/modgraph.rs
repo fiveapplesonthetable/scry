@@ -366,8 +366,8 @@ fn compute_reach_bitmap(
 /// On-disk cache for the small per-index fields of the
 /// constructed `ModuleGraph` (modules + per-file owner
 /// attribution + name index), keyed by both `module_graph.json`
-/// AND the scry index's `files.bin` mtime+size. Pair-loaded with
-/// `ReachCache` (which holds the 1GB reach bitmap) — together
+/// AND the scry index's `files_packed.bin` mtime+size. Pair-loaded
+/// with `ReachCache` (which holds the 1GB reach bitmap) — together
 /// they let `ModuleGraph` reconstitute in ~100ms cold without
 /// touching the 256MB JSON or rebuilding the 1.4M-file
 /// attribution loop.
@@ -377,12 +377,12 @@ fn compute_reach_bitmap(
 ///   bytes  9..13   version (u32)
 ///   bytes 13..21   module_graph.json mtime_nanos (u64)
 ///   bytes 21..29   module_graph.json size_bytes (u64)
-///   bytes 29..37   files.bin mtime_nanos (u64)
-///   bytes 37..45   files.bin size_bytes (u64)
+///   bytes 29..37   files_packed.bin mtime_nanos (u64)
+///   bytes 37..45   files_packed.bin size_bytes (u64)
 ///   bytes 45..77   blake3 hash of the source JSON (32 bytes)
 ///   bytes 77..     bincode of (modules, file_module, name_to_id_vec)
 ///
-/// On hit (steady state): two stats (json, files.bin) + one
+/// On hit (steady state): two stats (json, files_packed.bin) + one
 /// bincode decode (~10MB on AOSP scale, ~50ms) + one
 /// `ReachCache::try_load` (mmap-equivalent read of ~1GB bitmap,
 /// O(disk read)). The cached binding hash lets us call

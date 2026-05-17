@@ -145,7 +145,7 @@ propagation looks like normal sequencing:
 ```rust
 fn read_index(dir: &Path) -> Result<StoreReader> {
     let manifest: Manifest = read_bincode(&dir.join("manifest.bin"))?;
-    let files: Vec<FileEntry> = read_bincode(&dir.join("files.bin"))?;
+    let files = FilesPacked::open(&dir.join("files_packed.bin"))?;
     Ok(StoreReader::new(manifest, files))
 }
 ```
@@ -2924,10 +2924,10 @@ Sidecar sizes scale linearly too:
 
 | sidecar              | 1M files (live) | 3M files (estimated) |
 |----------------------|----------------:|---------------------:|
-| `files.bin`          | 103 MB          | ~310 MB              |
-| `symbols.bin`        | 2.7 GB          | ~8 GB                |
-| `refs.bin`           | 4.8 GB          | ~14 GB               |
-| `names.fst`          | 78 MB           | ~234 MB              |
+| `files_packed.bin`   | 70 MB           | ~210 MB              |
+| `symbols.bin`        | 3.0 GB          | ~9 GB                |
+| `refs.bin`           | 4.6 GB          | ~14 GB               |
+| `names.fst`          | 154 MB          | ~462 MB              |
 | `trigram_postings`   | 1.4 GB          | ~4.1 GB              |
 | total mmap surface   | ~10 GB          | ~30 GB               |
 

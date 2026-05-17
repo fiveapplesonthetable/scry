@@ -16,6 +16,10 @@ bincode = "1.3"
 fst = { version = "0.4", features = ["levenshtein"] }
 blake3 = "1"
 memmap2 = "0.9"
+# Parallel iterators over `files_packed.bin` (par_iter_files).
+# Already in the transitive dep tree via scry-cli's digest/embedding
+# pipelines, so this adds no new compile cost.
+rayon = "1"
 memchr = { workspace = true }
 serde_json = { workspace = true }
 # Only used inside the audited unsafe surface (see module-level

@@ -220,7 +220,7 @@ final index contains:
 <index>/
 ├── manifest.json           # version, stats, indexed-at
 ├── roots.bin               # Vec<RootEntry>
-├── files.bin               # Vec<FileEntry>
+├── files_packed.bin        # mmap'd packed file table (root_id, kind, size, relpath)
 ├── symbols.bin             # Vec<SymbolRecord> (cat'd from chunks)
 ├── symbols_offsets.bin     # u64 byte offset per symbol (lazy reader)
 ├── refs.bin                # Vec<RefRecord>

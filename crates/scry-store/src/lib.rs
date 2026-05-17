@@ -41,6 +41,7 @@ pub mod embed;
 pub mod modgraph;
 pub mod clang_usrs;
 pub mod scip_index;
+pub mod files_packed;
 
 /// Tell the kernel we plan to read every byte of `path` soon, so it
 /// can start pulling pages into the page cache while we do other
@@ -336,6 +337,47 @@ impl FileEntry {
     }
 }
 
+/// Borrowed read-side view of a single file in the index. Yielded
+/// by [`StoreReader::file_view`] / [`StoreReader::iter_files`] /
+/// [`StoreReader::par_iter_files`]. Same field shape as
+/// [`FileEntry`] (the indexer-side write struct), but `relpath`
+/// borrows from the mmap'd `files_packed.bin` — no allocation per
+/// record on the read path.
+///
+/// `display_path()` still allocates because the caller asks for an
+/// owned `String` — that's the price the caller chose to pay by
+/// rendering. For repeated lookups against a stable set of
+/// file_ids, prefer [`StoreReader::display_path_cached`].
+#[derive(Debug, Clone, Copy)]
+pub struct FileView<'r> {
+    pub id: u32,
+    pub root_id: u8,
+    pub kind: FileKind,
+    pub size: u64,
+    pub relpath: &'r str,
+    pub(crate) roots: &'r [RootEntry],
+}
+
+impl<'r> FileView<'r> {
+    pub fn display_path(&self) -> String {
+        let root = match self.roots.get(self.root_id as usize) {
+            Some(r) => r.path.as_str(),
+            None => "",
+        };
+        let mut s = String::with_capacity(root.len() + 1 + self.relpath.len());
+        s.push_str(root);
+        if !root.ends_with('/') && !self.relpath.is_empty() { s.push('/'); }
+        s.push_str(self.relpath);
+        s
+    }
+
+    /// The Profile of the root this file belongs to. Used by
+    /// build-precision routing (Soong vs GN vs Kbuild vs Cargo).
+    pub fn root_profile(&self) -> Option<Profile> {
+        self.roots.get(self.root_id as usize).map(|r| r.profile)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefRecord {
     pub name: String,
@@ -534,7 +576,13 @@ impl StorePaths {
     }
     pub fn manifest(&self) -> PathBuf { self.root.join("manifest.json") }
     pub fn roots(&self) -> PathBuf { self.root.join("roots.bin") }
-    pub fn files(&self) -> PathBuf { self.root.join("files.bin") }
+    /// Mmap sidecar carrying file metadata (root_id, kind, size,
+    /// relpath). Required by [`StoreReader::open`]; layout is in
+    /// [`crate::files_packed`]. Replaces the bincode-encoded
+    /// `files.bin` that v0.1.65 and earlier wrote — cold open went
+    /// from ~325 ms to <1 ms on the AOSP+Linux 1M-file index by
+    /// switching to mmap + per-record random access.
+    pub fn files_packed(&self) -> PathBuf { self.root.join("files_packed.bin") }
     pub fn symbols(&self) -> PathBuf { self.root.join("symbols.bin") }
     pub fn names_fst(&self) -> PathBuf { self.root.join("names.fst") }
     pub fn name_postings(&self) -> PathBuf { self.root.join("name_postings.bin") }
@@ -573,7 +621,7 @@ impl StorePaths {
     /// Bincode-cached full ModuleGraph (modules + per-file
     /// attribution + reach bitmap + name index). Skips both the
     /// JSON parse AND the 1.4M-file HashMap attribution loop.
-    /// Bound to mtime+size of module_graph.json + files.bin.
+    /// Bound to mtime+size of module_graph.json + files_packed.bin.
     pub fn module_graph_full(&self) -> PathBuf { self.root.join("module_graph_full.bin") }
     /// Optional Path B sidecar: per-symbol clang USRs from
     /// `scry-clang-index`. Present when the user has run the helper
@@ -603,7 +651,7 @@ impl StorePaths {
     /// Produced by `scry build-resolutions`; reader honors it on get_ref().
     pub fn ref_resolutions(&self) -> PathBuf { self.root.join("ref_resolutions.bin") }
     /// Per-file content digest: packed `[u8; 32]` per file_id (blake3).
-    /// Indexed parallel to `files.bin`. Used by `scry index --incremental`
+    /// Indexed parallel to `files_packed.bin`. Used by `scry index --incremental`
     /// to detect which files actually changed between two index builds.
     /// Optional sidecar — produced by `scry build-digests`; absence
     /// just means `--incremental` is unavailable until it's built.
@@ -925,7 +973,14 @@ impl StoreWriter {
         let tmp_paths = StorePaths::new(tmp.clone());
 
         write_bincode(&tmp_paths.roots(), &self.roots)?;
-        write_bincode(&tmp_paths.files(), &self.files)?;
+        // Packed mmap sidecar. See `files_packed` module for layout.
+        // The legacy `files.bin` bincode-encoded `Vec<FileEntry>` has
+        // been retired — `StoreReader::open` requires this file.
+        files_packed::write_from_iter(
+            &tmp_paths.files_packed(),
+            self.files.iter()
+                .map(|fe| (fe.root_id, fe.kind, fe.relpath.as_str(), fe.size)),
+        )?;
 
         // -- symbols.bin + symbols_offsets.bin + file_symbols.bin --
         //    Concatenate chunks into a single bincode Vec<SymbolRecord>,
@@ -1117,7 +1172,13 @@ impl StoreWriter {
         let tmp_paths = StorePaths::new(tmp.clone());
 
         write_bincode(&tmp_paths.roots(), &self.roots)?;
-        write_bincode(&tmp_paths.files(), &self.files)?;
+        // Packed mmap sidecar — see comment above the streaming
+        // finalize for the rationale.
+        files_packed::write_from_iter(
+            &tmp_paths.files_packed(),
+            self.files.iter()
+                .map(|fe| (fe.root_id, fe.kind, fe.relpath.as_str(), fe.size)),
+        )?;
         write_bincode(&tmp_paths.symbols(), &self.symbols)?;
         write_bincode(&tmp_paths.refs(), &self.refs)?;
 
@@ -1698,7 +1759,6 @@ pub struct StoreReader {
     pub paths: StorePaths,
     pub manifest: Manifest,
     pub roots: Vec<RootEntry>,
-    pub files: Vec<FileEntry>,
     /// Eager-loaded records. Empty in lazy mode (use lazy_symbols instead).
     pub symbols: Vec<SymbolRecord>,
     pub refs: Vec<RefRecord>,
@@ -1797,22 +1857,49 @@ pub struct StoreReader {
     pub(crate) display_paths_cell: std::sync::OnceLock<Vec<String>>,
     /// Lazy `display_path → file_id` reverse map. Built on first
     /// call to [`StoreReader::resolve_file_id`]. Without this the
-    /// resolver linear-scanned `files` (~1M entries) per call,
-    /// allocating a fresh display_path per file to compare against
-    /// — ~600 ms on the production AOSP+Linux index. After the
-    /// cache, exact-path resolution is one HashMap probe.
+    /// resolver linear-scanned the file table (~1M entries) per
+    /// call, allocating a fresh display_path per file to compare
+    /// against — ~600 ms on the production AOSP+Linux index. After
+    /// the cache, exact-path resolution is one HashMap probe.
     pub(crate) path_to_file_id_cell: std::sync::OnceLock<HashMap<String, u32>>,
+    /// Mmap-backed file metadata. The sole source of file
+    /// information for every accessor on the reader — `file_view`,
+    /// `iter_files`, `par_iter_files`, `file_kind`, `file_size`,
+    /// `file_root_id`, `file_relpath`, `display_path_cached`,
+    /// `resolve_file_id`. The bincode `Vec<FileEntry>` that earlier
+    /// versions held in RAM has been retired.
+    pub files_packed: files_packed::FilesPacked,
 }
 
 impl StoreReader {
     pub fn open<P: Into<PathBuf>>(root: P) -> Result<Self> {
+        // Optional cold-path profiler: set `SCRY_PROFILE_OPEN=1` to dump
+        // per-step open() timings to stderr. Hot path is unchanged.
+        let prof = std::env::var_os("SCRY_PROFILE_OPEN").is_some();
+        let t0 = std::time::Instant::now();
+        macro_rules! tick { ($label:expr) => {
+            if prof { eprintln!("[open] {:>26}  {:6} ms", $label, t0.elapsed().as_millis()); }
+        }; }
         let paths = StorePaths::new(root);
         let manifest: Manifest = serde_json::from_reader(BufReader::new(
             File::open(paths.manifest())
                 .with_context(|| format!("open {}", paths.manifest().display()))?,
         ))?;
+        tick!("manifest");
         let roots: Vec<RootEntry> = read_bincode(&paths.roots())?;
-        let files: Vec<FileEntry> = read_bincode(&paths.files())?;
+        tick!("roots");
+        // File metadata is served exclusively by `files_packed.bin`
+        // (mmap, O(1) accessors). The legacy bincode-encoded
+        // `files.bin` written by v0.1.65 and earlier has been
+        // retired — indices from older versions need to be
+        // re-run with `scry index`. Cold open on the AOSP+Linux
+        // 1M-file index: ~325 ms → <1 ms.
+        let files_packed = files_packed::FilesPacked::open(&paths.files_packed())
+            .with_context(|| format!(
+                "open {} (run `scry index` to (re)build — the file table sidecar is required since v0.1.66)",
+                paths.files_packed().display(),
+            ))?;
+        tick!("files");
         // Lazy-mode shortcut: if BOTH a record file and its offsets sidecar
         // exist, mmap them and skip the eager bincode-into-Vec load. The
         // eager symbols/refs fields stay empty; readers go through the
@@ -1820,9 +1907,11 @@ impl StoreReader {
         let lazy_symbols = if paths.symbols().exists() && paths.symbol_offsets().exists() {
             Some(LazyVec::<SymbolRecord>::open(&paths.symbols(), &paths.symbol_offsets())?)
         } else { None };
+        tick!("lazy_symbols");
         let lazy_refs = if paths.refs().exists() && paths.ref_offsets().exists() {
             Some(LazyVec::<RefRecord>::open(&paths.refs(), &paths.ref_offsets())?)
         } else { None };
+        tick!("lazy_refs");
         let symbols: Vec<SymbolRecord> = if lazy_symbols.is_some() {
             Vec::new()  // lazy mode — don't eagerly load 10 GB into RAM
         } else {
@@ -1835,12 +1924,15 @@ impl StoreReader {
         } else {
             read_bincode(&paths.refs())?
         };
+        tick!("symbols+refs");
         let fst = fst::Map::new(safe_mmap(&paths.names_fst())?)?;
         let postings_mmap = safe_mmap(&paths.name_postings())?;
+        tick!("name fst+postings");
         let ref_fst = fst::Map::new(safe_mmap(&paths.ref_names_fst())
             .with_context(|| format!("open {} (re-run \"scry index\" if missing)",
                                       paths.ref_names_fst().display()))?)?;
         let ref_postings_mmap = safe_mmap(&paths.ref_postings())?;
+        tick!("ref fst+postings");
         // Trigram index is opt-in (built with `--build-trigrams`).
         // Absent here just means the operator chose not to pay the
         // build cost; queries fall back to the slower path.
@@ -1853,6 +1945,7 @@ impl StoreReader {
         } else {
             (None, None)
         };
+        tick!("trigram fst+postings");
         // Name-trigram + unique-name sidecars (added 0.1.11). Always
         // written by the current writer; absence here means an old
         // index. lookup_substring will print a one-line "rebuild me"
@@ -1872,6 +1965,7 @@ impl StoreReader {
             } else {
                 (None, None, None, None)
             };
+        tick!("name_trigram+uniq");
         // file_symbols sidecar — produced by `scry build-file-symbols`
         // (or written inline by `index` when --build-file-symbols is
         // set). Optional everywhere (linear scan still works), so just
@@ -1883,6 +1977,7 @@ impl StoreReader {
         } else {
             (None, None)
         };
+        tick!("file_symbols");
         // file_refs sidecar — same packed shape as file_symbols, but
         // indexed at refs.bin instead. Powers `scry uses`.
         let (file_refs_mmap, file_refs_offsets_mmap) = if
@@ -1892,12 +1987,14 @@ impl StoreReader {
         } else {
             (None, None)
         };
+        tick!("file_refs");
         // Per-ref resolution overrides (Layer 2 sidecar). Optional.
         let ref_resolutions_mmap = if paths.ref_resolutions().exists() {
             Some(safe_mmap(&paths.ref_resolutions())?)
         } else {
             None
         };
+        tick!("ref_resolutions");
         // Per-file blake3 digests (for incremental change detection).
         // Optional sidecar; absence means we can't do `--incremental`.
         let file_digests_mmap = if paths.file_digests().exists() {
@@ -1926,13 +2023,14 @@ impl StoreReader {
         } else {
             (None, None, 0u32, 0u32)
         };
+        tick!("digests+tomb+embed");
         // Build-system module graph sidecar is loaded LAZILY (see
         // doc on module_graph_cell): parsing the 256MB AOSP graph
         // takes 10–30s cold and almost no queries actually need it,
         // so we defer construction until the first call to
         // `module_graph()` on a query that requires reachability.
         Ok(Self {
-            paths, manifest, roots, files, symbols, refs,
+            paths, manifest, roots, symbols, refs,
             fst, postings_mmap, ref_fst, ref_postings_mmap,
             trigram_fst, trigram_postings_mmap,
             name_trigram_fst, name_trigram_postings_mmap,
@@ -1946,19 +2044,89 @@ impl StoreReader {
             module_graph_cell: std::sync::OnceLock::new(),
             display_paths_cell: std::sync::OnceLock::new(),
             path_to_file_id_cell: std::sync::OnceLock::new(),
+            files_packed,
         })
     }
 
-    /// Cached `FileEntry::display_path` lookup keyed by `file_id`.
-    /// Builds the full path vec on first call (one `display_path`
-    /// per file, ~70 MB for the AOSP+Linux index); subsequent
-    /// lookups are a `Vec::get`. See `display_paths_cell` doc for
-    /// the rationale.
+    /// Number of files in the index.
+    pub fn file_count(&self) -> usize { self.files_packed.len() }
+
+    /// Borrowed read-side view of a single file. `None` if `file_id`
+    /// is out of range. Zero allocation.
+    pub fn file_view(&self, file_id: u32) -> Option<FileView<'_>> {
+        Some(FileView {
+            id: file_id,
+            root_id: self.files_packed.root_id(file_id)?,
+            kind: self.files_packed.kind(file_id)?,
+            size: self.files_packed.size(file_id)?,
+            relpath: self.files_packed.relpath(file_id)?,
+            roots: &self.roots,
+        })
+    }
+
+    /// Field-level accessors for callers that don't need a full
+    /// view. Same cost as [`file_view`] (one bounds check + a
+    /// couple of `u32::from_le_bytes` reads).
+    pub fn file_root_id(&self, file_id: u32) -> Option<u8> {
+        self.files_packed.root_id(file_id)
+    }
+    pub fn file_kind(&self, file_id: u32) -> Option<FileKind> {
+        self.files_packed.kind(file_id)
+    }
+    pub fn file_size(&self, file_id: u32) -> Option<u64> {
+        self.files_packed.size(file_id)
+    }
+    pub fn file_relpath(&self, file_id: u32) -> Option<&str> {
+        self.files_packed.relpath(file_id)
+    }
+
+    /// On-demand `root.path + "/" + relpath` rendering. Allocates
+    /// one fresh `String` per call but does NOT touch
+    /// `display_paths_cell`, so it stays cheap on queries that
+    /// only look up a handful of paths (e.g. `def NAME` returning
+    /// K results). The cached variant ([`display_path_cached`])
+    /// is for query shapes that touch most file_ids — it
+    /// amortises by materialising the full N-element vec on first
+    /// call.
+    pub fn file_display_path(&self, file_id: u32) -> Option<String> {
+        Some(self.file_view(file_id)?.display_path())
+    }
+
+    /// Sequential iterator over every file in id order.
+    pub fn iter_files(&self) -> impl Iterator<Item = FileView<'_>> + '_ {
+        (0..self.file_count() as u32).filter_map(move |i| self.file_view(i))
+    }
+
+    /// Rayon parallel iterator over every file in id order. Same
+    /// shape as [`iter_files`] — yields a borrowed [`FileView`] per
+    /// file, no per-record allocation.
+    pub fn par_iter_files(&self) -> impl rayon::iter::IndexedParallelIterator<Item = FileView<'_>> + '_ {
+        use rayon::prelude::*;
+        (0..self.file_count() as u32).into_par_iter().map(move |i|
+            self.file_view(i).expect("file_id in range yields Some"))
+    }
+
+    /// Cached `display_path` lookup keyed by `file_id`. Builds the
+    /// full path vec on first call (one `display_path` per file —
+    /// ~70 MB for the AOSP+Linux index); subsequent lookups are a
+    /// `Vec::get`. Use this for query shapes that touch most
+    /// file_ids (e.g. `--in` / `--not-in` filtering over the whole
+    /// corpus, ranked sorts where the comparator needs the path).
+    /// For per-record use on a small result set, prefer
+    /// [`file_display_path`] (no cache build, one alloc per call).
     pub fn display_path_cached(&self, file_id: u32) -> Option<&str> {
         let v = self.display_paths_cell.get_or_init(|| {
-            self.files.iter()
-                .map(|fe| fe.display_path(&self.roots))
-                .collect()
+            let p = &self.files_packed;
+            (0..p.len() as u32).map(|i| {
+                let root_idx = p.root_id(i).unwrap_or(0) as usize;
+                let root_path = self.roots.get(root_idx).map(|r| r.path.as_str()).unwrap_or("");
+                let relpath = p.relpath(i).unwrap_or("");
+                let mut s = String::with_capacity(root_path.len() + 1 + relpath.len());
+                s.push_str(root_path);
+                if !root_path.ends_with('/') && !relpath.is_empty() { s.push('/'); }
+                s.push_str(relpath);
+                s
+            }).collect()
         });
         v.get(file_id as usize).map(String::as_str)
     }
@@ -1970,11 +2138,12 @@ impl StoreReader {
     /// match is just a `str::ends_with` instead of a re-alloc.
     pub fn resolve_file_id(&self, arg: &str) -> Option<u32> {
         let arg = arg.trim();
-        let paths = self.display_paths_cell.get_or_init(|| {
-            self.files.iter()
-                .map(|fe| fe.display_path(&self.roots))
-                .collect()
-        });
+        // Reuse the same cell as `display_path_cached` so the cost
+        // is paid only once per process even if both APIs are used.
+        let _ = self.display_path_cached(0);
+        let paths = self.display_paths_cell.get().expect(
+            "display_paths_cell is populated by the line above"
+        );
         // Exact-path cache. Built once per StoreReader.
         let exact_map = self.path_to_file_id_cell.get_or_init(|| {
             let mut m: HashMap<String, u32> = HashMap::with_capacity(paths.len());
@@ -2015,7 +2184,10 @@ impl StoreReader {
             // skip the JSON parse, the file_module HashMap
             // attribution, and the Warshall recompute.
             let full_path = self.paths.module_graph_full();
-            let files_path = self.paths.files();
+            // Cache key invalidates when the file table changes,
+            // bound to `files_packed.bin` since the legacy
+            // `files.bin` has been retired.
+            let files_path = self.paths.files_packed();
             let full_cache = modgraph::FullModuleGraphCache {
                 path: &full_path,
                 json_path: &path,
@@ -2089,11 +2261,10 @@ impl StoreReader {
                 );
                 return None;
             }
-            let path_to_id: HashMap<String, u32> = self.files
-                .iter()
-                .map(|fe| (fe.display_path(&self.roots), fe.id))
+            let path_to_id: HashMap<String, u32> = self.iter_files()
+                .map(|fe| (fe.display_path(), fe.id))
                 .collect();
-            let total_files = self.files.len();
+            let total_files = self.file_count();
             let cache_path = self.paths.module_graph_reach();
             let cache = modgraph::ReachCache {
                 path: &cache_path,

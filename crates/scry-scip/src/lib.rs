@@ -37,7 +37,7 @@
 use anyhow::{anyhow, Context, Result};
 use protobuf::Message;
 use scip::types::Index;
-use scry_store::scip_index::{ScipRecord, ScipSidecar};
+use scry_store::scip_index::{self, ScipIndex, ScipRecord};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -110,17 +110,29 @@ pub fn import_scip_with_mode(
     let mut starting_records = 0usize;
     if append {
         let existing_path = index_dir.join("scip_index.bin");
-        if existing_path.exists() {
-            let raw = std::fs::read(&existing_path)
-                .with_context(|| format!("read existing {}", existing_path.display()))?;
-            let existing: ScipSidecar = bincode::deserialize(&raw)
-                .with_context(|| format!("decode existing {}", existing_path.display()))?;
-            for (i, s) in existing.symbol_table.iter().enumerate() {
-                symbol_id.insert(s.clone(), i as u32);
+        if let Some(existing) = ScipIndex::open(&existing_path)
+            .with_context(|| format!("open existing {}", existing_path.display()))?
+        {
+            // Seed the symbol table by interning every existing
+            // symbol string in id order, then materialise the records
+            // with the (preserved) symbol_ids.
+            for s in existing.iter_symbols() {
+                let id = symbol_table.len() as u32;
+                symbol_table.push(s.to_string());
+                symbol_id.insert(s.to_string(), id);
             }
-            starting_records = existing.records.len();
-            symbol_table = existing.symbol_table;
-            records = existing.records;
+            for (path, byte_offset, sym, role) in existing.iter_records() {
+                let id = *symbol_id
+                    .get(sym)
+                    .expect("symbol seen in iter_symbols above");
+                records.push(ScipRecord {
+                    abs_path: path.to_string(),
+                    byte_offset,
+                    symbol_id: id,
+                    role,
+                });
+            }
+            starting_records = records.len();
         }
     }
     // Set used to dedup `(abs_path, byte_offset, symbol_id)` across
@@ -183,27 +195,27 @@ pub fn import_scip_with_mode(
         docs_processed += 1;
     }
 
-    let sidecar = ScipSidecar { version: 1, symbol_table, records };
     let out = index_dir.join("scip_index.bin");
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let buf = bincode::serialize(&sidecar).context("serialize ScipSidecar")?;
     let tmp = out.with_extension("bin.tmp");
-    std::fs::write(&tmp, &buf).with_context(|| format!("write {}", tmp.display()))?;
+    scip_index::write(&tmp, &symbol_table, &records)
+        .with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &out)
         .with_context(|| format!("rename {} -> {}", tmp.display(), out.display()))?;
     let mode = if append { "append" } else { "replace" };
-    let added = sidecar.records.len().saturating_sub(starting_records);
+    let added = records.len().saturating_sub(starting_records);
+    let bytes_on_disk = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "[scip-import {mode}] {} docs processed ({} skipped: file missing on disk), \
          +{} occurrences (total {}), {} unique symbols, {} bytes → {} ({}s)",
         docs_processed,
         docs_skipped,
         added,
-        sidecar.records.len(),
-        sidecar.symbol_table.len(),
-        buf.len(),
+        records.len(),
+        symbol_table.len(),
+        bytes_on_disk,
         out.display(),
         t.elapsed().as_secs(),
     );

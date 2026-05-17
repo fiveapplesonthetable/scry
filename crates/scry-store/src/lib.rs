@@ -551,6 +551,10 @@ impl StorePaths {
     /// Warshall compute on cold opens; invalidated automatically
     /// when the source JSON changes (binding hash mismatch).
     pub fn module_graph_reach(&self) -> PathBuf { self.root.join("module_graph_reach.bin") }
+    /// Bincode-cached parsed form of `module_graph.json`. ~150MB
+    /// on AOSP, decodes in ~50ms vs serde_json's ~2.5s. Bound to
+    /// the JSON's mtime+size; rebuilt automatically on miss.
+    pub fn module_graph_parsed(&self) -> PathBuf { self.root.join("module_graph_parsed.bin") }
     /// Optional Path B sidecar: per-symbol clang USRs from
     /// `scry-clang-index`. Present when the user has run the helper
     /// against a compile_commands.json. v0.1.13+.
@@ -1880,18 +1884,42 @@ impl StoreReader {
         self.module_graph_cell.get_or_init(|| {
             let path = self.paths.module_graph_json();
             if !path.exists() { return None; }
-            let raw = match std::fs::read(&path) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[scry] module_graph.json: read failed: {e}");
-                    return None;
-                }
+            let parsed_path = self.paths.module_graph_parsed();
+            let parsed_cache = modgraph::ParsedCache {
+                path: &parsed_path,
+                json_path: &path,
             };
-            let v: modgraph::ModuleGraphJsonV1 = match serde_json::from_slice(&raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[scry] module_graph.json: parse failed: {e}");
-                    return None;
+            // Fast path: parsed bincode cache valid (JSON mtime+size
+            // unchanged since cache was written) → skip serde_json
+            // entirely. On AOSP this turns the modgraph open from
+            // ~3s into ~150ms.
+            let (v, binding_hash) = match parsed_cache.try_load() {
+                Some(hit) => (hit.payload, hit.binding_hash),
+                None => {
+                    let raw = match std::fs::read(&path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[scry] module_graph.json: read failed: {e}");
+                            return None;
+                        }
+                    };
+                    let v: modgraph::ModuleGraphJsonV1 = match serde_json::from_slice(&raw) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[scry] module_graph.json: parse failed: {e}");
+                            return None;
+                        }
+                    };
+                    let binding_hash: [u8; 32] = *blake3::hash(&raw).as_bytes();
+                    // Best-effort: write the parsed-form cache for next
+                    // time. Failure is non-fatal (next read just re-parses).
+                    if let Err(e) = parsed_cache.write(&v, binding_hash) {
+                        eprintln!(
+                            "[scry] module_graph: failed to write parsed cache: {e} \
+                             (queries still work; next open will re-parse JSON)",
+                        );
+                    }
+                    (v, binding_hash)
                 }
             };
             if v.version != 1 {
@@ -1907,11 +1935,6 @@ impl StoreReader {
                 .map(|fe| (fe.display_path(&self.roots), fe.id))
                 .collect();
             let total_files = self.files.len();
-            // Hash the raw JSON bytes (cheap on blake3 — ~30ms for
-            // 256MB) so we can bind a reach cache to this specific
-            // source. If module_graph.json changes, the hash flips
-            // and the old cache is silently ignored on next open.
-            let binding_hash: [u8; 32] = *blake3::hash(&raw).as_bytes();
             let cache_path = self.paths.module_graph_reach();
             let cache = modgraph::ReachCache {
                 path: &cache_path,

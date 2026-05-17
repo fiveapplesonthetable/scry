@@ -41,7 +41,7 @@
 //! information plus a precomputed transitive-closure bitmap; the
 //! sidecar is what the query path reads (mmap'd, O(1) lookup).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// One module in the build graph. The name is what the build system
@@ -49,7 +49,7 @@ use std::collections::HashMap;
 /// scry uses it only for display and as a key. The id is dense and
 /// stable across a single index (referenced by file→module mappings
 /// and by the reachability bitmap).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Module {
     pub id: u32,
     pub name: String,
@@ -85,7 +85,7 @@ pub struct ModuleGraph {
 
 /// Raw JSON form read from a v1 module-graph file. Adapters emit this
 /// shape; we deserialize via serde then compact into [`ModuleGraph`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ModuleGraphJsonV1 {
     pub version: u32,
     pub modules: Vec<Module>,
@@ -95,7 +95,7 @@ pub struct ModuleGraphJsonV1 {
     pub files: Vec<FileAttr>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FileAttr {
     pub path: String,
     pub module_id: u32,
@@ -295,6 +295,110 @@ fn compute_reach_bitmap(
         }
     }
     reach
+}
+
+/// On-disk cache for the parsed `ModuleGraphJsonV1` form, written
+/// alongside `module_graph.json` so subsequent loads can skip
+/// `serde_json::from_slice` entirely.
+///
+/// On AOSP scale the JSON is 256MB; serde_json parses it in ~2.5s
+/// (Python's `json.loads` clocks the same). bincode of the same
+/// data decodes in ~50ms, so the cache turns the cold `--reachable`
+/// pre-amble from "user notices the lag" into "user does not".
+///
+/// File layout (little-endian):
+///   bytes  0..  9   magic = b"scryMPV1\x01"
+///   bytes  9.. 13   format version (u32)
+///   bytes 13.. 21   source JSON mtime_nanos (u64; 0 if unknown)
+///   bytes 21.. 29   source JSON size_bytes (u64)
+///   bytes 29.. 61   blake3 hash of source JSON bytes (32 bytes)
+///   bytes 61..      bincode-serialized ModuleGraphJsonV1 payload
+///
+/// On load: stat the JSON path. If mtime_nanos + size_bytes match
+/// the cached header, return the decoded payload + cached hash —
+/// the JSON was not regenerated since this cache was written, so
+/// the cached parse is good. Any mismatch returns None (caller
+/// reads + parses the JSON normally and rewrites the cache).
+///
+/// This pairs with `ReachCache`: a cold `--reachable` open first
+/// hits `ParsedCache` (skips parse) then `ReachCache` (skips
+/// Warshall). With both warm the dominant cost is mmap of the
+/// reach bitmap, which is sub-100ms.
+pub struct ParsedCache<'a> {
+    pub path: &'a std::path::Path,
+    pub json_path: &'a std::path::Path,
+}
+
+const PARSED_CACHE_MAGIC: &[u8; 9] = b"scryMPV1\x01";
+const PARSED_CACHE_VERSION: u32 = 1;
+const PARSED_CACHE_HEADER_LEN: usize = 9 + 4 + 8 + 8 + 32;
+
+/// What `ParsedCache::try_load` returns on a hit: the cached
+/// payload plus the binding hash from the cache header (so the
+/// caller can feed it straight to `ReachCache` without rehashing
+/// the JSON).
+pub struct ParsedCacheHit {
+    pub payload: ModuleGraphJsonV1,
+    pub binding_hash: [u8; 32],
+}
+
+impl ParsedCache<'_> {
+    /// Try to load the cached parsed form. Returns `None` if the
+    /// cache file is absent / corrupted, or if the JSON's
+    /// (mtime, size) no longer matches the cache header. Any
+    /// `None` means "fall back to read + parse JSON".
+    pub fn try_load(&self) -> Option<ParsedCacheHit> {
+        let json_meta = std::fs::metadata(self.json_path).ok()?;
+        let json_mtime = json_meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64).unwrap_or(0);
+        let json_size = json_meta.len();
+        let bytes = std::fs::read(self.path).ok()?;
+        if bytes.len() < PARSED_CACHE_HEADER_LEN { return None; }
+        if &bytes[..9] != PARSED_CACHE_MAGIC { return None; }
+        let version = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+        if version != PARSED_CACHE_VERSION { return None; }
+        let cached_mtime = u64::from_le_bytes(bytes[13..21].try_into().ok()?);
+        let cached_size = u64::from_le_bytes(bytes[21..29].try_into().ok()?);
+        if cached_mtime != json_mtime || cached_size != json_size {
+            return None;
+        }
+        let binding_hash: [u8; 32] = bytes[29..61].try_into().ok()?;
+        let payload: ModuleGraphJsonV1 = bincode::deserialize(
+            &bytes[PARSED_CACHE_HEADER_LEN..],
+        ).ok()?;
+        Some(ParsedCacheHit { payload, binding_hash })
+    }
+
+    /// Atomically write the cache. Caller passes the binding hash
+    /// (typically `blake3(module_graph.json)`) so a later
+    /// `ReachCache` lookup doesn't need to re-read the JSON.
+    pub fn write(&self, v: &ModuleGraphJsonV1, binding_hash: [u8; 32]) -> std::io::Result<()> {
+        use std::io::Write;
+        let json_meta = std::fs::metadata(self.json_path)?;
+        let json_mtime = json_meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64).unwrap_or(0);
+        let json_size = json_meta.len();
+        let payload = bincode::serialize(v).map_err(|e|
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = self.path.with_extension("bin.tmp");
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(f);
+        w.write_all(PARSED_CACHE_MAGIC)?;
+        w.write_all(&PARSED_CACHE_VERSION.to_le_bytes())?;
+        w.write_all(&json_mtime.to_le_bytes())?;
+        w.write_all(&json_size.to_le_bytes())?;
+        w.write_all(&binding_hash)?;
+        w.write_all(&payload)?;
+        w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, self.path)?;
+        Ok(())
+    }
 }
 
 /// On-disk cache for the reachability bitmap. The bitmap dominates
@@ -560,6 +664,77 @@ mod tests {
             deps: j.deps.clone(),
             files: j.files.clone(),
         }
+    }
+
+    /// `ParsedCache` round-trip: write a parsed JSON cache,
+    /// reload via mtime+size binding, confirm the payload matches
+    /// and the cached binding hash returns intact.
+    #[test]
+    fn parsed_cache_roundtrip_and_mtime_binding() {
+        let tmp_dir = std::env::temp_dir().join(
+            format!("scry-parsedcache-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let json_path = tmp_dir.join("module_graph.json");
+        let cache_path = tmp_dir.join("module_graph_parsed.bin");
+        let json_bytes = br#"{"version":1,"modules":[],"deps":[],"files":[]}"#;
+        std::fs::write(&json_path, json_bytes).unwrap();
+        let v = ModuleGraphJsonV1 {
+            version: 1,
+            modules: vec![m(0, "A"), m(1, "B")],
+            deps: vec![[0, 1]],
+            files: vec![FileAttr { path: "x".into(), module_id: 0 }],
+        };
+        let binding_hash = *blake3::hash(b"sentinel-hash").as_bytes();
+        let cache = ParsedCache { path: &cache_path, json_path: &json_path };
+
+        // Round-trip: write + load.
+        cache.write(&v, binding_hash).unwrap();
+        let hit = cache.try_load().expect("cache should load after write");
+        assert_eq!(hit.binding_hash, binding_hash);
+        assert_eq!(hit.payload.modules.len(), 2);
+        assert_eq!(hit.payload.deps, vec![[0, 1]]);
+        assert_eq!(hit.payload.files.len(), 1);
+        assert_eq!(hit.payload.files[0].path, "x");
+
+        // Mtime-binding: rewrite the JSON. New mtime ⇒ cache miss.
+        // Sleep 10ms to guarantee the FS mtime moves (some FS have
+        // coarse mtime granularity).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&json_path, b"different content").unwrap();
+        assert!(cache.try_load().is_none(),
+            "cache must invalidate when source JSON mtime changes");
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// Bad / truncated / wrong-magic cache files are silently
+    /// ignored. The caller falls back to re-parsing the JSON.
+    #[test]
+    fn parsed_cache_bad_data_returns_none() {
+        let tmp_dir = std::env::temp_dir().join(
+            format!("scry-parsedbad-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let json_path = tmp_dir.join("module_graph.json");
+        let cache_path = tmp_dir.join("module_graph_parsed.bin");
+        std::fs::write(&json_path, b"{}").unwrap();
+
+        // Wrong magic.
+        std::fs::write(&cache_path, b"garbage_header_long_enough_to_pass_size_check_but_wrong_magic_bytes_padded").unwrap();
+        let cache = ParsedCache { path: &cache_path, json_path: &json_path };
+        assert!(cache.try_load().is_none(), "wrong magic must reject");
+
+        // File too short.
+        std::fs::write(&cache_path, b"short").unwrap();
+        assert!(cache.try_load().is_none(), "truncated file must reject");
+
+        // Absent file.
+        std::fs::remove_file(&cache_path).unwrap();
+        assert!(cache.try_load().is_none(), "missing file is a miss, not a panic");
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
     }
 
     /// A cache built for a different binding hash must be ignored.

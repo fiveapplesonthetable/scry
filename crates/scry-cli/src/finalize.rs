@@ -169,45 +169,47 @@ pub(crate) fn cmd_finalize(
     Ok(())
 }
 
-/// Walk each indexed root + each `--build-out` path looking for
-/// files whose name == `pattern` (when `match_ext_suffix` is false)
-/// or whose name ends with `pattern` (when true, for `.scip`-style
-/// extension matching). Returns `Ok(Some(path))` only when EXACTLY
-/// one file is found across all locations. On zero or multiple
-/// matches, returns `Ok(None)`; on multiple, emits a warning naming
-/// the candidates so the user knows to disambiguate via the
-/// explicit flag.
+/// Walk indexed roots + `--build-out` paths looking for files whose
+/// name == `pattern` (or whose name ends with `pattern` when
+/// `match_ext_suffix` is true, for `.scip`-style suffix matching).
+/// Returns `Ok(Some(path))` only when EXACTLY one file is found.
+/// On zero or multiple matches, returns `Ok(None)`; multiple
+/// matches emit a candidate warning so the user knows to pick one
+/// via `--clang-compile-commands` / `--scip` explicitly.
 ///
-/// Indexed-root walk: depth-capped (5) and hit-capped (8) so
-/// AOSP-class trees can't turn discovery into a multi-minute scan.
-/// Uses the `ignore` crate with standard filters on, so `.gitignore`
-/// is honored — vendored artifacts won't show up.
+/// **Priority of search paths:**
 ///
-/// `--build-out` walk: deeper cap (10) and same hit cap, but
-/// standard filters are OFF. Build outputs (`out/soong/...`,
-/// `build/`, `target/`, `.gradle/`) are exactly what `.gitignore`
-/// hides, so a filter-respecting walker can't see them; that's
-/// the whole reason `--build-out` exists as a separate signal.
+/// If `--build-out` paths are provided, ONLY those are searched.
+/// `--build-out` is a user-supplied authoritative signal pointing
+/// at the canonical build directory; competing matches inside the
+/// indexed source roots (e.g. LLVM ships a test-fixture
+/// `external/clang/test/Index/compile_commands.json` inside AOSP)
+/// would otherwise stuff the candidate pool with files the user
+/// didn't mean to nominate.
+///
+/// If no `--build-out` is given, fall back to walking the indexed
+/// source roots — that covers in-tree builds (CMake with the
+/// compdb landing in the source tree, `bear -- make` from the
+/// project root, scip-typescript writing `index.scip` to cwd).
+///
+/// **Walker policy:**
+///
+///  - Indexed-root walk: depth-capped (5), hit-capped (8),
+///    `.gitignore` honored (vendored artifacts skip).
+///  - `--build-out` walk: deeper cap (10), same hit cap,
+///    `.gitignore` OFF. Build outputs (`out/soong/...`, `build/`,
+///    `target/`) are exactly what `.gitignore` hides, so a
+///    filter-respecting walker would miss them — that's the whole
+///    reason `--build-out` exists as a distinct signal.
 fn pick_single_auto_discovered(
     index_dir: &Path,
     pattern: &str,
     match_ext_suffix: bool,
     build_out: &[PathBuf],
 ) -> Result<Option<PathBuf>> {
-    let roots: Vec<PathBuf> = match StoreReader::open(index_dir) {
-        Ok(r) => r.roots.iter().map(|root| PathBuf::from(&root.path)).collect(),
-        Err(e) => {
-            eprintln!("[finalize] WARN: cannot open index for auto-discovery: {e}");
-            Vec::new()
-        }
-    };
     const SRC_MAX_DEPTH: usize = 5;
     const OUT_MAX_DEPTH: usize = 10;
     const MAX_HITS: usize = 8;
-    // Track seen canonical paths so an indexed root and a --build-out
-    // path that overlap don't add the same physical file twice (which
-    // would falsely trigger the "multiple found" warning). Paths that
-    // fail to canonicalize fall back to identity comparison.
     let mut hits: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
@@ -223,29 +225,39 @@ fn pick_single_auto_discovered(
         }
         hits.len() >= MAX_HITS
     };
-    'outer: for root in &roots {
-        let mut walker = ignore::WalkBuilder::new(root);
-        walker.max_depth(Some(SRC_MAX_DEPTH));
-        walker.standard_filters(true);
-        for entry in walker.build().flatten() {
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
-            if match_name(&entry.file_name().to_string_lossy())
-                && push_hit(&mut hits, &mut seen, entry.into_path())
-            {
-                break 'outer;
+    if !build_out.is_empty() {
+        'outer2: for out_root in build_out {
+            let mut walker = ignore::WalkBuilder::new(out_root);
+            walker.max_depth(Some(OUT_MAX_DEPTH));
+            walker.standard_filters(false);
+            for entry in walker.build().flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
+                if match_name(&entry.file_name().to_string_lossy())
+                    && push_hit(&mut hits, &mut seen, entry.into_path())
+                {
+                    break 'outer2;
+                }
             }
         }
-    }
-    'outer2: for out_root in build_out {
-        let mut walker = ignore::WalkBuilder::new(out_root);
-        walker.max_depth(Some(OUT_MAX_DEPTH));
-        walker.standard_filters(false);
-        for entry in walker.build().flatten() {
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
-            if match_name(&entry.file_name().to_string_lossy())
-                && push_hit(&mut hits, &mut seen, entry.into_path())
-            {
-                break 'outer2;
+    } else {
+        let roots: Vec<PathBuf> = match StoreReader::open(index_dir) {
+            Ok(r) => r.roots.iter().map(|root| PathBuf::from(&root.path)).collect(),
+            Err(e) => {
+                eprintln!("[finalize] WARN: cannot open index for auto-discovery: {e}");
+                Vec::new()
+            }
+        };
+        'outer: for root in &roots {
+            let mut walker = ignore::WalkBuilder::new(root);
+            walker.max_depth(Some(SRC_MAX_DEPTH));
+            walker.standard_filters(true);
+            for entry in walker.build().flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) { continue; }
+                if match_name(&entry.file_name().to_string_lossy())
+                    && push_hit(&mut hits, &mut seen, entry.into_path())
+                {
+                    break 'outer;
+                }
             }
         }
     }

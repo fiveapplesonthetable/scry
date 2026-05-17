@@ -15,7 +15,7 @@
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use scry_store::clang_usrs::{UsrRecord, UsrSidecar};
+use scry_store::clang_usrs::{self, UsrRecord};
 use serde::Deserialize;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_int, c_void};
@@ -101,11 +101,10 @@ pub fn build_clang_usrs(
         .build_global()
         .ok();
 
-    let sidecar = Arc::new(Mutex::new(UsrSidecar {
-        version: 1,
-        usr_table: Vec::new(),
-        records: Vec::new(),
-    }));
+    // Per-TU records accumulate into two flat tables; we write the
+    // packed sidecar at the end from `(usr_table, records)`.
+    let usr_table: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let records: Arc<Mutex<Vec<UsrRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let interner: Arc<Mutex<std::collections::HashMap<String, u32>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
@@ -116,7 +115,7 @@ pub fn build_clang_usrs(
     let n = filtered.len();
 
     filtered.par_iter().for_each(|cmd| {
-        match parse_one(cmd, max_file_bytes, &sidecar, &interner) {
+        match parse_one(cmd, max_file_bytes, &usr_table, &records, &interner) {
             Ok(ParseOutcome::Parsed) => {
                 let done = parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if done % 50 == 0 || done == n {
@@ -143,24 +142,28 @@ pub fn build_clang_usrs(
         }
     });
 
-    let sidecar = Arc::try_unwrap(sidecar)
-        .map_err(|_| anyhow!("sidecar still has outstanding refs"))?
+    let usr_table = Arc::try_unwrap(usr_table)
+        .map_err(|_| anyhow!("usr_table still has outstanding refs"))?
+        .into_inner();
+    let records = Arc::try_unwrap(records)
+        .map_err(|_| anyhow!("records still has outstanding refs"))?
         .into_inner();
     let out = index_dir.join("clang_usrs.bin");
-    let buf = bincode::serialize(&sidecar).context("serialize sidecar")?;
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     let tmp = out.with_extension("bin.tmp");
-    std::fs::write(&tmp, &buf).with_context(|| format!("write {}", tmp.display()))?;
+    clang_usrs::write(&tmp, &usr_table, &records)
+        .with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &out)
         .with_context(|| format!("rename {} -> {}", tmp.display(), out.display()))?;
+    let bytes_on_disk = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "[clang-index] done: {} USRs, {} records, {} bytes \
          ({} parsed, {} failed, {} skipped) → {} ({}s)",
-        sidecar.usr_table.len(),
-        sidecar.records.len(),
-        buf.len(),
+        usr_table.len(),
+        records.len(),
+        bytes_on_disk,
         parsed.load(std::sync::atomic::Ordering::Relaxed),
         failed.load(std::sync::atomic::Ordering::Relaxed),
         skipped_missing.load(std::sync::atomic::Ordering::Relaxed),
@@ -182,7 +185,8 @@ enum ParseOutcome {
 fn parse_one(
     cmd: &CompileCommand,
     max_bytes: u64,
-    sidecar: &Mutex<UsrSidecar>,
+    usr_table: &Mutex<Vec<String>>,
+    records_out: &Mutex<Vec<UsrRecord>>,
     interner: &Mutex<std::collections::HashMap<String, u32>>,
 ) -> Result<ParseOutcome> {
     ensure_libclang_loaded()?;
@@ -233,13 +237,13 @@ fn parse_one(
     let mut local_recs: Vec<UsrRecord> = Vec::with_capacity(records.len());
     {
         let mut intern_guard = interner.lock();
-        let mut side_guard = sidecar.lock();
+        let mut table_guard = usr_table.lock();
         for (abs_path, byte_offset, usr, kind) in records {
             let id = match intern_guard.get(&usr) {
                 Some(&id) => id,
                 None => {
-                    let id = side_guard.usr_table.len() as u32;
-                    side_guard.usr_table.push(usr.clone());
+                    let id = table_guard.len() as u32;
+                    table_guard.push(usr.clone());
                     intern_guard.insert(usr, id);
                     id
                 }
@@ -251,8 +255,8 @@ fn parse_one(
                 kind,
             });
         }
-        side_guard.records.extend(local_recs);
     }
+    records_out.lock().extend(local_recs);
     Ok(ParseOutcome::Parsed)
 }
 

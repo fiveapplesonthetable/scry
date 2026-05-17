@@ -555,6 +555,11 @@ impl StorePaths {
     /// on AOSP, decodes in ~50ms vs serde_json's ~2.5s. Bound to
     /// the JSON's mtime+size; rebuilt automatically on miss.
     pub fn module_graph_parsed(&self) -> PathBuf { self.root.join("module_graph_parsed.bin") }
+    /// Bincode-cached full ModuleGraph (modules + per-file
+    /// attribution + reach bitmap + name index). Skips both the
+    /// JSON parse AND the 1.4M-file HashMap attribution loop.
+    /// Bound to mtime+size of module_graph.json + files.bin.
+    pub fn module_graph_full(&self) -> PathBuf { self.root.join("module_graph_full.bin") }
     /// Optional Path B sidecar: per-symbol clang USRs from
     /// `scry-clang-index`. Present when the user has run the helper
     /// against a compile_commands.json. v0.1.13+.
@@ -1884,6 +1889,38 @@ impl StoreReader {
         self.module_graph_cell.get_or_init(|| {
             let path = self.paths.module_graph_json();
             if !path.exists() { return None; }
+            // Fastest path: the full cache, bound to mtime+size
+            // of BOTH module_graph.json AND files.bin. If hit, we
+            // skip the JSON parse, the file_module HashMap
+            // attribution, and the Warshall recompute.
+            let full_path = self.paths.module_graph_full();
+            let files_path = self.paths.files();
+            let full_cache = modgraph::FullModuleGraphCache {
+                path: &full_path,
+                json_path: &path,
+                files_path: &files_path,
+            };
+            if let Some(hit) = full_cache.try_load() {
+                let n_modules = hit.modules.len();
+                let stride = n_modules.div_ceil(64);
+                let reach_path = self.paths.module_graph_reach();
+                let reach_cache = modgraph::ReachCache {
+                    path: &reach_path,
+                    binding_hash: hit.binding_hash,
+                };
+                if let Some(reach) = reach_cache.try_load_public(n_modules, stride) {
+                    return Some(modgraph::module_graph_from_parts(
+                        hit.modules,
+                        hit.file_module,
+                        hit.name_to_id,
+                        reach,
+                        stride,
+                    ));
+                }
+                // ReachCache miss (e.g. user deleted reach.bin) →
+                // fall through to the cold path, which will
+                // recompute Warshall and rewrite both caches.
+            }
             let parsed_path = self.paths.module_graph_parsed();
             let parsed_cache = modgraph::ParsedCache {
                 path: &parsed_path,
@@ -1940,11 +1977,24 @@ impl StoreReader {
                 path: &cache_path,
                 binding_hash,
             };
-            Some(modgraph::ModuleGraph::from_json_v1_with_cache(
+            let graph = modgraph::ModuleGraph::from_json_v1_with_cache(
                 v, total_files,
                 |p| path_to_id.get(p).copied(),
                 Some(cache),
-            ))
+            );
+            // Best-effort: write the small full-fields cache so
+            // subsequent opens skip JSON parse + per-file
+            // attribution entirely. Reach bitmap is already in
+            // module_graph_reach.bin from this same construction.
+            // Non-fatal if it fails — next open just takes the
+            // slow path again.
+            if let Err(e) = full_cache.write(&graph, binding_hash) {
+                eprintln!(
+                    "[scry] module_graph: failed to write full cache: {e} \
+                     (queries still work; next open will rebuild)",
+                );
+            }
+            Some(graph)
         }).as_ref()
     }
 

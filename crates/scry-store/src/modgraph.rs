@@ -297,6 +297,154 @@ fn compute_reach_bitmap(
     reach
 }
 
+/// On-disk cache for the small per-index fields of the
+/// constructed `ModuleGraph` (modules + per-file owner
+/// attribution + name index), keyed by both `module_graph.json`
+/// AND the scry index's `files.bin` mtime+size. Pair-loaded with
+/// `ReachCache` (which holds the 1GB reach bitmap) — together
+/// they let `ModuleGraph` reconstitute in ~100ms cold without
+/// touching the 256MB JSON or rebuilding the 1.4M-file
+/// attribution loop.
+///
+/// File layout (little-endian):
+///   bytes  0.. 9   magic = b"scryMFV1\x01"
+///   bytes  9..13   version (u32)
+///   bytes 13..21   module_graph.json mtime_nanos (u64)
+///   bytes 21..29   module_graph.json size_bytes (u64)
+///   bytes 29..37   files.bin mtime_nanos (u64)
+///   bytes 37..45   files.bin size_bytes (u64)
+///   bytes 45..77   blake3 hash of the source JSON (32 bytes)
+///   bytes 77..     bincode of (modules, file_module, name_to_id_vec)
+///
+/// On hit (steady state): two stats (json, files.bin) + one
+/// bincode decode (~10MB on AOSP scale, ~50ms) + one
+/// `ReachCache::try_load` (mmap-equivalent read of ~1GB bitmap,
+/// O(disk read)). The cached binding hash lets us call
+/// `ReachCache::try_load` without re-reading the JSON.
+pub struct FullModuleGraphCache<'a> {
+    pub path: &'a std::path::Path,
+    pub json_path: &'a std::path::Path,
+    pub files_path: &'a std::path::Path,
+}
+
+const FULL_MG_CACHE_MAGIC: &[u8; 9] = b"scryMFV1\x01";
+const FULL_MG_CACHE_VERSION: u32 = 1;
+const FULL_MG_CACHE_HEADER_LEN: usize = 9 + 4 + 8 + 8 + 8 + 8 + 32;
+
+#[derive(Serialize, Deserialize)]
+struct FullModuleGraphPayload {
+    modules: Vec<Module>,
+    file_module: Vec<Option<u32>>,
+    name_to_id: Vec<(String, u32)>,
+}
+
+/// Hit struct: the small per-index fields decoded from the cache,
+/// plus the binding hash recovered from the header. Caller pairs
+/// this with a `ReachCache::try_load(n_modules, stride)` call to
+/// reconstitute a full `ModuleGraph`.
+pub struct FullModuleGraphHit {
+    pub modules: Vec<Module>,
+    pub file_module: Vec<Option<u32>>,
+    pub name_to_id: HashMap<String, u32>,
+    pub binding_hash: [u8; 32],
+}
+
+impl FullModuleGraphCache<'_> {
+    /// Try to load the cached fields. Returns `None` on any
+    /// mismatch (missing file, wrong magic / version, binding
+    /// drift on either source file).
+    pub fn try_load(&self) -> Option<FullModuleGraphHit> {
+        let (json_mtime, json_size) = file_mtime_size(self.json_path)?;
+        let (files_mtime, files_size) = file_mtime_size(self.files_path)?;
+        let bytes = std::fs::read(self.path).ok()?;
+        if bytes.len() < FULL_MG_CACHE_HEADER_LEN { return None; }
+        if &bytes[..9] != FULL_MG_CACHE_MAGIC { return None; }
+        let ver = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+        if ver != FULL_MG_CACHE_VERSION { return None; }
+        let cmt = u64::from_le_bytes(bytes[13..21].try_into().ok()?);
+        let csz = u64::from_le_bytes(bytes[21..29].try_into().ok()?);
+        let fmt = u64::from_le_bytes(bytes[29..37].try_into().ok()?);
+        let fsz = u64::from_le_bytes(bytes[37..45].try_into().ok()?);
+        if cmt != json_mtime || csz != json_size { return None; }
+        if fmt != files_mtime || fsz != files_size { return None; }
+        let binding_hash: [u8; 32] = bytes[45..77].try_into().ok()?;
+        let payload: FullModuleGraphPayload =
+            bincode::deserialize(&bytes[FULL_MG_CACHE_HEADER_LEN..]).ok()?;
+        let name_to_id: HashMap<String, u32> = payload.name_to_id.into_iter().collect();
+        Some(FullModuleGraphHit {
+            modules: payload.modules,
+            file_module: payload.file_module,
+            name_to_id,
+            binding_hash,
+        })
+    }
+
+    /// Atomically write the cache. Failure is non-fatal for the
+    /// caller (next open recomputes); the on-disk file is either
+    /// fully written or absent thanks to tmp+rename.
+    pub fn write(&self, graph: &ModuleGraph, binding_hash: [u8; 32]) -> std::io::Result<()> {
+        use std::io::Write;
+        let (jmt, jsz) = file_mtime_size(self.json_path).unwrap_or((0, 0));
+        let (fmt, fsz) = file_mtime_size(self.files_path).unwrap_or((0, 0));
+        let payload = FullModuleGraphPayload {
+            modules: graph.modules.clone(),
+            file_module: graph.file_module.clone(),
+            name_to_id: graph.name_to_id.iter()
+                .map(|(k, v)| (k.clone(), *v)).collect(),
+        };
+        let body = bincode::serialize(&payload).map_err(|e|
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = self.path.with_extension("bin.tmp");
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(f);
+        w.write_all(FULL_MG_CACHE_MAGIC)?;
+        w.write_all(&FULL_MG_CACHE_VERSION.to_le_bytes())?;
+        w.write_all(&jmt.to_le_bytes())?;
+        w.write_all(&jsz.to_le_bytes())?;
+        w.write_all(&fmt.to_le_bytes())?;
+        w.write_all(&fsz.to_le_bytes())?;
+        w.write_all(&binding_hash)?;
+        w.write_all(&body)?;
+        w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, self.path)?;
+        Ok(())
+    }
+}
+
+/// Public constructor: rebuild a `ModuleGraph` from the cached
+/// fields + a loaded reach bitmap. The reach bitmap comes from
+/// `ReachCache::try_load_public` (the same on-disk file written
+/// by the cold path).
+pub fn module_graph_from_parts(
+    modules: Vec<Module>,
+    file_module: Vec<Option<u32>>,
+    name_to_id: HashMap<String, u32>,
+    reach: Vec<u64>,
+    stride: usize,
+) -> ModuleGraph {
+    ModuleGraph { modules, file_module, reach, stride, name_to_id }
+}
+
+impl ReachCache<'_> {
+    /// Public wrapper around `try_load` so the StoreReader can
+    /// reuse it from the fast path.
+    pub fn try_load_public(&self, n_modules: usize, stride: usize) -> Option<Vec<u64>> {
+        self.try_load(n_modules, stride)
+    }
+}
+
+fn file_mtime_size(p: &std::path::Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(p).ok()?;
+    let mtime = meta.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64).unwrap_or(0);
+    Some((mtime, meta.len()))
+}
+
 /// On-disk cache for the parsed `ModuleGraphJsonV1` form, written
 /// alongside `module_graph.json` so subsequent loads can skip
 /// `serde_json::from_slice` entirely.

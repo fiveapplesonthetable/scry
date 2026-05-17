@@ -2680,6 +2680,68 @@ doesn't ask for.
 
 ---
 
+## Chapter 13.5 — composing with real compilers (Path B / Path C)
+
+Tree-sitter gives scry name-level symbols. Across a million-file
+corpus, name-level matching is roughly grep-with-syntax: fast
+but lossy. The classic Kythe answer is to run a real
+compiler-driven extractor per translation unit and emit
+structured symbol IDs (clang USRs, scip-java symbols, etc.)
+that survive overload resolution and cross-module linking.
+
+scry doesn't reimplement Kythe. It consumes Kythe's two ideas:
+per-TU structured symbol IDs, and a separate join that uses
+them. Both come in as separate on-disk sidecars next to the
+mmap'd index:
+
+- **Path B**: `scry clang-index` drives libclang per TU from a
+  `compile_commands.json`. Emits `clang_usrs.bin` — a packed
+  table of `(abs_path, byte_offset, usr_id, kind)`. The USR
+  string is libclang's globally unique mangled identifier; the
+  same USR appears at the def of `strdup` AND at every call
+  site to it across the whole corpus.
+
+- **Path C**: `scry scip-import` ingests a SCIP protobuf
+  index emitted by any SCIP producer (`scip-java`, `scip-kotlin`,
+  `rust-analyzer scip`, `scip-go`, `scip-typescript`, `scip-python`).
+  Same record shape as Path B (`scip_index.bin`), but symbol IDs
+  are SCIP-formatted strings.
+
+Both sidecars are built once per source-tree change (or once per
+build for Path B's compile_commands.json). At query time scry
+mmap's the sidecar, asks it for the symbol at each candidate
+ref's `(path, byte_offset)`, and keeps only refs whose symbol
+matches a symbol at one of the def's locations.
+
+The information-theoretic shape: tree-sitter contributes the
+candidate set (every site whose tokenized name matches), and
+the structured-ID sidecar contributes a confirming bit per site
+(does the structured ID equal the def's ID?). Two independent
+sources of evidence; the AND of "name matches" + "structured
+ID matches" rejects the false positives a pure name match
+would keep.
+
+Crucially scry does NOT compute the structured IDs itself.
+That's where Kythe's complexity lives — per-language compiler
+plumbing, schema, verifier, build integration. scry stays small
+by treating the indexer artifact as just another file in the
+build output, walked by `scry finalize --build-out PATH` and
+ingested into the canonical sidecar shape. The complexity
+budget for "be Kythe-class precise for N languages" collapses
+from "implement N indexers" to "consume N indexer outputs in
+a shared on-disk format" — same value, two orders of magnitude
+less code.
+
+This is also why precision is default-on: the only thing the
+filter costs is one hash lookup per candidate ref, and if the
+sidecar isn't present the filter no-ops gracefully. There's
+nothing to "turn on" — you point `scry finalize` at the build
+dir once, and every subsequent query gets the structured
+narrowing. `--lexical` exists as an opt-out for "show me
+everything" workflows; the default workflow needs no flags.
+
+---
+
 ## Chapter 14 — the LLM-agent surface (JSON-RPC, MCP, token economy)
 
 ### 14.1 Why a separate agent interface at all

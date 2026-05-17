@@ -143,13 +143,83 @@ public class Binder implements IBinder {
 
 ---
 
-## Precision uplift via clangd (`--precise`)
+## Build-symbol precision (default-on)
+
+Whenever `<index>/clang_usrs.bin` (libclang USRs) or
+`<index>/scip_index.bin` (SCIP symbols from any SCIP producer)
+is present, scry's `def` / `ref` / `callers` / `callgraph` /
+`impact` queries auto-engage **structured-identity narrowing**:
+a candidate ref is kept only if its compiler-bound symbol ID
+matches one of the def's symbol IDs. This is the Kythe-class
+precision pillar, default-on, zero flags.
+
+```sh
+# 1. Build the source index (tree-sitter walk).
+$ scry index ~/dev/myproject -o ./idx
+
+# 2. Generate the per-language indexer artifact for your build.
+#    Examples (one-time per build regeneration):
+$ cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .   # C / C++
+$ scip-typescript index                                  # TypeScript
+$ rust-analyzer scip .                                   # Rust
+$ scip-go                                                # Go
+$ scip-python index .                                    # Python
+$ scip-java index --build-tool gradle                    # Java
+
+# 3. Tell scry where the build outputs live. finalize auto-discovers
+#    compile_commands.json + *.scip and runs clang-index + scip-import.
+$ scry finalize --index ./idx --build-out ~/dev/myproject/build
+
+# 4. Query. Build symbols narrow automatically.
+$ scry callers Foo --index ./idx
+[scry] --scip-precise: 18 → 7 refs after SCIP symbol identity filter (2 def symbols)
+# 7 surviving call sites; 11 name-match false positives dropped.
+
+# To opt out and see the raw tree-sitter name match:
+$ scry callers Foo --index ./idx --lexical
+```
+
+`--lexical` is the single user-facing knob. Behind it, two
+auto-engaged filters run when their sidecar is present:
+
+| Sidecar              | Filter            | Built by                          | Languages covered                         |
+|----------------------|-------------------|-----------------------------------|-------------------------------------------|
+| `clang_usrs.bin`     | clang USR identity | `scry clang-index` (libclang)     | C / C++ / ObjC                            |
+| `scip_index.bin`     | SCIP symbol identity | `scry scip-import`               | Java, Kotlin, Rust, Go, TS, Python, etc.  |
+
+A third filter, **`--reachable`**, narrows by build-graph module
+visibility (e.g. "drop callers in modules that can't link the
+callee"). It stays explicit opt-in because loading the 256MB
+AOSP module graph + computing Warshall closure costs ~30s
+cold — paying that on every query would crush latency.
+
+Cross-module call resolution is the natural consequence of
+clang USR uniqueness: a call to `strdup` in
+`bionic/libc/foo.c` has the same USR as `strdup`'s def in
+`bionic/libc/upstream-openbsd/.../strdup.c`. The filter links
+them across modules without scry needing per-module bookkeeping.
+
+For per-language one-line setup recipes (AOSP/Soong, CMake,
+Cargo, Gradle, etc.) see [`BUILD_AWARE.md`].
+
+[`BUILD_AWARE.md`]: BUILD_AWARE.md
+
+---
+
+## Precision uplift via clangd (`--precise`, legacy path)
 
 For C++ overload-sensitive queries, `scry callers NAME --precise`
 routes the query through `clangd` (the LLVM language server) over
 LSP. clangd does the real semantic analysis — type inference,
 overload resolution, ADL — so call sites that scry's heuristic
 ref-extractor mis-attributes get the correct answer.
+
+Note: `--precise` predates the default-on build-symbol precision
+above and is now mainly useful when you don't have a precomputed
+clang USR sidecar but DO have clangd + a live compile_commands
+nearby. For batch / repeated queries, `scry clang-index` + the
+default-on `--clang-precise` filter is faster (no per-query
+clangd warmup) and produces identical narrowing.
 
 ```sh
 $ scry callers transact --precise --index /mnt/agent/scry-index --limit 5

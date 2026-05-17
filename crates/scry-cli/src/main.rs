@@ -191,18 +191,19 @@ enum Cmd {
         /// Mutually exclusive with --json.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
-        /// Disable all precision filters (build-graph reachability,
-        /// clang USR identity, SCIP symbol identity). Defaults to
-        /// OFF: precision is ON when the relevant sidecar is
-        /// present, so out of the box you get the precise answer
-        /// when possible and gracefully fall back to raw name-match
-        /// when no sidecar exists. Pass `--no-precise` if you
-        /// specifically want unfiltered name-match results.
+        /// Use lexical (tree-sitter) name match only — skip the
+        /// compiler-backed precision filters that auto-engage when
+        /// the clang USR / SCIP symbol sidecars are present.
+        /// Default behavior: precision filters are ON whenever
+        /// their sidecar exists, so you get Kythe-class structured
+        /// narrowing for free wherever the build produced an
+        /// indexer artifact (`compile_commands.json` / `*.scip`),
+        /// and graceful fallback to lexical-only on uncovered code.
         #[arg(long)]
-        no_precise: bool,
+        lexical: bool,
         // Below are the individual precision-filter knobs from
         // v0.1.12–v0.1.16. They still work but are hidden from
-        // --help since the single `--no-precise` flag covers the
+        // --help since the single `--lexical` flag covers the
         // 95 % case; users who want fine-grained control can still
         // pass them explicitly.
         #[arg(long, hide = true)]
@@ -273,11 +274,10 @@ enum Cmd {
         /// compile_commands.json are missing.
         #[arg(long)]
         precise: bool,
-        /// Disable all precision filters (see `scry ref --no-precise`).
-        /// Defaults OFF: precision is automatically applied when the
-        /// relevant sidecar is present.
+        /// Use lexical (tree-sitter) name match only. See
+        /// `scry ref --lexical` for the full explanation.
         #[arg(long)]
-        no_precise: bool,
+        lexical: bool,
         // Hidden back-compat: individual precision knobs.
         #[arg(long, hide = true)]
         reachable: bool,
@@ -1278,17 +1278,17 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, not_in, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, not_in, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
+        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, lexical, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(no_precise, reachable, clang_precise, scip_precise);
+                resolve_precision(lexical, reachable, clang_precise, scip_precise);
             cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
-        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict, format } => {
+        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, lexical, reachable, clang_precise, scip_precise, scope, def_in, strict, format } => {
             if precise {
                 return cmd_callers_precise(name, index, lang, in_, not_in, limit, json);
             }
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(no_precise, reachable, clang_precise, scip_precise);
+                resolve_precision(lexical, reachable, clang_precise, scip_precise);
             cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
@@ -3335,20 +3335,21 @@ fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bo
 /// `module_graph.json` is 256MB and its eager parse + Warshall
 /// closure costs ~30s cold — paying that on every CLI invocation
 /// would crush the per-query latency the user expects from a
-/// grep-class tool. `--no-precise` disables everything.
+/// grep-class tool. `--lexical` turns everything off, leaving
+/// pure tree-sitter name match.
 fn resolve_precision(
-    no_precise: bool,
+    lexical: bool,
     explicit_reachable: bool,
     _explicit_clang: bool,
     _explicit_scip: bool,
 ) -> (bool, bool, bool) {
-    if no_precise {
+    if lexical {
         return (false, false, false);
     }
     // Cheap filters auto-engage; expensive reachability is opt-in.
-    // `_explicit_clang` / `_explicit_scip` are accepted from
-    // back-compat scripts but ignored — clang+scip are already on
-    // by default. Setting them again is a no-op.
+    // `_explicit_clang` / `_explicit_scip` are accepted from older
+    // hidden flags but ignored — clang+scip are already on by
+    // default. Setting them again is a no-op.
     (explicit_reachable, true, true)
 }
 
@@ -9053,7 +9054,7 @@ fn serve_one_request<W: std::io::Write>(
             serve_fuzzy_with_distance(reader, arg_str("substr"), in_, not_in, dist, limit)
         }
         "ref"     => {
-            let no_precise = args.get("no_precise")
+            let lexical = args.get("lexical")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -9062,7 +9063,7 @@ fn serve_one_request<W: std::io::Write>(
             let explicit_scip = args.get("scip_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
+                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -9070,7 +9071,7 @@ fn serve_one_request<W: std::io::Write>(
             serve_ref(reader, arg_str("name"), lang, kind, in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
         }
         "callers" => {
-            let no_precise = args.get("no_precise")
+            let lexical = args.get("lexical")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -9079,7 +9080,7 @@ fn serve_one_request<W: std::io::Write>(
             let explicit_scip = args.get("scip_precise")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
+                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);

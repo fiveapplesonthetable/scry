@@ -58,29 +58,62 @@ scry man | gzip > /usr/local/share/man/man1/scry.1.gz
 
 ## Quickstart
 
+Two simple commands cover the index → query loop. Build-symbol
+precision (clang USRs / SCIP symbols) auto-engages whenever the
+corresponding sidecar is present, so you get Kythe-class identity
+narrowing by default — no flags to remember.
+
 ```sh
-. ./env.sh                                       # optional: CARGO_HOME pinning
-cargo build --release                            # ~20 s cold, ~5 s incremental
-./target/release/scry def ActivityManagerService --kind class      # ~8 ms
-./target/release/scry callers transact --lang Java --limit 10      # ~80 ms
-./target/release/scry grep ZygoteInit                              # ~580 ms (rg: 21.2 s — 36×)
-./target/release/scry outline frameworks/base/cmds/app_process/app_main.cpp   # ~600 ms
-./target/release/scry coverage frameworks/base/services            # ~250 ms
+# 1. Index the source tree.
+scry index ~/dev/myproject -o ./idx
 
-# Precision-aware queries (v0.1.12+):
-./target/release/scry subclasses Activity --in frameworks/base/    # 597 subclasses
-./target/release/scry impact bindService                           # callers + subclasses + files touched
-./target/release/scry callgraph bindService --depth 3              # recursive caller tree
-./target/release/scry callers bindService --reachable              # build-graph pruned
-./target/release/scry callers Foo --clang-precise                  # USR-identity pruned (C/C++/ObjC)
-./target/release/scry callers Bar --scip-precise                   # SCIP-symbol pruned (any SCIP language)
+# 2. (Optional, per-build) Tell scry where the build outputs live.
+#    `scry finalize --build-out PATH` auto-discovers
+#    compile_commands.json (libclang USRs) and *.scip (SCIP
+#    symbols) and runs the per-TU indexer + sidecar import.
+scry finalize --index ./idx --build-out ~/dev/myproject/build
 
-# Cutting through polymorphism: which `close()` are you asking about? (v0.1.26+)
-./target/release/scry callers close --def-in PerfettoTrace.java    # narrow by callee location
-./target/release/scry callers close --strict                       # only confidently-resolved hits
-./target/release/scry callers close --format by-def --limit 10     # histogram: which def gets called most
-# (--def-in / --strict also work on ref, callgraph, and impact)
+# 3. Query. Build symbols narrow automatically when sidecars exist.
+scry def ActivityManagerService --kind class --index ./idx
+scry callers transact --lang Java --limit 10 --index ./idx
+scry ref Foo --index ./idx                           # auto-narrows by USR/SCIP
+scry callers Foo --lexical --index ./idx             # opt out → tree-sitter only
+scry grep ZygoteInit --index ./idx                   # 580 ms; rg: 21.2 s (36×)
 ```
+
+### Cross-cutting filters (work on `ref`, `callers`, `callgraph`, `impact`)
+
+```sh
+scry subclasses Activity --in frameworks/base/                  # type hierarchy
+scry impact bindService                                          # callers + subclasses + files
+scry callgraph bindService --depth 3                             # recursive caller tree
+scry callers bindService --reachable                             # build-graph pruned
+scry callers close --def-in PerfettoTrace.java                   # which def to follow
+scry callers close --strict                                      # only confidently-resolved
+scry callers close --format by-def --limit 10                    # histogram by callee def
+```
+
+### Per-language build-symbol setup (one-time)
+
+Generate the indexer artifact, then point `--build-out` at it.
+
+| Language          | One-line command                                                  | Output            |
+|-------------------|-------------------------------------------------------------------|-------------------|
+| C / C++ (CMake)   | `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .`             | `build/compile_commands.json` |
+| C / C++ (Make)    | `bear -- make`                                                    | `./compile_commands.json` |
+| C / C++ (AOSP)    | `SOONG_GEN_COMPDB=1 m nothing`                                    | `out/soong/development/ide/compdb/compile_commands.json` |
+| Java (Gradle)     | `scip-java index --build-tool gradle`                             | `./index.scip`    |
+| Kotlin            | `scip-kotlin --output index.scip src/`                            | `./index.scip`    |
+| Rust              | `rust-analyzer scip .`                                            | `./index.scip`    |
+| TypeScript        | `scip-typescript index`                                           | `./index.scip`    |
+| Go                | `scip-go`                                                         | `./index.scip`    |
+| Python            | `scip-python index .`                                             | `./index.scip`    |
+
+Then: `scry finalize --index ./idx --build-out <dir containing the artifact>`.
+Auto-discovery picks up at most one `compile_commands.json` and one
+`*.scip` per index; if you have multiple, pass `--clang-compile-commands`
+or `--scip` explicitly. Full per-language recipes + the architecture
+narrative live in [`docs/BUILD_AWARE.md`].
 
 Times above are warm-cache P50 on the live AOSP + Linux index
 (1,009,166 files, 70.4 GB source). The `rg` comparison is `rg -j4
@@ -119,6 +152,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
 | [`docs/MCP.md`]              | Model Context Protocol integration — wire shape, error semantics, client recipes (Claude Desktop / Cursor / Continue / custom) |
 | [`docs/SCIP_PRODUCERS.md`]   | which SCIP indexers scry's `scip-import` consumes (Java / Kotlin / Go / Rust / TS / Python / Ruby / C#), with the exact CLI per producer |
+| [`docs/BUILD_AWARE.md`]      | per-language Quick start: how to wire `compile_commands.json` / SCIP into scry, plus the v0.1.12 design narrative |
 | [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (transformer embeddings, in-place incremental writer, persistent clangd) plus a measured-and-rejected io_uring write-up |
 
 [`docs/USAGE.md`]: docs/USAGE.md

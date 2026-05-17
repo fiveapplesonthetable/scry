@@ -280,20 +280,20 @@ pub fn main_call() -> (String, String) {
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "finalize failed: {stderr}");
 
-    // True unfiltered baseline: use --no-precise to disable the
+    // True unfiltered baseline: use --lexical to disable the
     // auto-engaged precision filters. Both w.speak() and c.speak()
     // must show as call refs because scry-lang's Rust ref query
     // captures `field_expression.field_identifier` for both.
     let r = Command::new(scry_bin())
-        .args(["ref", "speak", "--kind", "call", "--no-precise", "--index"]).arg(&idx)
-        .output().expect("spawn scry ref --no-precise");
+        .args(["ref", "speak", "--kind", "call", "--lexical", "--index"]).arg(&idx)
+        .output().expect("spawn scry ref --lexical");
     assert!(r.status.success(),
-        "scry ref --no-precise failed: {}", String::from_utf8_lossy(&r.stderr));
+        "scry ref --lexical failed: {}", String::from_utf8_lossy(&r.stderr));
     let baseline_stdout = String::from_utf8_lossy(&r.stdout);
     let baseline_count = baseline_stdout.lines()
         .filter(|l| l.contains("(call rs)"))
         .count();
-    eprintln!("baseline (--no-precise) call rs refs: {baseline_count}");
+    eprintln!("baseline (--lexical) call rs refs: {baseline_count}");
     assert_eq!(baseline_count, 2,
         "Rust ref extraction should see 2 (call rs) refs to `speak` in the \
          fixture (w.speak + c.speak). Got {baseline_count}. stdout:\n{baseline_stdout}");

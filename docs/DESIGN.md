@@ -527,6 +527,140 @@ Output formats:
 - `--paths-only`: just paths (for piping to xargs)
 - `--count`: tallies, not results
 
+## 8.4 What a sidecar is, and why scry uses them
+
+A scry index is a directory of files. The required core files
+(produced by `scry index`) are the source-of-truth:
+
+```
+<index>/
+  manifest.json         # version + roots + lang breakdown
+  roots.bin             # list of indexed root paths
+  files.bin             # per-file metadata (path, kind, lang, digest)
+  symbols.bin           # per-symbol records (the def table)
+  refs.bin              # per-ref records (the use table)
+  names.fst             # FST: name → posting list in name_postings.bin
+  name_postings.bin     # symbol-id postings keyed off names.fst
+  ref_names.fst         # same shape for ref names
+  ref_postings.bin
+```
+
+Everything else in `<index>/` is a **sidecar**: an optional,
+independently-built, mmap'd file that adds capability without
+changing the core. The convention is one sidecar per file (so
+they can be regenerated and atomically swapped without touching
+the core), each with its own `version: u32` header (so format
+drift is detected at open time), each opened lazily (so the
+filter no-ops gracefully when the sidecar is missing).
+
+Why "sidecar" instead of "extend the main index":
+
+- **Optional.** A C++-only project doesn't need `scip_index.bin`.
+  An AOSP index without `m json-module-graph` run doesn't have
+  `module_graph.json`. Making these required would force every
+  user to install every toolchain.
+
+- **Independently regeneratable.** Editing source flips file
+  digests → next `scry index --incremental` reparses changed
+  files and rewrites `symbols.bin` / `refs.bin`. The sidecars
+  stay valid because they're keyed by `(abs_path, byte_offset)`
+  — only the parts of them whose source moved need a rebuild,
+  and that rebuild happens via the per-sidecar command (e.g.
+  `scry clang-index` when `compile_commands.json` changes,
+  `scry scip-import` when `*.scip` changes). The core never
+  forces an across-the-board rebuild.
+
+- **Independent versioning.** Each sidecar checks its own
+  version header on open: mismatched version → "absent" status
+  in `scry health`, query path skips the filter. No silent
+  decode of stale data.
+
+- **Bounded read cost.** mmap one sidecar; pay only the pages
+  touched on lookup. The 256MB AOSP module graph never enters
+  memory unless `--reachable` is set. The 800-byte synthetic
+  C++ fixture sidecar pages in instantly.
+
+Current sidecars (all optional; `scry health` reports each):
+
+| File                       | Built by                          | Used by                          |
+|----------------------------|-----------------------------------|----------------------------------|
+| `trigrams.fst` + `trigram_postings.bin` | `scry build-trigrams`     | `scry grep` (Russ-Cox prefilter) |
+| `symbols_offsets.bin`      | `scry build-offsets`              | O(1) symbol record lookup        |
+| `refs_offsets.bin`         | `scry build-offsets`              | O(1) ref record lookup           |
+| `file_symbols.bin` + `_offsets.bin` | `scry build-file-symbols` | `scry outline FILE` (file → syms)|
+| `file_refs.bin` + `_offsets.bin` | `scry build-file-refs`        | `scry uses NAME` (refs-in-file)  |
+| `ref_resolutions.bin`      | `scry build-resolutions`          | Layer-2 resolved_to per ref      |
+| `module_graph.json`        | `scry build-modgraph`             | `--reachable` filter             |
+| `clang_usrs.bin`           | `scry clang-index`                | `--clang-precise` (default-on)   |
+| `scip_index.bin`           | `scry scip-import`                | `--scip-precise` (default-on)    |
+
+`scry finalize` is the one-stop runner: it invokes each builder
+in order, skipping the ones whose input isn't available
+(`--build-soong /path`, `--build-out /path`, `--scip FILE`,
+`--clang-compile-commands FILE`). After `scry finalize`, the
+sidecars are all in place and every query auto-engages whatever
+precision the data supports.
+
+## 8.5 Build-symbol precision (Path B / Path C)
+
+Tree-sitter gives scry name-level symbols cheaply across every
+language. Name-level matching is fast but lossy: `transact()` in
+AOSP has 1981 name-matched call sites; only ~166 actually
+target `BBinder.transact`. The other ~1815 are false positives
+from unrelated `transact` methods in unrelated classes.
+
+Two compiler-backed precision layers sit on top of the tree-sitter
+base, both optional and both consumed as separate on-disk
+sidecars in the index dir:
+
+- **Path B (`clang_usrs.bin`)** — per-translation-unit libclang
+  parse driven by `scry clang-index <compile_commands.json>`.
+  Emits one `UsrRecord{ abs_path, byte_offset, usr_id, kind }`
+  per declaration / reference cursor in the TU. The clang USR
+  is a globally unique mangled identifier for the symbol — same
+  USR for the def of `strdup` and every call site to it across
+  every translation unit, regardless of which Soong module the
+  call sits in. Coverage: C, C++, Objective-C.
+
+- **Path C (`scip_index.bin`)** — generic SCIP protobuf ingest
+  driven by `scry scip-import <index.scip>`. SCIP
+  (https://github.com/sourcegraph/scip) is the Sourcegraph
+  successor to Kythe-the-format; one indexer per language
+  emits a single .scip file. Same record shape as Path B
+  (`ScipRecord{ abs_path, byte_offset, symbol_id, role }`)
+  but the symbol IDs are SCIP-formatted strings. Coverage:
+  every language with a SCIP producer — Java (`scip-java`),
+  Kotlin (`scip-kotlin`), Rust (`rust-analyzer scip`),
+  Go (`scip-go`), TypeScript (`scip-typescript`), Python
+  (`scip-python`), and others.
+
+Both sidecars are mmap'd into a `(path, byte_offset) → symbol_id`
+index at query time. Lookup is O(1). When a `ref` / `callers`
+query runs, scry asks the sidecar for the symbol at each
+candidate ref's location and keeps only those whose symbol
+matches one of the def's symbols. This is the Kythe-class
+structured-identity narrowing — false positives drop because
+the structured ID disagrees, even when the names match.
+
+**Default-on:** both filters auto-engage whenever their sidecar
+exists in the index dir. Users get the precise answer for free
+on covered code, and graceful fallback to lexical name match on
+uncovered code. `--lexical` is the explicit opt-out — useful
+for "show me everything" mode or for measuring filter impact.
+A third filter, `--reachable`, narrows by Soong/Bazel/Kernel
+module-graph visibility; it stays explicit opt-in because the
+256MB AOSP module graph + Warshall closure costs ~30s cold.
+
+**Auto-discovery:** `scry finalize --index DIR --build-out PATH`
+walks each indexed source root + each `--build-out PATH`
+looking for `compile_commands.json` and `*.scip` artifacts.
+Source roots honor `.gitignore` (vendored artifacts skip);
+`--build-out` paths walk verbatim because build outputs
+typically live in gitignored dirs (`out/soong`, `build/`,
+`target/`). One cc.json and one *.scip per index — multiple
+discovered candidates warn and skip, so user must pass
+`--clang-compile-commands` / `--scip` explicitly to disambiguate.
+
 ## 9. CLI surface (concrete)
 
 ```

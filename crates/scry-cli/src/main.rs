@@ -5738,12 +5738,19 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     }
     eprintln!("[res] pass 1 (by-name + per-file-pkg) in {} ms", t1.elapsed().as_millis());
 
-    // --- Pass 2: per-file import lists (Java + Kotlin) + C++ using-directives. ---
+    // --- Pass 2: per-file import lists (Java + Kotlin) + C++ using-directives
+    //              + class-inheritance edges (v0.1.32). ---
     let t2 = Instant::now();
     let mut per_file_imports: HashMap<u32, Vec<(String, Option<String>)>> = HashMap::new();
     // Per-file C++ using-namespace directives: rr.name == "X" for
     // `using namespace X;`. Stored as Vec<String> per file.
     let mut per_file_using_ns: HashMap<u32, Vec<String>> = HashMap::new();
+    // Class-inheritance edges (v0.1.32): child class simple name →
+    // parent class simple names. Built from InheritFrom refs whose
+    // ref name is the parent class and whose enclosing scope is the
+    // child class. Lets resolve_one walk the chain to find methods
+    // inherited from a parent.
+    let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
     let mut process_import = |rr: &RefRecord| {
         match rr.kind {
             scry_store::RefKind::Import => {
@@ -5763,12 +5770,25 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
                 }
                 per_file_using_ns.entry(rr.file_id).or_default().push(rr.name.clone());
             }
+            scry_store::RefKind::InheritFrom => {
+                if let Some(child) = rr.scope_path.last() {
+                    // Avoid self-edges and noisy duplicates.
+                    if child != &rr.name {
+                        let parents = child_to_parents.entry(child.clone()).or_default();
+                        if !parents.contains(&rr.name) {
+                            parents.push(rr.name.clone());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     };
     for rr in r.iter_refs() { process_import(&rr); }
-    eprintln!("[res] pass 2 (per-file imports: {} files, cpp using-ns: {} files) in {} ms",
-              per_file_imports.len(), per_file_using_ns.len(), t2.elapsed().as_millis());
+    eprintln!("[res] pass 2 (per-file imports: {} files, cpp using-ns: {} files, \
+               inheritance edges: {} children) in {} ms",
+              per_file_imports.len(), per_file_using_ns.len(),
+              child_to_parents.len(), t2.elapsed().as_millis());
 
     // --- Pass 3: resolve every ref, write sidecar. ---
     //
@@ -5796,7 +5816,7 @@ fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         let ids: Vec<u64> = chunk.par_iter().map(|rr| {
             let mut local_narrowed = 0u64;
             let id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
-                                 &per_file_using_ns, &mut local_narrowed);
+                                 &per_file_using_ns, &child_to_parents, &mut local_narrowed);
             if local_narrowed > 0 { narrowed_count.fetch_add(local_narrowed, Ordering::Relaxed); }
             if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
             id
@@ -5834,6 +5854,7 @@ fn resolve_one(
     per_file_pkg: &std::collections::HashMap<u32, String>,
     per_file_imports: &std::collections::HashMap<u32, Vec<(String, Option<String>)>>,
     per_file_using_ns: &std::collections::HashMap<u32, Vec<String>>,
+    child_to_parents: &std::collections::HashMap<String, Vec<String>>,
     narrowed: &mut u64,
 ) -> u64 {
     let cands = match by_name.get(&rr.name) {
@@ -5877,6 +5898,45 @@ fn resolve_one(
         if same_class.len() == 1 {
             *narrowed += 1;
             return same_class[0].id;
+        }
+    }
+
+    // Inheritance walk (v0.1.32). When the ref is inside a class that
+    // extends/implements another, the method might be defined on an
+    // ancestor. BFS up the chain collecting all candidates whose
+    // enclosing class equals any ancestor. If EXACTLY ONE candidate
+    // across the whole chain qualifies → prefer it. Multiple matches
+    // (diamond / interface conflict) → fall through to later rules
+    // rather than short-circuiting at the first level (so an
+    // import-aware narrowing could still disambiguate).
+    // Caps depth at 8 to bound pathological hierarchies — real
+    // Java/Kotlin/C++ inheritance rarely exceeds 5 levels deep.
+    if let Some(my_class) = rr.scope_path.last() {
+        if let Some(parents) = child_to_parents.get(my_class) {
+            let mut visited: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            visited.insert(my_class.as_str());
+            let mut queue: std::collections::VecDeque<&str> =
+                parents.iter().map(String::as_str).collect();
+            let mut ancestor_matches: Vec<&&ResolveDef> = Vec::new();
+            let mut steps = 0usize;
+            while let Some(cls) = queue.pop_front() {
+                if !visited.insert(cls) { continue; }
+                if steps > 8 { break; }
+                steps += 1;
+                for c in pool {
+                    if c.scope_path.last().map(String::as_str) == Some(cls) {
+                        ancestor_matches.push(c);
+                    }
+                }
+                if let Some(next_parents) = child_to_parents.get(cls) {
+                    for p in next_parents { queue.push_back(p.as_str()); }
+                }
+            }
+            if ancestor_matches.len() == 1 {
+                *narrowed += 1;
+                return ancestor_matches[0].id;
+            }
         }
     }
 
@@ -9295,7 +9355,7 @@ mod tests {
         by_name.insert("Foo".into(), vec![mk_def(42, FileKind::Java, None)]);
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        let chosen = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(chosen, 42);
         assert_eq!(n, 0);
     }
@@ -9305,7 +9365,7 @@ mod tests {
         let by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 0);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 0);
     }
 
     #[test]
@@ -9318,7 +9378,7 @@ mod tests {
         ]);
         let r = mk_ref("Foo", FileKind::Java, 0);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 200);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 200);
     }
 
     #[test]
@@ -9333,7 +9393,7 @@ mod tests {
         pkg.insert(5u32, "android.app".to_string());
         let r = mk_ref("Activity", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9348,7 +9408,7 @@ mod tests {
         imports.insert(5u32, vec![("Binder".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9363,7 +9423,7 @@ mod tests {
         imports.insert(5u32, vec![("*".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Binder", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9376,7 +9436,7 @@ mod tests {
         ]);
         let r = mk_ref("String", FileKind::Java, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9396,7 +9456,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 0, "ambiguous Java method call should resolve to 0 (unresolved), not arbitrary pool[0]");
         assert_eq!(n, 0);
     }
@@ -9415,7 +9475,7 @@ mod tests {
         let mut r = mk_ref("Foo", FileKind::Java, 5);
         r.kind = RefKind::TypeUse;
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 11);
         assert_eq!(n, 0);
     }
@@ -9438,7 +9498,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 7);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99, "same-file def should win over corpus-wide ambiguity");
         assert_eq!(n, 1, "same-file pick counts as narrowed");
     }
@@ -9447,6 +9507,88 @@ mod tests {
 
     /// Kotlin same-package narrowing mirrors Java: a file's package
     /// matches one candidate → that one wins.
+    /// Inheritance walk (v0.1.32). A call inside class Inner (which
+    /// extends Outer) to a method defined only on Outer should
+    /// resolve to Outer's method via the inheritance chain.
+    #[test]
+    fn resolve_one_inheritance_walks_parent_class() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("inherited".into(), vec![
+            // Defined only on the parent class.
+            ResolveDef { id: 42, file_id: 9, lang: FileKind::Java,
+                         pkg: Some("com.example".into()),
+                         scope_path: vec!["Outer".into()] },
+            // Unrelated class with same method name.
+            ResolveDef { id: 99, file_id: 8, lang: FileKind::Java,
+                         pkg: Some("com.other".into()),
+                         scope_path: vec!["Unrelated".into()] },
+        ]);
+        // Inner extends Outer; call site is inside Inner.
+        let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
+        child_to_parents.insert("Inner".to_string(), vec!["Outer".to_string()]);
+        let r = mk_ref_scoped("inherited", FileKind::Java, 5, &["Inner"]);
+        let mut n = 0u64;
+        let got = resolve_one(
+            &r, &by_name, &HashMap::new(), &HashMap::new(),
+            &empty_ns(), &child_to_parents, &mut n,
+        );
+        assert_eq!(got, 42, "should walk Inner → Outer and find inherited method");
+        assert_eq!(n, 1);
+    }
+
+    /// Inheritance walk handles multi-level chains (grandparent).
+    #[test]
+    fn resolve_one_inheritance_walks_grandparent() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("inherited".into(), vec![
+            ResolveDef { id: 7, file_id: 9, lang: FileKind::Java,
+                         pkg: Some("com.example".into()),
+                         scope_path: vec!["Grandparent".into()] },
+            ResolveDef { id: 99, file_id: 8, lang: FileKind::Java,
+                         pkg: Some("com.other".into()),
+                         scope_path: vec!["Unrelated".into()] },
+        ]);
+        // Child → Parent → Grandparent chain.
+        let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
+        child_to_parents.insert("Child".to_string(), vec!["Parent".to_string()]);
+        child_to_parents.insert("Parent".to_string(), vec!["Grandparent".to_string()]);
+        let r = mk_ref_scoped("inherited", FileKind::Java, 5, &["Child"]);
+        let mut n = 0u64;
+        let got = resolve_one(
+            &r, &by_name, &HashMap::new(), &HashMap::new(),
+            &empty_ns(), &child_to_parents, &mut n,
+        );
+        assert_eq!(got, 7);
+        assert_eq!(n, 1);
+    }
+
+    /// Inheritance walk falls through when multiple ancestors define
+    /// the same method (e.g. diamond / interface conflict).
+    #[test]
+    fn resolve_one_inheritance_diamond_stays_unresolved() {
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("close".into(), vec![
+            ResolveDef { id: 1, file_id: 7, lang: FileKind::Java,
+                         pkg: Some("com.a".into()),
+                         scope_path: vec!["IA".into()] },
+            ResolveDef { id: 2, file_id: 8, lang: FileKind::Java,
+                         pkg: Some("com.b".into()),
+                         scope_path: vec!["IB".into()] },
+        ]);
+        // Child implements both IA and IB — both define close.
+        let mut child_to_parents: HashMap<String, Vec<String>> = HashMap::new();
+        child_to_parents.insert("Child".to_string(),
+            vec!["IA".to_string(), "IB".to_string()]);
+        let r = mk_ref_scoped("close", FileKind::Java, 5, &["Child"]);
+        let mut n = 0u64;
+        let got = resolve_one(
+            &r, &by_name, &HashMap::new(), &HashMap::new(),
+            &empty_ns(), &child_to_parents, &mut n,
+        );
+        assert_eq!(got, 0,
+            "ambiguous inheritance (two ancestors define close) → unresolved");
+    }
+
     /// Same-class preference (v0.1.31). A call to `foo()` inside
     /// class chain [Outer, Inner] should prefer a candidate defined
     /// in [Outer, Inner] (or any prefix like [Outer]) even when in a
@@ -9468,7 +9610,7 @@ mod tests {
         ]);
         let r = mk_ref_scoped("helper", FileKind::Java, 5, &["Foo"]);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99, "should prefer same-class def even in different file");
         assert_eq!(n, 1);
     }
@@ -9493,7 +9635,7 @@ mod tests {
         // ref scope = [Outer, Inner] — call from inside the inner class.
         let r = mk_ref_scoped("parentMethod", FileKind::Java, 5, &["Outer", "Inner"]);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 42, "implicit-this from inner class should reach parent's methods");
         assert_eq!(n, 1);
     }
@@ -9521,7 +9663,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99, "should resolve to the imported class's method");
         assert_eq!(n, 1, "import-aware narrowing counts as narrowed");
     }
@@ -9545,7 +9687,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 99);
         assert_eq!(n, 1);
     }
@@ -9572,7 +9714,7 @@ mod tests {
         ]);
         let r = mk_ref("close", FileKind::Java, 5);
         let mut n = 0u64;
-        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n);
+        let got = resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n);
         assert_eq!(got, 0, "two viable imported candidates → unresolved (truthful)");
         assert_eq!(n, 0);
     }
@@ -9588,7 +9730,7 @@ mod tests {
         pkg.insert(5u32, "android.app".to_string());
         let r = mk_ref("Activity", FileKind::Kotlin, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9604,7 +9746,7 @@ mod tests {
         ]);
         let r = mk_ref("List", FileKind::Kotlin, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9620,7 +9762,7 @@ mod tests {
         imports.insert(5u32, vec![("Bundle".to_string(), Some("android.os".to_string()))]);
         let r = mk_ref("Bundle", FileKind::Kotlin, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &imports, &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9639,7 +9781,7 @@ mod tests {
         ]);
         let r = mk_ref_scoped("Parcel", FileKind::Cpp, 5, &["android", "os"]);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 
@@ -9656,7 +9798,7 @@ mod tests {
         using.insert(5u32, vec!["android::base".to_string()]);
         let r = mk_ref("StringPrintf", FileKind::Cpp, 5);
         let mut n = 0u64;
-        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &using, &mut n), 22);
+        assert_eq!(resolve_one(&r, &by_name, &HashMap::new(), &HashMap::new(), &using, &HashMap::new(), &mut n), 22);
         assert_eq!(n, 1);
     }
 

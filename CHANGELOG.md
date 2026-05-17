@@ -7,6 +7,50 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.32] — 2026-05-17
+
+Inheritance-aware method resolution in `cmd_build_resolutions`.
+
+When a method call inside `class Child extends Parent` references
+a method only defined on `Parent`, the resolver now walks the
+inheritance chain (BFS up child→parents) to find the inherited
+candidate.
+
+**Implementation:**
+- Pass 2 of `cmd_build_resolutions` additionally collects a
+  `child_to_parents: HashMap<String, Vec<String>>` from
+  `InheritFrom` refs (whose `name` is the parent class and whose
+  `scope_path.last()` is the child).
+- `resolve_one` adds an inheritance walk between the same-class
+  preference (v0.1.31) and the language-specific package
+  narrowing.
+- Collects ALL ancestor matches across the closure (depth-capped
+  at 8 levels). Prefers the candidate only if exactly one match
+  across the whole chain — diamond / interface-conflict cases
+  fall through to later rules rather than short-circuiting.
+
+**Behavior:**
+- `Child` extends `Parent` and `Parent` has `inherited()` →
+  call to `inherited()` from inside `Child` resolves to
+  `Parent.inherited`.
+- Multi-level: `Child → Parent → Grandparent` walked transitively.
+- Diamond / interface conflict (two ancestors both define the
+  method) → walk doesn't fire (truthful unresolved).
+
+**Live AOSP+Linux measurement:**
+- inheritance edges captured: **139,573 child classes**
+- resolved: 24.2 M → **24.4 M** (+220 K via inheritance)
+- narrowed via Java context: 8.0 M → 8.3 M (+270 K)
+- pass 3 wall time: 90s → 174s (BFS overhead; one-time cost
+  per `build-resolutions` invocation)
+
+3 new unit tests:
+- `resolve_one_inheritance_walks_parent_class`
+- `resolve_one_inheritance_walks_grandparent`
+- `resolve_one_inheritance_diamond_stays_unresolved`
+
+**To take effect:** run `scry build-resolutions --index DIR`.
+
 ## [0.1.31] — 2026-05-17
 
 Same-class preference across files in

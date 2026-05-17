@@ -2020,6 +2020,18 @@ impl StoreReader {
         if id != 0 { r.resolved_to = Some(id); }
     }
 
+    /// Count refs that the Layer 2 resolutions sidecar attributes to
+    /// a specific def. Streams the mmap 8 bytes at a time, counting
+    /// non-zero u64 entries. Returns None if the sidecar isn't
+    /// present (no `scry build-resolutions` was run).
+    ///
+    /// On a 506 MB sidecar (~63 M refs) this is ~0.5 s — cheap enough
+    /// to call from `scry stats`. v0.1.41.
+    pub fn count_resolved_refs(&self) -> Option<u64> {
+        let m = self.ref_resolutions_mmap.as_ref()?;
+        Some(m.chunks_exact(8).filter(|c| *c != [0u8; 8]).count() as u64)
+    }
+
     /// Function/method-like symbol whose source body encloses
     /// `byte_offset` in `file_id`. Used by `scry callgraph` to
     /// attribute a ref site to its containing routine.

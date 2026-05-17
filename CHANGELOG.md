@@ -7,6 +7,43 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.41] — 2026-05-17
+
+`scry stats` now shows Layer 2 resolution sidecar coverage.
+
+```
+$ scry stats --index /mnt/agent/scry-index | head -12
+scry-version: 0.1.36
+indexed-at:   2026-05-17T02:26:57Z
+roots:        2
+  - /home/zim/dev/aosp (Aosp)
+  - /mnt/agent/dev/linux (Linux)
+files-total:  1032084
+files-parsed: 1032084
+files-failed: 0
+bytes-total:  70.4 GB
+symbols:      31496680
+refs:         63318468
+refs-resolved: 31426932 (49.6%)    ← new in v0.1.41
+elapsed-ms:   690040
+```
+
+Reads the `ref_resolutions.bin` mmap 8 bytes at a time,
+counting nonzero u64 entries (a zero means "no Layer 2
+override; keep the record's own resolved_to"). ~0.5 s on a
+506 MB sidecar (~63 M refs) — cheap enough for the existing
+`stats` command.
+
+When the sidecar is absent (no `scry build-resolutions` was
+run), the line reads `refs-resolved: <no sidecar — run scry
+build-resolutions to enable>` and the JSON path emits
+`refs_resolved: null`. The JSON also gets a new
+`refs_resolved_pct` field (also nullable).
+
+New helper `StoreReader::count_resolved_refs() -> Option<u64>`
+is the single source of truth used by both the human and JSON
+paths.
+
 ## [0.1.40] — 2026-05-17
 
 Daemon / JSON-RPC / MCP parity for `--format by-def`.

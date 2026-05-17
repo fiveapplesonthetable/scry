@@ -3319,6 +3319,14 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
         *by_kind.entry(s.kind).or_default() += 1;
     }
 
+    // Resolution sidecar coverage (v0.1.41). None ⇒ sidecar absent
+    // (no `scry build-resolutions` was run).
+    let resolved_count = r.count_resolved_refs();
+    let total_refs = r.manifest.stats.refs;
+    let resolved_pct = resolved_count.map(|n|
+        if total_refs == 0 { 0.0 }
+        else { (n as f64) * 100.0 / (total_refs as f64) });
+
     if json {
         let by_lang_map: serde_json::Map<String, serde_json::Value> = by_lang.iter()
             .map(|(k, c)| (k.as_str().to_string(), serde_json::json!(c)))
@@ -3340,6 +3348,8 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
             "bytes_total":     r.manifest.stats.bytes_total,
             "symbols":         r.manifest.stats.symbols,
             "refs":            r.manifest.stats.refs,
+            "refs_resolved":   resolved_count,
+            "refs_resolved_pct": resolved_pct,
             "elapsed_ms":      r.manifest.stats.elapsed_ms,
             "by_lang":         serde_json::Value::Object(by_lang_map),
             "by_kind":         serde_json::Value::Object(by_kind_map),
@@ -3360,6 +3370,12 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
     println!("bytes-total:  {}", human_bytes(r.manifest.stats.bytes_total));
     println!("symbols:      {}", r.manifest.stats.symbols);
     println!("refs:         {}", r.manifest.stats.refs);
+    match (resolved_count, resolved_pct) {
+        (Some(n), Some(p)) => println!("refs-resolved: {n} ({p:.1}%)"),
+        _ => println!(
+            "refs-resolved: <no sidecar — run `scry build-resolutions` to enable>",
+        ),
+    }
     println!("elapsed-ms:   {}", r.manifest.stats.elapsed_ms);
 
     println!("\nby language:");

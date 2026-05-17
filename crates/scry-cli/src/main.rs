@@ -2917,8 +2917,8 @@ fn cmd_ref(
         anyhow::bail!("--json and --format are mutually exclusive");
     }
     if let Some(f) = format.as_deref() {
-        if f != "count" {
-            anyhow::bail!("--format must be 'count' (got '{f}')");
+        if !matches!(f, "count" | "by-def") {
+            anyhow::bail!("--format must be 'count' or 'by-def' (got '{f}')");
         }
     }
     let t = Instant::now();
@@ -3200,13 +3200,75 @@ fn cmd_ref(
     // --format count: just the totals, no per-hit rows. Pays off for
     // "how many callers does X have?" agent queries — one short line
     // regardless of how many hits the index actually holds.
-    if format.as_deref() == Some("count") {
-        println!("{} {label}", filtered.len());
-    } else {
-        print_refs(&r, &filtered, limit, json);
+    match format.as_deref() {
+        Some("count") => {
+            println!("{} {label}", filtered.len());
+        }
+        Some("by-def") => {
+            // Group refs by resolved_to (None bucketed as "unresolved").
+            // Sort descending by count, show top `limit` groups with
+            // the friendly def annotation. Answers "WHICH def do the
+            // callers actually target?" at a glance — invaluable for
+            // figuring out how a polymorphic name like `close` or
+            // `onCreate` is dispatched across the corpus.
+            print_refs_by_def(&r, &filtered, &name, limit);
+        }
+        _ => {
+            print_refs(&r, &filtered, limit, json);
+        }
     }
     log_query(&r, label, &name, filtered.len(), filtered.len().min(limit), t);
     Ok(())
+}
+
+/// Histogram of refs grouped by their Layer 2 resolved_to target.
+/// Shows: `<count>  → file:line [scope]` per group, descending by
+/// count, capped at `limit` groups. Unresolved refs are bucketed
+/// into a single `<unresolved>` row at the bottom.
+fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit: usize) {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<Option<u64>, usize> = HashMap::new();
+    for r in refs {
+        *by_id.entry(r.resolved_to).or_insert(0) += 1;
+    }
+    let unresolved = by_id.remove(&None).unwrap_or(0);
+    let mut groups: Vec<(u64, usize)> = by_id.into_iter()
+        .map(|(k, v)| (k.unwrap(), v))
+        .collect();
+    groups.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    // Build a name→symbols map ONCE so we don't pay lookup_exact
+    // per row. The ref's name is the same for the whole group.
+    let candidates = reader.lookup_exact(name);
+    let by_def_id: HashMap<u64, &SymbolRecord> = candidates.iter()
+        .map(|s| (s.id, s)).collect();
+    for (def_id, count) in groups.iter().take(limit) {
+        let annot = by_def_id.get(def_id)
+            .map(|s| {
+                let path = reader.files.get(s.file_id as usize)
+                    .map(|f| f.display_path(&reader.roots))
+                    .unwrap_or_default();
+                let fname = path.rsplit('/').next().unwrap_or(&path);
+                let scope = if s.scope_path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", s.scope_path.join("::"))
+                };
+                format!("{}:{}{}", fname, s.line, scope)
+            })
+            .unwrap_or_else(|| format!("def:{:x}", def_id));
+        println!("{:>8}  → {}", count, annot);
+    }
+    if unresolved > 0 {
+        println!("{:>8}  → <unresolved>", unresolved);
+    }
+    let shown_groups = groups.len().min(limit) + if unresolved > 0 { 1 } else { 0 };
+    let total_groups = groups.len() + if unresolved > 0 { 1 } else { 0 };
+    eprintln!(
+        "\n{} refs in {} group{} (showing {})",
+        refs.len(), total_groups,
+        if total_groups == 1 { "" } else { "s" },
+        shown_groups,
+    );
 }
 
 fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {

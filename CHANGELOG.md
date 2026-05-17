@@ -7,6 +7,46 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.35] — 2026-05-17
+
+New `--format by-def` output mode on `scry ref` / `scry callers`.
+
+Groups refs by their Layer 2 `resolved_to` target, sorts
+descending by count, and shows the top N groups with the
+friendly `file:line [scope]` annotation. Unresolved refs are
+collected into a single `<unresolved>` row at the bottom.
+
+**Why this is useful:** answers "WHICH def do the callers
+actually target?" at a glance — invaluable for understanding
+how a polymorphic name like `close`, `onCreate`, or `transact`
+is dispatched across the corpus.
+
+**Live example:**
+
+```
+$ scry callers transact --strict --format by-def --limit 8
+     166  → Binder.cpp:411 [android::BBinder]
+      14  → poc.cpp:77
+       7  → Binder.cpp:114 [android::hardware::BHwBinder]
+       7  → BpBinder.cpp:400 [android::BpBinder]
+       4  → utilities.h:123 [SampleData]
+       3  → BinderProxy.java:541 [BinderProxy]
+       3  → SubmergeSharedDataStore.java:403 [SubmergeSharedDataStore]
+       2  → ImsMediaManagerTest.java:188 [ImsMediaManagerTest::IMediaStubTest]
+
+219 refs in 19 groups (showing 8)
+```
+
+Reveals immediately that the BBinder impl is by far the most
+common target, with a long tail of test mocks and alternative
+binder implementations.
+
+Combines with `--def-in`, `--strict`, `--reachable`, etc — they
+all narrow the input set, then by-def groups whatever survives.
+
+`--format count` and `--format by-def` are mutually exclusive
+with `--json`.
+
 ## [0.1.34] — 2026-05-17
 
 `--strict` flag on `scry ref` / `scry callers` (and matching

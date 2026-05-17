@@ -251,7 +251,17 @@ impl JavacRule {
 /// patched module dirs.
 pub(crate) fn forward_javac_flags(binding: &str, source_root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut tokens = binding.split_whitespace().peekable();
+    // Use shell-aware tokenization so a single shell-quoted arg like
+    // `'-Xplugin:ErrorProne -Xep:X:ERROR …'` parses as ONE token,
+    // not N space-split tokens. AOSP's javacFlags wraps the entire
+    // Error Prone configuration in single quotes — without this,
+    // the first token leaks through (because the leading `'` made
+    // our `-Xplugin:` prefix check miss) AND every subsequent
+    // `-Xep:…` flag also leaked through and javac rejected them
+    // all with "invalid flag".
+    let parsed: Vec<String> = shell_words::split(binding)
+        .unwrap_or_else(|_| binding.split_whitespace().map(str::to_string).collect());
+    let mut tokens = parsed.iter().map(String::as_str).peekable();
     while let Some(tok) = tokens.next() {
         // Two-token flags whose value we either drop or already have.
         if matches!(tok, "-source" | "-target" | "-d" | "-processorpath"
@@ -387,7 +397,12 @@ impl KotlincRule {
 /// `expect`/`actual` declaration.
 pub(crate) fn forward_kotlinc_flags(binding: &str, source_root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut tokens = binding.split_whitespace().peekable();
+    // Shell-aware tokenization for the same reason as
+    // [`forward_javac_flags`]: kotlincFlags occasionally inlines
+    // quoted multi-word args.
+    let parsed: Vec<String> = shell_words::split(binding)
+        .unwrap_or_else(|_| binding.split_whitespace().map(str::to_string).collect());
+    let mut tokens = parsed.iter().map(String::as_str).peekable();
     while let Some(tok) = tokens.next() {
         // Two-token flags whose value we either drop or already have.
         if matches!(tok, "-d" | "-jvm-target" | "-classpath" | "-cp"
@@ -1028,6 +1043,21 @@ build out/soong/.intermediates/libcore/core-libart/android_common/javac/core-lib
             "-Xfriend-paths=/aosp/foo/a.jar:/aosp/bar/b.jar".to_string(),
             "-Xjvm-default=all".to_string(),
         ]);
+    }
+
+    #[test]
+    fn forward_javac_flags_handles_shell_quoted_errorprone_blob() {
+        // AOSP wraps the entire Error Prone configuration in single
+        // quotes as ONE shell-quoted arg. Without proper shell-aware
+        // tokenization, the leading `'-Xplugin:` failed our prefix
+        // check and every inner `-Xep:…` flag also leaked, causing
+        // javac to bail with "invalid flag" before producing any
+        // semanticdb output.
+        let src = "-Xlint:-dep-ann \
+                   '-Xplugin:ErrorProne -Xep:JdkObsolete:ERROR \
+                    -XepExcludedPaths:.*/gen/.*'";
+        let out = forward_javac_flags(src, Path::new("/aosp"));
+        assert_eq!(out, vec!["-Xlint:-dep-ann".to_string()]);
     }
 
     #[test]

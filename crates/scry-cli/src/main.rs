@@ -3173,19 +3173,33 @@ fn resolve_precision(
 }
 
 /// Apply build-symbol precision filtering (clang USR + SCIP symbol
-/// identity) to a candidate set of refs. Both filters consult their
-/// own on-disk sidecar (`clang_usrs.bin` / `scip_index.bin`); when
-/// the sidecar is absent the filter no-ops with a one-line warning.
+/// identity) to a candidate set of refs.
 ///
-/// `name` is the symbol the caller queried — we look up its defs to
-/// gather the "ground truth" symbol IDs (USR / SCIP) that surviving
-/// refs must match. `lookup_exact` runs once for both filters so a
-/// query with both enabled isn't N=2 lookups.
+/// **Strict-by-default semantics (Kythe parity).** When precision is
+/// engaged we treat every ref as guilty until proven innocent: a ref
+/// survives only if its byte-position resolves to the same identity
+/// (USR / SCIP symbol) as one of NAME's defs. The previous
+/// "permissive over-include when uncovered" behaviour was a
+/// tree-sitter heuristic — it kept refs whose TU the build indexer
+/// hadn't seen, masking the gap and silently degrading precision.
+/// That fallback is gone; the only way back to tree-sitter
+/// behaviour is `--lexical`, which short-circuits this function
+/// entirely.
 ///
-/// Returns the surviving refs. Errors propagate from sidecar open
-/// (the underlying `ClangUsrIndex::open` / `ScipIndex::open` can
-/// fail on corrupted files — soft-fail on missing, hard-fail on
-/// corrupt).
+/// **Per-language sidecar policy.** C/C++/ObjC files use the clang
+/// USR sidecar; everything else uses SCIP. The two filters operate
+/// independently:
+///   - C-family ref + clang sidecar present  →  must match a def USR.
+///   - C-family ref + clang sidecar absent   →  unverifiable; drop.
+///   - Non-C ref     + SCIP sidecar present  →  must match a def sym.
+///   - Non-C ref     + SCIP sidecar absent   →  unverifiable; drop.
+///
+/// **Hard error only when BOTH sidecars are absent AND both filters
+/// were requested.** Otherwise we silently drop unverifiable refs
+/// (with a diagnostic). This lets a Python-only or Rust-only index
+/// run the default-on precision path without insisting on
+/// `clang_usrs.bin`, while still refusing to silently degrade to
+/// tree-sitter when nothing precision-grade exists.
 pub(crate) fn apply_precision_filter(
     r: &StoreReader,
     name: &str,
@@ -3193,123 +3207,147 @@ pub(crate) fn apply_precision_filter(
     clang_precise: bool,
     scip_precise: bool,
 ) -> Result<Vec<RefRecord>> {
+    if !clang_precise && !scip_precise {
+        return Ok(refs);
+    }
     // Window covers the offset drift between tree-sitter (identifier
-    // position) and clang (cursor position — sometimes at the keyword
-    // for class/struct/typedef). 64 bytes covers every real-world
-    // identifier without bridging adjacent decls.
+    // position) and the indexer's cursor position (clang sometimes
+    // sits at the keyword for class/struct/typedef). 64 bytes covers
+    // every real-world identifier without bridging adjacent decls.
     const WINDOW: u32 = 64;
-    // Look up the defs once and share between both filters.
-    let defs_lazy = if clang_precise || scip_precise {
-        Some(r.lookup_exact(name))
+    let defs = r.lookup_exact(name);
+
+    let cusr_opt: Option<scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
+        scry_store::clang_usrs::ClangUsrIndex::open(&r.paths.clang_usrs())?
+    } else {
+        None
+    };
+    let sidx_opt: Option<scry_store::scip_index::ScipIndex> = if scip_precise {
+        scry_store::scip_index::ScipIndex::open(&r.paths.scip_index())?
     } else {
         None
     };
 
-    let refs = if clang_precise {
-        let sidecar_path = r.paths.clang_usrs();
-        match scry_store::clang_usrs::ClangUsrIndex::open(&sidecar_path)? {
-            None => {
-                eprintln!(
-                    "[scry] --clang-precise: this index has no clang_usrs.bin \
-                     sidecar; run `scry clang-index --compile-commands FILE \
-                     --index DIR` first. Returning unfiltered.",
-                );
-                refs
+    if cusr_opt.is_none() && sidx_opt.is_none() {
+        anyhow::bail!(
+            "precision query but no precision sidecars at {} (looked for \
+             clang_usrs.bin and scip_index.bin). Run \
+             `scry clang-index --compile-commands FILE --index DIR` or \
+             `scry scip-import --scip FILE.scip --index DIR` first, or \
+             pass `--lexical` to opt into tree-sitter name match.",
+            r.paths.clang_usrs().parent().map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+    }
+
+    // Gather def identities once per sidecar. Empty sets are fine:
+    // they signal "this name has no defs the sidecar attributes to a
+    // symbol", which then forces every ref in that family to drop
+    // (Kythe parity — no def attribution means no ref attribution).
+    let def_usrs: std::collections::HashSet<String> = match &cusr_opt {
+        Some(cusr) => defs.iter()
+            .filter_map(|s| {
+                let p = r.files.get(s.file_id as usize)?
+                    .display_path(&r.roots);
+                if !is_c_family(&p) { return None; }
+                cusr.usr_for_window(&p, s.byte_start, WINDOW)
+                    .map(str::to_string)
+            })
+            .collect(),
+        None => Default::default(),
+    };
+    let def_syms: std::collections::HashSet<String> = match &sidx_opt {
+        Some(sidx) => defs.iter()
+            .filter_map(|s| {
+                let p = r.files.get(s.file_id as usize)?
+                    .display_path(&r.roots);
+                if is_c_family(&p) { return None; }
+                sidx.symbol_for_window(&p, s.byte_start, WINDOW)
+                    .map(str::to_string)
+            })
+            .collect(),
+        None => Default::default(),
+    };
+
+    let before = refs.len();
+    let mut c_dropped_uncov = 0usize;
+    let mut c_dropped_id = 0usize;
+    let mut s_dropped_uncov = 0usize;
+    let mut s_dropped_id = 0usize;
+    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
+        let p = match r.files.get(rr.file_id as usize) {
+            Some(fe) => fe.display_path(&r.roots),
+            None => return false,
+        };
+        let c_family = is_c_family(&p);
+        if c_family {
+            // C-family ref: clang sidecar owns the verdict.
+            let Some(cusr) = cusr_opt.as_ref() else {
+                c_dropped_uncov += 1;
+                return false;
+            };
+            match cusr.usr_for_window(&p, rr.byte_start, WINDOW) {
+                Some(u) => {
+                    let ok = def_usrs.contains(u);
+                    if !ok { c_dropped_id += 1; }
+                    ok
+                }
+                None => {
+                    c_dropped_uncov += 1;
+                    false
+                }
             }
-            Some(cusr) => {
-                let def_usrs: std::collections::HashSet<String> = defs_lazy
-                    .as_ref().unwrap().iter()
-                    .filter_map(|s| {
-                        let p = r.files.get(s.file_id as usize)?
-                            .display_path(&r.roots);
-                        cusr.usr_for_window(&p, s.byte_start, WINDOW)
-                            .map(str::to_string)
-                    })
-                    .collect();
-                if def_usrs.is_empty() {
-                    eprintln!(
-                        "[scry] --clang-precise: no clang USR found for any def \
-                         of {name:?} (def site outside the indexed \
-                         compile_commands?). Returning unfiltered.",
-                    );
-                    refs
-                } else {
-                    let before = refs.len();
-                    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
-                        let p = match r.files.get(rr.file_id as usize) {
-                            Some(fe) => fe.display_path(&r.roots),
-                            None => return true,
-                        };
-                        match cusr.usr_for_window(&p, rr.byte_start, WINDOW) {
-                            Some(u) => def_usrs.contains(u),
-                            None => true, // uncovered TU / non-C++ → keep
-                        }
-                    }).collect();
-                    eprintln!(
-                        "[scry] --clang-precise: {} → {} refs after USR identity \
-                         filter ({} def USRs)",
-                        before, kept.len(), def_usrs.len(),
-                    );
-                    kept
+        } else {
+            // Non-C ref: SCIP sidecar owns the verdict.
+            let Some(sidx) = sidx_opt.as_ref() else {
+                s_dropped_uncov += 1;
+                return false;
+            };
+            match sidx.symbol_for_window(&p, rr.byte_start, WINDOW) {
+                Some(s) => {
+                    let ok = def_syms.contains(s);
+                    if !ok { s_dropped_id += 1; }
+                    ok
+                }
+                None => {
+                    s_dropped_uncov += 1;
+                    false
                 }
             }
         }
-    } else {
-        refs
+    }).collect();
+
+    // Always log when precision was engaged — quiet success is
+    // indistinguishable from quiet pass-through, and we want users
+    // (and tests) to be able to see that strict-precise actually ran.
+    let sidecars = match (cusr_opt.is_some(), sidx_opt.is_some()) {
+        (true, true)  => "clang_usrs + scip_index",
+        (true, false) => "clang_usrs",
+        (false, true) => "scip_index",
+        // unreachable: bailed above on (false, false)
+        (false, false) => "(none)",
     };
-    let refs = if scip_precise {
-        let sidecar_path = r.paths.scip_index();
-        match scry_store::scip_index::ScipIndex::open(&sidecar_path)? {
-            None => {
-                eprintln!(
-                    "[scry] --scip-precise: this index has no scip_index.bin \
-                     sidecar; run `scry scip-import --scip FILE.scip \
-                     --index DIR` first. Returning unfiltered.",
-                );
-                refs
-            }
-            Some(sidx) => {
-                let def_syms: std::collections::HashSet<String> = defs_lazy
-                    .as_ref().unwrap().iter()
-                    .filter_map(|s| {
-                        let p = r.files.get(s.file_id as usize)?
-                            .display_path(&r.roots);
-                        sidx.symbol_for_window(&p, s.byte_start, WINDOW)
-                            .map(str::to_string)
-                    })
-                    .collect();
-                if def_syms.is_empty() {
-                    eprintln!(
-                        "[scry] --scip-precise: no SCIP symbol found for any def \
-                         of {name:?} (def site outside the imported SCIP \
-                         index?). Returning unfiltered.",
-                    );
-                    refs
-                } else {
-                    let before = refs.len();
-                    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
-                        let p = match r.files.get(rr.file_id as usize) {
-                            Some(fe) => fe.display_path(&r.roots),
-                            None => return true,
-                        };
-                        match sidx.symbol_for_window(&p, rr.byte_start, WINDOW) {
-                            Some(s) => def_syms.contains(s),
-                            None => true,
-                        }
-                    }).collect();
-                    eprintln!(
-                        "[scry] --scip-precise: {} → {} refs after SCIP symbol \
-                         identity filter ({} def symbols)",
-                        before, kept.len(), def_syms.len(),
-                    );
-                    kept
-                }
-            }
-        }
-    } else {
-        refs
-    };
-    Ok(refs)
+    eprintln!(
+        "[scry] precise ({sidecars}): {before} → {} refs (clang: {} id-mismatch, \
+         {} uncovered TU; SCIP: {} id-mismatch, {} uncovered TU; \
+         {} def USRs, {} def SCIP symbols)",
+        kept.len(),
+        c_dropped_id, c_dropped_uncov,
+        s_dropped_id, s_dropped_uncov,
+        def_usrs.len(), def_syms.len(),
+    );
+    Ok(kept)
+}
+
+/// File-path classifier used by [`apply_precision_filter`] to decide
+/// which precision sidecar owns a given ref. C/C++/ObjC live in the
+/// clang USR sidecar; everything else lives in SCIP.
+fn is_c_family(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next().unwrap_or(""),
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx"
+        | "ipp" | "inl" | "m" | "mm"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

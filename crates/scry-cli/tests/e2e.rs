@@ -251,8 +251,9 @@ fn synthetic_tree_roundtrip() {
         .expect("spawn scry build-resolutions");
     assert!(out.status.success(),
             "scry build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
+    // --lexical: synthetic Java/AOSP fixture, no precision sidecars.
     let out = Command::new(scry_bin())
-        .args(["callers", "transact", "--index"])
+        .args(["callers", "transact", "--lexical", "--index"])
         .arg(&idx)
         .args(["--json"])
         .output()
@@ -727,7 +728,7 @@ fn synthetic_tree_roundtrip() {
     };
     assert_smoke(&["prefix", "Bra", "--json"],     "Bravo",   "cmd_prefix");
     assert_smoke(&["fuzzy", "Bravo", "--json"],    "Bravo",   "cmd_fuzzy");
-    assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
+    assert_smoke(&["ref",   "Bravo", "--lexical", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
 
     // 8h-fail. Locks the `[fail] PATH kind=… size=… reason=…` log line
@@ -877,8 +878,9 @@ fn synthetic_tree_roundtrip() {
     // 8j-bis. callers / ref --format=count — cheapest "how many?"
     // reply. Mutually exclusive with --json. Closes the consistency
     // gap surfaced by the Qwen small-model comparison.
+    // --lexical: synthetic AOSP fixture, no precision sidecars.
     let out = Command::new(scry_bin())
-        .args(["callers", "transact", "--format", "count",
+        .args(["callers", "transact", "--lexical", "--format", "count",
                "--index"]).arg(&inc_idx)
         .output().expect("callers --format count");
     assert!(out.status.success(),
@@ -887,7 +889,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.contains(" callers"),
             "callers --format count must say `N callers`; got: {stdout}");
     let out = Command::new(scry_bin())
-        .args(["ref", "transact", "--format", "count",
+        .args(["ref", "transact", "--lexical", "--format", "count",
                "--index"]).arg(&inc_idx)
         .output().expect("ref --format count");
     assert!(out.status.success());
@@ -896,7 +898,7 @@ fn synthetic_tree_roundtrip() {
             "ref --format count must say `N ref`; got: {stdout}");
     // Mutual-exclusion with --json.
     let out = Command::new(scry_bin())
-        .args(["callers", "transact", "--format", "count", "--json",
+        .args(["callers", "transact", "--lexical", "--format", "count", "--json",
                "--index"]).arg(&inc_idx)
         .output().expect("callers --format + --json");
     assert!(!out.status.success(),
@@ -1918,8 +1920,13 @@ public class Caller { public void run() { new Animal().speak(); } }
     //   subclasses ≥ 1 (Dog; Puppy at depth ≥ 2)
     //   callers ≥ 1 (Caller.run() calls speak() on an Animal)
     // files_touched should include at least Dog.java and Caller.java.
+    //
+    // --lexical: the test fixture is a synthetic index with no
+    // build-symbol sidecars (no clang_usrs.bin, no scip_index.bin),
+    // so we explicitly opt into tree-sitter name match. Without it,
+    // default-precise refuses to silently degrade.
     let out = Command::new(scry_bin())
-        .args(["impact", "Animal", "--index"]).arg(&idx)
+        .args(["impact", "Animal", "--lexical", "--index"]).arg(&idx)
         .args(["--subclass-depth", "2", "--json", "--limit", "20"])
         .output().expect("spawn scry impact");
     assert!(out.status.success(), "impact Animal failed: {}",
@@ -1946,7 +1953,7 @@ public class Caller { public void run() { new Animal().speak(); } }
         .spawn().expect("spawn serve");
     {
         let stdin = child.stdin.as_mut().unwrap();
-        writeln!(stdin, r#"{{"id":1,"cmd":"impact","args":{{"name":"Animal","subclass_depth":2,"limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"impact","args":{{"name":"Animal","subclass_depth":2,"limit":20,"lexical":true}}}}"#).unwrap();
     }
     let out = child.wait_with_output().expect("serve wait");
     assert!(out.status.success(), "serve failed: {}",
@@ -1989,7 +1996,7 @@ public class Tree {
 
     // callgraph a --depth 1: just b.
     let out = Command::new(scry_bin())
-        .args(["callgraph", "a", "--index"]).arg(&idx)
+        .args(["callgraph", "a", "--lexical", "--index"]).arg(&idx)
         .args(["--depth", "1", "--json"])
         .output().expect("spawn scry callgraph");
     assert!(out.status.success(),
@@ -2004,7 +2011,7 @@ public class Tree {
 
     // callgraph a --depth 3: b, c, d nested.
     let out = Command::new(scry_bin())
-        .args(["callgraph", "a", "--index"]).arg(&idx)
+        .args(["callgraph", "a", "--lexical", "--index"]).arg(&idx)
         .args(["--depth", "3", "--json"])
         .output().expect("spawn scry callgraph --depth=3");
     assert!(out.status.success());
@@ -2168,8 +2175,11 @@ public class Caller {
             "index failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // Look for the import ref by its FULL qualified name.
+    // --lexical: synthetic index, no precision sidecars; this test
+    // exercises tree-sitter import ref capture, not symbol identity.
     let out = Command::new(scry_bin())
-        .args(["ref", "android.os.PerfettoTrace", "--kind", "import",
+        .args(["ref", "android.os.PerfettoTrace", "--lexical",
+               "--kind", "import",
                "--index"]).arg(&idx).args(["--json"])
         .output().expect("spawn scry ref");
     assert!(out.status.success(),
@@ -2185,7 +2195,8 @@ public class Caller {
     // The opposite: looking up by the bare class name should now miss
     // (because the import ref's name is the full path, not "PerfettoTrace").
     let out = Command::new(scry_bin())
-        .args(["ref", "PerfettoTrace", "--kind", "import", "--index"]).arg(&idx)
+        .args(["ref", "PerfettoTrace", "--lexical",
+               "--kind", "import", "--index"]).arg(&idx)
         .args(["--json"])
         .output().expect("spawn scry ref");
     assert!(out.status.success());
@@ -2278,8 +2289,11 @@ public class OtherCaller {
             "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // (1) --def-in PerfettoTrace.java --strict → exactly the Caller's call.
+    // --lexical: synthetic Java fixture has no SCIP sidecar; this
+    // test exercises Layer 2 import-aware resolution, not symbol
+    // identity (which is what --lexical's opt-out is for).
     let out = Command::new(scry_bin())
-        .args(["callers", "close",
+        .args(["callers", "close", "--lexical",
                "--def-in", "PerfettoTrace.java",
                "--strict",
                "--index"]).arg(&idx)
@@ -2305,7 +2319,7 @@ public class OtherCaller {
 
     // (2) --format by-def shows both defs as distinct groups.
     let out = Command::new(scry_bin())
-        .args(["callers", "close",
+        .args(["callers", "close", "--lexical",
                "--format", "by-def",
                "--limit", "10",
                "--index"]).arg(&idx)
@@ -2350,8 +2364,10 @@ public class Caller {
             "index failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // The wildcard import should be searchable as "android.os.*".
+    // --lexical: synthetic index has no precision sidecars.
     let out = Command::new(scry_bin())
-        .args(["ref", "android.os.*", "--kind", "import", "--index"]).arg(&idx)
+        .args(["ref", "android.os.*", "--lexical",
+               "--kind", "import", "--index"]).arg(&idx)
         .args(["--json"])
         .output().expect("spawn scry ref");
     assert!(out.status.success(),
@@ -2372,7 +2388,8 @@ public class Caller {
     // scoped_identifier child) with the wildcard version. Looking up
     // by the bare "android.os" path should miss.
     let out = Command::new(scry_bin())
-        .args(["ref", "android.os", "--kind", "import", "--index"]).arg(&idx)
+        .args(["ref", "android.os", "--lexical",
+               "--kind", "import", "--index"]).arg(&idx)
         .args(["--json"])
         .output().expect("spawn scry ref");
     assert!(out.status.success());
@@ -2667,11 +2684,16 @@ public class A {
     // v0.1.54 — same hint extended to subclasses + callgraph + uses
     // + impact. Each runs on the typo `bindServce` and must surface
     // `bindService` in its stderr hint.
+    //
+    // --lexical: synthetic index has no precision sidecars; precision
+    // would hard-error before the hint code path runs. callgraph and
+    // impact respect --lexical; subclasses and uses bypass precision
+    // entirely (type-hierarchy / outgoing-edge ops).
     for (subcmd, extra_args) in [
         ("subclasses", vec!["--limit", "3"]),
-        ("callgraph",  vec!["--depth", "1"]),
+        ("callgraph",  vec!["--depth", "1", "--lexical"]),
         ("uses",       vec!["--limit", "3"]),
-        ("impact",     vec!["--limit", "3"]),
+        ("impact",     vec!["--limit", "3", "--lexical"]),
     ] {
         let mut cmd = Command::new(scry_bin());
         cmd.arg(subcmd).arg("bindServce").arg("--index").arg(&idx);
@@ -2734,7 +2756,7 @@ public class Idle {
 
     // (1) CLI human format: stdout is the path list, one per line.
     let out = Command::new(scry_bin())
-        .args(["callers", "open", "--index"]).arg(&idx)
+        .args(["callers", "open", "--lexical", "--index"]).arg(&idx)
         .args(["--format", "paths", "--limit", "20"])
         .output().expect("spawn callers paths");
     assert!(out.status.success(),
@@ -2757,7 +2779,7 @@ public class Idle {
 
     // (2) CLI JSON format: single sorted array of strings.
     let out = Command::new(scry_bin())
-        .args(["callers", "open", "--index"]).arg(&idx)
+        .args(["callers", "open", "--lexical", "--index"]).arg(&idx)
         .args(["--format", "paths", "--limit", "20", "--json"])
         .output().expect("spawn callers paths --json");
     assert!(out.status.success(),
@@ -2781,8 +2803,8 @@ public class Idle {
         .spawn().expect("spawn serve");
     {
         let stdin = child.stdin.as_mut().unwrap();
-        writeln!(stdin, r#"{{"id":1,"cmd":"callers","args":{{"name":"open","format":"paths","limit":20}}}}"#).unwrap();
-        writeln!(stdin, r#"{{"id":2,"cmd":"ref","args":{{"name":"open","format":"paths","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"callers","args":{{"name":"open","format":"paths","limit":20,"lexical":true}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"ref","args":{{"name":"open","format":"paths","limit":20,"lexical":true}}}}"#).unwrap();
     }
     let out = child.wait_with_output().expect("serve wait");
     assert!(out.status.success(),

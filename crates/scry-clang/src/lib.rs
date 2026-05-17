@@ -216,9 +216,31 @@ fn parse_one(
     Ok(())
 }
 
-/// Drop compile-driver args that libclang shouldn't see.
+/// Build the argv libclang sees: drop compile-driver args it shouldn't,
+/// then prepend tolerance flags so we keep parsing TUs whose original
+/// compile invocation used `-W` flags newer than our linked libclang
+/// knows about (common on Chromium-flavored sub-repos in AOSP that
+/// pass `-Wno-cast-function-type-mismatch` etc.). Without these
+/// prefixes libclang emits `-Werror,-Wunknown-warning-option` and
+/// aborts the entire TU — losing every symbol from that file even
+/// though the parse would have otherwise succeeded.
+///
+/// Two flags, both load-bearing:
+///   - `-Wno-unknown-warning-option` — silences "unknown -W flag".
+///   - `-Wno-error` — downgrades any remaining errors-from-warnings
+///     back to warnings (e.g. `-Werror=foo` in the original cmdline).
+///
+/// We PREPEND them so they take effect even if the original args
+/// later set `-Werror`. libclang processes args left-to-right and
+/// later flags win, so we then APPEND a second copy as belt-and-
+/// braces: the prepend wins for `-Werror=...` (which appears once
+/// near the front), the append wins for any blanket `-Werror`.
 fn filter_args(raw: &[String], src_file: &str) -> Vec<CString> {
-    let mut out: Vec<CString> = Vec::with_capacity(raw.len());
+    const TOLERANCE: &[&str] = &["-Wno-unknown-warning-option", "-Wno-error"];
+    let mut out: Vec<CString> = Vec::with_capacity(raw.len() + 2 * TOLERANCE.len());
+    for flag in TOLERANCE {
+        out.push(CString::new(*flag).unwrap());
+    }
     let mut iter = raw.iter().enumerate();
     iter.next(); // skip argv[0]
     while let Some((_, a)) = iter.next() {
@@ -238,6 +260,9 @@ fn filter_args(raw: &[String], src_file: &str) -> Vec<CString> {
         if let Ok(c) = CString::new(a.as_bytes()) {
             out.push(c);
         }
+    }
+    for flag in TOLERANCE {
+        out.push(CString::new(*flag).unwrap());
     }
     out
 }

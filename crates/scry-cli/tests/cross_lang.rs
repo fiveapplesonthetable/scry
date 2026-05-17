@@ -164,10 +164,10 @@ export function pet(a: Animal): string { return a.speak(); }
     // symbol must equal the def's structured symbol.
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
     assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
-    assert!(stderr.contains("--scip-precise:"),
+    assert!(stderr.contains("[scry] precise ("),
         "--scip-precise should emit a diagnostic line proving the filter \
          was engaged; got stderr:\n{stderr}");
-    assert!(stderr.contains("after SCIP symbol identity filter"),
+    assert!(stderr.contains("def SCIP symbols"),
         "filter output should mention the identity filter step; got:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
@@ -310,15 +310,15 @@ pub fn main_call() -> (String, String) {
     assert!(r.status.success(),
         "scry ref --scip-precise failed: {stderr}");
     let diag = stderr.lines()
-        .find(|l| l.contains("--scip-precise:") && l.contains("→"))
+        .find(|l| l.contains("[scry] precise (") && l.contains("→"))
         .unwrap_or("").to_string();
     eprintln!("--scip-precise diagnostic: {diag}");
     assert!(!diag.is_empty(),
-        "--scip-precise must emit a 'N → M refs after SCIP symbol identity \
-         filter' diagnostic; got stderr:\n{stderr}");
+        "precision must emit a '[scry] precise (sidecar): N → M refs ...' \
+         diagnostic; got stderr:\n{stderr}");
     let precise_count = stdout.lines()
         .filter(|l| l.contains("(call rs)")).count();
-    eprintln!("after --scip-precise: {precise_count} (call rs) refs");
+    eprintln!("after precise: {precise_count} (call rs) refs");
     assert!(precise_count < baseline_count,
         "--scip-precise MUST drop the cross-module Cat::speak ref \
          (Kythe-level identity narrowing). \
@@ -410,7 +410,7 @@ repositories { mavenCentral() }
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
     assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
-    assert!(stderr.contains("--scip-precise:"),
+    assert!(stderr.contains("[scry] precise ("),
         "precision filter should be engaged on Java refs; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
@@ -586,7 +586,7 @@ fun pet(a: Animal): String {
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
     assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
-    assert!(stderr.contains("--scip-precise:"),
+    assert!(stderr.contains("[scry] precise ("),
         "precision filter should be engaged; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
@@ -662,7 +662,7 @@ pub fn pet<S: Speak>(s: &S) -> &'static str { s.speak() }
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
     assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
-    assert!(stderr.contains("--scip-precise:"),
+    assert!(stderr.contains("[scry] precise ("),
         "filter should be engaged; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
@@ -731,7 +731,7 @@ func Pet(a Animal) string { return a.Speak() }
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "Speak");
     assert!(ok, "scry ref Speak --scip-precise failed: {stderr}");
-    assert!(stderr.contains("--scip-precise:"),
+    assert!(stderr.contains("[scry] precise ("),
         "filter should be engaged; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();
@@ -808,7 +808,7 @@ def pet(a: Animal) -> str:
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
     assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
-    assert!(stderr.contains("--scip-precise:"),
+    assert!(stderr.contains("[scry] precise ("),
         "filter should be engaged; got stderr:\n{stderr}");
 
     std::fs::remove_dir_all(&base).ok();

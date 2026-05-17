@@ -7,6 +7,34 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.49] — 2026-05-17
+
+`--strict` on `scry uses`. CLI + JSON-RPC + MCP parity in
+the same commit. Symmetric to the `--strict` flag already on
+`ref`/`callers`/`callgraph`/`impact`.
+
+`scry uses NAME` returns refs INSIDE NAME's function body —
+the outgoing edges. The names of those refs vary (one per
+called function), so `--def-in` doesn't make sense here. But
+`--strict` does: drop edges whose Layer 2 resolution didn't
+pin a specific target. Useful for "what does NAME call that
+we know the target of?" — strips heuristic-only matches.
+
+```
+$ scry uses bindServiceLocked --strict --kind call --limit 5
+[scry] uses --strict: 23 → 18 edges (unresolved dropped)
+...
+```
+
+`--def-in` is intentionally NOT added to `uses` — the
+outgoing refs have different names (different called methods),
+so narrowing by a single def-site path would only match a
+subset arbitrarily. The right tool for "which callees from
+NAME's body resolve to defs in PATH" is to pipe `uses NAME
+--json` and filter on `resolved_to`/`path` client-side.
+
+MCP `uses` tool advertises the new `strict` parameter.
+
 ## [0.1.48] — 2026-05-17
 
 Better diagnostic when `--def-in PATH` returns 0 hits that

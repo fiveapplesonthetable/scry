@@ -383,6 +383,12 @@ enum Cmd {
         /// Default: all kinds.
         #[arg(long, short = 'k')]
         kind: Option<String>,
+        /// Strict mode: drop outgoing edges whose Layer 2 resolution
+        /// didn't pin a target def. Useful for "what does NAME call
+        /// that we know the target of?" — strips out unresolved
+        /// calls that the heuristic resolver couldn't attribute.
+        #[arg(long)]
+        strict: bool,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -1231,8 +1237,8 @@ fn main() -> Result<()> {
             cmd_impact(name, index, in_, subclass_depth, reachable, def_in, strict, limit, json),
         Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, def_in, strict, json } =>
             cmd_callgraph(name, index, in_, depth, max_nodes, reachable, def_in, strict, json),
-        Cmd::Uses { name, index, in_, kind, limit, json } =>
-            cmd_uses(name, index, in_, kind, limit, json),
+        Cmd::Uses { name, index, in_, kind, strict, limit, json } =>
+            cmd_uses(name, index, in_, kind, strict, limit, json),
         Cmd::Finalize {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, workers,
@@ -4928,6 +4934,7 @@ fn cmd_uses(
     index: Option<PathBuf>,
     in_: Option<String>,
     kind: Option<String>,
+    strict: bool,
     limit: usize,
     json: bool,
 ) -> Result<()> {
@@ -4981,6 +4988,19 @@ fn cmd_uses(
                 out_refs.push(rr);
             }
         }
+    }
+
+    // v0.1.49 — --strict drops outgoing edges the resolver couldn't
+    // attribute to a specific def. Useful for "show me only the
+    // outgoing calls whose target we KNOW", filtering out the noise
+    // of unresolved heuristic-only matches.
+    if strict {
+        let before = out_refs.len();
+        out_refs.retain(|rr| rr.resolved_to.is_some());
+        eprintln!(
+            "[scry] uses --strict: {} → {} edges (unresolved dropped)",
+            before, out_refs.len(),
+        );
     }
 
     if json {
@@ -7621,6 +7641,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "kind":  {"type": "string",
                     "description": "Filter by ref kind: call, type, field, import, inherit, using-ns. Default: all."},
                 "limit": limit_prop,
+                "strict": {"type": "boolean", "default": false,
+                    "description": "Drop outgoing edges whose Layer 2 resolution didn't pin a target. Use for `what does NAME call that we KNOW the target of?` — strips heuristic-only matches the resolver couldn't attribute."},
             })),
         ),
         tool(
@@ -8496,7 +8518,8 @@ fn serve_one_request<W: std::io::Write>(
             serve_callgraph(reader, arg_str("name"), in_, depth, max_nodes, reachable, def_in, strict)
         }
         "uses" => {
-            serve_uses(reader, arg_str("name"), in_, kind, limit)
+            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            serve_uses(reader, arg_str("name"), in_, kind, strict, limit)
         }
         "grep"    => {
             let ci = args.get("case_insensitive")
@@ -8928,6 +8951,7 @@ fn serve_uses(
     name: &str,
     in_: Option<&str>,
     kind: Option<&str>,
+    strict: bool,
     limit: usize,
 ) -> serde_json::Value {
     let in_prefix = in_.unwrap_or("");
@@ -8954,6 +8978,8 @@ fn serve_uses(
             if let Some(k) = kind {
                 if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
             }
+            // v0.1.49 — --strict drops unresolved outgoing edges.
+            if strict && rr.resolved_to.is_none() { continue; }
             let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
             if seen.insert(key) {
                 out.push(ref_to_json(r, &rr));

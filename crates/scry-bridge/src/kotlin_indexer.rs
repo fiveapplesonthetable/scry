@@ -65,7 +65,7 @@ impl Default for KotlinIndexerConfig {
             kotlinc: PathBuf::from("kotlinc-embeddable"),
             semanticdb_kotlinc_jar: dirs_semanticdb_kotlinc()
                 .unwrap_or_else(|| PathBuf::from("semanticdb-kotlinc.jar")),
-            targetroot: std::env::temp_dir().join("scry-semanticdb"),
+            targetroot: crate::scry_tmp_dir().join("scry-semanticdb"),
             jvm_target: "21".into(),
             tolerate_kotlinc_errors: true,
         }

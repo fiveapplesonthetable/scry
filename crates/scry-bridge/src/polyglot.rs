@@ -166,7 +166,7 @@ impl Default for PolyglotConfig {
             scip_go: PathBuf::from("scip-go"),
             scip_typescript: PathBuf::from("scip-typescript"),
             scip_python: PathBuf::from("scip-python"),
-            scip_out_dir: std::env::temp_dir().join("scry-polyglot-scip"),
+            scip_out_dir: crate::scry_tmp_dir().join("scry-polyglot-scip"),
             per_target_timeout_secs: 600,
         }
     }

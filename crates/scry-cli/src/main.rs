@@ -986,10 +986,10 @@ enum Cmd {
         #[arg(long)]
         skip_java: bool,
     },
-    /// `scry build-precision` — unified Kythe-class precision pipeline.
+    /// `scry build-symbols` — Kythe-class symbol-identity sidecars.
     ///
     /// One command, one explicit `--build-{soong,gn,kbuild,cmake,cargo}`
-    /// flag, builds whatever precision sidecars apply:
+    /// flag, produces the matching sidecars:
     ///   - Soong  → SCIP for Java + Kotlin via the Soong bridge.
     ///   - GN     → clang USRs from `compile_commands.json`.
     ///   - Kbuild → same (kernel C), via the kernel's
@@ -997,10 +997,11 @@ enum Cmd {
     ///   - CMake  → same; `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
     ///   - Cargo  → polyglot pass only (Rust via rust-analyzer scip).
     ///
-    /// `--with-polyglot` also runs the polyglot pass (Rust/Go/TS/Python)
-    /// over the source root regardless of the build type, so a Soong
-    /// project that also has Python tooling gets both passes.
-    BuildPrecision {
+    /// `--with-polyglot` also runs the polyglot pass (Rust / Go /
+    /// TypeScript / Python) over the source root regardless of the
+    /// build type, so a Soong tree that also has Python tooling gets
+    /// both passes.
+    BuildSymbols {
         /// Source root.
         #[arg(long, value_name = "PATH")]
         source_root: PathBuf,
@@ -1543,22 +1544,22 @@ fn main() -> Result<()> {
                 scip_typescript, scip_python, no_rust, no_go, no_typescript,
                 no_python, only_root, max_targets,
             ),
-        Cmd::BuildPrecision { source_root, build_soong, build_gn, gn_binary,
-                              build_kbuild, build_cmake, cmake_binary, build_cargo,
-                              index, with_polyglot, no_rust, no_go, no_typescript,
-                              no_python, workers, targetroot, scip_out_dir,
-                              rust_analyzer, scip_go, scip_typescript, scip_python } => {
+        Cmd::BuildSymbols { source_root, build_soong, build_gn, gn_binary,
+                            build_kbuild, build_cmake, cmake_binary, build_cargo,
+                            index, with_polyglot, no_rust, no_go, no_typescript,
+                            no_python, workers, targetroot, scip_out_dir,
+                            rust_analyzer, scip_go, scip_typescript, scip_python } => {
             let build = match (build_soong, build_gn, build_kbuild, build_cmake, build_cargo) {
-                (Some(d), None, None, None, false) => bridge_subcmds::PrecisionBuild::Soong { build_dir: d },
-                (None, Some(d), None, None, false) => bridge_subcmds::PrecisionBuild::Gn { build_dir: d, gn_binary },
-                (None, None, Some(d), None, false) => bridge_subcmds::PrecisionBuild::Kbuild { build_dir: d },
-                (None, None, None, Some(d), false) => bridge_subcmds::PrecisionBuild::Cmake { build_dir: d, cmake_binary },
-                (None, None, None, None, true)     => bridge_subcmds::PrecisionBuild::Cargo,
+                (Some(d), None, None, None, false) => bridge_subcmds::BuildKind::Soong { build_dir: d },
+                (None, Some(d), None, None, false) => bridge_subcmds::BuildKind::Gn { build_dir: d, gn_binary },
+                (None, None, Some(d), None, false) => bridge_subcmds::BuildKind::Kbuild { build_dir: d },
+                (None, None, None, Some(d), false) => bridge_subcmds::BuildKind::Cmake { build_dir: d, cmake_binary },
+                (None, None, None, None, true)     => bridge_subcmds::BuildKind::Cargo,
                 _ => anyhow::bail!(
-                    "build-precision requires exactly one --build-{{soong,gn,kbuild,cmake,cargo}} flag"
+                    "build-symbols requires exactly one --build-{{soong,gn,kbuild,cmake,cargo}} flag"
                 ),
             };
-            bridge_subcmds::cmd_build_precision(
+            bridge_subcmds::cmd_build_symbols(
                 source_root, build, index, with_polyglot,
                 no_rust, no_go, no_typescript, no_python,
                 workers, targetroot, scip_out_dir,

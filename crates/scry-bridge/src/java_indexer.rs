@@ -63,7 +63,7 @@ impl Default for JavaIndexerConfig {
             semanticdb_javac_jar: dirs_semanticdb_javac()
                 .unwrap_or_else(|| PathBuf::from("semanticdb-javac.jar")),
             scip_java: PathBuf::from("scip-java"),
-            targetroot: std::env::temp_dir().join("scry-semanticdb"),
+            targetroot: crate::scry_tmp_dir().join("scry-semanticdb"),
             source_version: "11".into(),
             target_version: "11".into(),
             tolerate_javac_errors: true,

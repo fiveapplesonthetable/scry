@@ -30,6 +30,19 @@
 
 #![forbid(unsafe_code)]
 
+/// Where scry drops its scratch output (per-target `.scip` shards,
+/// per-compilation `.semanticdb` files). `$SCRY_TMP_DIR` overrides
+/// the default of `/mnt/agent/tmp` — preferred over `$TMPDIR` /
+/// `std::env::temp_dir()` because semanticdb shards and per-shard
+/// classes/ trees can be tens of GB on AOSP and `/tmp` is often a
+/// small tmpfs.
+pub fn scry_tmp_dir() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("SCRY_TMP_DIR") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from("/mnt/agent/tmp")
+}
+
 pub mod cmake;
 pub mod gn;
 pub mod java_indexer;

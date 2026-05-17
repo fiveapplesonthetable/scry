@@ -18,10 +18,10 @@ use std::time::Instant;
 use crate::default_index_dir;
 
 /// Which build system the precision pipeline is acting on. Explicit
-/// — `scry build-precision` requires one of these flags, no
+/// — `scry build-symbols` requires one of these flags, no
 /// auto-detection (per the user policy: "no flaky guessing").
 #[derive(Debug, Clone)]
-pub(crate) enum PrecisionBuild {
+pub(crate) enum BuildKind {
     /// Soong (AOSP). Walks the build dir for javac/kotlinc rules.
     Soong { build_dir: PathBuf },
     /// GN (Chromium / Perfetto / Fuchsia). Uses the build dir's
@@ -339,7 +339,7 @@ pub(crate) fn cmd_build_polyglot_scip(
     Ok(())
 }
 
-/// `scry build-precision` — unified Kythe-class precision pipeline.
+/// `scry build-symbols` — unified Kythe-class precision pipeline.
 ///
 /// Takes ONE explicit build-system flag (`--build-soong PATH`,
 /// `--build-gn PATH`, `--build-kbuild PATH`), produces the right
@@ -352,9 +352,9 @@ pub(crate) fn cmd_build_polyglot_scip(
 /// scry sidecar in append mode (SCIP) or replace mode (clang USR
 /// — only one C-family pass per index).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_build_precision(
+pub(crate) fn cmd_build_symbols(
     source_root: PathBuf,
-    build: PrecisionBuild,
+    build: BuildKind,
     index: Option<PathBuf>,
     with_polyglot: bool,
     no_rust: bool,
@@ -373,20 +373,20 @@ pub(crate) fn cmd_build_precision(
     let index_dir = index.clone().unwrap_or_else(default_index_dir);
 
     match &build {
-        PrecisionBuild::Soong { build_dir } => {
-            eprintln!("[build-precision] soong build_dir: {}", build_dir.display());
+        BuildKind::Soong { build_dir } => {
+            eprintln!("[build-symbols] soong build_dir: {}", build_dir.display());
             cmd_build_jvm_scip(
                 source_root.clone(), Some(build_dir.clone()), index.clone(),
                 None, None, None, None, None, targetroot, None, None, false, false,
             )?;
         }
-        PrecisionBuild::Gn { build_dir, gn_binary } => {
-            eprintln!("[build-precision] gn build_dir: {}", build_dir.display());
+        BuildKind::Gn { build_dir, gn_binary } => {
+            eprintln!("[build-symbols] gn build_dir: {}", build_dir.display());
             let cc = ensure_gn_compile_commands(build_dir, &source_root, gn_binary.as_deref())?;
             run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
         }
-        PrecisionBuild::Kbuild { build_dir } => {
-            eprintln!("[build-precision] kbuild build_dir: {}", build_dir.display());
+        BuildKind::Kbuild { build_dir } => {
+            eprintln!("[build-symbols] kbuild build_dir: {}", build_dir.display());
             if !kbuild::looks_like_kernel_source(&source_root) {
                 anyhow::bail!(
                     "{} doesn't look like a Linux kernel source tree \
@@ -397,22 +397,22 @@ pub(crate) fn cmd_build_precision(
             let cc = ensure_kbuild_compile_commands(build_dir, &source_root)?;
             run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
         }
-        PrecisionBuild::Cmake { build_dir, cmake_binary } => {
-            eprintln!("[build-precision] cmake build_dir: {}", build_dir.display());
+        BuildKind::Cmake { build_dir, cmake_binary } => {
+            eprintln!("[build-symbols] cmake build_dir: {}", build_dir.display());
             let cc = ensure_cmake_compile_commands(build_dir, cmake_binary.as_deref())?;
             run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
         }
-        PrecisionBuild::Cargo => {
+        BuildKind::Cargo => {
             // No C-family step; polyglot pass handles Rust via
             // rust-analyzer scip.  Force --with-polyglot on.
-            eprintln!("[build-precision] cargo: skipping C-family step, polyglot pass will handle Rust");
+            eprintln!("[build-symbols] cargo: skipping C-family step, polyglot pass will handle Rust");
         }
     }
 
     // Cargo always needs the polyglot pass since it's pure-Rust.
-    let auto_polyglot = matches!(&build, PrecisionBuild::Cargo);
+    let auto_polyglot = matches!(&build, BuildKind::Cargo);
     if with_polyglot || auto_polyglot {
-        eprintln!("[build-precision] running polyglot pass over {}", source_root.display());
+        eprintln!("[build-symbols] running polyglot pass over {}", source_root.display());
         cmd_build_polyglot_scip(
             source_root.clone(), index, scip_out_dir,
             rust_analyzer, scip_go, scip_typescript, scip_python,
@@ -422,7 +422,7 @@ pub(crate) fn cmd_build_precision(
     }
 
     eprintln!(
-        "[build-precision] ALL STAGES OK in {:.2}s",
+        "[build-symbols] ALL STAGES OK in {:.2}s",
         t_total.elapsed().as_secs_f64(),
     );
     Ok(())
@@ -434,11 +434,11 @@ fn ensure_gn_compile_commands(
     gn_binary: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(cc) = gn::locate_compile_commands(build_dir)? {
-        eprintln!("[build-precision] gn: reusing existing {}", cc.display());
+        eprintln!("[build-symbols] gn: reusing existing {}", cc.display());
         return Ok(cc);
     }
     let gn = gn_binary.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("gn"));
-    eprintln!("[build-precision] gn: regenerating compile_commands.json via `{} gen --export-compile-commands {}`",
+    eprintln!("[build-symbols] gn: regenerating compile_commands.json via `{} gen --export-compile-commands {}`",
         gn.display(), build_dir.display());
     gn::regenerate_compile_commands(&gn, source_root, build_dir)
 }
@@ -448,10 +448,10 @@ fn ensure_kbuild_compile_commands(
     source_root: &Path,
 ) -> Result<PathBuf> {
     if let Some(cc) = kbuild::locate_compile_commands(build_dir)? {
-        eprintln!("[build-precision] kbuild: reusing existing {}", cc.display());
+        eprintln!("[build-symbols] kbuild: reusing existing {}", cc.display());
         return Ok(cc);
     }
-    eprintln!("[build-precision] kbuild: regenerating compile_commands.json via gen_compile_commands.py");
+    eprintln!("[build-symbols] kbuild: regenerating compile_commands.json via gen_compile_commands.py");
     kbuild::regenerate_compile_commands(source_root, build_dir)
 }
 
@@ -460,11 +460,11 @@ fn ensure_cmake_compile_commands(
     cmake_binary: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(cc) = cmake::locate_compile_commands(build_dir)? {
-        eprintln!("[build-precision] cmake: reusing existing {}", cc.display());
+        eprintln!("[build-symbols] cmake: reusing existing {}", cc.display());
         return Ok(cc);
     }
     let cmake_bin = cmake_binary.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("cmake"));
-    eprintln!("[build-precision] cmake: regenerating compile_commands.json via {}", cmake_bin.display());
+    eprintln!("[build-symbols] cmake: regenerating compile_commands.json via {}", cmake_bin.display());
     cmake::regenerate_compile_commands(&cmake_bin, build_dir)
 }
 
@@ -480,7 +480,7 @@ fn run_clang_on_cc(
         4 * 1024 * 1024,
     )?;
     eprintln!(
-        "[build-precision] clang USRs landed in {} in {:.2}s",
+        "[build-symbols] clang USRs landed in {} in {:.2}s",
         index_dir.join("clang_usrs.bin").display(),
         t.elapsed().as_secs_f64(),
     );

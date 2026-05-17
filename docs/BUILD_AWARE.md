@@ -21,21 +21,70 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/ma
 ```
 
 What it does (idempotent):
-- Installs `libclang`, `JDK`, `Go`, `node`, `npm` via your distro
+- Installs `libclang`, `JDK`, `Go`, `node`, `npm` via the system
   package manager (apt-get / dnf / brew).
-- Installs `scip-typescript`, `scip-python` via npm into
-  `$PREFIX/lib/node_modules/.bin` (default `$PREFIX=~/.local`).
+- Installs `scip-typescript`, `scip-python` via npm.
 - Installs `rust-analyzer` via `rustup component add`.
 - Installs `scip-go` via `go install`.
-- Downloads `scip-java` launcher from the GitHub release.
-- Downloads `gradle 8.10.2` (needed by scip-java + scip-kotlin).
-- Downloads `sbt 1.10.5` and uses it to build `semanticdb-kotlinc`
-  from source, publishing to `~/.m2/repository` (scip-kotlin isn't
-  on Maven Central — sbt publishM2 is the only install path).
+- Downloads the `scip-java` launcher (GitHub release).
+- Downloads `gradle 8.10.2` + `sbt 1.10.5` and builds
+  `semanticdb-kotlinc` from source, publishing it to
+  `~/.m2/repository` (scip-kotlin isn't on Maven Central —
+  `sbt publishM2` is the only install path).
+- Installs a `kotlinc-embeddable` launcher under
+  `/mnt/agent/tools/bin` that the Kotlin SCIP bridge requires
+  (Sourcegraph's plugin was built against the shaded
+  embeddable jar; stock `kotlinc` 2.0+ dropped that shading and
+  the plugin crashes when loaded by the default launcher).
 
-After it finishes, every `scry finalize --build-out PATH` call
-auto-discovers `compile_commands.json` and `*.scip` produced by
-these tools without per-language flag plumbing.
+### The one command per build system
+
+`scry build-symbols` produces the Kythe-class symbol-identity
+sidecars (`clang_usrs.bin` and `scip_index.bin`) for an existing
+scry index. Pick ONE explicit build-system flag:
+
+```bash
+# AOSP / Soong — Java + Kotlin via SCIP, plus auto-extracted
+# clang USRs from out/soong/development/ide/compdb/compile_commands.json.
+scry build-symbols --source-root /path/to/aosp \
+                   --build-soong /path/to/aosp/out/soong \
+                   --index /path/to/scry-index
+
+# Chromium / Perfetto / Fuchsia — GN.
+scry build-symbols --source-root /path/to/chromium \
+                   --build-gn /path/to/chromium/out/Default \
+                   --index /path/to/scry-index
+
+# Linux kernel — Kbuild. scry shells out to the kernel's bundled
+# scripts/clang-tools/gen_compile_commands.py if no compdb exists.
+scry build-symbols --source-root /path/to/linux \
+                   --build-kbuild /path/to/linux \
+                   --index /path/to/scry-index
+
+# CMake.
+scry build-symbols --source-root /path/to/proj \
+                   --build-cmake /path/to/proj/build \
+                   --index /path/to/scry-index
+
+# Cargo workspace (Rust-only). Runs rust-analyzer scip on the
+# workspace root.
+scry build-symbols --source-root /path/to/repo \
+                   --build-cargo \
+                   --index /path/to/scry-index
+```
+
+The build-system flags are mutually exclusive. The directory passed
+to `--build-{soong,gn,kbuild,cmake}` is always the BUILD OUT dir
+(the one containing `out/soong/.intermediates`, `args.gn`,
+`.config`, or `CMakeCache.txt`) — never the source root.
+
+Add `--with-polyglot` to also walk the source tree for Rust /
+Go / TypeScript / Python project markers and run rust-analyzer
+scip / scip-go / scip-typescript / scip-python on each project
+root, importing each `.scip` into the same sidecar.
+
+After it finishes, every query auto-engages the precision filter
+unless you pass `--lexical`.
 
 ### Auto-discovery
 

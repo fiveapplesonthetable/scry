@@ -597,7 +597,6 @@ name = "scry-clang"
 version = "0.1.66"
 dependencies = [
  "anyhow",
- "bincode",
  "clang-sys",
  "parking_lot",
  "rayon",
@@ -670,7 +669,6 @@ name = "scry-scip"
 version = "0.1.66"
 dependencies = [
  "anyhow",
- "bincode",
  "protobuf",
  "scip",
  "scry-store",

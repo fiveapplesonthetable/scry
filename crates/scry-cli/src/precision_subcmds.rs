@@ -62,7 +62,7 @@ pub(crate) fn cmd_clang_stats(index: Option<PathBuf>) -> Result<()> {
                 std::fs::metadata(&sidecar_path)
                     .map(|m| m.len()).unwrap_or(0),
             );
-            for u in idx.sidecar.usr_table.iter().take(3) {
+            for u in idx.iter_usrs().take(3) {
                 println!("  sample: {u}");
             }
         }
@@ -119,7 +119,7 @@ pub(crate) fn cmd_scip_stats(index: Option<PathBuf>) -> Result<()> {
                 idx.len(),
                 std::fs::metadata(&sidecar_path).map(|m| m.len()).unwrap_or(0),
             );
-            for s in idx.sidecar.symbol_table.iter().take(3) {
+            for s in idx.iter_symbols().take(3) {
                 println!("  sample: {s}");
             }
         }

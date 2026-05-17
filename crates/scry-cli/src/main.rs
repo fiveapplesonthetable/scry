@@ -416,6 +416,19 @@ enum Cmd {
         /// whose owning module can reach NAME's module.
         #[arg(long)]
         reachable: bool,
+        /// Narrow ROOT-LEVEL callers by callee location — same shape
+        /// as `scry ref --def-in PATH`. Only NAME's callers whose
+        /// Layer 2 resolution points at a def in PATH (or whose
+        /// resolution is None, permissively) are walked. Deeper
+        /// levels are not narrowed because the callgraph walker
+        /// doesn't track per-frame def context.
+        #[arg(long, value_name = "PATH")]
+        def_in: Option<String>,
+        /// Strict mode: drop root-level callers whose Layer 2
+        /// resolution didn't land on a specific def. See
+        /// `scry ref --strict`.
+        #[arg(long)]
+        strict: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1205,8 +1218,8 @@ fn main() -> Result<()> {
         Cmd::ScipLookup { index, path, offset } => cmd_scip_lookup(index, &path, offset),
         Cmd::Impact { name, index, in_, subclass_depth, reachable, limit, json } =>
             cmd_impact(name, index, in_, subclass_depth, reachable, limit, json),
-        Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, json } =>
-            cmd_callgraph(name, index, in_, depth, max_nodes, reachable, json),
+        Cmd::Callgraph { name, index, in_, depth, max_nodes, reachable, def_in, strict, json } =>
+            cmd_callgraph(name, index, in_, depth, max_nodes, reachable, def_in, strict, json),
         Cmd::Uses { name, index, in_, kind, limit, json } =>
             cmd_uses(name, index, in_, kind, limit, json),
         Cmd::Finalize {
@@ -2504,6 +2517,8 @@ fn cmd_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
+    def_in: Option<String>,
+    strict: bool,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
@@ -2520,6 +2535,26 @@ fn cmd_callgraph(
         })
     } else { None };
 
+    // v0.1.43 — --def-in PATH narrows ROOT-LEVEL callers by the
+    // callee's def location. Same shape as cmd_ref's --def-in.
+    // Empty target set ⇒ diagnostic + no narrowing.
+    let root_def_target_ids: Option<std::collections::HashSet<u64>> =
+        def_in.as_deref().map(|p| {
+            let ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
+                .iter()
+                .filter(|s| r.files.get(s.file_id as usize)
+                    .is_some_and(|fe| fe.display_path(&r.roots).contains(p)))
+                .map(|s| s.id)
+                .collect();
+            if ids.is_empty() {
+                eprintln!(
+                    "[scry] --def-in: no def of {name:?} found in any file \
+                     containing {p:?}; root-level callers will not be narrowed.",
+                );
+            }
+            ids
+        });
+
     /// One node in the callers tree. Children are callers of this
     /// function (i.e. parents on the call stack).
     #[derive(Debug, Default, serde::Serialize)]
@@ -2532,12 +2567,18 @@ fn cmd_callgraph(
         callers: std::collections::BTreeMap<String, Node>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand(
         r: &StoreReader,
         callee: &str,
         depth_left: usize,
         in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
+        // v0.1.43: root-level only. Some(set) ⇒ filter by Layer 2
+        // resolved_to ∈ set (with strict toggle). None ⇒ no filter
+        // (also the case for all non-root recursive levels).
+        root_def_target_ids: Option<&std::collections::HashSet<u64>>,
+        strict: bool,
         visited: &mut std::collections::HashSet<String>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
@@ -2563,6 +2604,21 @@ fn cmd_callgraph(
                     }
                 }
             }
+            // Root-level --def-in / --strict filter (v0.1.43).
+            // Non-root recursive levels skip this branch because
+            // root_def_target_ids is None then.
+            if let Some(tids) = root_def_target_ids {
+                if !tids.is_empty() {
+                    match rr.resolved_to {
+                        Some(id) if !tids.contains(&id) => continue,
+                        None if strict => continue,
+                        _ => {}
+                    }
+                }
+            }
+            if root_def_target_ids.is_none() && strict && rr.resolved_to.is_none() {
+                continue;
+            }
             // Prefer the byte-range enclosing function (more accurate
             // than scope_path.last() which reports the class on Java).
             // Fall back to scope_path when file_symbols is missing.
@@ -2581,11 +2637,13 @@ fn cmd_callgraph(
             *budget = budget.saturating_sub(1);
             if *budget == 0 { break; }
         }
-        // Recurse into each caller, expanding their callers.
+        // Recurse into each caller, expanding their callers. Pass
+        // None for root_def_target_ids so the narrowing only fires
+        // at the topmost level (we don't have per-frame def context).
         for (caller_name, node) in &mut out {
             node.callers = expand(
                 r, caller_name, depth_left - 1, in_prefix,
-                callee_modules, visited, budget,
+                callee_modules, None, strict, visited, budget,
             );
         }
         visited.remove(callee);
@@ -2595,7 +2653,9 @@ fn cmd_callgraph(
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let prefix = in_.as_deref().unwrap_or("");
-    let tree = expand(&r, &name, depth, prefix, callee_modules.as_ref(), &mut visited, &mut budget);
+    let tree = expand(&r, &name, depth, prefix, callee_modules.as_ref(),
+                      root_def_target_ids.as_ref(), strict,
+                      &mut visited, &mut budget);
 
     if json {
         println!("{}", serde_json::json!({

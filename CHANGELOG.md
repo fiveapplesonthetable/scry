@@ -7,6 +7,42 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.43] — 2026-05-17
+
+`--def-in PATH` and `--strict` on `scry callgraph`.
+
+The recursive caller-tree walker now accepts the same two
+narrowing flags as `scry callers`. ROOT-LEVEL refs are
+filtered:
+- `--def-in PATH` keeps only callers whose Layer 2
+  resolution points at a def in PATH (permissive on
+  unresolved by default).
+- `--strict` drops unresolved root callers entirely.
+
+Deeper levels of the walk are NOT narrowed because the
+callgraph walker doesn't track per-frame def context. This is
+the same limitation as `cmd_callers_precise`'s recursive
+expansion. A diagnostic prints when `--def-in` produced an
+empty target set (so the user knows the narrowing was a
+no-op).
+
+Example:
+```
+$ scry callgraph transact --strict --def-in libs/binder/Binder.cpp \
+    --depth 2 --max-nodes 30
+callgraph (incoming, depth 2) of "transact":
+  JHwRemoteBinder_native_transact (1 call site) — ...HwRemoteBinder.cpp:347
+  addUniqueId (1 call site) — ...IDrmManagerService.cpp:119
+  ...
+```
+
+Without `--def-in`, the same `callgraph transact` would
+include callers of every `transact` overload in the corpus
+(BBinder, BpBinder, BHwBinder, test mocks, ndk versions);
+with `--def-in libs/binder/Binder.cpp --strict` only callers
+the resolver confidently attributed to `android::BBinder::transact`
+make it into the root.
+
 ## [0.1.42] — 2026-05-17
 
 Daemon / JSON-RPC / MCP parity for v0.1.41's `refs-resolved`

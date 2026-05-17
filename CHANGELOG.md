@@ -7,6 +7,40 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.40] — 2026-05-17
+
+Daemon / JSON-RPC / MCP parity for `--format by-def`.
+
+v0.1.35 shipped `--format by-def` on the CLI; v0.1.37 added
+JSON output for it. This release extends the same capability
+to the daemon's `ref` and `callers` JSON-RPC commands (and
+the matching MCP tools).
+
+**Usage:**
+```json
+{"cmd":"callers","args":{"name":"close","format":"by-def","limit":10}}
+```
+
+**Response shape:** matches the CLI's JSON output verbatim —
+```json
+[
+  {"count": 166, "def": {"path": "...", "line": 411, "col": 19,
+                         "scope": ["android","BBinder"],
+                         "kind": "method", "id": "29f1a6bde1a13a0d"}},
+  ...,
+  {"count": 8123, "def": null}
+]
+```
+
+The daemon path correctly collects ALL surviving refs (not just
+the first `limit`) before building the histogram, so the group
+counts are accurate. `limit` then caps the number of GROUPS
+returned (top N by count, plus the unresolved bucket).
+
+MCP schemas for `ref` and `callers` now advertise the `format`
+parameter with enum `["by-def"]`, with descriptions calling out
+the "WHICH def do the callers actually target?" use case.
+
 ## [0.1.39] — 2026-05-17
 
 Compact resolved-def annotations now show **last 2 path

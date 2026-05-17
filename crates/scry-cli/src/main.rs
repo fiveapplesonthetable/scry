@@ -7403,6 +7403,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Substring of the def-site file path. Keeps only refs whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` disambiguates `close` when many unrelated classes also define `close`. Refs whose resolved_to is None pass through (over-include rather than silently drop). No-op without a build-resolutions sidecar."},
                 "strict": {"type": "boolean", "default": false,
                     "description": "Drop refs whose Layer 2 resolution didn't land on a specific def (resolved_to=None). With `def_in`, also drops the permissive over-include — only refs the resolver confidently attributed to the target survive. Without `def_in`, shows only refs that resolved to some specific def."},
+                "format": {"type": "string", "enum": ["by-def"],
+                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {path, line, col, scope, kind, id}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. Use this to see WHICH def the refs actually target. Without `format`, returns the per-ref JSONL stream."},
             })),
         ),
         tool(
@@ -7431,6 +7433,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Substring of the def-site file path. Keeps only callers whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` cuts through cases where many classes share a method name like `close`. Callers whose resolved_to is None pass through. No-op without a build-resolutions sidecar."},
                 "strict": {"type": "boolean", "default": false,
                     "description": "Drop callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include — only callers the resolver confidently attributed survive. Trades recall for precision."},
+                "format": {"type": "string", "enum": ["by-def"],
+                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {...}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. Use this to see WHICH def the callers actually target — invaluable for polymorphic names like `close`, `onCreate`, `transact`."},
             })),
         ),
         tool(
@@ -8285,7 +8289,8 @@ fn serve_one_request<W: std::io::Write>(
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict)
+            let format = args.get("format").and_then(serde_json::Value::as_str);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
         }
         "callers" => {
             let no_precise = args.get("no_precise")
@@ -8301,7 +8306,8 @@ fn serve_one_request<W: std::io::Write>(
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict)
+            let format = args.get("format").and_then(serde_json::Value::as_str);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
         }
         "subclasses" | "implementations" => {
             let depth = args.get("depth")
@@ -8570,6 +8576,7 @@ fn serve_ref(
     scope: Option<&str>,
     def_in: Option<&str>,
     strict: bool,
+    format: Option<&str>,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     // --def-in PATH: precompute the target def id set. Empty target
@@ -8621,9 +8628,13 @@ fn serve_ref(
             c.symbol_for_window(&p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
         }).collect()
     });
+    let by_def = format == Some("by-def");
+    // by-def needs to see ALL surviving refs to build the histogram
+    // correctly; the default JSONL path caps at `limit` for cost.
     let mut out = Vec::new();
+    let mut by_def_keep: Vec<RefRecord> = Vec::new();
     for rr in r.lookup_refs_exact(name).into_iter() {
-        if out.len() >= limit { break; }
+        if !by_def && out.len() >= limit { break; }
         if let Some(l) = lang {
             if !rr.lang.as_str().eq_ignore_ascii_case(l) { continue; }
         }
@@ -8687,7 +8698,63 @@ fn serve_ref(
                 }
             }
         }
-        out.push(ref_to_json(r, &rr));
+        if by_def {
+            by_def_keep.push(rr);
+        } else {
+            out.push(ref_to_json(r, &rr));
+        }
+    }
+    if by_def {
+        return serve_ref_by_def_histogram(r, name, &by_def_keep, limit);
+    }
+    serde_json::Value::Array(out)
+}
+
+/// JSON-RPC histogram for `format: "by-def"` — same data layout as
+/// the CLI's `print_refs_by_def` (v0.1.35) with the v0.1.37 JSON
+/// shape. Sorted descending by count, capped at `limit` resolved
+/// groups + a final unresolved bucket if any.
+fn serve_ref_by_def_histogram(
+    reader: &StoreReader,
+    name: &str,
+    refs: &[RefRecord],
+    limit: usize,
+) -> serde_json::Value {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<Option<u64>, usize> = HashMap::new();
+    for r in refs {
+        *by_id.entry(r.resolved_to).or_insert(0) += 1;
+    }
+    let unresolved = by_id.remove(&None).unwrap_or(0);
+    let mut groups: Vec<(u64, usize)> = by_id.into_iter()
+        .map(|(k, v)| (k.unwrap(), v))
+        .collect();
+    groups.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let candidates = reader.lookup_exact(name);
+    let by_def_id: HashMap<u64, &SymbolRecord> = candidates.iter()
+        .map(|s| (s.id, s)).collect();
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(
+        groups.len().min(limit) + if unresolved > 0 { 1 } else { 0 });
+    for (def_id, count) in groups.iter().take(limit) {
+        let def_val = by_def_id.get(def_id).map(|s| {
+            let path = reader.files.get(s.file_id as usize)
+                .map(|f| f.display_path(&reader.roots))
+                .unwrap_or_default();
+            serde_json::json!({
+                "path": path,
+                "line": s.line,
+                "col": s.col,
+                "scope": s.scope_path,
+                "kind": s.kind.short(),
+                "id": format!("{:x}", def_id),
+            })
+        }).unwrap_or_else(|| serde_json::json!({
+            "id": format!("{:x}", def_id),
+        }));
+        out.push(serde_json::json!({"count": count, "def": def_val}));
+    }
+    if unresolved > 0 {
+        out.push(serde_json::json!({"count": unresolved, "def": null}));
     }
     serde_json::Value::Array(out)
 }

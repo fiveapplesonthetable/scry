@@ -7,6 +7,40 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.30] — 2026-05-17
+
+Human-readable resolved-def annotations in `scry ref` / `scry callers`.
+
+Before:
+```
+poc.cpp:52:9  (call cpp)  transact  → def:29f29fbf38f25d8d
+```
+
+After:
+```
+poc.cpp:52:9  (call cpp)  transact  → Binder.cpp:411 [android::BBinder]
+```
+
+The opaque 16-hex def-id was unintelligible — users couldn't tell
+whether the resolution was correct without dumping JSON and
+manually cross-referencing the symbol id. The new format shows
+the def's filename + line + scope, which is the same shape as
+the rest of the output and tells you immediately which method
+the ref resolves to.
+
+**Implementation:**
+- New `format_resolved_def(reader, ref_name, def_id)` helper
+  looks up symbols with the same name as the ref and finds the
+  one whose id matches. Typically O(K) where K = candidates per
+  name, which is small for most methods.
+- Falls back to the old `→ def:{hex}` form if the id can't be
+  located (rare; would indicate a cross-build mismatch between
+  the refs sidecar and symbols vec).
+- JSON output (`--json`) is unchanged — still emits the raw
+  `resolved_to: <u64>` for programmatic consumers.
+
+No index format change. Takes effect immediately.
+
 ## [0.1.29] — 2026-05-17
 
 Wildcard imports (`import android.os.*;`) now captured.

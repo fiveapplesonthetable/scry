@@ -4056,7 +4056,7 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
             format!("  [{}]", r.scope_path.join("::"))
         };
         let resolved = r.resolved_to
-            .map(|id| format!("  → def:{:x}", id))
+            .map(|id| format_resolved_def(reader, &r.name, id))
             .unwrap_or_default();
         println!(
             "{}:{}:{}  ({} {}){}  {}{}",
@@ -4069,6 +4069,32 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
         );
     }
     eprintln!("\n{} refs (showing {})", refs.len(), refs.len().min(limit));
+}
+
+/// Render the `→ def:...` suffix for a ref whose Layer 2 resolution
+/// picked a specific def. Shows the def's filename + line + scope so
+/// users can SEE which class's method the ref targets — the previous
+/// `→ def:707c64fb...` hex id was unintelligible and made it
+/// impossible to spot bad resolutions without a JSON dump. Falls
+/// back to the hex form if the id can't be located among same-name
+/// symbols (e.g. cross-build mismatch where ref.name != def.name).
+fn format_resolved_def(reader: &StoreReader, ref_name: &str, def_id: u64) -> String {
+    let def = reader.lookup_exact(ref_name).into_iter().find(|s| s.id == def_id);
+    match def {
+        Some(s) => {
+            let path = reader.files.get(s.file_id as usize)
+                .map(|f| f.display_path(&reader.roots))
+                .unwrap_or_default();
+            let fname = path.rsplit('/').next().unwrap_or(&path);
+            let scope = if s.scope_path.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", s.scope_path.join("::"))
+            };
+            format!("  → {}:{}{}", fname, s.line, scope)
+        }
+        None => format!("  → def:{:x}", def_id),
+    }
 }
 
 // ---------------------------------------------------------------------------

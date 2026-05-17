@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn roundtrip_empty() {
-        let tmp = std::env::temp_dir().join(format!("scry-cusr-empty-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-cusr-empty-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = UsrSidecar { version: 1, usr_table: vec![], records: vec![] };
         std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn lookup_by_loc() {
-        let tmp = std::env::temp_dir().join(format!("scry-cusr-lookup-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-cusr-lookup-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = UsrSidecar {
             version: 1,
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn missing_returns_none() {
-        let nope = std::env::temp_dir().join(format!(
+        let nope = crate::scry_tmp_dir().join(format!(
             "scry-cusr-missing-{}", std::process::id(),
         ));
         let _ = std::fs::remove_file(&nope);
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn window_lookup_finds_closest_within_range() {
-        let tmp = std::env::temp_dir().join(format!("scry-cusr-win-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-cusr-win-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = UsrSidecar {
             version: 1,
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_version() {
-        let tmp = std::env::temp_dir().join(format!("scry-cusr-badv-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-cusr-badv-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = UsrSidecar { version: 99, ..Default::default() };
         std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();

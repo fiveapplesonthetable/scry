@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn roundtrip_empty_and_versioned() {
-        let tmp = std::env::temp_dir().join(format!("scry-scip-empty-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-scip-empty-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = ScipSidecar { version: 1, symbol_table: vec![], records: vec![] };
         std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn lookup_exact_and_window() {
-        let tmp = std::env::temp_dir().join(format!("scry-scip-look-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-scip-look-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = ScipSidecar {
             version: 1,
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_version() {
-        let tmp = std::env::temp_dir().join(format!("scry-scip-badv-{}", std::process::id()));
+        let tmp = crate::scry_tmp_dir().join(format!("scry-scip-badv-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let s = ScipSidecar { version: 99, ..Default::default() };
         std::fs::write(&tmp, bincode::serialize(&s).unwrap()).unwrap();
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn missing_returns_none() {
-        let nope = std::env::temp_dir().join(format!("scry-scip-missing-{}", std::process::id()));
+        let nope = crate::scry_tmp_dir().join(format!("scry-scip-missing-{}", std::process::id()));
         let _ = std::fs::remove_file(&nope);
         assert!(ScipIndex::open(&nope).unwrap().is_none());
     }

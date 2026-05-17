@@ -44,7 +44,7 @@ fn find_tool(names: &[&str], extra_dirs: &[&str]) -> Option<PathBuf> {
 fn temp_dir(prefix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let p = std::env::temp_dir().join(format!("scry-xlang-{prefix}-{nanos}"));
+    let p = scry_store::scry_tmp_dir().join(format!("scry-xlang-{prefix}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

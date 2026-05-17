@@ -327,7 +327,7 @@ mod tests {
     /// find_compile_commands walks up from a file location.
     #[test]
     fn find_compile_commands_walks_up() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-cc-{}", std::process::id())
         );
         let nested = tmp.join("a/b/c");
@@ -338,7 +338,7 @@ mod tests {
         let found = find_compile_commands(&nested);
         assert_eq!(found, Some(tmp.join("a")));
         // Walk from somewhere with no compile_commands above — None.
-        let other = std::env::temp_dir().join(format!("scry-no-cc-{}", std::process::id()));
+        let other = scry_store::scry_tmp_dir().join(format!("scry-no-cc-{}", std::process::id()));
         std::fs::create_dir_all(&other).unwrap();
         assert!(find_compile_commands(&other).is_none());
         let _ = std::fs::remove_dir_all(&tmp);

@@ -261,7 +261,7 @@ mod tests {
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let base = std::env::temp_dir().join(format!("scry-scip-e2e-{nanos}"));
+        let base = scry_store::scry_tmp_dir().join(format!("scry-scip-e2e-{nanos}"));
         let src = base.join("src");
         let idx = base.join("idx");
         std::fs::create_dir_all(src.join("a/b")).unwrap();

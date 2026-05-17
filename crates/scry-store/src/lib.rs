@@ -72,6 +72,21 @@ pub fn restore_default_sigpipe() {
     }
 }
 
+/// Scratch directory for any file scry needs to create that ISN'T
+/// part of the user-visible `--index` / `--out` tree. Honours
+/// `$SCRY_TMP_DIR` and defaults to `/mnt/agent/tmp`. Deliberately
+/// NOT `crate::scry_tmp_dir()` (which resolves to `/tmp`) — on the
+/// production host `/tmp` is a near-full tmpfs that AOSP-scale runs
+/// would fill in seconds. Every caller across the workspace —
+/// production code AND tests — routes scratch paths through this
+/// so a single env var moves them all.
+pub fn scry_tmp_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("SCRY_TMP_DIR") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from("/mnt/agent/tmp")
+}
+
 pub fn prefault_path(path: &Path) {
     use std::os::unix::io::AsRawFd;
     if let Ok(f) = File::open(path) {
@@ -3163,7 +3178,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("scry-store-test-{tag}-{nanos}"));
+        let p = crate::scry_tmp_dir().join(format!("scry-store-test-{tag}-{nanos}"));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -3788,7 +3803,7 @@ mod tests {
     #[test]
     fn scan_file_literal_basic_cases() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join(
+        let tmp = crate::scry_tmp_dir().join(
             format!("scry-scan-{}", std::process::id())
         );
         // Multi-match: "foo" appears 3x in "foo bar foo baz foo".
@@ -3815,7 +3830,7 @@ mod tests {
         assert!(m6.is_empty());
         // Write a partial-write helper test: file with no trailing
         // newline still scans correctly.
-        let tmp2 = std::env::temp_dir().join(
+        let tmp2 = crate::scry_tmp_dir().join(
             format!("scry-scan-2-{}", std::process::id())
         );
         let mut f = File::create(&tmp2).unwrap();

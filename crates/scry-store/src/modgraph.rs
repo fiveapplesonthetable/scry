@@ -935,7 +935,7 @@ mod tests {
     /// the bitmap matches.
     #[test]
     fn reach_cache_roundtrip_loads_same_bitmap() {
-        let tmp_dir = std::env::temp_dir().join(format!("scry-reachcache-{}", std::process::id()));
+        let tmp_dir = crate::scry_tmp_dir().join(format!("scry-reachcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp_dir);
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cache_path = tmp_dir.join("reach.bin");
@@ -988,7 +988,7 @@ mod tests {
     /// and the cached binding hash returns intact.
     #[test]
     fn parsed_cache_roundtrip_and_mtime_binding() {
-        let tmp_dir = std::env::temp_dir().join(
+        let tmp_dir = crate::scry_tmp_dir().join(
             format!("scry-parsedcache-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -1031,7 +1031,7 @@ mod tests {
     /// ignored. The caller falls back to re-parsing the JSON.
     #[test]
     fn parsed_cache_bad_data_returns_none() {
-        let tmp_dir = std::env::temp_dir().join(
+        let tmp_dir = crate::scry_tmp_dir().join(
             format!("scry-parsedbad-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let json_path = tmp_dir.join("module_graph.json");
@@ -1059,7 +1059,7 @@ mod tests {
     /// content changes.
     #[test]
     fn reach_cache_wrong_binding_hash_is_ignored() {
-        let tmp_dir = std::env::temp_dir().join(format!("scry-reachhash-{}", std::process::id()));
+        let tmp_dir = crate::scry_tmp_dir().join(format!("scry-reachhash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp_dir);
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cache_path = tmp_dir.join("reach.bin");

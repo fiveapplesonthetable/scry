@@ -139,7 +139,7 @@ fn synthetic_tree_roundtrip() {
     // nanos-suffix avoids the dependency and is good enough for one test.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-e2e-{}", nanos));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-e2e-{}", nanos));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(&src).unwrap();
@@ -738,10 +738,10 @@ fn synthetic_tree_roundtrip() {
     // the path of the locked file. Then chmod back so the dir is
     // deletable.
     {
-        let fail_src = std::env::temp_dir().join(format!(
+        let fail_src = scry_store::scry_tmp_dir().join(format!(
             "scry-fail-fixture-{}", std::process::id()
         ));
-        let fail_idx = std::env::temp_dir().join(format!(
+        let fail_idx = scry_store::scry_tmp_dir().join(format!(
             "scry-fail-idx-{}", std::process::id()
         ));
         std::fs::create_dir_all(&fail_src).unwrap();
@@ -1261,7 +1261,7 @@ fn tcp_serve_roundtrip() {
     use std::time::Duration;
 
     // Build a fresh synthetic index dedicated to this test.
-    let base = std::env::temp_dir().join(format!("scry-tcp-e2e-{}", std::process::id()));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-tcp-e2e-{}", std::process::id()));
     let src = base.join("src");
     let idx = base.join("idx");
     std::fs::create_dir_all(&src).unwrap();
@@ -1373,7 +1373,7 @@ fn unix_serve_concurrent_stress() {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    let base = std::env::temp_dir().join(format!("scry-cc-e2e-{}", std::process::id()));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-cc-e2e-{}", std::process::id()));
     let src = base.join("src");
     let idx = base.join("idx");
     let sock = base.join("scry.sock");
@@ -1472,7 +1472,7 @@ fn callers_precise_malformed_compile_commands() {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    let base = std::env::temp_dir().join(format!("scry-bad-cc-{}", std::process::id()));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-bad-cc-{}", std::process::id()));
     let src = base.join("src");
     let idx = base.join("idx");
     std::fs::create_dir_all(&src).unwrap();
@@ -1542,7 +1542,7 @@ fn parse_timeout_skips_pathological_file() {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    let base = std::env::temp_dir().join(format!("scry-pt-{}", std::process::id()));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-pt-{}", std::process::id()));
     let src = base.join("src");
     let idx = base.join("idx");
     std::fs::create_dir_all(&src).unwrap();
@@ -1636,7 +1636,7 @@ fn sigpipe_does_not_panic_on_truncated_stdout() {
 fn stale_index_emits_warning_on_every_open() {
     use std::process::Command;
 
-    let base = std::env::temp_dir().join(format!("scry-stale-{}", std::process::id()));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-stale-{}", std::process::id()));
     let src = base.join("src");
     let idx = base.join("idx");
     std::fs::create_dir_all(&src).unwrap();
@@ -1710,7 +1710,7 @@ fn unix_serve_max_conns_drops_over_cap() {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    let base = std::env::temp_dir().join(format!("scry-mc-{}", std::process::id()));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-mc-{}", std::process::id()));
     let src = base.join("src");
     let idx = base.join("idx");
     let sock = base.join("scry.sock");
@@ -1797,7 +1797,7 @@ fn subclasses_e2e_via_cli_and_rpc() {
     // to index in <100 ms.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-subclasses-e2e-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-subclasses-e2e-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("java/zoo")).unwrap();
@@ -1893,7 +1893,7 @@ fn impact_e2e_via_cli_and_rpc() {
     // shape: parent + child + grandchild + a caller in a separate file.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-impact-e2e-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-impact-e2e-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("zoo")).unwrap();
@@ -1975,7 +1975,7 @@ fn callgraph_e2e_walks_caller_chain() {
     // should surface both b() and c() in the tree.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-callgraph-e2e-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-callgraph-e2e-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("zoo")).unwrap();
@@ -2033,7 +2033,7 @@ fn uses_e2e_outgoing_edges() {
     // NOT return calls outside run()'s body (e.g. inside main()).
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-uses-e2e-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-uses-e2e-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("zoo")).unwrap();
@@ -2095,7 +2095,7 @@ fn grep_regex_with_lossy_literals_falls_back_to_full_scan() {
     //   scry grep 'Trace\.traceBegin.*[Bb]roadcast' → 0 hits.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-grep-regex-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-grep-regex-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("am")).unwrap();
@@ -2155,7 +2155,7 @@ public class Hit {
 fn java_import_ref_captures_full_qualified_path() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-java-import-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-java-import-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("com/example")).unwrap();
@@ -2232,7 +2232,7 @@ public class Caller {
 fn close_polymorphism_full_stack() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-close-polymorphism-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-close-polymorphism-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("android/os")).unwrap();
@@ -2344,7 +2344,7 @@ public class OtherCaller {
 fn java_wildcard_import_captured_with_dot_star_suffix() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-java-wildcard-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-java-wildcard-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("com/example")).unwrap();
@@ -2416,7 +2416,7 @@ fn daemon_format_by_def_and_stats_refs_resolved() {
     use std::io::Write;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-daemon-bydef-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-daemon-bydef-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("com/a")).unwrap();
@@ -2513,7 +2513,7 @@ fn not_in_filter_cli_and_daemon() {
     use std::io::Write;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-not-in-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-not-in-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     // Lay out a "prod + tests" shape so --not-in /tests/ has work to do.
@@ -2639,7 +2639,7 @@ public class ServiceTest {
 fn fuzzy_hint_on_zero_results() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-fuzzy-hint-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-fuzzy-hint-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(&src).unwrap();
@@ -2721,7 +2721,7 @@ fn format_paths_cli_and_daemon() {
     use std::io::Write;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-fmt-paths-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-fmt-paths-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(src.join("a")).unwrap();
@@ -2841,7 +2841,7 @@ fn uses_format_paths_and_count() {
     use std::io::Write;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-uses-fmt-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-uses-fmt-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(&src).unwrap();
@@ -2962,7 +2962,7 @@ fn subclasses_format_paths_and_count() {
     use std::io::Write;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-sub-fmt-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-sub-fmt-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(&src).unwrap();
@@ -3072,7 +3072,7 @@ public class Cat extends Animal {}
 fn finalize_auto_discovers_real_compile_commands() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-autodisc-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-autodisc-{nanos}"));
     let src = base.join("src");
     let idx = base.join("index");
     std::fs::create_dir_all(&src).unwrap();
@@ -3185,7 +3185,7 @@ int kick(const Widget& w) { return w.poke(41); }
 fn finalize_build_out_discovers_cc_json_in_gitignored_dir() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = std::env::temp_dir().join(format!("scry-build-out-{nanos}"));
+    let base = scry_store::scry_tmp_dir().join(format!("scry-build-out-{nanos}"));
     let src = base.join("src");
     let out = base.join("out/build/compdb");
     let idx = base.join("index");

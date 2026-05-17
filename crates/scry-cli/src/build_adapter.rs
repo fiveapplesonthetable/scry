@@ -374,7 +374,7 @@ mod kernel {
 
         #[test]
         fn rejects_non_kernel_root() {
-            let tmp = std::env::temp_dir().join(format!(
+            let tmp = scry_store::scry_tmp_dir().join(format!(
                 "scry-kernel-bad-{}", std::process::id(),
             ));
             std::fs::create_dir_all(&tmp).ok();
@@ -386,7 +386,7 @@ mod kernel {
 
         #[test]
         fn synthetic_kernel_tree_produces_subsystem_modules() {
-            let tmp = std::env::temp_dir().join(format!(
+            let tmp = scry_store::scry_tmp_dir().join(format!(
                 "scry-kernel-fake-{}", std::process::id(),
             ));
             let _ = std::fs::remove_dir_all(&tmp);
@@ -673,7 +673,7 @@ mod soong {
 
         #[test]
         fn parses_module_info_array_shape() {
-            let tmp = std::env::temp_dir().join(format!(
+            let tmp = scry_store::scry_tmp_dir().join(format!(
                 "scry-soong-fake-{}", std::process::id(),
             ));
             let _ = std::fs::remove_dir_all(&tmp);
@@ -721,7 +721,7 @@ mod tests {
     /// the v1 schema.
     #[test]
     fn cargo_synthetic_workspace_roundtrips() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = scry_store::scry_tmp_dir().join(format!(
             "scry-cargo-adapter-{}", std::process::id(),
         ));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -794,7 +794,7 @@ edition = "2021"
     #[test]
     fn cargo_adapter_output_feeds_reachability() {
         use scry_store::modgraph::ModuleGraphJsonV1;
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = scry_store::scry_tmp_dir().join(format!(
             "scry-cargo-adapter-reach-{}", std::process::id(),
         ));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -945,7 +945,7 @@ mod gn {
 
         #[test]
         fn parses_gn_project_json() {
-            let tmp = std::env::temp_dir().join(format!(
+            let tmp = scry_store::scry_tmp_dir().join(format!(
                 "scry-gn-fake-{}", std::process::id(),
             ));
             let _ = std::fs::remove_dir_all(&tmp);
@@ -1121,7 +1121,7 @@ mod bazel {
 
         #[test]
         fn parses_bazel_jsonproto_shape() {
-            let tmp = std::env::temp_dir().join(format!(
+            let tmp = scry_store::scry_tmp_dir().join(format!(
                 "scry-bazel-fake-{}", std::process::id(),
             ));
             let _ = std::fs::remove_dir_all(&tmp);

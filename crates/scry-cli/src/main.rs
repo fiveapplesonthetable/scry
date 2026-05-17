@@ -966,7 +966,8 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         semanticdb_kotlinc_jar: Option<PathBuf>,
         /// Where the per-compilation .semanticdb shards land.
-        /// Defaults to `$TMPDIR/scry-semanticdb`.
+        /// Defaults to `$SCRY_TMP_DIR/scry-semanticdb`
+        /// (i.e. `/mnt/agent/tmp/scry-semanticdb` unless overridden).
         #[arg(long, value_name = "PATH")]
         targetroot: Option<PathBuf>,
         /// Filter compilations by substring of the module name.
@@ -1126,7 +1127,8 @@ enum Cmd {
         #[arg(long, value_name = "DIR")]
         index: Option<PathBuf>,
         /// Per-target `.scip` files land here. Defaults to
-        /// `$TMPDIR/scry-polyglot-scip`.
+        /// `$SCRY_TMP_DIR/scry-polyglot-scip`
+        /// (i.e. `/mnt/agent/tmp/scry-polyglot-scip` unless overridden).
         #[arg(long, value_name = "PATH")]
         scip_out_dir: Option<PathBuf>,
         /// Override the rust-analyzer binary.
@@ -10237,7 +10239,7 @@ mod tests {
     /// content.
     #[test]
     fn rotate_log_renames_on_overflow() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-rotlog-{}.log", std::process::id())
         );
         let backup = tmp.with_extension("log.1");
@@ -10256,7 +10258,7 @@ mod tests {
     /// Cap = 0 → no rotation regardless of size.
     #[test]
     fn rotate_log_cap_zero_disables() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-norot-{}.log", std::process::id())
         );
         std::fs::write(&tmp, vec![b'x'; 10_000]).unwrap();
@@ -10269,7 +10271,7 @@ mod tests {
     /// Under cap → no rotation.
     #[test]
     fn rotate_log_under_cap_leaves_file() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-undercap-{}.log", std::process::id())
         );
         std::fs::write(&tmp, vec![b'x'; 50]).unwrap();
@@ -10284,7 +10286,7 @@ mod tests {
     /// Missing file → no panic, no rotation attempted.
     #[test]
     fn rotate_log_missing_file_is_noop() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-missing-{}.log", std::process::id())
         );
         // Pre-condition: doesn't exist.
@@ -11261,7 +11263,7 @@ mod tests {
 
     #[test]
     fn parse_owners_collects_emails_and_per_file() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-owners-test-{}", std::process::id())
         );
         std::fs::write(&tmp,
@@ -11303,7 +11305,7 @@ mod tests {
     /// Comments-only file → empty parsed record.
     #[test]
     fn parse_owners_comments_only() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-owners-comments-{}", std::process::id())
         );
         std::fs::write(&tmp, "# just\n# comments\n\n").unwrap();
@@ -11318,7 +11320,7 @@ mod tests {
     /// some AOSP OWNERS files use the shorter form.
     #[test]
     fn parse_owners_bare_noparent_recognized() {
-        let tmp = std::env::temp_dir().join(
+        let tmp = scry_store::scry_tmp_dir().join(
             format!("scry-owners-bare-noparent-{}", std::process::id())
         );
         std::fs::write(&tmp, "noparent\nlocal@example.com\n").unwrap();

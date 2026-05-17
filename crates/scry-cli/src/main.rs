@@ -212,6 +212,20 @@ enum Cmd {
         /// class matching use `--in` on the file path instead.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
+        /// Narrow which definition of NAME the refs must point at,
+        /// by path substring of the def's file. Useful for
+        /// overloaded names like `close()` where the index has
+        /// many distinct defs across the corpus:
+        ///   `scry ref close --def-in PerfettoTrace.java`
+        /// keeps only refs whose Layer 2 resolution (resolved_to)
+        /// points at a def in PerfettoTrace.java. Refs that
+        /// couldn't be resolved (resolved_to=None) pass through —
+        /// we'd rather over-include than silently drop the
+        /// unresolved ones. Build the resolutions sidecar via
+        /// `scry build-resolutions` (or `scry finalize`) for the
+        /// strongest narrowing.
+        #[arg(long, value_name = "PATH")]
+        def_in: Option<String>,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls.
@@ -258,6 +272,11 @@ enum Cmd {
         /// drops the 1400+ traceBegin sites outside that class.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
+        /// Narrow which definition of NAME the callers must target,
+        /// by path substring of the def's file. See `scry ref
+        /// --def-in` for the full description.
+        #[arg(long, value_name = "PATH")]
+        def_in: Option<String>,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -1135,25 +1154,18 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope } => {
-            // Default-on precision: when --no-precise isn't set, turn
-            // every filter on. Each one auto-no-ops if its sidecar
-            // isn't there, so behavior degrades cleanly.
+        Cmd::Ref { name, index, lang, kind, in_, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in } => {
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, reachable, clang_precise, scip_precise);
-            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise, scope)
+            cmd_ref(name, index, lang, kind, in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in)
         }
-        Cmd::Callers { name, index, lang, in_, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, format } => {
+        Cmd::Callers { name, index, lang, in_, limit, json, precise, no_precise, reachable, clang_precise, scip_precise, scope, def_in, format } => {
             if precise {
-                // clangd path returns precise callers; reachable filter
-                // is composed on top there too (TODO: thread through —
-                // for now precise route ignores --reachable; falls back
-                // to heuristic + reachable below if both are passed).
                 return cmd_callers_precise(name, index, lang, in_, limit, json);
             }
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, reachable, clang_precise, scip_precise);
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise, scope)
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
@@ -2871,6 +2883,7 @@ fn resolve_precision(
     (explicit_reachable, true, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_ref(
     name: String,
     index: Option<PathBuf>,
@@ -2884,6 +2897,7 @@ fn cmd_ref(
     clang_precise: bool,
     scip_precise: bool,
     scope: Option<String>,
+    def_in: Option<String>,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -2931,6 +2945,45 @@ fn cmd_ref(
             true
         })
         .collect();
+    // --def-in PATH: only keep refs whose resolved_to points at a
+    // def whose file path contains PATH. Refs with resolved_to=None
+    // (build-resolutions couldn't narrow them) pass through — we'd
+    // rather over-include than silently drop the ones Layer 2
+    // resolution didn't reach.
+    let filtered = if let Some(def_path) = def_in.as_deref() {
+        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
+            .iter()
+            .filter(|s| r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(def_path)))
+            .map(|s| s.id)
+            .collect();
+        if target_ids.is_empty() {
+            eprintln!(
+                "[scry] --def-in: no def of {name:?} found in any file containing \
+                 {def_path:?}; returning all refs unfiltered.",
+            );
+            filtered
+        } else {
+            let before = filtered.len();
+            let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
+                match rr.resolved_to {
+                    Some(id) => target_ids.contains(&id),
+                    None => true, // permissive: keep unresolved
+                }
+            }).collect();
+            let resolved_kept = kept.iter().filter(|rr| rr.resolved_to.is_some()).count();
+            let unresolved = kept.len() - resolved_kept;
+            eprintln!(
+                "[scry] --def-in {def_path:?}: {} → {} refs ({} resolved to a \
+                 def in scope, {} unresolved-but-kept; run `scry build-resolutions` \
+                 for tighter narrowing)",
+                before, kept.len(), resolved_kept, unresolved,
+            );
+            kept
+        }
+    } else {
+        filtered
+    };
     // --reachable: drop refs whose owning module can't transitively
     // reach any module that defines the name, per the Soong / GN /
     // kernel module-graph sidecar. No-op without the sidecar
@@ -6063,7 +6116,7 @@ fn grep_candidates_for_regex(
         .and_then(|lits| candidates_for_literals(r, &lits));
     let suffix_cands = regex_literals_kind(pattern, ExtractKind::Suffix)
         .and_then(|lits| candidates_for_literals(r, &lits));
-    match (prefix_cands, suffix_cands) {
+    let result = match (prefix_cands, suffix_cands) {
         (Some(p), Some(s)) => {
             // AND-intersect smaller-into-larger to minimize hash lookups.
             let (mut keep, drop_) = if p.len() <= s.len() { (p, s) } else { (s, p) };
@@ -6072,6 +6125,18 @@ fn grep_candidates_for_regex(
         }
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
+    };
+    // Safety net: a regex whose literal-extraction yields an empty
+    // candidate set is almost always lossy literal extraction
+    // (`[Bb]` split into pieces too short to be useful trigrams,
+    // alternation imploding to nothing, etc.) — not a confident "no
+    // file matches". Fall back to full scan rather than silently
+    // returning zero hits. Eval-agent regression:
+    //   scry grep 'Trace\.traceBegin.*[Bb]roadcast' → 0 hits in v0.1.25
+    //   same query                                  → real hits in v0.1.26
+    match result {
+        Some(s) if s.is_empty() => None,
+        other => other,
     }
 }
 
@@ -6984,6 +7049,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer). No-op without the scip_index.bin sidecar (`scry scip-import ...`)."},
                 "scope": {"type": "string",
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
+                "def_in": {"type": "string",
+                    "description": "Substring of the def-site file path. Keeps only refs whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` disambiguates `close` when many unrelated classes also define `close`. Refs whose resolved_to is None pass through (over-include rather than silently drop). No-op without a build-resolutions sidecar."},
             })),
         ),
         tool(
@@ -7008,6 +7075,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Same as on `ref` — SCIP symbol identity filter; no-op without scip_index.bin."},
                 "scope": {"type": "string",
                     "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
+                "def_in": {"type": "string",
+                    "description": "Substring of the def-site file path. Keeps only callers whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` cuts through cases where many classes share a method name like `close`. Callers whose resolved_to is None pass through. No-op without a build-resolutions sidecar."},
             })),
         ),
         tool(
@@ -7860,7 +7929,8 @@ fn serve_one_request<W: std::io::Write>(
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope)
+            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
+            serve_ref(reader, arg_str("name"), lang, kind, in_, limit, reachable, clang_precise, scip_precise, scope, def_in)
         }
         "callers" => {
             let no_precise = args.get("no_precise")
@@ -7874,7 +7944,8 @@ fn serve_one_request<W: std::io::Write>(
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(no_precise, explicit_reachable, explicit_clang, explicit_scip);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope)
+            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, limit, reachable, clang_precise, scip_precise, scope, def_in)
         }
         "subclasses" | "implementations" => {
             let depth = args.get("depth")
@@ -8141,8 +8212,19 @@ fn serve_ref(
     clang_precise: bool,
     scip_precise: bool,
     scope: Option<&str>,
+    def_in: Option<&str>,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
+    // --def-in PATH: precompute the target def id set. Empty target
+    // set ⇒ no filtering (matches cmd_ref's "over-include rather than
+    // silently drop" policy; daemon stays quiet on diagnostics).
+    let def_target_ids: Option<std::collections::HashSet<u64>> = def_in.map(|p| {
+        r.lookup_exact(name).iter()
+            .filter(|s| r.files.get(s.file_id as usize)
+                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)))
+            .map(|s| s.id)
+            .collect()
+    });
     // Precompute the callee module set ONCE if --reachable + sidecar.
     // Same shape as cmd_ref's filter. No graph or no defs → no filter
     // (callers pass through unchanged; the daemon doesn't emit a
@@ -8194,6 +8276,17 @@ fn serve_ref(
         if !file_in_prefix(r, rr.file_id, prefix) { continue; }
         if let Some(sc) = scope {
             if !rr.scope_path.iter().any(|seg| seg == sc) { continue; }
+        }
+        // --def-in filter: keep refs whose resolved_to lands in the
+        // target def set (or resolved_to=None, kept permissively).
+        // Empty target set ⇒ no narrowing.
+        if let Some(tids) = def_target_ids.as_ref() {
+            if !tids.is_empty() {
+                match rr.resolved_to {
+                    Some(id) if !tids.contains(&id) => continue,
+                    _ => {}
+                }
+            }
         }
         // Reachability filter: keep only refs whose owning module can
         // reach at least one module that defines `name`.

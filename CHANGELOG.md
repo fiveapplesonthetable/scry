@@ -7,6 +7,41 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.26] — 2026-05-17
+
+Two agent-critique fixes bundled together.
+
+**`--def-in PATH` for `ref` / `callers`:**
+
+- New flag lets you narrow xrefs to a specific callee location
+  when many unrelated classes share a method name. Example:
+  `scry callers close --def-in PerfettoTrace.java` keeps only
+  refs whose Layer 2 resolution (`resolved_to`) points at a
+  def whose file path contains "PerfettoTrace.java".
+- Refs that build-resolutions couldn't narrow (`resolved_to =
+  None`) pass through unfiltered — we'd rather over-include
+  than silently drop the ones cross-file resolution didn't
+  reach. CLI prints a one-line stderr summary
+  (`N → M refs (K resolved to a def in scope, M-K
+  unresolved-but-kept)`).
+- Wired through CLI, JSON-RPC, and MCP. Daemon path stays
+  silent (no per-request diagnostics).
+- Empty target def set ⇒ no-op narrowing + a diagnostic
+  suggesting either a better path substring or rebuilding the
+  resolutions sidecar.
+
+**`grep` no-literal-extracted regex fallback:**
+
+- When `grep_candidates_for_regex` couldn't extract any usable
+  literal seed from a regex with too much alternation /
+  character-class noise (e.g.
+  `Trace\.traceBegin.*[Bb]roadcast`), the trigram pre-filter
+  returned an empty candidate set and the search silently
+  returned 0 hits. Fixed by collapsing `Some(empty) → None`
+  so the search falls back to a full content scan. Regression
+  test `grep_regex_with_lossy_literals_falls_back_to_full_scan`
+  covers the original failing pattern.
+
 ## [0.1.25] — 2026-05-17
 
 `scry uses NAME` — outgoing edges from NAME's body. Symmetric

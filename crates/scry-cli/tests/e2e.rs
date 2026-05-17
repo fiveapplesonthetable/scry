@@ -2067,3 +2067,61 @@ public class Tree {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn grep_regex_with_lossy_literals_falls_back_to_full_scan() {
+    // Regression: a regex whose literal-extraction yields an empty
+    // candidate set (e.g. character classes like [Bb] that split
+    // into too-short trigrams) MUST fall back to a full scan rather
+    // than silently returning zero hits. Eval-agent reported v0.1.25:
+    //   scry grep 'Trace\.traceBegin.*[Bb]roadcast' → 0 hits.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let base = std::env::temp_dir().join(format!("scry-grep-regex-{nanos}"));
+    let src = base.join("src");
+    let idx = base.join("index");
+    std::fs::create_dir_all(src.join("am")).unwrap();
+    // The target literal exists verbatim, but a regex with a
+    // case-class around the lead-byte will produce lossy literals.
+    std::fs::write(src.join("am/Hit.java"), r#"package am;
+public class Hit {
+    public void run() {
+        Trace.traceBegin("Broadcast.enqueueOrderedBroadcastLocked");
+    }
+}
+"#).unwrap();
+
+    let out = Command::new(scry_bin())
+        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
+        .output().expect("spawn scry index");
+    assert!(out.status.success(),
+            "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    // build-trigrams so the pre-filter exists at all (without it the
+    // test trivially passes — we explicitly want the regex path
+    // through grep_candidates_for_regex to exercise).
+    let out = Command::new(scry_bin())
+        .args(["build-trigrams", "--index"]).arg(&idx)
+        .output().expect("spawn scry build-trigrams");
+    assert!(out.status.success(),
+            "build-trigrams failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // The case-class regex was the eval-agent's exact query shape.
+    let out = Command::new(scry_bin())
+        .args(["grep", "--regex", "--index"]).arg(&idx)
+        .args([r"Trace\.traceBegin.*[Bb]roadcast", "--json"])
+        .output().expect("spawn scry grep --regex");
+    assert!(out.status.success(),
+            "grep --regex failed: {}", String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
+        .lines().filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(!lines.is_empty(),
+            "regex with [Bb] should find the Hit.java match; got 0 hits — \
+             the lossy-literal fallback regressed");
+    assert!(lines.iter().any(|v| v["path"].as_str().unwrap_or("").ends_with("Hit.java")),
+            "expected a Hit.java match; got {:?}",
+            lines.iter().map(|v| v["path"].clone()).collect::<Vec<_>>());
+
+    std::fs::remove_dir_all(&base).ok();
+}

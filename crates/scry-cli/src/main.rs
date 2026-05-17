@@ -2913,13 +2913,17 @@ fn cmd_ref(
     def_in: Option<String>,
     strict: bool,
 ) -> Result<()> {
-    if json && format.is_some() {
-        anyhow::bail!("--json and --format are mutually exclusive");
-    }
     if let Some(f) = format.as_deref() {
         if !matches!(f, "count" | "by-def") {
             anyhow::bail!("--format must be 'count' or 'by-def' (got '{f}')");
         }
+    }
+    // --json + --format=count is meaningless (count is a one-line
+    // total, not a multi-record stream). --json + --format=by-def is
+    // useful — emits the histogram as a JSON array. --json alone
+    // emits per-ref JSONL. Anything else conflicts.
+    if json && format.as_deref() == Some("count") {
+        anyhow::bail!("--json and --format=count are mutually exclusive");
     }
     let t = Instant::now();
     let r = open_index(index)?;
@@ -3211,7 +3215,7 @@ fn cmd_ref(
             // callers actually target?" at a glance — invaluable for
             // figuring out how a polymorphic name like `close` or
             // `onCreate` is dispatched across the corpus.
-            print_refs_by_def(&r, &filtered, &name, limit);
+            print_refs_by_def(&r, &filtered, &name, limit, json);
         }
         _ => {
             print_refs(&r, &filtered, limit, json);
@@ -3222,10 +3226,12 @@ fn cmd_ref(
 }
 
 /// Histogram of refs grouped by their Layer 2 resolved_to target.
-/// Shows: `<count>  → file:line [scope]` per group, descending by
-/// count, capped at `limit` groups. Unresolved refs are bucketed
-/// into a single `<unresolved>` row at the bottom.
-fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit: usize) {
+/// Human format: `<count>  → file:line [scope]` per group,
+/// descending by count, capped at `limit` groups. Unresolved refs
+/// are bucketed into a single `<unresolved>` row at the bottom.
+/// JSON format: `[{"count": N, "def": {"path": ..., "line": ...,
+/// "scope": [...], "id": "0x..."}}, ..., {"count": M, "def": null}]`.
+fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit: usize, json: bool) {
     use std::collections::HashMap;
     let mut by_id: HashMap<Option<u64>, usize> = HashMap::new();
     for r in refs {
@@ -3241,6 +3247,38 @@ fn print_refs_by_def(reader: &StoreReader, refs: &[RefRecord], name: &str, limit
     let candidates = reader.lookup_exact(name);
     let by_def_id: HashMap<u64, &SymbolRecord> = candidates.iter()
         .map(|s| (s.id, s)).collect();
+
+    if json {
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(
+            groups.len().min(limit) + if unresolved > 0 { 1 } else { 0 });
+        for (def_id, count) in groups.iter().take(limit) {
+            let def_val = by_def_id.get(def_id).map(|s| {
+                let path = reader.files.get(s.file_id as usize)
+                    .map(|f| f.display_path(&reader.roots))
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "path": path,
+                    "line": s.line,
+                    "col": s.col,
+                    "scope": s.scope_path,
+                    "kind": s.kind.short(),
+                    "id": format!("{:x}", def_id),
+                })
+            }).unwrap_or_else(|| serde_json::json!({
+                // Resolution points at an id we can't find by name —
+                // cross-build mismatch or stale sidecar. Surface
+                // the hex id so callers can debug.
+                "id": format!("{:x}", def_id),
+            }));
+            out.push(serde_json::json!({"count": count, "def": def_val}));
+        }
+        if unresolved > 0 {
+            out.push(serde_json::json!({"count": unresolved, "def": null}));
+        }
+        println!("{}", serde_json::Value::Array(out));
+        return;
+    }
+
     for (def_id, count) in groups.iter().take(limit) {
         let annot = by_def_id.get(def_id)
             .map(|s| {

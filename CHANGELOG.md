@@ -7,6 +7,32 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.37] — 2026-05-17
+
+`--json` now composes with `--format by-def`. Useful for
+dashboards / agent pipelines that want the histogram as
+structured data instead of human-readable text.
+
+**Output shape:**
+```json
+[
+  {"count": 166, "def": {"path": "...Binder.cpp", "line": 411,
+                         "col": 19, "scope": ["android","BBinder"],
+                         "kind": "method", "id": "29f1a6bde1a13a0d"}},
+  {"count": 14, "def": {"path": "...poc.cpp", "line": 77, ...}},
+  ...
+  {"count": 8123, "def": null}    // unresolved bucket
+]
+```
+
+The unresolved bucket appears LAST as `{"count": N, "def": null}`.
+Groups with a resolved def whose id isn't findable by name
+(cross-build mismatch / stale sidecar) get a degraded
+`{"id": "<hex>"}` def object with no path/line.
+
+`--json` + `--format count` remains mutually exclusive (count
+is a one-line total, not a multi-record stream).
+
 ## [0.1.36] — 2026-05-17
 
 **Critical fix: Package symbols were never emitted.** Plus a

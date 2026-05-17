@@ -7,6 +7,34 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.55] — 2026-05-17
+
+Finish the `--not-in` rollout — every command that accepts `--in`
+now also accepts `--not-in`. Added to: `subclasses`,
+`implementations`, `prefix`, `fuzzy`, `grep`, `ask`. Combined
+with v0.1.51's coverage of def/ref/callers/uses/callgraph/impact,
+this closes the loop on path-filter symmetry across the CLI,
+JSON-RPC daemon, and MCP tool schemas.
+
+```
+# Drop test files from a grep pre-filter scan
+$ scry grep bindService --not-in /tests/ --format count
+100 hits across 2904 files       # vs 3393 unfiltered
+
+# Subclass walk that excludes test paths
+$ scry subclasses Activity --not-in /tests/ --limit 3
+
+# Prefix walk skipping test stubs
+$ scry prefix bindServ --not-in /tests/ --limit 5
+```
+
+Daemon parity: `args.not_in: "/tests/"` on every JSON-RPC tool
+that takes `args.in`. MCP schemas pick up the same field.
+
+Internal cleanup: removed the now-dead `file_in_prefix` helper —
+all daemon call sites consolidated on `file_path_matches`, which
+handles both filters in one lookup.
+
 ## [0.1.54] — 2026-05-17
 
 Extend the "Did you mean: …" hint (v0.1.52) to four more

@@ -57,18 +57,18 @@ Any other method gets a JSON-RPC `-32601` (method not found) error.
 | `def`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`                                                                  | symbol definition records                    |
 | `ref`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`              | reference records (any kind)                 |
 | `callers`        | `name`        | `lang`, `in`, `not_in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                      | references with `kind=call`                  |
-| `prefix`         | `prefix`      | `in`, `limit`                                                                                            | symbols whose name starts with PREFIX        |
-| `fuzzy`          | `substr`      | `in`, `distance`, `limit`                                                                                | edit-distance-ranked symbol matches          |
-| `grep`           | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `limit`, `format`                                             | content matches                              |
+| `prefix`         | `prefix`      | `in`, `not_in`, `limit`                                                                                  | symbols whose name starts with PREFIX        |
+| `fuzzy`          | `substr`      | `in`, `not_in`, `distance`, `limit`                                                                      | edit-distance-ranked symbol matches          |
+| `grep`           | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `not_in`, `limit`, `format`                                   | content matches                              |
 | `outline`        | `path`        | `limit`                                                                                                  | every symbol in the file, by line            |
 | `coverage`       | `path`        | `by_kind`                                                                                                | per-language file/byte/symbol counts         |
 | `stats`          | —             | —                                                                                                        | index metadata (incl `refs_resolved` %)      |
-| `subclasses`     | `name`        | `in`, `limit`, `depth`                                                                                   | direct or transitive subtypes                |
-| `implementations`| `name`        | `in`, `limit`, `depth`                                                                                   | alias of `subclasses` (LSP shape)            |
+| `subclasses`     | `name`        | `in`, `not_in`, `limit`, `depth`                                                                         | direct or transitive subtypes                |
+| `implementations`| `name`        | `in`, `not_in`, `limit`, `depth`                                                                         | alias of `subclasses` (LSP shape)            |
 | `impact`         | `name`        | `in`, `not_in`, `limit`, `subclass_depth`, `reachable`, `def_in`, `strict`                               | callers + subclasses + files_touched         |
 | `callgraph`      | `name`        | `in`, `not_in`, `depth`, `max_nodes`, `reachable`, `def_in`, `strict`                                    | recursive caller tree                        |
 | `uses`           | `name`        | `in`, `not_in`, `kind`, `limit`                                                                          | outgoing edges from NAME's body              |
-| `ask`            | `query`       | `in`, `limit`                                                                                            | semantic-retrieval chunks (cosine-ranked)    |
+| `ask`            | `query`       | `in`, `not_in`, `limit`                                                                                  | semantic-retrieval chunks (cosine-ranked)    |
 
 `limit` defaults to 20. `in` is a path-substring filter, same
 semantics as the CLI's `--in`. `not_in` (v0.1.51) is the

@@ -515,6 +515,10 @@ enum Cmd {
         /// Restrict to children whose file path contains the SUBSTRING.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop children whose file path contains SUBSTR (v0.1.55).
+        /// Symmetric to `--in`.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         /// Walk the hierarchy this many levels deep. 0 = direct only.
         #[arg(long, default_value_t = 0)]
         depth: usize,
@@ -531,6 +535,9 @@ enum Cmd {
         index: Option<PathBuf>,
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop implementations whose file path contains SUBSTR (v0.1.55).
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         #[arg(long, default_value_t = 0)]
         depth: usize,
         #[arg(long, default_value = "100")]
@@ -543,6 +550,12 @@ enum Cmd {
         prefix: String,
         #[arg(long)]
         index: Option<PathBuf>,
+        /// Restrict to symbols whose file path contains SUBSTR.
+        #[arg(long, value_name = "SUBSTR")]
+        in_: Option<String>,
+        /// Drop symbols whose file path contains SUBSTR (v0.1.55).
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         #[arg(long, default_value = "50")]
         limit: usize,
         #[arg(long)]
@@ -564,6 +577,10 @@ enum Cmd {
         /// hits.
         #[arg(long, value_name = "SUBSTR")]
         in_: Option<String>,
+        /// Drop symbols whose file path contains SUBSTR (v0.1.55).
+        /// Symmetric to `--in`; combines for "scope and exclude".
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         /// Levenshtein distance bound for typo tolerance. The actual
         /// per-result distance shown in output is computed exactly
         /// via Wagner-Fischer; this flag only caps the candidate set
@@ -661,6 +678,11 @@ enum Cmd {
         lang: Option<String>,
         #[arg(long, value_name = "PREFIX")]
         in_: Option<String>,
+        /// Drop hits in files whose path contains SUBSTR (v0.1.55).
+        /// Symmetric to `--in`; useful for `--not-in /tests/`-style
+        /// pruning of test/generated noise.
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         #[arg(long, default_value = "100")]
         limit: usize,
         #[arg(long)]
@@ -1106,6 +1128,9 @@ enum Cmd {
         /// Substring path filter, same semantics as elsewhere.
         #[arg(long = "in")]
         in_: Option<String>,
+        /// Drop chunks whose file path contains SUBSTR (v0.1.55).
+        #[arg(long, value_name = "SUBSTR")]
+        not_in: Option<String>,
         /// Number of top-K chunks to return.
         #[arg(long, default_value = "10")]
         limit: usize,
@@ -1221,11 +1246,11 @@ fn main() -> Result<()> {
         Cmd::Def { name, index, lang, kind, in_, not_in, limit, json, md, budget } => {
             cmd_def(name, index, lang, kind, in_, not_in, limit, json, md, budget)
         }
-        Cmd::Prefix { prefix, index, limit, json } => {
-            cmd_prefix(prefix, index, limit, json)
+        Cmd::Prefix { prefix, index, in_, not_in, limit, json } => {
+            cmd_prefix(prefix, index, in_, not_in, limit, json)
         }
-        Cmd::Fuzzy { substr, index, in_, distance, limit, json } => {
-            cmd_fuzzy(substr, index, in_, distance, limit, json)
+        Cmd::Fuzzy { substr, index, in_, not_in, distance, limit, json } => {
+            cmd_fuzzy(substr, index, in_, not_in, distance, limit, json)
         }
         Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, no_precise, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
             let (reachable, clang_precise, scip_precise) =
@@ -1246,10 +1271,10 @@ fn main() -> Result<()> {
             cmd_outline(path, index, json, limit, with_snippets),
         Cmd::Tldr { path, index, json } => cmd_tldr(path, index, json),
         Cmd::Grep {
-            pattern, index, regex, ignore_case, lang, in_, limit, json, workers,
+            pattern, index, regex, ignore_case, lang, in_, not_in, limit, json, workers,
             max_file_bytes, mem_cap, format, explain,
         } => cmd_grep(
-            pattern, index, regex, ignore_case, lang, in_, limit, json, workers,
+            pattern, index, regex, ignore_case, lang, in_, not_in, limit, json, workers,
             max_file_bytes, mem_cap, format, explain,
         ),
         Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
@@ -1276,10 +1301,10 @@ fn main() -> Result<()> {
             index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
             scip, clang_compile_commands, clang_root, workers,
         ),
-        Cmd::Subclasses { name, index, in_, depth, limit, json } =>
-            cmd_subclasses(name, index, in_, depth, limit, json),
-        Cmd::Implementations { name, index, in_, depth, limit, json } =>
-            cmd_subclasses(name, index, in_, depth, limit, json),
+        Cmd::Subclasses { name, index, in_, not_in, depth, limit, json } =>
+            cmd_subclasses(name, index, in_, not_in, depth, limit, json),
+        Cmd::Implementations { name, index, in_, not_in, depth, limit, json } =>
+            cmd_subclasses(name, index, in_, not_in, depth, limit, json),
         Cmd::Recall { last, cmd, grep, log, dedup, json } =>
             cmd_recall(last, cmd, grep, log, dedup, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -1302,8 +1327,8 @@ fn main() -> Result<()> {
         Cmd::Tombstone { path, index } => cmd_tombstone(path, index),
         Cmd::BuildEmbeddings { index, dim, chunk_lines, chunk_overlap, workers } =>
             cmd_build_embeddings(index, dim, chunk_lines, chunk_overlap, workers),
-        Cmd::Ask { query, index, in_, limit, json } =>
-            cmd_ask(query, index, in_, limit, json),
+        Cmd::Ask { query, index, in_, not_in, limit, json } =>
+            cmd_ask(query, index, in_, not_in, limit, json),
         Cmd::Completions { shell } => cmd_completions(shell),
         Cmd::Man => cmd_man(),
     }
@@ -2958,6 +2983,7 @@ fn cmd_subclasses(
     name: String,
     index: Option<PathBuf>,
     in_: Option<String>,
+    not_in: Option<String>,
     depth: usize,
     limit: usize,
     json: bool,
@@ -2970,10 +2996,11 @@ fn cmd_subclasses(
         r.subclasses_transitive(&name, depth)
     };
     let mut filtered: Vec<SymbolRecord> = results.into_iter()
-        .filter(|s| match in_.as_deref() {
-            None => true,
-            Some(p) => r.files.get(s.file_id as usize)
-                .is_some_and(|fe| fe.display_path(&r.roots).contains(p)),
+        .filter(|s| match r.files.get(s.file_id as usize) {
+            Some(fe) => path_matches(
+                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+            ),
+            None => in_.is_none() && not_in.is_none(),
         })
         .collect();
     rank_symbols(&mut filtered, &r);
@@ -2981,7 +3008,7 @@ fn cmd_subclasses(
     // v0.1.54 — fuzzy "Did you mean" hint when no subclasses found.
     // Gated on no filter narrowing the search: with --in set, an empty
     // result means "no subclass in that subtree", not "name unknown".
-    if filtered.is_empty() && in_.is_none() {
+    if filtered.is_empty() && in_.is_none() && not_in.is_none() {
         if let Some(hint) = suggest_similar(&r, &name) {
             eprintln!("[scry] {hint}");
         }
@@ -2996,13 +3023,29 @@ fn cmd_subclasses(
     Ok(())
 }
 
-fn cmd_prefix(prefix: String, index: Option<PathBuf>, limit: usize, json: bool) -> Result<()> {
+fn cmd_prefix(
+    prefix: String,
+    index: Option<PathBuf>,
+    in_: Option<String>,
+    not_in: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     let t = Instant::now();
     let r = open_index(index)?;
     // Over-fetch then rank; the FST gives unordered hits and the limit
     // should land on the BEST matches, not just the first ones the FST
     // happens to encounter.
-    let mut results = r.lookup_prefix(&prefix, limit.saturating_mul(8).max(limit));
+    let cap = limit.saturating_mul(8).max(limit);
+    let mut results = r.lookup_prefix(&prefix, cap);
+    if in_.is_some() || not_in.is_some() {
+        results.retain(|s| match r.files.get(s.file_id as usize) {
+            Some(fe) => path_matches(
+                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+            ),
+            None => false,
+        });
+    }
     rank_symbols(&mut results, &r);
     let shown = limit.min(results.len());
     print_results(&r, &results[..shown], limit, json);
@@ -3014,6 +3057,7 @@ fn cmd_fuzzy(
     substr: String,
     index: Option<PathBuf>,
     in_: Option<String>,
+    not_in: Option<String>,
     distance: u32,
     limit: usize,
     json: bool,
@@ -3022,13 +3066,17 @@ fn cmd_fuzzy(
     let r = open_index(index)?;
     // Ranked path: substring matches + Levenshtein-bounded matches,
     // deduped, re-sorted by exact Wagner-Fischer distance. Apply
-    // --in AFTER the ranked walk so the ranker sees the full
-    // candidate set first; the prefix filter is then a cheap
-    // path-substring test on the (typically small) ranked output.
+    // --in / --not-in AFTER the ranked walk so the ranker sees the
+    // full candidate set first; the path filters are then a cheap
+    // substring test on the (typically small) ranked output.
     let mut scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(&substr, distance, limit);
-    if let Some(prefix) = in_.as_deref() {
-        scored.retain(|(s, _)| r.files.get(s.file_id as usize)
-            .is_some_and(|fe| fe.display_path(&r.roots).contains(prefix)));
+    if in_.is_some() || not_in.is_some() {
+        scored.retain(|(s, _)| match r.files.get(s.file_id as usize) {
+            Some(fe) => path_matches(
+                &fe.display_path(&r.roots), in_.as_deref(), not_in.as_deref()
+            ),
+            None => false,
+        });
     }
     let shown = scored.len();
     print_fuzzy_results(&r, &scored, json);
@@ -4595,6 +4643,7 @@ fn cmd_grep(
     ignore_case: bool,
     lang: Option<String>,
     in_: Option<String>,
+    not_in: Option<String>,
     limit: usize,
     json: bool,
     workers: Option<usize>,
@@ -4764,14 +4813,20 @@ fn cmd_grep(
                     return false;
                 }
             }
-            if !prefix.is_empty() {
+            if !prefix.is_empty() || not_in.is_some() {
                 // Same semantics as cmd_def/cmd_ref: --in is a substring
                 // of the absolute path so the caller can pass either a
                 // root-relative subdir ("frameworks/base/") or an absolute
-                // one and have both work.
+                // one and have both work. --not-in (v0.1.55) drops paths
+                // containing SUBSTR — useful for `--not-in /tests/`.
                 let full = fe.display_path(&r.roots);
-                if !full.contains(prefix) {
+                if !prefix.is_empty() && !full.contains(prefix) {
                     return false;
+                }
+                if let Some(neg) = not_in.as_deref() {
+                    if !neg.is_empty() && full.contains(neg) {
+                        return false;
+                    }
                 }
             }
             true
@@ -6077,6 +6132,7 @@ fn cmd_ask(
     query: String,
     index: Option<PathBuf>,
     in_: Option<String>,
+    not_in: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
@@ -6091,12 +6147,12 @@ fn cmd_ask(
     // Embed query with the same kernel + dim used at build-time.
     let q_vec = scry_store::embed::embed_text(&query, dim);
 
-    // Over-fetch from the ranker so the --in path filter can drop
-    // some without starving the result count.
-    let cap = limit.saturating_mul(if in_.is_some() { 8 } else { 1 }).max(limit);
+    // Over-fetch from the ranker so the path filters can drop some
+    // without starving the result count.
+    let any_filter = in_.is_some() || not_in.is_some();
+    let cap = limit.saturating_mul(if any_filter { 8 } else { 1 }).max(limit);
     let ranked = r.semantic_rank(&q_vec, cap);
 
-    let in_prefix = in_.as_deref().unwrap_or("");
     let mut shown = 0usize;
     let mut hits: Vec<serde_json::Value> = Vec::new();
     for (chunk_idx, sim) in ranked {
@@ -6105,7 +6161,7 @@ fn cmd_ask(
         };
         let fe = match r.files.get(entry.file_id as usize) { Some(f) => f, None => continue };
         let path = fe.display_path(&r.roots);
-        if !in_prefix.is_empty() && !path.contains(in_prefix) { continue; }
+        if !path_matches(&path, in_.as_deref(), not_in.as_deref()) { continue; }
         // Read a slice of the file to show context (best-effort).
         let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
         if json {
@@ -7810,6 +7866,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
                 "depth": {"type": "integer", "minimum": 0, "default": 0,
                     "description": "BFS depth. 0 = direct subclasses; 1 = grandchildren too; etc."},
@@ -7823,6 +7880,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
                 "depth": {"type": "integer", "minimum": 0, "default": 0},
             })),
@@ -7898,6 +7956,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["prefix"], serde_json::json!({
                 "prefix": {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
             })),
         ),
@@ -7909,6 +7968,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             obj(&["substr"], serde_json::json!({
                 "substr": {"type": "string"},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "distance": {"type": "integer", "default": 2,
                     "description": "Levenshtein bound for typo tolerance (1-3 is sensible; higher = noisier results)."},
                 "limit": limit_prop,
@@ -7932,6 +7992,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Match case-insensitively. Works for literal and regex patterns. Trigram pre-filter expands each query trigram across ASCII case variants so this stays fast."},
                 "lang":    lang_prop,
                 "in":      in_prop,
+                "not_in":  not_in_prop,
                 "limit":   limit_prop,
                 "format":  {"type": "string",
                     "description": "Optional. 'lines' = rg-shape `path:line:col\\tsnippet` per hit (cheapest list form). 'count' = just `N hits across M files`. Mutually exclusive with json output."},
@@ -8001,6 +8062,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "query": {"type": "string",
                     "description": "Natural-language description of what you're looking for."},
                 "in":    in_prop,
+                "not_in": not_in_prop,
                 "limit": limit_prop,
             })),
         ),
@@ -8652,11 +8714,11 @@ fn serve_one_request<W: std::io::Write>(
 
     let mut result = match cmd {
         "def"     => serve_def(reader, arg_str("name"), lang, kind, in_, not_in, limit),
-        "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, limit),
+        "prefix"  => serve_prefix(reader, arg_str("prefix"), in_, not_in, limit),
         "fuzzy"   => {
             let dist = args.get("distance").and_then(serde_json::Value::as_u64)
                 .map(|n| n as u32).unwrap_or(2);
-            serve_fuzzy_with_distance(reader, arg_str("substr"), in_, dist, limit)
+            serve_fuzzy_with_distance(reader, arg_str("substr"), in_, not_in, dist, limit)
         }
         "ref"     => {
             let no_precise = args.get("no_precise")
@@ -8696,7 +8758,7 @@ fn serve_one_request<W: std::io::Write>(
             let depth = args.get("depth")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(0);
-            serve_subclasses(reader, arg_str("name"), in_, depth, limit)
+            serve_subclasses(reader, arg_str("name"), in_, not_in, depth, limit)
         }
         "impact" => {
             let depth = args.get("subclass_depth")
@@ -8729,14 +8791,14 @@ fn serve_one_request<W: std::io::Write>(
             let ci = args.get("case_insensitive")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            serve_grep(reader, arg_str("pattern"), lang, in_, limit, ci)
+            serve_grep(reader, arg_str("pattern"), lang, in_, not_in, limit, ci)
         }
         "outline" => serve_outline(reader, arg_str("path"), limit),
         "tldr"    => serve_tldr(reader, arg_str("path")),
         "coverage" => serve_coverage(reader, arg_str("path"),
             args.get("by_kind").and_then(serde_json::Value::as_bool).unwrap_or(false)),
         "stats"   => serve_stats(reader),
-        "ask"     => serve_ask(reader, arg_str("query"), in_, limit),
+        "ask"     => serve_ask(reader, arg_str("query"), in_, not_in, limit),
         other     => {
             let resp = serde_json::json!({
                 "id": id, "error": format!("unknown cmd: {other}"),
@@ -8869,24 +8931,12 @@ fn truncate_array_to_budget(value: &mut serde_json::Value, budget: usize) {
     }
 }
 
-/// Does the symbol/ref live under the given subdir prefix?
-///
-/// `display_path` returns the full absolute path (root.path + relpath),
-/// so a caller-supplied filter like "frameworks/base/" — a repo-root-
-/// relative substring — must match via `contains`, not `starts_with`
-/// (the path always starts with the root, never with the subdir).
-/// This matches the semantics of CLI cmd_def/cmd_ref (lines 1178/1220).
-fn file_in_prefix(r: &StoreReader, file_id: u32, prefix: &str) -> bool {
-    if prefix.is_empty() { return true; }
-    match r.files.get(file_id as usize) {
-        Some(fe) => fe.display_path(&r.roots).contains(prefix),
-        None => false,
-    }
-}
-
-/// Daemon-path companion of `path_matches`. Combines `--in` (must
-/// contain) and `--not-in` (must NOT contain) substring filters in
-/// one lookup. Empty / None on either side skips that filter.
+/// Daemon-path file-id wrapper around `path_matches`. Combines
+/// `--in` (must contain) and `--not-in` (must NOT contain) substring
+/// filters in one lookup. Empty / None on either side skips that
+/// filter. `display_path` returns the full absolute path
+/// (root.path + relpath), so substrings like `frameworks/base/` —
+/// repo-root-relative — match via `contains`, not `starts_with`.
 fn file_path_matches(r: &StoreReader, file_id: u32, in_: Option<&str>, not_in: Option<&str>) -> bool {
     match r.files.get(file_id as usize) {
         Some(fe) => path_matches(&fe.display_path(&r.roots), in_, not_in),
@@ -8919,13 +8969,18 @@ fn serve_def(
     serde_json::Value::Array(out)
 }
 
-fn serve_prefix(r: &StoreReader, prefix: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
-    let in_prefix = in_.unwrap_or("");
+fn serve_prefix(
+    r: &StoreReader,
+    prefix: &str,
+    in_: Option<&str>,
+    not_in: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
     // Over-fetch then rank+filter — the limit should land on the BEST
     // matches, not just the first ones the FST happens to return.
     let cap = limit.saturating_mul(8).max(limit);
     let mut filtered: Vec<SymbolRecord> = r.lookup_prefix(prefix, cap).into_iter()
-        .filter(|s| file_in_prefix(r, s.file_id, in_prefix))
+        .filter(|s| file_path_matches(r, s.file_id, in_, not_in))
         .collect();
     rank_symbols(&mut filtered, r);
     let v: Vec<_> = filtered.iter().take(limit).map(|s| symbol_to_json(r, s)).collect();
@@ -8940,17 +8995,18 @@ fn serve_fuzzy_with_distance(
     r: &StoreReader,
     substr: &str,
     in_: Option<&str>,
+    not_in: Option<&str>,
     distance: u32,
     limit: usize,
 ) -> serde_json::Value {
-    let in_prefix = in_.unwrap_or("");
     let cap = limit.saturating_mul(8).max(limit);
-    // Over-fetch from the ranked path; filter by --in *after* ranking
-    // so a tight subdir filter doesn't kick out closer matches.
+    // Over-fetch from the ranked path; filter by --in / --not-in
+    // *after* ranking so a tight subdir filter doesn't kick out
+    // closer matches.
     let scored: Vec<(SymbolRecord, u32)> = r.lookup_fuzzy_ranked(substr, distance, cap);
     let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
     for (s, d) in scored {
-        if !file_in_prefix(r, s.file_id, in_prefix) { continue; }
+        if !file_path_matches(r, s.file_id, in_, not_in) { continue; }
         let mut j = symbol_to_json(r, &s);
         j.as_object_mut().unwrap()
             .insert("distance".to_string(), serde_json::json!(d));
@@ -9414,10 +9470,10 @@ fn serve_subclasses(
     r: &StoreReader,
     name: &str,
     in_: Option<&str>,
+    not_in: Option<&str>,
     depth: usize,
     limit: usize,
 ) -> serde_json::Value {
-    let prefix = in_.unwrap_or("");
     let results = if depth == 0 {
         r.subclasses(name)
     } else {
@@ -9426,7 +9482,7 @@ fn serve_subclasses(
     let mut out = Vec::new();
     for s in results.into_iter() {
         if out.len() >= limit { break; }
-        if !prefix.is_empty() && !file_in_prefix(r, s.file_id, prefix) { continue; }
+        if !file_path_matches(r, s.file_id, in_, not_in) { continue; }
         out.push(symbol_to_json(r, &s));
     }
     serde_json::Value::Array(out)
@@ -9440,13 +9496,13 @@ fn serve_grep(
     pattern: &str,
     lang: Option<&str>,
     in_: Option<&str>,
+    not_in: Option<&str>,
     limit: usize,
     case_insensitive: bool,
 ) -> serde_json::Value {
     if pattern.is_empty() {
         return serde_json::json!({"error": "empty pattern"});
     }
-    let prefix = in_.unwrap_or("");
     let needle = pattern.as_bytes();
     let candidates: Option<std::collections::HashSet<u32>> = if case_insensitive {
         r.grep_candidates_ci(needle)
@@ -9481,12 +9537,12 @@ fn serve_grep(
         if let Some(l) = lang {
             if !fe.kind.as_str().eq_ignore_ascii_case(l) { continue; }
         }
-        if !prefix.is_empty() {
-            // Substring match — same semantics as file_in_prefix and
+        if in_.is_some() || not_in.is_some() {
+            // Substring match — same semantics as file_path_matches and
             // CLI cmd_grep; absolute paths never start with a root-
             // relative subdir.
             let p = fe.display_path(&r.roots);
-            if !p.contains(prefix) { continue; }
+            if !path_matches(&p, in_, not_in) { continue; }
         }
         scanned += 1;
         let path = fe.display_path(&r.roots);
@@ -9717,15 +9773,21 @@ fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Val
 /// JSON-RPC semantic-retrieval handler. Returns an empty array (not
 /// an error) when the index lacks the embedding sidecar — agents can
 /// detect by length zero + a `stats` query that reports the dim is 0.
-fn serve_ask(r: &StoreReader, query: &str, in_: Option<&str>, limit: usize) -> serde_json::Value {
+fn serve_ask(
+    r: &StoreReader,
+    query: &str,
+    in_: Option<&str>,
+    not_in: Option<&str>,
+    limit: usize,
+) -> serde_json::Value {
     if r.embeddings_mmap.is_none() || r.chunks.is_none() {
         return serde_json::json!({"error": "no embedding sidecar — run `scry build-embeddings`"});
     }
     let dim = r.embedding_dim as usize;
     let q_vec = scry_store::embed::embed_text(query, dim);
-    let cap = limit.saturating_mul(if in_.is_some() { 8 } else { 1 }).max(limit);
+    let any_filter = in_.is_some() || not_in.is_some();
+    let cap = limit.saturating_mul(if any_filter { 8 } else { 1 }).max(limit);
     let ranked = r.semantic_rank(&q_vec, cap);
-    let in_prefix = in_.unwrap_or("");
     let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
     for (chunk_idx, sim) in ranked {
         let entry = match r.chunks.as_ref().and_then(|c| c.get(chunk_idx as usize)) {
@@ -9733,7 +9795,7 @@ fn serve_ask(r: &StoreReader, query: &str, in_: Option<&str>, limit: usize) -> s
         };
         let fe = match r.files.get(entry.file_id as usize) { Some(f) => f, None => continue };
         let path = fe.display_path(&r.roots);
-        if !in_prefix.is_empty() && !path.contains(in_prefix) { continue; }
+        if !path_matches(&path, in_, not_in) { continue; }
         let snippet = chunk_snippet(&path, entry.start_line, entry.end_line);
         out.push(serde_json::json!({
             "path": path,

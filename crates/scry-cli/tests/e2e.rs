@@ -263,11 +263,16 @@ fn synthetic_tree_roundtrip() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     assert!(!lines.is_empty(), "expected at least one transact caller");
+    // build-resolutions is Kythe-only: every resolved_to comes from
+    // clang_usrs.bin / scip_index.bin. This synthetic fixture ships
+    // neither sidecar, so every resolved_to must be null. (The
+    // tree-sitter heuristic resolver was deleted in favour of the
+    // Kythe-only contract — see cmd_build_resolutions.)
     let resolved_count = lines.iter()
         .filter(|l| l["resolved_to"].as_u64().is_some()).count();
-    assert!(resolved_count > 0,
-            "build-resolutions should have populated at least one resolved_to, got 0/{} (refs: {:?})",
-            lines.len(), lines);
+    assert_eq!(resolved_count, 0,
+            "no SCIP / clang USR sidecar → all resolved_to must be null; got {}/{} resolved (refs: {:?})",
+            resolved_count, lines.len(), lines);
 
     // 7. Unix-socket serve mode. Spawn the daemon, give it ~100 ms to
     // bind, connect with a UnixStream, send two requests, read two
@@ -2150,130 +2155,6 @@ public class Caller {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// Full-stack resolver test (v0.1.26 → v0.1.35).
-///
-/// Builds a 3-file Java fixture with two distinct `close()` methods
-/// (PerfettoTrace.Session.close + Other.close), indexes it, runs
-/// build-resolutions, then asserts:
-///
-/// 1. `scry callers close --def-in PerfettoTrace.java --strict` returns
-///    EXACTLY the one call from the file that imports PerfettoTrace
-///    (the strict + import-aware path).
-/// 2. `scry callers close --format by-def` shows both defs as
-///    distinct groups with non-zero counts.
-///
-/// This is the canary for the polymorphism story: if any of the
-/// shipped resolver/UX pieces regress, this test catches it
-/// immediately. Smaller than the previous file-level tests but
-/// covers more layers end-to-end (importer + resolver +
-/// --def-in + --strict + --format by-def + format_resolved_def).
-#[test]
-fn close_polymorphism_full_stack() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = scry_store::scry_tmp_dir().join(format!("scry-close-polymorphism-{nanos}"));
-    let src = base.join("src");
-    let idx = base.join("index");
-    std::fs::create_dir_all(src.join("android/os")).unwrap();
-    std::fs::create_dir_all(src.join("com/example")).unwrap();
-    std::fs::create_dir_all(src.join("com/other")).unwrap();
-
-    // PerfettoTrace.Session.close — the def we want to find callers of.
-    std::fs::write(src.join("android/os/PerfettoTrace.java"), r#"package android.os;
-public class PerfettoTrace {
-    public static class Session implements AutoCloseable {
-        public void close() {}
-    }
-}
-"#).unwrap();
-
-    // Other.close — distinct def, same simple name.
-    std::fs::write(src.join("com/other/Other.java"), r#"package com.other;
-public class Other {
-    public void close() {}
-}
-"#).unwrap();
-
-    // Caller imports PerfettoTrace and calls close on a Session instance.
-    // This is the call we want --def-in PerfettoTrace.java --strict to find.
-    std::fs::write(src.join("com/example/Caller.java"), r#"package com.example;
-import android.os.PerfettoTrace;
-public class Caller {
-    public void run(PerfettoTrace.Session s) {
-        s.close();
-    }
-}
-"#).unwrap();
-
-    // OtherCaller calls Other.close — must NOT match --def-in PerfettoTrace.
-    std::fs::write(src.join("com/other/OtherCaller.java"), r#"package com.other;
-public class OtherCaller {
-    public void run(Other o) {
-        o.close();
-    }
-}
-"#).unwrap();
-
-    let out = Command::new(scry_bin())
-        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
-        .output().expect("spawn scry index");
-    assert!(out.status.success(),
-            "index failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    // Layer 2 resolution is needed for --def-in to actually pin refs.
-    let out = Command::new(scry_bin())
-        .args(["build-resolutions", "--index"]).arg(&idx)
-        .output().expect("spawn scry build-resolutions");
-    assert!(out.status.success(),
-            "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    // (1) --def-in PerfettoTrace.java --strict → exactly the Caller's call.
-    // --lexical: synthetic Java fixture has no SCIP sidecar; this
-    // test exercises Layer 2 import-aware resolution, not symbol
-    // identity (which is what --lexical's opt-out is for).
-    let out = Command::new(scry_bin())
-        .args(["callers", "close", "--lexical",
-               "--def-in", "PerfettoTrace.java",
-               "--strict",
-               "--index"]).arg(&idx)
-        .args(["--json"])
-        .output().expect("spawn scry callers");
-    assert!(out.status.success(),
-            "callers failed: {}", String::from_utf8_lossy(&out.stderr));
-    let lines: Vec<serde_json::Value> = std::str::from_utf8(&out.stdout).unwrap()
-        .lines().filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    assert_eq!(lines.len(), 1,
-        "--def-in PerfettoTrace.java --strict should return exactly 1 caller \
-         (the import-resolved Caller.java call), got {}: {:?}",
-        lines.len(),
-        lines.iter().map(|v| (v["path"].clone(), v["line"].clone()))
-            .collect::<Vec<_>>());
-    assert!(lines[0]["path"].as_str().unwrap_or("").ends_with("Caller.java"),
-        "expected the Caller.java call, got {:?}", lines[0]);
-    assert!(lines[0]["resolved_to"].is_number(),
-        "the strict hit must be resolved (Layer 2 import-aware narrowing); \
-         got resolved_to={:?}", lines[0]["resolved_to"]);
-
-    // (2) --format by-def shows both defs as distinct groups.
-    let out = Command::new(scry_bin())
-        .args(["callers", "close", "--lexical",
-               "--format", "by-def",
-               "--limit", "10",
-               "--index"]).arg(&idx)
-        .output().expect("spawn scry callers --format by-def");
-    assert!(out.status.success(),
-            "by-def failed: {}", String::from_utf8_lossy(&out.stderr));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("PerfettoTrace.java"),
-        "by-def histogram should mention PerfettoTrace.java; got:\n{}", stdout);
-    assert!(stdout.contains("Other.java"),
-        "by-def histogram should mention Other.java; got:\n{}", stdout);
-
-    std::fs::remove_dir_all(&base).ok();
-}
-
 /// v0.1.28 — Java wildcard imports (`import android.os.*;`) must be
 /// captured with the synthetic `.*` suffix so the build-resolutions
 /// wildcard branch fires. Tree-sitter queries can't combine the
@@ -2417,14 +2298,17 @@ public class B {
         assert!(g["def"].is_object() || g["def"].is_null(),
                 "each group's def must be object or null: {g}");
     }
-    // At least one group should resolve to A.java or B.java by name.
-    let any_resolved = groups.iter().any(|g| {
-        g["def"].as_object().and_then(|d| d["path"].as_str())
-            .is_some_and(|p| p.ends_with("A.java") || p.ends_with("B.java"))
-    });
-    assert!(any_resolved,
-        "expected at least one by-def group resolving to A.java or B.java; got {:?}",
-        groups);
+    // build-resolutions is Kythe-only. This fixture has no SCIP or
+    // clang USR sidecar, so every group's `def` must be null
+    // (unresolved bucket). The shape — "by-def returns a list of
+    // {count, def?} groups even when nothing resolves" — is what
+    // this test pins for the daemon transport. End-to-end Kythe
+    // attribution is validated against the real AOSP index by the
+    // headline manual checks, not by a synthetic fixture.
+    let resolved_groups: Vec<_> = groups.iter().filter(|g| g["def"].is_object()).collect();
+    assert!(resolved_groups.is_empty(),
+        "no SCIP / clang USR sidecar → all by-def groups must be in the unresolved bucket; got {} resolved: {:?}",
+        resolved_groups.len(), resolved_groups);
 
     // (2) stats includes the v0.1.42 refs_resolved + refs_resolved_pct.
     let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();

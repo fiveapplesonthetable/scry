@@ -86,14 +86,25 @@ build_kzip.bash (Soong)        any Kythe-aware build
    ▼  Soong's merge_zips packs every per-compile .kzip into ONE all.kzip
    │
    ▼  scry build-symbols --build-kzip PATH/all.kzip
-   │      decomposes the kzip, invokes the matching SCIP indexer per
-   │      language (scip-java for JVM, kythe→scip for C++, …), feeds
-   │      the resulting SCIP into the existing scip-import path
+   │      decomposes the kzip per CU and invokes the matching Kythe
+   │      v0.0.75 indexer (cxx_indexer for C/C++/ObjC, java_indexer
+   │      for source-level Java, jvm_indexer for JVM bytecode,
+   │      go_indexer, proto_indexer, textproto_indexer). Each
+   │      indexer's delimited Entry-proto stream is decoded inline
+   │      into scry's packed sidecar format — no SCIP intermediate.
    │
    ▼  packed sidecars
-   clang_usrs.bin
-   scip_index.bin
+   clang_usrs.bin   (cxx_indexer output)
+   scip_index.bin   (java + jvm + go + proto + textproto output)
 ```
+
+The Kythe v0.0.75 public release does not ship a Rust indexer or a
+source-level Kotlin indexer; CUs labeled `rust` are skipped and
+logged, and kotlin CUs are routed to `jvm_indexer` only when the
+CU ships real `.class` inputs (Soong's kotlinc emits `.java` srcjars
+which trip jvm_indexer's missing-JarDetails check, so those skip
+too). Per-language CU counts and skip reasons land in
+`<index>/kythe-logs/summary.txt`.
 
 The Kythe extractors see what the compiler sees: post-rewrite sources
 from protologsrc / jarjar / AAPT2 / hiddenAPI / AIDL / KAPT,

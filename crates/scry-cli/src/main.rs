@@ -203,10 +203,13 @@ enum Cmd {
         /// and graceful fallback to lexical-only on uncovered code.
         #[arg(long)]
         lexical: bool,
-        // Build-graph reachability filter. Hidden here for now —
-        // promoted in a follow-up commit to mirror --reachable on
-        // callgraph / impact.
-        #[arg(long, hide = true)]
+        /// Compose with build-graph reachability: drop refs whose
+        /// owning module can't transitively reach a definition of
+        /// NAME per the Soong/GN/kernel module graph. No-op if the
+        /// index has no `module_graph.json` sidecar. Opt-in (not
+        /// default) because parsing the AOSP 256 MB module graph
+        /// adds ~50–500 ms to the first query in a process.
+        #[arg(long)]
         reachable: bool,
         /// Keep only refs whose enclosing scope_path contains
         /// SCOPE as an exact segment. Example:
@@ -274,10 +277,14 @@ enum Cmd {
         /// `scry ref --lexical` for the full explanation.
         #[arg(long)]
         lexical: bool,
-        // Build-graph reachability filter. Hidden here for now —
-        // promoted in a follow-up commit to mirror --reachable on
-        // callgraph / impact.
-        #[arg(long, hide = true)]
+        /// Compose with build-graph reachability: drop callers whose
+        /// owning module can't transitively reach a definition of
+        /// NAME per the Soong/GN/kernel module graph. Same semantics
+        /// as `--reachable` on `callgraph` / `impact`. No-op if the
+        /// index has no `module_graph.json` sidecar. Opt-in (not
+        /// default) because parsing the AOSP 256 MB module graph
+        /// adds ~50–500 ms to the first query in a process.
+        #[arg(long)]
         reachable: bool,
         /// Keep only callers whose enclosing scope_path contains
         /// SCOPE as an exact segment. Big win on hub functions:

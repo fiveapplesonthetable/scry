@@ -3437,8 +3437,23 @@ pub(crate) fn apply_precision_filter(
     } else {
         None
     };
+    // JVM-FQN canonical companion sidecar — see [`StorePaths::scip_index_fqn`].
+    // Gated on the same --scip-precise switch as the main SCIP
+    // sidecar; both feed `def_syms` independently and the ref-side
+    // verdict accepts EITHER side's match. This is the cross-CU
+    // bridge: when a def-side anchor and a ref-side call site
+    // project the same JVM entity onto two different symbol-string
+    // namespaces (the language=java VName signature vs the
+    // bridged `jvm:...` FQN), the FQN sidecar carries both anchors
+    // keyed on the same canonical FQN, so the def_syms ∩ ref-side
+    // lookup succeeds.
+    let sidx_fqn_opt: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
+        r.scip_index_fqn()
+    } else {
+        None
+    };
 
-    if cusr_opt.is_none() && sidx_opt.is_none() {
+    if cusr_opt.is_none() && sidx_opt.is_none() && sidx_fqn_opt.is_none() {
         anyhow::bail!(
             "precision query but no precision sidecars at {} (looked for \
              clang_usrs.bin and scip_index.bin). Run \
@@ -3482,6 +3497,14 @@ pub(crate) fn apply_precision_filter(
             n_files,
         )
     });
+    let sidx_fqn_lookup = sidx_fqn_opt.map(|sidx| {
+        sidx.precompute_by_file_ids(
+            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
+                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
+            }),
+            n_files,
+        )
+    });
 
     // Gather def identities once per sidecar. Empty sets are fine:
     // they signal "this name has no defs the sidecar attributes to a
@@ -3498,16 +3521,36 @@ pub(crate) fn apply_precision_filter(
             .collect(),
         None => Default::default(),
     };
-    let def_syms: std::collections::HashSet<String> = match &sidx_lookup {
-        Some(sl) => defs.iter()
-            .filter_map(|s| {
-                let (_, cf) = path_by_id.get(s.file_id as usize)?.as_ref()?;
-                if *cf { return None; }
-                sl.symbol_for_window(s.file_id, s.byte_start, WINDOW)
-                    .map(str::to_string)
-            })
-            .collect(),
-        None => Default::default(),
+    // Def-side symbol identities. Pull from BOTH the main SCIP sidecar
+    // (source-level language=java VName signatures) AND the FQN
+    // companion (canonical `jvm:` FQNs). Both go into one set — the
+    // two namespaces are disjoint by construction (`jvm:` prefix vs
+    // the Kythe SCIP signature shape), so there's no collision.
+    // Carrying both lets the ref-side filter below accept a match
+    // against either projection of the same def.
+    let def_syms: std::collections::HashSet<String> = {
+        let mut set: std::collections::HashSet<String> = Default::default();
+        if let Some(sl) = sidx_lookup.as_ref() {
+            for s in defs.iter() {
+                let Some((_, cf)) = path_by_id.get(s.file_id as usize).and_then(|o| o.as_ref())
+                else { continue; };
+                if *cf { continue; }
+                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, WINDOW) {
+                    set.insert(sym.to_string());
+                }
+            }
+        }
+        if let Some(sl) = sidx_fqn_lookup.as_ref() {
+            for s in defs.iter() {
+                let Some((_, cf)) = path_by_id.get(s.file_id as usize).and_then(|o| o.as_ref())
+                else { continue; };
+                if *cf { continue; }
+                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, WINDOW) {
+                    set.insert(sym.to_string());
+                }
+            }
+        }
+        set
     };
 
     let before = refs.len();
@@ -3537,21 +3580,37 @@ pub(crate) fn apply_precision_filter(
                 }
             }
         } else {
-            // Non-C ref: SCIP sidecar owns the verdict.
-            let Some(sl) = sidx_lookup.as_ref() else {
+            // Non-C ref: SCIP sidecar owns the verdict. Try the main
+            // sidecar first, then the JVM-FQN companion — a match
+            // against either def_syms projection keeps the ref.
+            // "Uncovered TU" only fires when NEITHER sidecar covers
+            // the file_id; "id mismatch" fires when at least one
+            // looked up a symbol but none was in def_syms. Counters
+            // are charged once per ref, no double-counting.
+            let main_covers = sidx_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
+            let fqn_covers = sidx_fqn_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
+            if !main_covers && !fqn_covers {
                 s_dropped_uncov += 1;
                 return false;
-            };
-            match sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW) {
-                Some(s) => {
-                    let ok = def_syms.contains(s);
-                    if !ok { s_dropped_id += 1; }
-                    ok
-                }
-                None => {
-                    s_dropped_uncov += 1;
-                    false
-                }
+            }
+            let from_main = if main_covers {
+                sidx_lookup.as_ref()
+                    .and_then(|sl| sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW))
+                    .filter(|s| def_syms.contains(*s))
+            } else { None };
+            if from_main.is_some() {
+                return true;
+            }
+            let from_fqn = if fqn_covers {
+                sidx_fqn_lookup.as_ref()
+                    .and_then(|sl| sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW))
+                    .filter(|s| def_syms.contains(*s))
+            } else { None };
+            if from_fqn.is_some() {
+                true
+            } else {
+                s_dropped_id += 1;
+                false
             }
         }
     }).collect();
@@ -3559,12 +3618,20 @@ pub(crate) fn apply_precision_filter(
     // Always log when precision was engaged — quiet success is
     // indistinguishable from quiet pass-through, and we want users
     // (and tests) to be able to see that strict-precise actually ran.
-    let sidecars = match (cusr_opt.is_some(), sidx_opt.is_some()) {
-        (true, true)  => "clang_usrs + scip_index",
-        (true, false) => "clang_usrs",
-        (false, true) => "scip_index",
-        // unreachable: bailed above on (false, false)
-        (false, false) => "(none)",
+    let sidecars = match (cusr_opt.is_some(), sidx_opt.is_some(), sidx_fqn_opt.is_some()) {
+        (true,  true,  true)  => "clang_usrs + scip_index + scip_index_fqn",
+        (true,  true,  false) => "clang_usrs + scip_index",
+        (true,  false, false) => "clang_usrs",
+        (false, true,  true)  => "scip_index + scip_index_fqn",
+        (false, true,  false) => "scip_index",
+        (false, false, true)  => "scip_index_fqn",
+        // FQN-only without main is supported (the bridge can carry
+        // both decl and ref anchors on its own); listed for completeness.
+        (true,  false, true)  => "clang_usrs + scip_index_fqn",
+        // unreachable: bailed above when ALL of (cusr, sidx) are None.
+        // sidx_fqn_opt alone doesn't trip the bail, but the bail
+        // intentionally requires at least one of cusr/sidx to be present.
+        (false, false, false) => "(none)",
     };
     eprintln!(
         "[scry] precise ({sidecars}): {before} → {} refs (clang: {} id-mismatch, \
@@ -6553,8 +6620,24 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         v
     };
     let scip_idx = r.scip_index();
+    let scip_fqn_idx = r.scip_index_fqn();
     let cusr_idx = r.clang_usrs();
     let scip_lookup = scip_idx.map(|sx| {
+        sx.precompute_by_file_ids(
+            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
+                p.as_deref().map(|s| (i as u32, s))
+            }),
+            path_by_file_id.len(),
+        )
+    });
+    // JVM-FQN canonical companion. Same precompute shape as the
+    // regular SCIP sidecar — both contribute defs and ref lookups
+    // independently in pass 2b / pass 3. The FQN sidecar carries
+    // anchors keyed by language=jvm canonical FQNs (the bridge
+    // target of language=java VNames), which is what lets
+    // cross-CU Java refs resolve when the ref-side CU compiled
+    // against bytecode rather than source.
+    let scip_fqn_lookup = scip_fqn_idx.map(|sx| {
         sx.precompute_by_file_ids(
             path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
                 p.as_deref().map(|s| (i as u32, s))
@@ -6571,11 +6654,21 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
         )
     });
     const KYTHE_WINDOW: u32 = 64;
+    // Both sidecars feed a single string→def_id map. JVM-FQN
+    // canonical symbols (`jvm:android.os.Binder#clearCallingIdentity:()J`)
+    // and language=java VName signatures from the Kythe entries live
+    // in disjoint symbol-string namespaces by construction (the FQN
+    // sidecar's strings always start with `jvm:`, the main sidecar's
+    // strings carry the Kythe SCIP signature shape), so merging into
+    // one map can't collide. Pass 3 then asks BOTH sidecars for the
+    // call-site's symbol and accepts the first one that maps to an
+    // indexed def.
     let mut scip_def_by_symbol: HashMap<String, u64> = HashMap::new();
     let mut cusr_def_by_symbol: HashMap<String, u64> = HashMap::new();
     let mut scip_defs_indexed = 0u64;
+    let mut scip_fqn_defs_indexed = 0u64;
     let mut cusr_defs_indexed = 0u64;
-    if scip_lookup.is_some() || cusr_lookup.is_some() {
+    if scip_lookup.is_some() || scip_fqn_lookup.is_some() || cusr_lookup.is_some() {
         // Pass 2b uses KIND_MASK_DECL_ONLY so we only pick up
         // def-anchors at def sites — pass 3 below uses the
         // complementary KIND_MASK_REF_OR_CALL at ref sites. The
@@ -6602,20 +6695,31 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
                             .or_insert_with(|| { cusr_defs_indexed += 1; s.id });
                     }
                 }
-            } else if let Some(sl) = scip_lookup.as_ref() {
-                if let Some(sym) = sl.symbol_for_window_kind(
-                    s.file_id, s.byte_start, KYTHE_WINDOW,
-                    scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                ) {
-                    scip_def_by_symbol.entry(sym.to_string())
-                        .or_insert_with(|| { scip_defs_indexed += 1; s.id });
+            } else {
+                if let Some(sl) = scip_lookup.as_ref() {
+                    if let Some(sym) = sl.symbol_for_window_kind(
+                        s.file_id, s.byte_start, KYTHE_WINDOW,
+                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
+                    ) {
+                        scip_def_by_symbol.entry(sym.to_string())
+                            .or_insert_with(|| { scip_defs_indexed += 1; s.id });
+                    }
+                }
+                if let Some(sl) = scip_fqn_lookup.as_ref() {
+                    if let Some(sym) = sl.symbol_for_window_kind(
+                        s.file_id, s.byte_start, KYTHE_WINDOW,
+                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
+                    ) {
+                        scip_def_by_symbol.entry(sym.to_string())
+                            .or_insert_with(|| { scip_fqn_defs_indexed += 1; s.id });
+                    }
                 }
             }
         }
     }
     eprintln!(
-        "[res] pass 2b (Kythe def-symbol index): {} SCIP defs, {} clang USR defs in {} ms",
-        scip_defs_indexed, cusr_defs_indexed, t2b.elapsed().as_millis(),
+        "[res] pass 2b (Kythe def-symbol index): {} SCIP defs, {} SCIP-FQN defs, {} clang USR defs in {} ms",
+        scip_defs_indexed, scip_fqn_defs_indexed, cusr_defs_indexed, t2b.elapsed().as_millis(),
     );
 
     // --- Pass 3: resolve every ref, write sidecar. ---
@@ -6688,22 +6792,51 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
                     }
                 }
             } else {
-                match scip_lookup.as_ref() {
-                    Some(sl) if sl.covers_file_id(rr.file_id) => {
-                        match sl.symbol_in_span_kind(
-                            rr.file_id, rr.byte_start, rr.byte_end,
-                            scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                        ).and_then(|sym| scip_def_by_symbol.get(sym).copied()) {
-                            Some(kid) => kid,
-                            None => {
-                                unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
-                                0
-                            }
+                // Try the regular SCIP sidecar first (language=java
+                // VName symbol-strings). If that's blank for this
+                // ref — the common cause is a cross-CU call where
+                // the def-side CU and ref-side CU disagree on the
+                // canonical Java signature — fall through to the
+                // JVM-FQN companion sidecar. Both writers use
+                // disjoint symbol-string namespaces, so the
+                // string→def_id lookup picks the right side
+                // automatically.
+                //
+                // "Covered" semantics: a file is covered if EITHER
+                // sidecar has anchor data for it. That way refs in
+                // services.core (only the FQN sidecar carries the
+                // cross-CU bridge entries) don't get accounted as
+                // unresolved_no_sidecar just because the regular
+                // sidecar doesn't reach them.
+                let scip_covers = scip_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
+                let fqn_covers = scip_fqn_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
+                if !scip_covers && !fqn_covers {
+                    unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
+                    0
+                } else {
+                    let from_scip = if scip_covers {
+                        scip_lookup.as_ref().and_then(|sl| {
+                            sl.symbol_in_span_kind(
+                                rr.file_id, rr.byte_start, rr.byte_end,
+                                scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
+                            ).and_then(|sym| scip_def_by_symbol.get(sym).copied())
+                        })
+                    } else { None };
+                    let resolved = from_scip.or_else(|| {
+                        if !fqn_covers { return None; }
+                        scip_fqn_lookup.as_ref().and_then(|sl| {
+                            sl.symbol_in_span_kind(
+                                rr.file_id, rr.byte_start, rr.byte_end,
+                                scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
+                            ).and_then(|sym| scip_def_by_symbol.get(sym).copied())
+                        })
+                    });
+                    match resolved {
+                        Some(kid) => kid,
+                        None => {
+                            unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
+                            0
                         }
-                    }
-                    _ => {
-                        unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
-                        0
                     }
                 }
             };

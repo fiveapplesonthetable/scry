@@ -635,6 +635,14 @@ impl StorePaths {
     /// imported from external SCIP tools (scip-java, gopls,
     /// rust-analyzer, …) via `scry scip-import`. v0.1.16+.
     pub fn scip_index(&self) -> PathBuf { self.root.join("scip_index.bin") }
+    /// Optional companion sidecar: per-occurrence canonical JVM FQN
+    /// symbols produced by [`scry_kzip::fqn_importer`]. Holds the
+    /// language=jvm bridge canonicalized form of `scip_index.bin`'s
+    /// language=java VNames — lets cross-CU Java refs resolve when
+    /// the def-side and ref-side CUs disagree on the language=java
+    /// signature (the usual cause: classpath bytecode visibility).
+    /// Read alongside `scip_index.bin` by `build-resolutions`.
+    pub fn scip_index_fqn(&self) -> PathBuf { self.root.join("scip_index_fqn.bin") }
     /// file_id → list of symbol indices. Packed: per file_id (in order),
     /// a u32 count followed by `count` u32 indices into symbols.bin.
     pub fn file_symbols(&self) -> PathBuf { self.root.join("file_symbols.bin") }
@@ -1851,6 +1859,7 @@ pub struct StoreReader {
     /// `mcp`) build that index once at first query; CLI callers
     /// pay it per process.
     pub(crate) scip_index_cell: std::sync::OnceLock<Option<scip_index::ScipIndex>>,
+    pub(crate) scip_index_fqn_cell: std::sync::OnceLock<Option<scip_index::ScipIndex>>,
     pub(crate) clang_usrs_cell: std::sync::OnceLock<Option<clang_usrs::ClangUsrIndex>>,
 }
 
@@ -2010,6 +2019,7 @@ impl StoreReader {
             display_paths_cell: std::sync::OnceLock::new(),
             path_to_file_id_cell: std::sync::OnceLock::new(),
             scip_index_cell: std::sync::OnceLock::new(),
+            scip_index_fqn_cell: std::sync::OnceLock::new(),
             clang_usrs_cell: std::sync::OnceLock::new(),
             files_packed,
         })
@@ -2023,6 +2033,17 @@ impl StoreReader {
     pub fn scip_index(&self) -> Option<&scip_index::ScipIndex> {
         self.scip_index_cell
             .get_or_init(|| scip_index::ScipIndex::open(&self.paths.scip_index()).ok().flatten())
+            .as_ref()
+    }
+
+    /// Lazy accessor for the JVM-FQN canonical companion sidecar
+    /// (see [`StorePaths::scip_index_fqn`]). Same open/decode shape
+    /// as [`scip_index`]; returns `None` when the sidecar isn't on
+    /// disk — that's the common case for non-Java indexes and for
+    /// older indexes built before `scry-kzip`'s fqn_importer phase.
+    pub fn scip_index_fqn(&self) -> Option<&scip_index::ScipIndex> {
+        self.scip_index_fqn_cell
+            .get_or_init(|| scip_index::ScipIndex::open(&self.paths.scip_index_fqn()).ok().flatten())
             .as_ref()
     }
 

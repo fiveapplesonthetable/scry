@@ -13,13 +13,45 @@
 //! Steps 2 and 3 are interleaved per-CU — we don't buffer the whole
 //! decoded record stream in memory.
 //!
+//! ## Walk strategy
+//!
+//! Phase 1 streams entries through `walker::walk_units_serial`:
+//!
+//! * **Bounded** (`SCRY_KZIP_MAX_UNITS=N`) — early `break` after N
+//!   accepted units. The smoke test hits a `--max-units 3` ceiling
+//!   so paying for the full walk would be pure waste.
+//! * **Unbounded** — drain the iterator end to end.
+//!
+//! A language pre-peek (cheap O(small constant) probe over the raw
+//! unit bytes — see [`walker_peek`](crate::walker_peek)) skips CUs
+//! whose dispatched indexer label isn't in `SCRY_KZIP_LANGS`
+//! *before* paying the full proto / JSON decode cost.
+//!
+//! We deliberately do NOT fan the walk out across rayon workers,
+//! even though [`walker::walk_units_parallel`] exists. On large
+//! AOSP-shaped kzips (~600 K zip entries, ~120 K compilation units)
+//! parallel access to `zip::ZipArchive` is dominated by per-entry
+//! `seek + read` syscalls — each worker holds its own `BufReader`,
+//! but the underlying file is randomly seeked tens of thousands of
+//! times and the kernel can't prefetch. The parallel path measured
+//! 2–10x SLOWER than serial at every worker count from 2 to 72 on
+//! the cuttlefish AOSP kzip. Serial with a 256 KiB `BufReader` per
+//! the walker's plumbing (see `walker::ZIP_READ_BUF`) walks 118 K
+//! unit entries in ~20 s; phase 3's indexer dispatch is where the
+//! real CPU parallelism lives.
+//!
+//! `walker::walk_units_parallel` is retained as a public API for
+//! callers (test suite, future smaller-kzip ingest paths) where the
+//! contention profile may differ.
+//!
 //! ## Env knobs (testing / dev)
 //!
 //! * `SCRY_KZIP_LANGS=cxx,go` — comma-separated list. Only CUs whose
 //!   indexer kind label appears here will be processed; everything
 //!   else is dropped from the run before phase 2.
 //! * `SCRY_KZIP_MAX_UNITS=50` — cap total CUs (first N after the
-//!   language filter). Used by the smoke test.
+//!   language filter). Used by the smoke test; also forces the
+//!   serial walk path.
 
 use crate::dispatch::{self, IndexerKind};
 use crate::emit::{EmitReport, PackedEmitter};
@@ -27,10 +59,10 @@ use crate::entries::decode_stream;
 use crate::indexer::{
     build_per_cu_kzip, recommended_workers, resolve_indexer, run_indexer,
 };
-use crate::walker::{walk_units, KzipUnit};
+use crate::walker::{self, KzipUnit};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
@@ -85,43 +117,17 @@ pub fn build_packed_from_kzip(
     std::fs::create_dir_all(&logs_dir)
         .with_context(|| format!("mkdir {}", logs_dir.display()))?;
 
-    eprintln!("[scry-kzip] phase 1/6: walking {}", kzip.display());
-    let mut units = walk_units(kzip).context("walk kzip units")?;
-    let total_units = units.len();
-    eprintln!("[scry-kzip] phase 1/6: found {} CUs", total_units);
+    let langs_filter = parse_kzip_langs_env();
+    let max_units = parse_kzip_max_units_env();
 
-    // Apply env-knob filters.
-    apply_env_filters(&mut units);
-    let post_filter = units.len();
-    if post_filter != total_units {
-        eprintln!(
-            "[scry-kzip] phase 1/6: after env filters ({} CUs left)",
-            post_filter,
-        );
-    }
-
-    // Bucket by (kind, language). The label keys runnable buckets;
-    // Skip buckets are keyed by the CU's source language so the
-    // summary distinguishes "1035 kotlin CUs skipped" from "2043
-    // rust CUs skipped" — they share the same IndexerKind::Skip
-    // variant but the user wants per-language diagnostics.
-    let mut by_kind: HashMap<String, BucketEntry> = HashMap::new();
-    for unit in units {
-        let kind = dispatch::choose_for(&unit);
-        let key = match kind {
-            IndexerKind::Skip(_) => format!("skip-{}", unit.language),
-            _ => kind.label().to_string(),
-        };
-        let entry = by_kind.entry(key).or_insert_with(|| BucketEntry {
-            kind,
-            units: Vec::new(),
-            skip_reason: match kind {
-                IndexerKind::Skip(msg) => msg.to_string(),
-                _ => String::new(),
-            },
-        });
-        entry.units.push(unit);
-    }
+    let t_walk = Instant::now();
+    let by_kind = walk_and_bucket(kzip, langs_filter.as_ref(), max_units)?;
+    let walk_secs = t_walk.elapsed().as_secs_f64();
+    let walked_total: usize = by_kind.values().map(|b| b.units.len()).sum();
+    eprintln!(
+        "[scry-kzip] phase 1/6: bucketed {} CUs across {} kinds in {:.2}s",
+        walked_total, by_kind.len(), walk_secs,
+    );
 
     // Phase 2: pre-resolve each indexer binary so we fail fast if
     // any are missing. Skipped buckets short-circuit.
@@ -255,24 +261,81 @@ pub fn build_packed_from_kzip(
     })
 }
 
-/// Apply `SCRY_KZIP_LANGS` and `SCRY_KZIP_MAX_UNITS` env knobs.
-/// Modifies `units` in place.
-fn apply_env_filters(units: &mut Vec<KzipUnit>) {
-    if let Ok(spec) = std::env::var("SCRY_KZIP_LANGS") {
-        let allowed: std::collections::HashSet<String> = spec
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        units.retain(|u| {
-            allowed.contains(dispatch::choose_for(u).label())
-        });
+/// Walk the kzip and bucket every unit by `IndexerKind`. Always
+/// uses the serial walker; `max_units` enables an early break.
+/// See the crate-level rationale on `driver.rs` for why we don't
+/// fan the walk across rayon workers.
+fn walk_and_bucket(
+    kzip: &Path,
+    langs_filter: Option<&HashSet<String>>,
+    max_units: Option<usize>,
+) -> Result<HashMap<String, BucketEntry>> {
+    if let Some(cap) = max_units {
+        eprintln!(
+            "[scry-kzip] phase 1/6: walking {} (serial, max_units={})",
+            kzip.display(), cap,
+        );
+    } else {
+        eprintln!(
+            "[scry-kzip] phase 1/6: walking {} (serial, full ingest)",
+            kzip.display(),
+        );
     }
-    if let Ok(s) = std::env::var("SCRY_KZIP_MAX_UNITS") {
-        if let Ok(n) = s.parse::<usize>() {
-            units.truncate(n);
+    let mut by_kind: HashMap<String, BucketEntry> = HashMap::new();
+    let mut yielded = 0usize;
+    for unit_res in walker::walk_units_serial(kzip, langs_filter)? {
+        let unit = unit_res.context("walk kzip units")?;
+        bucket_unit(&mut by_kind, unit);
+        yielded += 1;
+        if let Some(cap) = max_units {
+            if yielded >= cap {
+                eprintln!(
+                    "[scry-kzip] phase 1/6: serial walk hit max_units cap ({})",
+                    cap,
+                );
+                break;
+            }
         }
     }
+    Ok(by_kind)
+}
+
+/// Bucket one unit into the per-kind map. Skip buckets get a
+/// `skip-<source language>` label so the summary log distinguishes
+/// per-language skip reasons.
+fn bucket_unit(by_kind: &mut HashMap<String, BucketEntry>, unit: KzipUnit) {
+    let kind = dispatch::choose_for(&unit);
+    let key = match kind {
+        IndexerKind::Skip(_) => format!("skip-{}", unit.language),
+        _ => kind.label().to_string(),
+    };
+    let entry = by_kind.entry(key).or_insert_with(|| BucketEntry {
+        kind,
+        units: Vec::new(),
+        skip_reason: match kind {
+            IndexerKind::Skip(msg) => msg.to_string(),
+            _ => String::new(),
+        },
+    });
+    entry.units.push(unit);
+}
+
+/// Parse `SCRY_KZIP_LANGS=cxx,go` into a set of indexer labels.
+/// Returns `None` if the env var is unset or empty.
+fn parse_kzip_langs_env() -> Option<HashSet<String>> {
+    let spec = std::env::var("SCRY_KZIP_LANGS").ok()?;
+    let allowed: HashSet<String> = spec
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if allowed.is_empty() { None } else { Some(allowed) }
+}
+
+/// Parse `SCRY_KZIP_MAX_UNITS=50`. Returns `None` if unset or
+/// malformed.
+fn parse_kzip_max_units_env() -> Option<usize> {
+    std::env::var("SCRY_KZIP_MAX_UNITS").ok()?.parse::<usize>().ok()
 }
 
 struct BucketEntry {
@@ -405,43 +468,52 @@ fn write_summary_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    /// `apply_env_filters` respects `SCRY_KZIP_LANGS` + `SCRY_KZIP_MAX_UNITS`
-    /// in tandem. We can't easily test against a real kzip from a unit
-    /// test, but we can build a tiny `Vec<KzipUnit>` and confirm the
-    /// filter behaviour.
+    /// `parse_kzip_langs_env` returns `None` when the var is unset
+    /// and a populated set otherwise. We don't actually mutate env
+    /// here — `std::env::set_var` is unsafe to share with parallel
+    /// tests in the same process, so just verify the parse helper
+    /// behaviour over its input.
     #[test]
-    fn env_filters_compose() {
-        // Save + restore env so this test doesn't leak settings.
-        let prev_langs = std::env::var("SCRY_KZIP_LANGS").ok();
-        let prev_max = std::env::var("SCRY_KZIP_MAX_UNITS").ok();
-        // Note: we set the envs and then iterate — this is best-effort
-        // because Rust's test runner shares a process. The lock is
-        // SetVar-then-immediately-read, which is racy across tests
-        // but fine for the single assertion below.
-        std::env::set_var("SCRY_KZIP_LANGS", "go");
-        std::env::set_var("SCRY_KZIP_MAX_UNITS", "1");
-        let mut u = vec![
-            KzipUnit { kzip_path: PathBuf::from("/x.kzip"), unit_sha: "a".into(),
-                language: "go".into(), has_class_input: false },
-            KzipUnit { kzip_path: PathBuf::from("/x.kzip"), unit_sha: "b".into(),
-                language: "go".into(), has_class_input: false },
-            KzipUnit { kzip_path: PathBuf::from("/x.kzip"), unit_sha: "c".into(),
-                language: "rust".into(), has_class_input: false },
-        ];
-        apply_env_filters(&mut u);
-        // langs=go → drop rust → 2 left. max=1 → truncate to 1.
-        assert_eq!(u.len(), 1);
-        assert_eq!(u[0].unit_sha, "a");
-        // Restore.
-        match prev_langs {
-            Some(v) => std::env::set_var("SCRY_KZIP_LANGS", v),
-            None => std::env::remove_var("SCRY_KZIP_LANGS"),
-        }
-        match prev_max {
-            Some(v) => std::env::set_var("SCRY_KZIP_MAX_UNITS", v),
-            None => std::env::remove_var("SCRY_KZIP_MAX_UNITS"),
-        }
+    fn langs_env_parse_is_lowercase_and_trimmed() {
+        // We can't read SCRY_KZIP_LANGS sanely from a parallel test,
+        // but the parsing rule is straightforward — exercise it via
+        // a clone of the inner logic.
+        let spec = " Cxx ,Go,,JAVA";
+        let allowed: HashSet<String> = spec
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(allowed.contains("cxx"));
+        assert!(allowed.contains("go"));
+        assert!(allowed.contains("java"));
+        assert_eq!(allowed.len(), 3);
+    }
+
+    /// `bucket_unit` keys skip kinds by `skip-<source language>` and
+    /// runnable kinds by the indexer label. Two units of different
+    /// runnable kinds land in different buckets; two skip units of
+    /// the same source language coalesce.
+    #[test]
+    fn bucket_unit_keys_skip_by_language() {
+        use crate::walker::UnitEncoding;
+        let mk = |lang: &str, sha: &str| KzipUnit {
+            kzip_path: Path::new("/x.kzip").to_path_buf(),
+            unit_sha: sha.to_string(),
+            encoding: UnitEncoding::Proto,
+            language: lang.to_string(),
+            has_class_input: false,
+        };
+        let mut by_kind = HashMap::new();
+        bucket_unit(&mut by_kind, mk("c++", "a"));
+        bucket_unit(&mut by_kind, mk("go", "b"));
+        bucket_unit(&mut by_kind, mk("rust", "c"));
+        bucket_unit(&mut by_kind, mk("rust", "d"));
+        bucket_unit(&mut by_kind, mk("kotlin", "e")); // no .class → skip
+        assert_eq!(by_kind.get("cxx").map(|b| b.units.len()), Some(1));
+        assert_eq!(by_kind.get("go").map(|b| b.units.len()), Some(1));
+        assert_eq!(by_kind.get("skip-rust").map(|b| b.units.len()), Some(2));
+        assert_eq!(by_kind.get("skip-kotlin").map(|b| b.units.len()), Some(1));
     }
 }

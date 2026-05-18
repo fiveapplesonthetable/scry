@@ -42,5 +42,7 @@ pub mod entries;
 pub mod indexer;
 pub mod proto;
 pub mod walker;
+mod walker_decode;
+mod walker_peek;
 
 pub use driver::{build_packed_from_kzip, KzipBuildReport};

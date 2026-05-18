@@ -19,9 +19,18 @@
 use crate::dispatch::IndexerKind;
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Wrap the source-kzip `File` in a `BufReader` before handing it
+/// to `zip::ZipArchive`. The zip crate hands its inflate decoder
+/// raw `Read` access; without buffering each entry open + decode
+/// fans out into thousands of small `read()` syscalls. Sized to
+/// match the walker's choice (see `walker::ZIP_READ_BUF`); they're
+/// kept independent because indexer.rs opens fresh archives per
+/// per-CU sub-kzip build and shouldn't import walker's plumbing.
+const SRC_KZIP_READ_BUF: usize = 256 * 1024;
 
 /// Resolve a Kythe indexer binary. Two sources, in priority order:
 ///   1. `SCRY_INDEXER_KYTHE_<NAME>` — per-binary override
@@ -86,8 +95,16 @@ impl IndexerRun {
 /// twin). Returns the path to the new kzip.
 ///
 /// We use the `stored` (no-compress) zip mode and copy raw bytes
-/// straight from the source kzip — repacking is O(unit-size +
-/// inputs-size), not O(full-kzip).
+/// straight from the source kzip for the `root/files/<digest>` blobs
+/// — repacking is O(unit-size + inputs-size), not O(full-kzip).
+///
+/// If the source CU is JSON-encoded under `root/units/<sha>` (the
+/// AOSP cxx + java extractor norm), we parse it via
+/// `protobuf-json-mapping` and re-serialize to proto3 binary before
+/// writing it as `root/pbunits/<sha>` in the per-CU sub-kzip. Every
+/// Kythe v0.0.75 indexer accepts proto-encoded units; emitting only
+/// the proto form sidesteps the mixed-encoding-rejection check that
+/// trips when both `pbunits/` and `units/` are present.
 pub fn build_per_cu_kzip(
     src_kzip: &Path,
     unit_sha: &str,
@@ -98,22 +115,42 @@ pub fn build_per_cu_kzip(
 
     let src = File::open(src_kzip)
         .with_context(|| format!("open source kzip {}", src_kzip.display()))?;
-    let mut zin = zip::ZipArchive::new(src)
+    let src_buf = BufReader::with_capacity(SRC_KZIP_READ_BUF, src);
+    let mut zin = zip::ZipArchive::new(src_buf)
         .with_context(|| format!("read source kzip header {}", src_kzip.display()))?;
 
-    // Locate the pbunit (try `root/pbunits/<sha>` then `root/units/<sha>`).
-    let unit_entry_name = locate_unit_entry(&mut zin, unit_sha)?;
+    // Locate the source unit (try `root/pbunits/<sha>` then
+    // `root/units/<sha>`) and grab its bytes.
+    let (src_entry_name, src_encoding) = locate_unit_entry(&mut zin, unit_sha)?;
+    let mut src_unit_bytes = Vec::new();
+    zin.by_name(&src_entry_name)
+        .with_context(|| format!("open unit {src_entry_name}"))?
+        .read_to_end(&mut src_unit_bytes)
+        .with_context(|| format!("read unit {src_entry_name}"))?;
 
-    let mut unit_bytes = Vec::new();
-    zin.by_name(&unit_entry_name)
-        .with_context(|| format!("open pbunit {unit_entry_name}"))?
-        .read_to_end(&mut unit_bytes)
-        .with_context(|| format!("read pbunit {unit_entry_name}"))?;
-
-    // Decode the unit so we know which `root/files/<digest>` blobs
-    // the indexer is going to demand.
-    let indexed = IndexedCompilation::parse_from_bytes(&unit_bytes)
-        .with_context(|| format!("decode IndexedCompilation {unit_sha}"))?;
+    // Decode the unit into the generated proto type regardless of
+    // source encoding. The JSON path goes through
+    // `protobuf-json-mapping` (accepts snake_case + camelCase field
+    // names per the proto3-JSON spec).
+    let indexed: IndexedCompilation = match src_encoding {
+        SrcEncoding::Proto => IndexedCompilation::parse_from_bytes(&src_unit_bytes)
+            .with_context(|| format!("decode IndexedCompilation {unit_sha}"))?,
+        SrcEncoding::Json => {
+            let text = std::str::from_utf8(&src_unit_bytes).with_context(|| {
+                format!("JSON unit {unit_sha} is not valid UTF-8")
+            })?;
+            protobuf_json_mapping::parse_from_str_with_options(
+                text,
+                &crate::walker::lenient_json_opts(),
+            )
+            .with_context(|| format!("parse JSON IndexedCompilation {unit_sha}"))?
+        }
+    };
+    // Always write proto into the per-CU sub-kzip — the indexers
+    // accept it uniformly and mixed-encoding kzips are rejected.
+    let proto_unit_bytes = indexed
+        .write_to_bytes()
+        .with_context(|| format!("re-serialize IndexedCompilation {unit_sha}"))?;
     let cu = indexed
         .unit
         .into_option()
@@ -146,7 +183,7 @@ pub fn build_per_cu_kzip(
     zout.add_directory("root/pbunits/", opts).ok();
     zout.add_directory("root/files/", opts).ok();
     zout.start_file(format!("root/pbunits/{unit_sha}"), opts)?;
-    zout.write_all(&unit_bytes)?;
+    zout.write_all(&proto_unit_bytes)?;
     let avail: std::collections::HashSet<String> = zin
         .file_names()
         .map(|s| s.to_string())
@@ -166,17 +203,29 @@ pub fn build_per_cu_kzip(
     Ok(out_path)
 }
 
-/// Find the in-zip entry name carrying this pbunit's bytes.
+/// On-disk encoding of the source unit we just located. Mirrors
+/// `walker::UnitEncoding` but kept private here so `indexer.rs` doesn't
+/// need a public dep on the walker module's enum surface.
+#[derive(Debug, Clone, Copy)]
+enum SrcEncoding {
+    Proto,
+    Json,
+}
+
+/// Find the in-zip entry name carrying this unit's bytes, along with
+/// its on-disk encoding. Prefers proto (`root/pbunits/<sha>`) when both
+/// encodings exist for the same SHA — the same precedence the walker
+/// applies.
 fn locate_unit_entry(
-    zin: &mut zip::ZipArchive<File>,
+    zin: &mut zip::ZipArchive<BufReader<File>>,
     unit_sha: &str,
-) -> Result<String> {
-    for cand in [
-        format!("root/pbunits/{unit_sha}"),
-        format!("root/units/{unit_sha}"),
+) -> Result<(String, SrcEncoding)> {
+    for (cand, enc) in [
+        (format!("root/pbunits/{unit_sha}"), SrcEncoding::Proto),
+        (format!("root/units/{unit_sha}"),   SrcEncoding::Json),
     ] {
         if zin.by_name(&cand).is_ok() {
-            return Ok(cand);
+            return Ok((cand, enc));
         }
     }
     Err(anyhow!("unit sha {unit_sha} not found in kzip"))

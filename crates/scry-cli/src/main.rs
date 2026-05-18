@@ -4964,6 +4964,13 @@ fn cmd_grep(
             );
         }
     }
+    // Auto-detect regex: if the pattern contains any regex metacharacter
+    // (`\`, `[`, `]`, `^`, `$`, `*`, `+`, `?`, `(`, `)`, `{`, `}`, `|`)
+    // and the user didn't pass --regex, promote to regex anyway. The
+    // literal trigram path otherwise extracts trigrams from the raw
+    // bytes (`bindService\b` → `"e\\b"`, `"ce\\"`, …) and silently
+    // returns zero hits. Patterns with no metacharacter stay literal.
+    let is_regex = is_regex || looks_like_regex(&pattern);
     if explain {
         // --explain short-circuits the actual scan: dump the query
         // plan to stdout, exit. Works on literal patterns; for regex
@@ -6947,6 +6954,27 @@ pub(crate) fn cmd_build_trigrams(
         t_total.elapsed().as_millis(),
     );
     Ok(())
+}
+
+/// Heuristic: does this string contain any regex metacharacter? If so
+/// the user almost certainly meant a regex pattern, not a literal
+/// substring search. Without this, `scry grep 'bindService\b'` runs
+/// the literal trigram path, which extracts trigrams from the bytes
+/// `bindService\b` (treating `\b` as the two ASCII characters
+/// backslash + b) and yields zero candidate files. Auto-detecting
+/// regex from metacharacter presence lets the common case
+/// (word-boundary lookups, character classes, anchors, alternation)
+/// Just Work without the user remembering `--regex`.
+///
+/// The set mirrors the standard PCRE/regex-syntax metacharacters that
+/// have meaning ONLY inside a regex. Patterns with none of these are
+/// safe to treat as literals: their byte representation IS what the
+/// user wants to find.
+fn looks_like_regex(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b,
+        b'\\' | b'[' | b']' | b'^' | b'$' | b'*' | b'+'
+        | b'?' | b'(' | b')' | b'{' | b'}' | b'|'
+    ))
 }
 
 /// Extract literal substrings from a regex for trigram pre-filtering,
@@ -9700,6 +9728,28 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         rotate_log_if_oversized(&tmp, 100);
         assert!(!tmp.exists());
+    }
+
+    /// Regex auto-detection: any of the standard metacharacters trips
+    /// the heuristic, plain identifiers do not.
+    #[test]
+    fn looks_like_regex_basics() {
+        // Plain identifiers / paths → literal.
+        assert!(!looks_like_regex("bindService"));
+        assert!(!looks_like_regex("ZygoteInit"));
+        assert!(!looks_like_regex("a/b/c.kt"));
+        assert!(!looks_like_regex(""));
+        // Word boundary — the original bug.
+        assert!(looks_like_regex(r"bindService\b"));
+        // Standard metacharacters.
+        assert!(looks_like_regex(".*"));
+        assert!(looks_like_regex("foo|bar"));
+        assert!(looks_like_regex("^main"));
+        assert!(looks_like_regex("end$"));
+        assert!(looks_like_regex("[A-Z]+"));
+        assert!(looks_like_regex("a?"));
+        assert!(looks_like_regex("a{1,3}"));
+        assert!(looks_like_regex("(foo)"));
     }
 
     /// Literal pattern → identity extraction.

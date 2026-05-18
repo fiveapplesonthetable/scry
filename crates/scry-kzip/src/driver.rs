@@ -51,11 +51,21 @@
 //!   `primary_path` (the first source-extension `required_input`)
 //!   starts with at least one prefix are kept. Used to scope an
 //!   ingest to a subtree of the repo (e.g. just `frameworks/base/`
-//!   for a faster targeted run).
+//!   for a faster targeted run). Wrapper-aware: see
+//!   `SCRY_KZIP_STRIP_WRAPPERS`.
 //! * `SCRY_KZIP_PATH_EXCLUDE=external/,prebuilts/` — comma-separated
 //!   list of path prefixes that drop matching CUs. Evaluated BEFORE
 //!   the include filter, so excludes win. Useful to skip vendor /
 //!   third-party code without listing every wanted prefix explicitly.
+//! * `SCRY_KZIP_STRIP_WRAPPERS=out/soong/.intermediates/,...` —
+//!   comma-separated list of build-system staging prefixes peeled
+//!   off `primary_path` before include/exclude matching. Defaults to
+//!   `out/soong/.intermediates/` (the AOSP Soong norm). Required
+//!   because Soong stages CUs with srcjar dependencies (KAPT, AIDL,
+//!   aconfig, R.java — including services.core's unboosted variant)
+//!   under this prefix, so a `frameworks/base/` filter would
+//!   otherwise miss them. Override when Soong's `OUT_DIR` is
+//!   redirected or a different Kythe extractor uses another layout.
 //! * `SCRY_KZIP_LANGS=cxx,go` — comma-separated list. Only CUs whose
 //!   indexer kind label appears here will be processed; everything
 //!   else is dropped from the run before phase 2.
@@ -174,10 +184,12 @@ pub fn build_packed_from_kzip(
     let max_units = parse_kzip_max_units_env();
     let path_include = parse_kzip_path_prefix_env();
     let path_exclude = parse_kzip_path_exclude_env();
+    let strip_wrappers = parse_kzip_strip_wrappers_env();
     if let Some(prefixes) = &path_include {
         eprintln!(
-            "[scry-kzip] phase 1/6: SCRY_KZIP_PATH_PREFIX active ({} prefixes)",
+            "[scry-kzip] phase 1/6: SCRY_KZIP_PATH_PREFIX active ({} prefixes, peeling {} wrapper(s))",
             prefixes.len(),
+            strip_wrappers.len(),
         );
     }
     if let Some(prefixes) = &path_exclude {
@@ -242,6 +254,7 @@ pub fn build_packed_from_kzip(
     let by_kind = walk_and_bucket(
         kzip, langs_filter.as_ref(), max_units,
         path_include.as_ref(), path_exclude.as_ref(),
+        &strip_wrappers,
         resumed_skip_set_for_walk,
     )?;
     let walk_secs = t_walk.elapsed().as_secs_f64();
@@ -432,6 +445,24 @@ fn parse_kzip_path_prefix_env() -> Option<Vec<String>> {
 /// always win over includes. Returns `None` if unset or empty.
 fn parse_kzip_path_exclude_env() -> Option<Vec<String>> {
     parse_prefix_list("SCRY_KZIP_PATH_EXCLUDE")
+}
+
+/// Parse `SCRY_KZIP_STRIP_WRAPPERS=out/soong/.intermediates/,...` into
+/// a list of build-system staging prefixes that the include/exclude
+/// filters should peel off `primary_path` before matching. Defaults
+/// to AOSP Soong's `out/soong/.intermediates/` when unset. Setting it
+/// to a single comma is a way to disable peeling entirely (the list
+/// parses to empty and the filter falls back to plain prefix
+/// semantics).
+///
+/// Configurable because Soong's `OUT_DIR` can be redirected and
+/// other Kythe extractors (Bazel, custom pipelines) use different
+/// intermediate layouts.
+fn parse_kzip_strip_wrappers_env() -> Vec<String> {
+    match parse_prefix_list("SCRY_KZIP_STRIP_WRAPPERS") {
+        Some(v) => v,
+        None => vec!["out/soong/.intermediates/".to_string()],
+    }
 }
 
 fn parse_prefix_list(var: &str) -> Option<Vec<String>> {

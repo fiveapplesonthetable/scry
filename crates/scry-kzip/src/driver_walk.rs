@@ -40,6 +40,7 @@ pub(crate) fn walk_and_bucket(
     max_units: Option<usize>,
     path_include: Option<&Vec<String>>,
     path_exclude: Option<&Vec<String>>,
+    strip_wrappers: &[String],
     done_shas: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, BucketEntry>> {
     if let Some(cap) = max_units {
@@ -83,13 +84,13 @@ pub(crate) fn walk_and_bucket(
             continue;
         }
         if let Some(excludes) = path_exclude {
-            if primary_path_matches(&unit.primary_path, excludes) {
+            if primary_path_matches(&unit.primary_path, excludes, strip_wrappers) {
                 dropped_by_exclude += 1;
                 continue;
             }
         }
         if let Some(prefixes) = path_include {
-            if !primary_path_matches(&unit.primary_path, prefixes) {
+            if !primary_path_matches(&unit.primary_path, prefixes, strip_wrappers) {
                 dropped_by_include += 1;
                 continue;
             }
@@ -133,10 +134,37 @@ pub(crate) fn walk_and_bucket(
     Ok(by_kind)
 }
 
-/// True if `primary_path` starts with any of the given prefixes.
-/// Empty primary paths (CU with no required inputs) never match.
-fn primary_path_matches(primary_path: &str, prefixes: &[String]) -> bool {
-    !primary_path.is_empty() && prefixes.iter().any(|p| primary_path.starts_with(p))
+/// True if `primary_path` starts with any of the given prefixes,
+/// either directly or after stripping any of `strip_wrappers`. Empty
+/// primary paths (CU with no required inputs) never match.
+///
+/// `strip_wrappers` exists because build systems often stage CUs that
+/// depend on generated sources (srcjars from KAPT / AIDL / aconfig /
+/// R.java) under an intermediates directory whose layout encodes the
+/// module's repo path. For Soong-built AOSP that wrapper is
+/// `out/soong/.intermediates/<module-repo-path>/<module-name>/<arch>/...`,
+/// so e.g. `services.core.unboosted`'s primary path begins with
+/// `out/soong/.intermediates/frameworks/base/services/core/...`. Peeling
+/// the wrapper lets the repo-path filter see `frameworks/base/...` and
+/// match correctly. Wrappers are configurable so non-default Soong
+/// `OUT_DIR` and other extractor layouts work without code changes.
+fn primary_path_matches(
+    primary_path: &str,
+    prefixes: &[String],
+    strip_wrappers: &[String],
+) -> bool {
+    if primary_path.is_empty() {
+        return false;
+    }
+    prefixes.iter().any(|p| {
+        if primary_path.starts_with(p) {
+            return true;
+        }
+        strip_wrappers
+            .iter()
+            .filter_map(|w| primary_path.strip_prefix(w.as_str()))
+            .any(|peeled| peeled.starts_with(p))
+    })
 }
 
 /// Bucket one unit into the per-kind map. Skip buckets get a
@@ -195,9 +223,75 @@ mod tests {
     #[test]
     fn primary_path_matches_basic() {
         let prefixes = vec!["frameworks/".to_string(), "system/".to_string()];
-        assert!(primary_path_matches("frameworks/base/X.java", &prefixes));
-        assert!(primary_path_matches("system/core/Y.cc", &prefixes));
-        assert!(!primary_path_matches("external/A.cc", &prefixes));
-        assert!(!primary_path_matches("", &prefixes));
+        let no_wrappers: Vec<String> = Vec::new();
+        assert!(primary_path_matches("frameworks/base/X.java", &prefixes, &no_wrappers));
+        assert!(primary_path_matches("system/core/Y.cc", &prefixes, &no_wrappers));
+        assert!(!primary_path_matches("external/A.cc", &prefixes, &no_wrappers));
+        assert!(!primary_path_matches("", &prefixes, &no_wrappers));
+    }
+
+    /// CUs whose primary source path is staged under
+    /// `out/soong/.intermediates/<module-repo-path>/<module>/<arch>/...`
+    /// (services.core.unboosted, aconfig flags, AIDL stubs, KAPT
+    /// factories, etc.) must still match a `frameworks/base/` filter
+    /// once the configured wrapper is peeled. Non-matching modules
+    /// (cronet, hardware/google) stay excluded.
+    #[test]
+    fn primary_path_matches_through_soong_wrapper() {
+        let prefixes = vec!["frameworks/base/".to_string()];
+        let wrappers = vec!["out/soong/.intermediates/".to_string()];
+        // services.core staged primary path (real example from
+        // aosp_cf_x86_64_phone.kzip — `services.core.unboosted`
+        // pulls KAPT/AIDL/aconfig srcjars staged under xref42/).
+        assert!(primary_path_matches(
+            "out/soong/.intermediates/frameworks/base/services/core/services.core.unboosted/android_common/xref42/srcjars.xref/frameworks/base/services/core/java/com/android/server/am/BroadcastQueueImpl.java",
+            &prefixes, &wrappers,
+        ));
+        // aconfig flag stub for a frameworks/base/-defined flag.
+        assert!(primary_path_matches(
+            "out/soong/.intermediates/frameworks/base/android.app.supervision.flags-aconfig-java/android_common/xref/srcjars.xref/android/app/supervision/flags/CustomFeatureFlags.java",
+            &prefixes, &wrappers,
+        ));
+        // External codegen wrapped by Soong — peeled segment is
+        // `external/cronet/...`, not frameworks/base/.
+        assert!(!primary_path_matches(
+            "out/soong/.intermediates/external/cronet/stable/base/stable_cronet_base_metrics_jni_java__unfiltered/android_common/xref/srcjars.xref/android/net/connectivity/org/jni_zero/GEN_JNI.java",
+            &prefixes, &wrappers,
+        ));
+        // hardware/google AIDL stub — peeled segment is hardware/google/...
+        assert!(!primary_path_matches(
+            "out/soong/.intermediates/hardware/google/interfaces/display/com.google.hardware.pixel.display-V3-java-source/gen/com/google/hardware/pixel/display/HbmState.java",
+            &prefixes, &wrappers,
+        ));
+    }
+
+    /// Wrapper-peeling is opt-in: with an empty wrapper list the
+    /// match falls back to plain prefix semantics, so a Soong-wrapped
+    /// CU won't match a `frameworks/base/` filter unless the caller
+    /// supplies the wrapper.
+    #[test]
+    fn primary_path_matches_requires_wrapper_to_peel() {
+        let prefixes = vec!["frameworks/base/".to_string()];
+        let no_wrappers: Vec<String> = Vec::new();
+        assert!(!primary_path_matches(
+            "out/soong/.intermediates/frameworks/base/services/core/services.core.unboosted/android_common/xref42/srcjars.xref/frameworks/base/services/core/java/com/android/server/am/BroadcastQueueImpl.java",
+            &prefixes, &no_wrappers,
+        ));
+    }
+
+    /// A non-default `OUT_DIR` re-routes Soong intermediates; the
+    /// wrapper list accepts any prefix so users can point at e.g.
+    /// `myout/soong/.intermediates/` without code changes.
+    #[test]
+    fn primary_path_matches_custom_wrapper() {
+        let prefixes = vec!["frameworks/base/".to_string()];
+        let wrappers = vec![
+            "myout/soong/.intermediates/".to_string(),
+            "out/soong/.intermediates/".to_string(),
+        ];
+        assert!(primary_path_matches(
+            "myout/soong/.intermediates/frameworks/base/services/core/services.core.unboosted/android_common/xref42/srcjars.xref/frameworks/base/services/core/java/com/android/server/am/BroadcastQueueImpl.java",
+            &prefixes, &wrappers,
+        ));
     }
 }

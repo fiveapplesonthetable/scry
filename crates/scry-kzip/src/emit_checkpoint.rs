@@ -174,13 +174,14 @@ impl KzipFingerprint {
 /// Subset of process env that participates in the fingerprint. Any
 /// var that changes which CUs are processed (`SCRY_KZIP_LANGS`,
 /// `SCRY_KZIP_PATH_PREFIX`, `SCRY_KZIP_PATH_EXCLUDE`,
-/// `SCRY_KZIP_MAX_UNITS`) MUST be here — different values mean the
-/// checkpoint covers a different slice of the kzip and resuming would
-/// silently produce a mixed-scope sidecar.
+/// `SCRY_KZIP_STRIP_WRAPPERS`, `SCRY_KZIP_MAX_UNITS`) MUST be here —
+/// different values mean the checkpoint covers a different slice of
+/// the kzip and resuming would silently produce a mixed-scope sidecar.
 pub const FINGERPRINTED_ENV_KEYS: &[&str] = &[
     "SCRY_KZIP_LANGS",
     "SCRY_KZIP_PATH_PREFIX",
     "SCRY_KZIP_PATH_EXCLUDE",
+    "SCRY_KZIP_STRIP_WRAPPERS",
     "SCRY_KZIP_MAX_UNITS",
 ];
 

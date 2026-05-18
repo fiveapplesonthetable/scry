@@ -416,11 +416,11 @@ mod tests {
         std::env::set_var("SCRY_KZIP_MAX_UNITS", "1");
         let mut u = vec![
             KzipUnit { kzip_path: PathBuf::from("/x.kzip"), unit_sha: "a".into(),
-                language: "go".into(), has_class_or_jar_input: false },
+                language: "go".into(), has_class_input: false },
             KzipUnit { kzip_path: PathBuf::from("/x.kzip"), unit_sha: "b".into(),
-                language: "go".into(), has_class_or_jar_input: false },
+                language: "go".into(), has_class_input: false },
             KzipUnit { kzip_path: PathBuf::from("/x.kzip"), unit_sha: "c".into(),
-                language: "rust".into(), has_class_or_jar_input: false },
+                language: "rust".into(), has_class_input: false },
         ];
         apply_env_filters(&mut u);
         // langs=go → drop rust → 2 left. max=1 → truncate to 1.

@@ -40,9 +40,10 @@ pub struct KzipUnit {
     /// the extractor didn't set it; in that case we infer from the
     /// `required_input[*].info.path` suffix.
     pub language: String,
-    /// True if any `required_input[*].info.path` ends `.class` or
-    /// `.jar`. Drives the Kotlin/JVM dispatch fork.
-    pub has_class_or_jar_input: bool,
+    /// True if any `required_input[*].info.path` ends `.class`.
+    /// Drives the Kotlin/JVM dispatch fork — jars without bytecode
+    /// (e.g. kotlinc-emitted source jars) won't satisfy jvm_indexer.
+    pub has_class_input: bool,
 }
 
 /// Open `kzip` and stream every unit out as a `KzipUnit`.
@@ -128,20 +129,22 @@ pub fn walk_units(kzip: &Path) -> Result<Vec<KzipUnit>> {
         } else {
             language
         };
-        let has_class_or_jar_input = cu.required_input.iter().any(|fi| {
+        // We need real bytecode for jvm_indexer to do anything useful;
+        // a .jar that ships .java source files (kotlinc's srcjar
+        // output, the AOSP norm) trips the indexer's NPE on missing
+        // JarDetails. Only count actual .class inputs as JVM-bytecode
+        // signal — .jar alone isn't enough.
+        let has_class_input = cu.required_input.iter().any(|fi| {
             fi.info
                 .as_ref()
-                .map(|i| {
-                    let p = i.path.as_str();
-                    p.ends_with(".class") || p.ends_with(".jar")
-                })
+                .map(|i| i.path.as_str().ends_with(".class"))
                 .unwrap_or(false)
         });
         out.push(KzipUnit {
             kzip_path: kzip.to_path_buf(),
             unit_sha: sha.to_string(),
             language,
-            has_class_or_jar_input,
+            has_class_input,
         });
     }
     Ok(out)

@@ -55,16 +55,21 @@ impl IndexerKind {
 /// the schema uses: "c++", "java", "kotlin", "go", "protobuf",
 /// "textproto", "rust"). Unrecognised languages fall through to
 /// `Skip` with an explanation.
-pub fn choose(language: &str, has_class_or_jar_input: bool) -> IndexerKind {
+pub fn choose(language: &str, has_class_input: bool) -> IndexerKind {
     match language {
         "c++" | "c" | "objc" => IndexerKind::Cxx,
         "java" => IndexerKind::JavaSource,
         "kotlin" => {
-            if has_class_or_jar_input {
+            if has_class_input {
                 IndexerKind::JvmBytecode
             } else {
+                // No source-level Kotlin indexer ships in public
+                // Kythe v0.0.75 (it's Google-internal). The bytecode
+                // indexer needs real .class files; .jar inputs alone
+                // are often kotlinc srcjars (the AOSP norm) which
+                // trip jvm_indexer's missing-JarDetails NPE.
                 IndexerKind::Skip(
-                    "kotlin source-only indexer not in public Kythe v0.0.75",
+                    "kotlin source-level indexer not in public Kythe v0.0.75 (and no .class inputs for jvm_indexer)",
                 )
             }
         }
@@ -81,7 +86,7 @@ pub fn choose(language: &str, has_class_or_jar_input: bool) -> IndexerKind {
 
 /// Convenience: `choose` against a `KzipUnit`'s fields.
 pub fn choose_for(unit: &KzipUnit) -> IndexerKind {
-    choose(&unit.language, unit.has_class_or_jar_input)
+    choose(&unit.language, unit.has_class_input)
 }
 
 #[cfg(test)]

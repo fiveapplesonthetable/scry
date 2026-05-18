@@ -935,6 +935,12 @@ enum Cmd {
         /// Per-target `.scip` files (polyglot only).
         #[arg(long, value_name = "PATH")]
         scip_out_dir: Option<PathBuf>,
+        /// Resume from existing checkpoint at <out_dir>/kythe-logs/checkpoint/.
+        /// Errors if no checkpoint exists or its fingerprint doesn't
+        /// match the current kzip + env. Only meaningful with
+        /// `--build-kzip`.
+        #[arg(long)]
+        resume: bool,
     },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
@@ -1243,11 +1249,11 @@ fn main() -> Result<()> {
         Cmd::BuildSymbols {
             source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
             build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
-            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir,
+            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
         } => cmd_build_symbols(
             source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
             build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
-            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir,
+            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
         ),
         Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
             cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
@@ -1312,6 +1318,7 @@ fn cmd_build_symbols(
     no_python: bool,
     workers: usize,
     scip_out_dir: Option<PathBuf>,
+    resume: bool,
 ) -> Result<()> {
     use scry_bridge::{cmake, gn, kbuild, polyglot};
     let t_total = Instant::now();
@@ -1402,15 +1409,19 @@ fn cmd_build_symbols(
         );
     } else if let Some(kzip_path) = build_kzip.as_ref() {
         eprintln!(
-            "[build-symbols] kzip: {} (kythe-root: {})",
-            kzip_path.display(), kythe_root.display(),
+            "[build-symbols] kzip: {} (kythe-root: {}, resume={})",
+            kzip_path.display(), kythe_root.display(), resume,
         );
-        let report = scry_kzip::build_packed_from_kzip(kzip_path, &index_dir, &kythe_root)
+        let report = scry_kzip::build_packed_from_kzip(
+            kzip_path, &index_dir, &kythe_root, resume,
+        )
             .with_context(|| format!("build packed sidecars from {}", kzip_path.display()))?;
         eprintln!(
             "[build-symbols] kzip done: {} clang USRs, {} SCIP records in {:.1}s",
             report.emit.cxx_records, report.emit.scip_records, report.wall_secs,
         );
+    } else if resume {
+        anyhow::bail!("--resume is only meaningful with --build-kzip");
     }
 
     if let Some(scip_path) = scip.as_ref() {

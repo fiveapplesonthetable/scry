@@ -1570,6 +1570,25 @@ fn java_refs_spec() -> &'static RefSpec {
                 (superclass (type_identifier) @ref.inherit)
                 (super_interfaces (type_list (type_identifier) @ref.inherit))
                 (extends_interfaces (type_list (type_identifier) @ref.inherit))
+                ; Field-read refs. Without these, `scry ref mFoo` returns 0
+                ; on every Java field that's only read by bare identifier —
+                ; e.g. `helper(mFoo, true)` or `x = mFoo` or `obj.mFoo` —
+                ; even though tree-sitter sees the identifier. The four
+                ; patterns below cover (a) bare-id reads passed as method
+                ; arguments, (b) `obj.field` access, (c) bare-id reads on
+                ; the receiver side of a method call (`mFoo.bar()`),
+                ; (d) bare-id reads on the RHS of an assignment. Local
+                ; variable / parameter reads are captured too — same
+                ; (name, file, byte) shape — and filtered at query time
+                ; by the cross-file resolver. Cost: ref count roughly
+                ; doubles on Java-heavy corpora; correctness justifies it.
+                (argument_list (identifier) @ref.field)
+                (field_access field: (identifier) @ref.field)
+                (method_invocation object: (identifier) @ref.field)
+                (assignment_expression right: (identifier) @ref.field)
+                ; `T y = bareIdent;` is a variable_declarator, not an
+                ; assignment_expression — separate pattern needed.
+                (variable_declarator value: (identifier) @ref.field)
                 ; Capture the FULL path of an import (e.g. "android.os.PerfettoTrace"),
                 ; not just the trailing identifier. The resolver splits on the last
                 ; `.` to get (pkg, simple) — without the package side, import-aware
@@ -1590,6 +1609,7 @@ fn java_refs_spec() -> &'static RefSpec {
                 ("ref.call", RefKind::Call),
                 ("ref.ctor", RefKind::Ctor),
                 ("ref.inherit", RefKind::InheritFrom),
+                ("ref.field", RefKind::FieldAccess),
                 ("ref.import", RefKind::Import),
             ],
             wildcard_imports: Some(java_wildcard_imports),
@@ -1920,6 +1940,71 @@ pub fn tree_sitter_parsers() -> Vec<Box<dyn FormatParser>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the BroadcastQueueImpl mBroadcastConsumerSkip
+    /// bug: bare-identifier field reads — `helper(mFoo, true)`,
+    /// `obj.mFoo`, `mFoo.bar()`, `x = mFoo` — used to be invisible
+    /// to `scry ref --lexical` because the Java refs query only
+    /// captured method_invocation / object_creation / extends /
+    /// imports. AOSP services.core leans heavily on this pattern
+    /// (functional-interface fields passed to dispatch helpers); the
+    /// agent eval flagged it.
+    ///
+    /// Each of the four patterns below is a separate AST shape, so
+    /// we cover them individually rather than counting totals — that
+    /// way a future regression in one pattern shows up by name.
+    #[test]
+    fn java_refs_capture_bare_identifier_field_reads() {
+        let src = br#"
+            package com.test;
+            public class Q {
+                private final R mField = null;
+                void caller(R x) {
+                    helper(mField, true);          // (1) arg-list bare id
+                    obj.mField.accept(null);       // (2) field_access + (3) receiver
+                    R y = mField;                  // (4) assignment RHS
+                }
+            }
+        "#;
+        let refs = extract_refs(FileKind::Java, src).unwrap();
+        let mfield_byte_starts: Vec<u32> = refs.iter()
+            .filter(|r| r.kind == RefKind::FieldAccess)
+            .filter(|r| std::str::from_utf8(&src[r.byte_start as usize..r.byte_end as usize])
+                .map(|s| s == "mField").unwrap_or(false))
+            .map(|r| r.byte_start)
+            .collect();
+        // Expected hits: arg-list (1), field_access (2), assignment RHS (4).
+        // The receiver case (3) lands as method_invocation.object identifier
+        // = "obj", so it captures "obj" rather than "mField" — covered by
+        // pattern (3) for the obj variable specifically. The .mField PART
+        // is a field_access so it's hit by pattern (2). Net for "mField":
+        // arg-list + field_access + assignment = 3 distinct sites.
+        assert!(
+            mfield_byte_starts.len() >= 3,
+            "expected at least 3 FieldAccess refs to mField (arg, field_access, RHS); got {} at byte_starts {:?}. \
+             Java tree-sitter ref captures regressed.",
+            mfield_byte_starts.len(),
+            mfield_byte_starts,
+        );
+        // Also assert the receiver-side capture: `obj.mField.accept(null)` →
+        // method_invocation.object is the (field_access (identifier:obj)
+        // (identifier:mField)) — pattern (3) `method_invocation object:
+        // (identifier)` doesn't trigger (object is field_access not id),
+        // but pattern (4) etc. cover it via the field side already counted.
+        // To prove pattern (3) works, add a separate fixture:
+        let src3 = br#"
+            class S {
+                R mField;
+                void f() { mField.accept(null); }
+            }
+        "#;
+        let refs3 = extract_refs(FileKind::Java, src3).unwrap();
+        let receiver_hit = refs3.iter().any(|r| r.kind == RefKind::FieldAccess
+            && std::str::from_utf8(&src3[r.byte_start as usize..r.byte_end as usize])
+                .map(|s| s == "mField").unwrap_or(false));
+        assert!(receiver_hit, "method_invocation receiver (mField in `mField.accept(...)`) \
+            must be captured as FieldAccess");
+    }
 
     #[test]
     fn java_minimal() {

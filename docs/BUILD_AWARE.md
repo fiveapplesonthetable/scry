@@ -83,6 +83,49 @@ scry build-symbols --source-root /home/zim/dev/aosp \
                    --index /mnt/agent/scry-index
 ```
 
+### Operational gotchas
+
+Producing a full AOSP kzip is a multi-hour, multi-hundred-GB
+operation. The following pitfalls each cost a full restart if
+you trip on them — bake them into the wrapper script up front.
+
+- **`-j` tuning.** Each Kythe extractor is a JVM that defaults its
+  max heap to ~25% of RAM. The default Soong parallelism of
+  `-j$(nproc)` (e.g. 72) routinely OOMs on a 128 GB host. Use
+  `-j 24` as the starting point; on OOM, retry at `-j 12`, then
+  `-j 6`. Do not set `JAVA_TOOL_OPTIONS=-Xmx2g` to compensate —
+  that flag is inherited by Soong's bootstrap JDK and breaks it.
+
+- **`OUT_DIR` must be in-tree.** Soong refuses `OUT_DIR` paths
+  it considers "outside the directory" (any absolute path under
+  `/mnt/agent/...` for an AOSP root at `~/dev/aosp/`). Symlink
+  instead: `ln -sfn /mnt/agent/aosp-out ~/dev/aosp/out`, then
+  drop `OUT_DIR` from the env. Soong now writes through the
+  symlink while believing it's writing to the in-tree default.
+
+- **`find` vs `find -L`.** With the symlink trick above, plain
+  `find out -name '*.kzip'` reports zero matches because `out` is
+  itself a symlink. Use `find -L out -name '*.kzip'` (follow
+  symlinks) when post-processing.
+
+- **merge_zips location.** `build_kzip.bash` invokes
+  `out/host/linux-x86/bin/merge_zips` to pack every per-CU `.kzip`
+  into the final `all.kzip`. If the script crashes after the
+  per-CU `.kzip`s are written but before the merge, re-run
+  `merge_zips` manually pointing it at the same input list — no
+  need to redo the extraction.
+
+- **Disk budget.** A full `aosp_cf_x86_64_phone` produces ~26 GB
+  `all.kzip` from ~3,257 CompilationUnits; Soong's intermediates
+  add ~150 GB to `OUT_DIR`. Put both on the same large volume to
+  avoid cross-device copies during merge.
+
+A reference wrapper that bakes in all of the above lives in this
+repo at [`scripts/aosp_build_kzip.sh`](../scripts/aosp_build_kzip.sh).
+Run it from anywhere; defaults to `AOSP_ROOT=~/dev/aosp`,
+`DIST_DIR=/mnt/agent/scry-kzip`. Every variable in the script
+header is overridable via environment.
+
 ## compile_commands.json builds
 
 `--build-gn`, `--build-kbuild`, and `--build-cmake` all locate (and

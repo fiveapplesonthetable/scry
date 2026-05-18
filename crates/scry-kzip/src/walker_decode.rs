@@ -7,7 +7,7 @@
 
 use crate::proto::analysis::{CompilationUnit, IndexedCompilation};
 use crate::walker::{KzipArchive, KzipUnit, LangFilter, UnitEncoding, UnitEntry};
-use crate::walker_peek::{peek_matches_filter, peek_unit_language};
+use crate::walker_peek::peek_matches_filter;
 use anyhow::{anyhow, Context, Result};
 use protobuf::Message;
 use std::io::Read as _;
@@ -69,31 +69,15 @@ pub(crate) fn read_one_entry(
         {
             return Ok(None);
         }
-        // Continue reading the rest of the body iff we'll need the full
-        // CU to compute `has_class_input` or infer the language. For the
-        // languages that don't need either, we skip the rest of the
-        // decompress.
-        let peeked_lang = peek_unit_language(&buf, entry.encoding).unwrap_or_default();
-        if language_skips_full_decode(&peeked_lang) {
-            let unit = KzipUnit {
-                kzip_path: kzip.to_path_buf(),
-                unit_sha: entry.sha.clone(),
-                encoding: entry.encoding,
-                language: peeked_lang,
-                has_class_input: false,
-                // Skipped languages (rust/kotlin without bytecode) never
-                // run an indexer, so primary_path doesn't influence
-                // dispatch — empty is fine. Path-prefix filter handled
-                // for runnable kinds via the full-decode branch below.
-                primary_path: String::new(),
-            };
-            if let Some(allowed) = filter {
-                let kind = crate::dispatch::choose(&unit.language, unit.has_class_input);
-                if !allowed.contains(kind.label()) { return Ok(None); }
-            }
-            return Ok(Some(unit));
-        }
-        // Need full decode — drain the rest of the body.
+        // The cheap pre-peek above (`peek_matches_filter`) already
+        // dropped CUs whose language is outside `SCRY_KZIP_LANGS` —
+        // that's the bulk of the savings. Everything that survives
+        // needs full decode so `KzipUnit::primary_path` (which feeds
+        // `SCRY_KZIP_PATH_PREFIX` / `_EXCLUDE`) is populated from a
+        // real scan of `required_input`. An earlier optimization
+        // short-circuited the full decode for languages that didn't
+        // need `has_class_input`, but that left `primary_path` empty
+        // for cxx / java / etc. and silently disabled path filtering.
         buf.reserve(total.saturating_sub(peek_len));
         zf.read_to_end(&mut buf)
             .with_context(|| format!("read kzip entry {}", entry.name))?;
@@ -111,38 +95,6 @@ pub(crate) fn read_one_entry(
         }
     }
     Ok(Some(unit))
-}
-
-/// Languages where peek alone gives us everything we need: dispatch
-/// doesn't consult `has_class_input` for them, and the language is
-/// already known (non-empty), so `infer_language_from_inputs` is
-/// not required. Listing them as a closed set keeps this routine
-/// in lockstep with `dispatch::choose` — if a future language gets
-/// a class-introspection fork, it must NOT appear here.
-fn language_skips_full_decode(lang: &str) -> bool {
-    matches!(
-        lang,
-        "c++" | "c" | "objc" | "go" | "protobuf" | "proto" | "textproto" | "rust",
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Keep the decode-skip allow-list in step with the dispatcher.
-    /// Languages NOT in this list must be the ones whose dispatch
-    /// kind consults `has_class_input` (kotlin) or whose v_name
-    /// language string is empty (forces input-suffix inference).
-    #[test]
-    fn skip_set_excludes_kotlin_java_and_empty() {
-        for lang in ["c++", "c", "objc", "go", "protobuf", "proto", "textproto", "rust"] {
-            assert!(language_skips_full_decode(lang), "should skip full decode for {lang}");
-        }
-        for lang in ["kotlin", "java", "", "haskell"] {
-            assert!(!language_skips_full_decode(lang), "must NOT skip full decode for {lang}");
-        }
-    }
 }
 
 fn decode_proto_unit(

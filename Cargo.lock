@@ -862,6 +862,7 @@ name = "scry-kzip"
 version = "0.1.66"
 dependencies = [
  "anyhow",
+ "bincode",
  "num_cpus",
  "protobuf",
  "protobuf-codegen",

@@ -37,7 +37,10 @@
 
 pub mod dispatch;
 pub mod driver;
+pub mod driver_resume;
+mod driver_walk;
 pub mod emit;
+pub mod emit_checkpoint;
 pub mod entries;
 pub mod indexer;
 pub mod proto;
@@ -46,3 +49,4 @@ mod walker_decode;
 mod walker_peek;
 
 pub use driver::{build_packed_from_kzip, KzipBuildReport};
+pub use driver_resume::ResumeDecision;

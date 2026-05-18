@@ -63,16 +63,21 @@
 //!   language filter). Used by the smoke test; also forces the
 //!   serial walk path.
 
-use crate::dispatch::{self, IndexerKind};
+use crate::dispatch::IndexerKind;
+use crate::driver_resume::{enforce_resume_policy, parse_checkpoint_every_env};
+use crate::driver_walk::walk_and_bucket;
 use crate::emit::{EmitReport, PackedEmitter};
-use crate::entries::decode_stream;
+use crate::emit_checkpoint::{
+    self, CheckpointManifest, CHECKPOINT_SUBDIR, DEFAULT_MANIFEST_EVERY,
+};
+use crate::entries::{decode_stream, DecodedRecord};
 use crate::indexer::{
     build_per_cu_kzip, recommended_workers, resolve_indexer, run_indexer,
 };
-use crate::walker::{self, KzipUnit};
+use crate::walker::KzipUnit;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
@@ -115,10 +120,17 @@ pub struct LangReport {
 ///
 /// Writes per-language indexer stderr to `out_dir/kythe-logs/<lang>.log`
 /// and a summary to `out_dir/kythe-logs/summary.txt`.
+///
+/// `resume = true` opts into reading an existing on-disk checkpoint at
+/// `<out_dir>/kythe-logs/checkpoint/` and continuing it; `resume =
+/// false` insists on a fresh checkpoint and refuses to overwrite one
+/// that already exists. See [`enforce_resume_policy`] for the
+/// three-state validator (fresh / mismatched / matched).
 pub fn build_packed_from_kzip(
     kzip: &Path,
     out_dir: &Path,
     kythe_root: &Path,
+    resume: bool,
 ) -> Result<KzipBuildReport> {
     let t_total = Instant::now();
     std::fs::create_dir_all(out_dir)
@@ -126,6 +138,19 @@ pub fn build_packed_from_kzip(
     let logs_dir = out_dir.join("kythe-logs");
     std::fs::create_dir_all(&logs_dir)
         .with_context(|| format!("mkdir {}", logs_dir.display()))?;
+
+    // Three-state checkpoint validator runs BEFORE phase 1 so a
+    // misconfigured run fails in microseconds, not after a half-hour
+    // walk.
+    let checkpoint_dir = out_dir.join(CHECKPOINT_SUBDIR);
+    let current_manifest = CheckpointManifest::fresh(
+        emit_checkpoint::KzipFingerprint::probe(kzip)?,
+        emit_checkpoint::snapshot_env(),
+        kythe_root,
+    );
+    let resume_decision = enforce_resume_policy(
+        resume, &checkpoint_dir, &current_manifest,
+    )?;
 
     let langs_filter = parse_kzip_langs_env();
     let max_units = parse_kzip_max_units_env();
@@ -144,16 +169,70 @@ pub fn build_packed_from_kzip(
         );
     }
 
+    // Build the emitter. Resuming attaches the existing checkpoint;
+    // a fresh run creates the checkpoint dir + files lazily on the
+    // first CU commit (but we open the log handles up front so a
+    // permission failure surfaces before phase 1).
+    //
+    // When resuming we hand `build_checkpoint_state` the ON-DISK
+    // manifest (which carries the committed `done_shas` list) rather
+    // than the fresh-from-this-process one. Both have the same
+    // fingerprint (the validator just confirmed that), but the
+    // on-disk one is the only place the committed-CU SHAs survive
+    // across processes.
+    let manifest_every = parse_checkpoint_every_env().unwrap_or(DEFAULT_MANIFEST_EVERY);
+    let seed_manifest = if resume_decision.is_resume() {
+        CheckpointManifest::load(&checkpoint_dir.join("manifest.json"))
+            .with_context(|| format!(
+                "load on-disk manifest at {}", checkpoint_dir.display(),
+            ))?
+    } else {
+        current_manifest.clone()
+    };
+    let checkpoint_state = PackedEmitter::build_checkpoint_state(
+        &checkpoint_dir, seed_manifest, manifest_every,
+    )?;
+    let emitter = PackedEmitter::with_checkpoint(checkpoint_state);
+
+    // On resume, replay the on-disk record log into the in-memory
+    // buckets BEFORE phase 1 so the done-set is populated when the
+    // walker filter is applied.
+    let resumed_skip_set: HashSet<String> = if resume_decision.is_resume() {
+        let counts = emitter.replay_from_checkpoint()?;
+        eprintln!(
+            "[scry-kzip] checkpoint: replayed {} cxx CUs ({} records), {} scip CUs ({} records); manifest done_shas={}{}",
+            counts.cxx_cus, counts.cxx_records, counts.scip_cus, counts.scip_records,
+            emitter.checkpoint().map(|c| c.done_shas.lock().unwrap().len())
+                .unwrap_or(0),
+            if counts.cxx_truncated_bytes + counts.scip_truncated_bytes > 0 {
+                format!(" (warning: {} truncated tail bytes discarded)",
+                    counts.cxx_truncated_bytes + counts.scip_truncated_bytes)
+            } else { String::new() },
+        );
+        emitter.checkpoint().unwrap().done_shas.lock().unwrap().clone()
+    } else {
+        HashSet::new()
+    };
+    let resumed_skip_set_for_walk = if resumed_skip_set.is_empty() {
+        None
+    } else {
+        Some(&resumed_skip_set)
+    };
+
     let t_walk = Instant::now();
     let by_kind = walk_and_bucket(
         kzip, langs_filter.as_ref(), max_units,
         path_include.as_ref(), path_exclude.as_ref(),
+        resumed_skip_set_for_walk,
     )?;
     let walk_secs = t_walk.elapsed().as_secs_f64();
     let walked_total: usize = by_kind.values().map(|b| b.units.len()).sum();
     eprintln!(
-        "[scry-kzip] phase 1/6: bucketed {} CUs across {} kinds in {:.2}s",
+        "[scry-kzip] phase 1/6: bucketed {} CUs across {} kinds in {:.2}s{}",
         walked_total, by_kind.len(), walk_secs,
+        if resume_decision.is_resume() {
+            format!(" (resume: {} CUs skipped from checkpoint)", resumed_skip_set.len())
+        } else { String::new() },
     );
 
     // Phase 2: pre-resolve each indexer binary so we fail fast if
@@ -185,7 +264,6 @@ pub fn build_packed_from_kzip(
         .num_threads(workers)
         .build()
         .context("build rayon worker pool")?;
-    let emitter = PackedEmitter::new();
     let lang_reports: Mutex<Vec<LangReport>> = Mutex::new(Vec::new());
 
     // Where per-CU sub-kzips land. Cleaned up at the end of the run.
@@ -288,121 +366,6 @@ pub fn build_packed_from_kzip(
     })
 }
 
-/// Walk the kzip and bucket every unit by `IndexerKind`. Always
-/// uses the serial walker; `max_units` enables an early break.
-/// See the crate-level rationale on `driver.rs` for why we don't
-/// fan the walk across rayon workers.
-fn walk_and_bucket(
-    kzip: &Path,
-    langs_filter: Option<&HashSet<String>>,
-    max_units: Option<usize>,
-    path_include: Option<&Vec<String>>,
-    path_exclude: Option<&Vec<String>>,
-) -> Result<HashMap<String, BucketEntry>> {
-    if let Some(cap) = max_units {
-        eprintln!(
-            "[scry-kzip] phase 1/6: walking {} (serial, max_units={})",
-            kzip.display(), cap,
-        );
-    } else {
-        eprintln!(
-            "[scry-kzip] phase 1/6: walking {} (serial, full ingest)",
-            kzip.display(),
-        );
-    }
-    let mut by_kind: HashMap<String, BucketEntry> = HashMap::new();
-    let mut yielded = 0usize;
-    let mut dropped_by_include = 0usize;
-    let mut dropped_by_exclude = 0usize;
-    let mut seen = 0usize;
-    let t_walk_phase = Instant::now();
-    for unit_res in walker::walk_units_serial(kzip, langs_filter)? {
-        let unit = unit_res.context("walk kzip units")?;
-        seen += 1;
-        if seen % 5000 == 0 {
-            eprintln!(
-                "[scry-kzip] phase 1/6: walked {} CUs ({:.1}s, {} bucketed, {} excluded, {} include-dropped)",
-                seen, t_walk_phase.elapsed().as_secs_f64(),
-                yielded, dropped_by_exclude, dropped_by_include,
-            );
-        }
-        // Path filters apply only to CUs that would actually run an
-        // indexer; Skip-kind CUs preserve their per-language skip
-        // tally in the summary regardless of path scope.
-        let kind = dispatch::choose_for(&unit);
-        if matches!(kind, IndexerKind::Skip(_)) {
-            bucket_unit(&mut by_kind, unit);
-            yielded += 1;
-            if let Some(cap) = max_units {
-                if yielded >= cap { break; }
-            }
-            continue;
-        }
-        if let Some(excludes) = path_exclude {
-            if primary_path_matches(&unit.primary_path, excludes) {
-                dropped_by_exclude += 1;
-                continue;
-            }
-        }
-        if let Some(prefixes) = path_include {
-            if !primary_path_matches(&unit.primary_path, prefixes) {
-                dropped_by_include += 1;
-                continue;
-            }
-        }
-        bucket_unit(&mut by_kind, unit);
-        yielded += 1;
-        if let Some(cap) = max_units {
-            if yielded >= cap {
-                eprintln!(
-                    "[scry-kzip] phase 1/6: serial walk hit max_units cap ({})",
-                    cap,
-                );
-                break;
-            }
-        }
-    }
-    if dropped_by_include > 0 {
-        eprintln!(
-            "[scry-kzip] phase 1/6: {} CUs dropped by SCRY_KZIP_PATH_PREFIX",
-            dropped_by_include,
-        );
-    }
-    if dropped_by_exclude > 0 {
-        eprintln!(
-            "[scry-kzip] phase 1/6: {} CUs dropped by SCRY_KZIP_PATH_EXCLUDE",
-            dropped_by_exclude,
-        );
-    }
-    Ok(by_kind)
-}
-
-/// True if `primary_path` starts with any of the given prefixes.
-/// Empty primary paths (CU with no required inputs) never match.
-fn primary_path_matches(primary_path: &str, prefixes: &[String]) -> bool {
-    !primary_path.is_empty() && prefixes.iter().any(|p| primary_path.starts_with(p))
-}
-
-/// Bucket one unit into the per-kind map. Skip buckets get a
-/// `skip-<source language>` label so the summary log distinguishes
-/// per-language skip reasons.
-fn bucket_unit(by_kind: &mut HashMap<String, BucketEntry>, unit: KzipUnit) {
-    let kind = dispatch::choose_for(&unit);
-    let key = match kind {
-        IndexerKind::Skip(_) => format!("skip-{}", unit.language),
-        _ => kind.label().to_string(),
-    };
-    let entry = by_kind.entry(key).or_insert_with(|| BucketEntry {
-        kind,
-        units: Vec::new(),
-        skip_reason: match kind {
-            IndexerKind::Skip(msg) => msg.to_string(),
-            _ => String::new(),
-        },
-    });
-    entry.units.push(unit);
-}
-
 /// Parse `SCRY_KZIP_LANGS=cxx,go` into a set of indexer labels.
 /// Returns `None` if the env var is unset or empty.
 fn parse_kzip_langs_env() -> Option<HashSet<String>> {
@@ -446,13 +409,6 @@ fn parse_prefix_list(var: &str) -> Option<Vec<String>> {
         .filter(|s| !s.is_empty())
         .collect();
     if prefixes.is_empty() { None } else { Some(prefixes) }
-}
-
-struct BucketEntry {
-    kind: IndexerKind,
-    units: Vec<KzipUnit>,
-    /// Populated only when kind is `Skip(_)`.
-    skip_reason: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,19 +464,30 @@ fn run_one_cu(
         else { counters.lock().unwrap().1 += 1; }
         return;
     }
-    // Stream-decode the entries into the emitter.
+    // Decode the entries into a per-CU staging buffer first, then
+    // hand the complete batch to the emitter. The two-step path is
+    // what makes the per-CU on-disk record log atomic — the log
+    // append happens inside `commit_cu` only after the decode has
+    // succeeded, so a SIGKILL between CUs never logs partial state.
+    let mut staged: Vec<DecodedRecord> = Vec::new();
     let decoded = decode_stream(&run.stdout[..], |rec| {
-        emitter.record_decoded(kind, &rec);
+        staged.push(rec);
     });
-    match decoded {
-        Ok(_) => counters.lock().unwrap().0 += 1,
-        Err(e) => {
-            log_to(log_file, format!(
-                "[{} {}/{}] decode failed: {e}\n", label, seq, total,
-            ));
-            counters.lock().unwrap().2 += 1;
-        }
+    if let Err(e) = decoded {
+        log_to(log_file, format!(
+            "[{} {}/{}] decode failed: {e}\n", label, seq, total,
+        ));
+        counters.lock().unwrap().2 += 1;
+        return;
     }
+    if let Err(e) = emitter.commit_cu(&run.unit_sha, kind, &staged) {
+        log_to(log_file, format!(
+            "[{} {}/{}] checkpoint commit failed: {e}\n", label, seq, total,
+        ));
+        counters.lock().unwrap().2 += 1;
+        return;
+    }
+    counters.lock().unwrap().0 += 1;
     // Progress every 50 completions (not every 50th input index — with
     // rayon, items finish out of order, so a `seq % 50` check would
     // only fire when items #50, #100, ... happened to complete, which
@@ -601,30 +568,4 @@ mod tests {
         assert_eq!(allowed.len(), 3);
     }
 
-    /// `bucket_unit` keys skip kinds by `skip-<source language>` and
-    /// runnable kinds by the indexer label. Two units of different
-    /// runnable kinds land in different buckets; two skip units of
-    /// the same source language coalesce.
-    #[test]
-    fn bucket_unit_keys_skip_by_language() {
-        use crate::walker::UnitEncoding;
-        let mk = |lang: &str, sha: &str| KzipUnit {
-            kzip_path: Path::new("/x.kzip").to_path_buf(),
-            unit_sha: sha.to_string(),
-            encoding: UnitEncoding::Proto,
-            language: lang.to_string(),
-            has_class_input: false,
-            primary_path: String::new(),
-        };
-        let mut by_kind = HashMap::new();
-        bucket_unit(&mut by_kind, mk("c++", "a"));
-        bucket_unit(&mut by_kind, mk("go", "b"));
-        bucket_unit(&mut by_kind, mk("rust", "c"));
-        bucket_unit(&mut by_kind, mk("rust", "d"));
-        bucket_unit(&mut by_kind, mk("kotlin", "e")); // no .class → skip
-        assert_eq!(by_kind.get("cxx").map(|b| b.units.len()), Some(1));
-        assert_eq!(by_kind.get("go").map(|b| b.units.len()), Some(1));
-        assert_eq!(by_kind.get("skip-rust").map(|b| b.units.len()), Some(2));
-        assert_eq!(by_kind.get("skip-kotlin").map(|b| b.units.len()), Some(1));
-    }
 }

@@ -122,21 +122,6 @@ struct AnchorAccum {
     pending: Vec<(VName, Role)>,
 }
 
-/// One anchor whose emission is deferred until end-of-CU. Held in
-/// `decode_stream`'s local buffer when the anchor's target VName is
-/// synthetic (empty `path` — Kythe's `###<hash>` convention), giving
-/// us a chance to rewrite the target through the `/kythe/edge/callableas`
-/// map once the full entry stream has been consumed. Anchors with
-/// concrete file-anchored targets emit immediately; only the
-/// "needs-rewriting" subset pays the buffering cost.
-struct DeferredAnchor {
-    file_path: String,
-    start: u32,
-    end: u32,
-    role: Role,
-    target_vn: VName,
-}
-
 /// Stream-decode Entry protos out of `reader`. Calls `sink` once
 /// per flushed `DecodedRecord`. Returns the total Entry count read,
 /// useful for the per-language summary.
@@ -157,24 +142,6 @@ where
 {
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
     let mut anchors: HashMap<VName, AnchorAccum> = HashMap::new();
-    // `callableas` rewrite table: callable-VName → method-def-VName.
-    //
-    // Kythe Java's call edges target a synthetic callable-VName (one
-    // per overload-signature, shaped `kythe:java:###<hash>` — `path`
-    // is empty because the callable isn't bound to a file). That same
-    // callable then carries an outbound `/kythe/edge/callableas` edge
-    // to the actual file-anchored method-def VName. Without following
-    // that second hop, every call across the corpus to e.g.
-    // `Binder.clearCallingIdentity()` ends up referencing the shared
-    // hash placeholder instead of `Binder.java`'s method def — and
-    // none of those calls match the def's symbol in scry's reverse
-    // lookup. Following the chain restores the direct call → def
-    // relationship.
-    let mut callable_to_def: HashMap<VName, VName> = HashMap::new();
-    // Anchors whose target had an empty path get buffered here
-    // pending end-of-CU rewrite. Concrete file-anchored targets
-    // bypass this buffer and stream straight to the sink.
-    let mut deferred: Vec<DeferredAnchor> = Vec::new();
     let mut total: u64 = 0;
     let mut entry_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
@@ -193,31 +160,12 @@ where
         let entry = Entry::parse_from_bytes(&entry_buf)
             .with_context(|| format!("decode Entry #{total}"))?;
         total += 1;
-        process_entry(&entry, &mut anchors, &mut callable_to_def, &mut deferred, &mut sink);
+        process_entry(&entry, &mut anchors, &mut sink);
     }
     // Drop the accumulator. Any anchors that didn't accumulate
     // start + end + at least one edge are incomplete — Kythe
     // routinely emits these for non-binding decls.
     drop(anchors);
-    // Flush deferred anchors, rewriting any whose target VName is
-    // a known callable into the corresponding method-def VName.
-    // Anchors whose target wasn't a callable (e.g. type-only refs
-    // to synthetic generics) keep their original hashed symbol —
-    // that's correct: those refs match against def-anchors that
-    // share the same hash, just not via callableas.
-    for d in deferred {
-        let target_symbol = match callable_to_def.get(&d.target_vn) {
-            Some(def_vn) => def_vn.to_symbol_string(),
-            None => d.target_vn.to_symbol_string(),
-        };
-        sink(DecodedRecord {
-            file_path: d.file_path,
-            start: d.start,
-            end: d.end,
-            target_symbol,
-            role: d.role,
-        });
-    }
     Ok(total)
 }
 
@@ -249,8 +197,6 @@ fn read_varint_from<R: Read>(reader: &mut R) -> Result<Option<u64>> {
 fn process_entry<F: FnMut(DecodedRecord)>(
     entry: &Entry,
     anchors: &mut HashMap<VName, AnchorAccum>,
-    callable_to_def: &mut HashMap<VName, VName>,
-    deferred: &mut Vec<DeferredAnchor>,
     sink: &mut F,
 ) {
     let Some(source) = entry.source.as_ref() else { return };
@@ -262,42 +208,30 @@ fn process_entry<F: FnMut(DecodedRecord)>(
                 if entry.fact_value.as_slice() == b"anchor" {
                     let a = anchors.entry(source_vn.clone()).or_default();
                     a.is_anchor = true;
-                    flush_ready(&source_vn, a, deferred, sink);
+                    flush_ready(&source_vn, a, sink);
                 }
             }
             "/kythe/loc/start" => {
                 if let Some(v) = parse_ascii_u32(&entry.fact_value) {
                     let a = anchors.entry(source_vn.clone()).or_default();
                     a.start = Some(v);
-                    flush_ready(&source_vn, a, deferred, sink);
+                    flush_ready(&source_vn, a, sink);
                 }
             }
             "/kythe/loc/end" => {
                 if let Some(v) = parse_ascii_u32(&entry.fact_value) {
                     let a = anchors.entry(source_vn.clone()).or_default();
                     a.end = Some(v);
-                    flush_ready(&source_vn, a, deferred, sink);
+                    flush_ready(&source_vn, a, sink);
                 }
             }
             _ => {} // facts we don't need
         }
     } else {
-        // Edge. We care about anchor → target edges (Decl / Ref / Call)
-        // AND the callable → method-def edge (`/kythe/edge/callableas`)
-        // that lets us rewrite synthetic callable targets later.
+        // Edge. We only care about anchors-to-targets.
         let Some(target) = entry.target.as_ref() else { return };
         let target_vn = VName::from_proto(target);
         if target_vn.is_empty() { return; }
-        if entry.edge_kind == "/kythe/edge/callableas"
-            || entry.edge_kind.starts_with("/kythe/edge/callableas.")
-        {
-            // source is the callable-VName, target is the method-def
-            // VName. First-writer-wins on conflict (Kythe shouldn't
-            // emit conflicting callableas for the same callable, but
-            // be defensive).
-            callable_to_def.entry(source_vn).or_insert(target_vn);
-            return;
-        }
         let role = match entry.edge_kind.as_str() {
             // defines/binding is the canonical decl edge. defines (no
             // /binding) covers non-binding decls (e.g. forward decls).
@@ -316,60 +250,40 @@ fn process_entry<F: FnMut(DecodedRecord)>(
             _ => return,
         };
         let a = anchors.entry(source_vn.clone()).or_default();
-        if !emit_or_defer(&source_vn, a, &target_vn, role, deferred, sink) {
+        if let Some(rec) = make_record(&source_vn, a, &target_vn, role) {
+            sink(rec);
+        } else {
             a.pending.push((target_vn, role));
         }
     }
 }
 
-/// Emit a finished anchor record either to the sink (concrete
-/// file-anchored target — terminal) or to the deferred buffer
-/// (synthetic empty-path target — pending end-of-CU rewrite through
-/// the callableas map). Returns `true` if the anchor was processable
-/// (facts complete + source has a path); `false` means the caller
-/// must queue the edge in the per-anchor `pending` list and retry
-/// once the missing facts land.
-fn emit_or_defer<F: FnMut(DecodedRecord)>(
+/// Try to emit a single record for `(source, target, role)`. Returns
+/// `None` if the anchor's facts (start, end, is_anchor) aren't all in
+/// yet, or the source VName doesn't carry a path.
+fn make_record(
     source: &VName,
     a: &AnchorAccum,
     target: &VName,
     role: Role,
-    deferred: &mut Vec<DeferredAnchor>,
-    sink: &mut F,
-) -> bool {
-    if !a.is_anchor { return false; }
-    let Some(start) = a.start else { return false; };
-    let Some(end) = a.end else { return false; };
-    if source.path.is_empty() { return true; } // no file to anchor in; drop quietly
-    if target.path.is_empty() && matches!(role, Role::Ref | Role::Call) {
-        // Synthetic target — could be a Kythe callable-VName (which
-        // we'll rewrite via callableas at end-of-CU) or a type-only
-        // hashed VName (which we keep as-is so it can still match
-        // its def-anchor's symbol).
-        deferred.push(DeferredAnchor {
-            file_path: source.path.clone(),
-            start, end, role,
-            target_vn: target.clone(),
-        });
-    } else {
-        sink(DecodedRecord {
-            file_path: source.path.clone(),
-            start, end,
-            target_symbol: target.to_symbol_string(),
-            role,
-        });
-    }
-    true
+) -> Option<DecodedRecord> {
+    if !a.is_anchor { return None; }
+    let start = a.start?;
+    let end = a.end?;
+    if source.path.is_empty() { return None; }
+    Some(DecodedRecord {
+        file_path: source.path.clone(),
+        start, end,
+        target_symbol: target.to_symbol_string(),
+        role,
+    })
 }
 
 /// When start/end/is_anchor have all just landed, flush any edges
-/// that had been queued because they arrived before the facts. Each
-/// pending edge routes through the same emit-or-defer split that
-/// edges arriving after the facts get.
+/// that had been queued because they arrived before the facts.
 fn flush_ready<F: FnMut(DecodedRecord)>(
     source: &VName,
     a: &mut AnchorAccum,
-    deferred: &mut Vec<DeferredAnchor>,
     sink: &mut F,
 ) {
     if !a.is_anchor || a.start.is_none() || a.end.is_none() {
@@ -378,7 +292,9 @@ fn flush_ready<F: FnMut(DecodedRecord)>(
     if a.pending.is_empty() { return; }
     let pending = std::mem::take(&mut a.pending);
     for (target, role) in pending {
-        emit_or_defer(source, a, &target, role, deferred, sink);
+        if let Some(r) = make_record(source, a, &target, role) {
+            sink(r);
+        }
     }
 }
 
@@ -498,86 +414,6 @@ mod tests {
         decode_stream(&stream[..], |r| out.push(r)).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, Role::Ref);
-    }
-
-    /// Helper to build a path-less callable VName the way Kythe Java
-    /// emits them: `signature` carries the overload hash, everything
-    /// else is empty (synthetic node, not bound to a file).
-    fn callable_vn(hash: &str) -> PVName {
-        let mut v = PVName::new();
-        v.signature = format!("###{hash}");
-        v.language = "java".to_string();
-        v  // corpus / path / root all empty
-    }
-
-    /// `callableas` chain rewrite. Kythe Java emits a call edge from
-    /// an anchor to a synthetic callable-VName (path empty, signature
-    /// `###<hash>`), and a separate `callableas` edge from that
-    /// callable to the actual file-anchored method-def VName. Without
-    /// following the second hop, every call across the corpus to a
-    /// given method shares the callable's hash and never matches the
-    /// def's symbol. The rewrite makes the emitted record's
-    /// `target_symbol` equal the method-def VName's symbol string, so
-    /// scry's downstream Kythe-only ref-to-def map resolves the call
-    /// to its def.
-    #[test]
-    fn callable_target_rewritten_through_callableas_edge() {
-        let call_anchor = vn("call-anchor-1", "src/Caller.java");
-        let callable = callable_vn("abc123");
-        let method_def = vn("Bar#bar()", "src/Bar.java");
-        let stream = write_stream(&[
-            fact(call_anchor.clone(), "/kythe/node/kind", b"anchor"),
-            fact(call_anchor.clone(), "/kythe/loc/start", b"10"),
-            fact(call_anchor.clone(), "/kythe/loc/end",   b"13"),
-            edge(call_anchor.clone(), callable.clone(),   "/kythe/edge/ref/call"),
-            // callableas links callable → method def. Emitted AFTER
-            // the call edge to exercise the end-of-CU rewrite path.
-            edge(callable.clone(),   method_def.clone(), "/kythe/edge/callableas"),
-        ]);
-        let mut out = Vec::new();
-        decode_stream(&stream[..], |r| out.push(r)).unwrap();
-        assert_eq!(out.len(), 1, "expected one record, got {out:?}");
-        assert_eq!(out[0].role, Role::Call);
-        assert_eq!(out[0].file_path, "src/Caller.java");
-        assert_eq!(
-            out[0].target_symbol,
-            VName::from_proto(&method_def).to_symbol_string(),
-            "call's target_symbol should have been rewritten through callableas \
-             to the method-def VName, not left as the callable's hash",
-        );
-        assert!(
-            !out[0].target_symbol.contains("###abc123"),
-            "rewritten symbol should NOT carry the callable hash; got {}",
-            out[0].target_symbol,
-        );
-    }
-
-    /// Anchors whose target is a synthetic `###<hash>` VName that
-    /// is NOT a callable (i.e. no callableas edge points out of it)
-    /// must still emit with the original hash so a def-anchor sharing
-    /// the same hash still matches. This covers Kythe's hashed type
-    /// VNames (generics, anonymous classes) that don't go through
-    /// the callable indirection.
-    #[test]
-    fn synthetic_target_without_callableas_keeps_original_hash() {
-        let ref_anchor = vn("ref-anchor-1", "src/User.java");
-        let hashed_type = callable_vn("typeXYZ");
-        let stream = write_stream(&[
-            fact(ref_anchor.clone(), "/kythe/node/kind", b"anchor"),
-            fact(ref_anchor.clone(), "/kythe/loc/start", b"20"),
-            fact(ref_anchor.clone(), "/kythe/loc/end",   b"25"),
-            edge(ref_anchor.clone(), hashed_type.clone(), "/kythe/edge/ref"),
-            // No callableas — this is a type-only reference. End-of-CU
-            // rewrite should leave the symbol alone.
-        ]);
-        let mut out = Vec::new();
-        decode_stream(&stream[..], |r| out.push(r)).unwrap();
-        assert_eq!(out.len(), 1);
-        assert!(
-            out[0].target_symbol.contains("###typeXYZ"),
-            "synthetic non-callable target should retain its hash, got {}",
-            out[0].target_symbol,
-        );
     }
 
     /// `/kythe/edge/ref/call` routes to Call role.

@@ -140,6 +140,24 @@ minimal shape for JSON) extracts `v_name.language` and short-circuits
 CUs that don't match the filter — saving the full decode cost on the
 ~90 %+ of CUs the smoke / scoped runs ignore.
 
+Two further env knobs scope an ingest to a subtree of the repo. They
+operate on the CU's *primary source path* — the first
+`required_input` entry whose extension is a known source-language
+suffix (`.cc`, `.java`, `.kt`, `.go`, `.rs`, …). Skipping headers and
+classpath jars matters: Java CUs put bootclasspath jars first in
+`required_input`, so naive `required_input[0]` filtering would miss
+every `.java` source.
+
+* `SCRY_KZIP_PATH_PREFIX=frameworks/base/,frameworks/native/` — keep
+  only CUs whose primary source starts with one of these prefixes.
+* `SCRY_KZIP_PATH_EXCLUDE=external/,prebuilts/,out/` — drop CUs
+  whose primary source starts with any listed prefix. Evaluated
+  BEFORE the include filter, so excludes win.
+
+Path filters apply only to runnable CUs; Skip-kind CUs (rust, kotlin
+without bytecode) are always counted in the per-language skip tally
+regardless of path scope so the summary stays accurate.
+
 The Kythe extractors see what the compiler sees: post-rewrite sources
 from protologsrc / jarjar / AAPT2 / hiddenAPI / AIDL / KAPT,
 variant-selected source sets, every javac shard, every flag. Soong's

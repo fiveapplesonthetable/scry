@@ -46,6 +46,16 @@
 //!
 //! ## Env knobs (testing / dev)
 //!
+//! * `SCRY_KZIP_PATH_PREFIX=frameworks/base/,frameworks/native/` —
+//!   comma-separated list of path prefixes. Only CUs whose
+//!   `primary_path` (the first source-extension `required_input`)
+//!   starts with at least one prefix are kept. Used to scope an
+//!   ingest to a subtree of the repo (e.g. just `frameworks/base/`
+//!   for a faster targeted run).
+//! * `SCRY_KZIP_PATH_EXCLUDE=external/,prebuilts/` — comma-separated
+//!   list of path prefixes that drop matching CUs. Evaluated BEFORE
+//!   the include filter, so excludes win. Useful to skip vendor /
+//!   third-party code without listing every wanted prefix explicitly.
 //! * `SCRY_KZIP_LANGS=cxx,go` — comma-separated list. Only CUs whose
 //!   indexer kind label appears here will be processed; everything
 //!   else is dropped from the run before phase 2.
@@ -119,9 +129,26 @@ pub fn build_packed_from_kzip(
 
     let langs_filter = parse_kzip_langs_env();
     let max_units = parse_kzip_max_units_env();
+    let path_include = parse_kzip_path_prefix_env();
+    let path_exclude = parse_kzip_path_exclude_env();
+    if let Some(prefixes) = &path_include {
+        eprintln!(
+            "[scry-kzip] phase 1/6: SCRY_KZIP_PATH_PREFIX active ({} prefixes)",
+            prefixes.len(),
+        );
+    }
+    if let Some(prefixes) = &path_exclude {
+        eprintln!(
+            "[scry-kzip] phase 1/6: SCRY_KZIP_PATH_EXCLUDE active ({} prefixes)",
+            prefixes.len(),
+        );
+    }
 
     let t_walk = Instant::now();
-    let by_kind = walk_and_bucket(kzip, langs_filter.as_ref(), max_units)?;
+    let by_kind = walk_and_bucket(
+        kzip, langs_filter.as_ref(), max_units,
+        path_include.as_ref(), path_exclude.as_ref(),
+    )?;
     let walk_secs = t_walk.elapsed().as_secs_f64();
     let walked_total: usize = by_kind.values().map(|b| b.units.len()).sum();
     eprintln!(
@@ -269,6 +296,8 @@ fn walk_and_bucket(
     kzip: &Path,
     langs_filter: Option<&HashSet<String>>,
     max_units: Option<usize>,
+    path_include: Option<&Vec<String>>,
+    path_exclude: Option<&Vec<String>>,
 ) -> Result<HashMap<String, BucketEntry>> {
     if let Some(cap) = max_units {
         eprintln!(
@@ -283,8 +312,34 @@ fn walk_and_bucket(
     }
     let mut by_kind: HashMap<String, BucketEntry> = HashMap::new();
     let mut yielded = 0usize;
+    let mut dropped_by_include = 0usize;
+    let mut dropped_by_exclude = 0usize;
     for unit_res in walker::walk_units_serial(kzip, langs_filter)? {
         let unit = unit_res.context("walk kzip units")?;
+        // Path filters apply only to CUs that would actually run an
+        // indexer; Skip-kind CUs preserve their per-language skip
+        // tally in the summary regardless of path scope.
+        let kind = dispatch::choose_for(&unit);
+        if matches!(kind, IndexerKind::Skip(_)) {
+            bucket_unit(&mut by_kind, unit);
+            yielded += 1;
+            if let Some(cap) = max_units {
+                if yielded >= cap { break; }
+            }
+            continue;
+        }
+        if let Some(excludes) = path_exclude {
+            if primary_path_matches(&unit.primary_path, excludes) {
+                dropped_by_exclude += 1;
+                continue;
+            }
+        }
+        if let Some(prefixes) = path_include {
+            if !primary_path_matches(&unit.primary_path, prefixes) {
+                dropped_by_include += 1;
+                continue;
+            }
+        }
         bucket_unit(&mut by_kind, unit);
         yielded += 1;
         if let Some(cap) = max_units {
@@ -297,7 +352,25 @@ fn walk_and_bucket(
             }
         }
     }
+    if dropped_by_include > 0 {
+        eprintln!(
+            "[scry-kzip] phase 1/6: {} CUs dropped by SCRY_KZIP_PATH_PREFIX",
+            dropped_by_include,
+        );
+    }
+    if dropped_by_exclude > 0 {
+        eprintln!(
+            "[scry-kzip] phase 1/6: {} CUs dropped by SCRY_KZIP_PATH_EXCLUDE",
+            dropped_by_exclude,
+        );
+    }
     Ok(by_kind)
+}
+
+/// True if `primary_path` starts with any of the given prefixes.
+/// Empty primary paths (CU with no required inputs) never match.
+fn primary_path_matches(primary_path: &str, prefixes: &[String]) -> bool {
+    !primary_path.is_empty() && prefixes.iter().any(|p| primary_path.starts_with(p))
 }
 
 /// Bucket one unit into the per-kind map. Skip buckets get a
@@ -336,6 +409,33 @@ fn parse_kzip_langs_env() -> Option<HashSet<String>> {
 /// malformed.
 fn parse_kzip_max_units_env() -> Option<usize> {
     std::env::var("SCRY_KZIP_MAX_UNITS").ok()?.parse::<usize>().ok()
+}
+
+/// Parse `SCRY_KZIP_PATH_PREFIX=frameworks/base/,frameworks/native/`
+/// into a list of path prefixes. A CU is kept iff its `primary_path`
+/// (the first source-extension `required_input` — `.cc`, `.java`,
+/// etc.) starts with any entry. Returns `None` if the env var is
+/// unset or empty after trimming.
+fn parse_kzip_path_prefix_env() -> Option<Vec<String>> {
+    parse_prefix_list("SCRY_KZIP_PATH_PREFIX")
+}
+
+/// Parse `SCRY_KZIP_PATH_EXCLUDE=external/,prebuilts/` into a list
+/// of path prefixes. A CU is dropped iff its `primary_path` starts
+/// with any entry. Evaluated BEFORE the include filter, so excludes
+/// always win over includes. Returns `None` if unset or empty.
+fn parse_kzip_path_exclude_env() -> Option<Vec<String>> {
+    parse_prefix_list("SCRY_KZIP_PATH_EXCLUDE")
+}
+
+fn parse_prefix_list(var: &str) -> Option<Vec<String>> {
+    let spec = std::env::var(var).ok()?;
+    let prefixes: Vec<String> = spec
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if prefixes.is_empty() { None } else { Some(prefixes) }
 }
 
 struct BucketEntry {
@@ -504,6 +604,7 @@ mod tests {
             encoding: UnitEncoding::Proto,
             language: lang.to_string(),
             has_class_input: false,
+            primary_path: String::new(),
         };
         let mut by_kind = HashMap::new();
         bucket_unit(&mut by_kind, mk("c++", "a"));

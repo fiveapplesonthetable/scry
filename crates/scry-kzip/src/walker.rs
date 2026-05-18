@@ -119,6 +119,11 @@ pub struct KzipUnit {
     /// Drives the Kotlin/JVM dispatch fork — jars without bytecode
     /// (e.g. kotlinc-emitted source jars) won't satisfy jvm_indexer.
     pub has_class_input: bool,
+    /// First `required_input` path (the CU's primary source as the
+    /// compiler saw it). Used by `SCRY_KZIP_PATH_PREFIX` to scope an
+    /// ingest to a subtree of the repo (e.g. `frameworks/base/`).
+    /// Empty string if the CU has no required inputs.
+    pub primary_path: String,
 }
 
 /// Optional pre-filter applied during the walk. When `Some`, every

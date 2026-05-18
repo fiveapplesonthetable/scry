@@ -81,6 +81,11 @@ pub(crate) fn read_one_entry(
                 encoding: entry.encoding,
                 language: peeked_lang,
                 has_class_input: false,
+                // Skipped languages (rust/kotlin without bytecode) never
+                // run an indexer, so primary_path doesn't influence
+                // dispatch — empty is fine. Path-prefix filter handled
+                // for runnable kinds via the full-decode branch below.
+                primary_path: String::new(),
             };
             if let Some(allowed) = filter {
                 let kind = crate::dispatch::choose(&unit.language, unit.has_class_input);
@@ -205,12 +210,24 @@ fn kzip_unit_from_cu(
             .map(|i| i.path.as_str().ends_with(".class"))
             .unwrap_or(false)
     });
+    // The "primary path" we expose for `SCRY_KZIP_PATH_PREFIX` filtering
+    // is the first required_input whose path ends in a source-language
+    // extension. Java CUs put classpath jars first in required_input
+    // (the .java source appears later); cxx CUs typically put the .cc
+    // first but headers also appear. Scanning by extension gives the
+    // file the compiler actually treats as the TU's source.
+    let primary_path = cu.required_input.iter()
+        .filter_map(|fi| fi.info.as_ref().map(|i| i.path.as_str()))
+        .find(|p| is_source_path(p))
+        .map(String::from)
+        .unwrap_or_default();
     KzipUnit {
         kzip_path: kzip.to_path_buf(),
         unit_sha: sha.to_string(),
         encoding,
         language,
         has_class_input,
+        primary_path,
     }
 }
 
@@ -227,6 +244,20 @@ pub(crate) fn lenient_json_opts() -> protobuf_json_mapping::ParseOptions {
         ignore_unknown_fields: true,
         ..Default::default()
     }
+}
+
+/// True if `path` looks like a compiler source-language file
+/// (excluding headers, includes, and classpath jars). Used by
+/// `KzipUnit::primary_path` selection so that path-prefix filtering
+/// matches the actual TU source, not the bootclasspath or include
+/// header lists.
+pub(crate) fn is_source_path(path: &str) -> bool {
+    let exts: &[&str] = &[
+        ".cc", ".cpp", ".cxx", ".c++", ".c", ".m", ".mm",
+        ".java", ".kt", ".go", ".rs",
+        ".proto", ".textpb", ".textproto",
+    ];
+    exts.iter().any(|e| path.ends_with(e))
 }
 
 /// Best-effort language inference for units whose `v_name.language`

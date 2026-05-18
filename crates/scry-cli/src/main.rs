@@ -201,6 +201,14 @@ enum Cmd {
         /// narrowing for free wherever the build produced an
         /// indexer artifact (`compile_commands.json` / `*.scip`),
         /// and graceful fallback to lexical-only on uncovered code.
+        ///
+        /// Composes orthogonally with `--strict`: `--lexical`
+        /// chooses HOW refs are matched (compiler symbol identity
+        /// vs tree-sitter name), `--strict` chooses WHICH matched
+        /// refs survive (require Layer 2 resolution vs allow
+        /// unresolved). `--lexical --strict` is a coherent
+        /// "name-match only, but drop the ones the resolver
+        /// couldn't pin to a def" query.
         #[arg(long)]
         lexical: bool,
         /// Compose with build-graph reachability: drop refs whose
@@ -239,6 +247,9 @@ enum Cmd {
         /// PRECISION at the cost of recall: only refs the resolver
         /// can confidently attribute survive. Without --def-in,
         /// just shows refs that resolved to ANY specific def.
+        ///
+        /// Composes orthogonally with `--lexical`: see that flag's
+        /// help for the matrix.
         #[arg(long)]
         strict: bool,
     },

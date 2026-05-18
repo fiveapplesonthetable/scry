@@ -132,12 +132,20 @@ pub struct LangReport {
 /// at `num_cpus/2` to keep JVM-based indexers from OOM'ing the host).
 /// `Some(N)` is honored verbatim — callers who pass a value have
 /// taken responsibility for the resident-set arithmetic.
+///
+/// `source_root` is the on-disk prefix to prepend to Kythe's
+/// corpus-relative paths (`frameworks/base/...` →
+/// `<source_root>/frameworks/base/...`). MANDATORY for the sidecars
+/// to be usable by `scry ref` / `callers` queries — without it the
+/// stored `abs_path` is corpus-relative while queries pass absolute
+/// filesystem paths, so every precision lookup misses.
 pub fn build_packed_from_kzip(
     kzip: &Path,
     out_dir: &Path,
     kythe_root: &Path,
     resume: bool,
     workers: Option<usize>,
+    source_root: &Path,
 ) -> Result<KzipBuildReport> {
     let t_total = Instant::now();
     std::fs::create_dir_all(out_dir)
@@ -154,6 +162,7 @@ pub fn build_packed_from_kzip(
         emit_checkpoint::KzipFingerprint::probe(kzip)?,
         emit_checkpoint::snapshot_env(),
         kythe_root,
+        Some(source_root),
     );
     let resume_decision = enforce_resume_policy(
         resume, &checkpoint_dir, &current_manifest,
@@ -199,7 +208,8 @@ pub fn build_packed_from_kzip(
     let checkpoint_state = PackedEmitter::build_checkpoint_state(
         &checkpoint_dir, seed_manifest, manifest_every,
     )?;
-    let emitter = PackedEmitter::with_checkpoint(checkpoint_state);
+    let emitter = PackedEmitter::with_checkpoint(checkpoint_state)
+        .with_source_root(source_root.to_path_buf());
 
     // On resume, replay the on-disk record log into the in-memory
     // buckets BEFORE phase 1 so the done-set is populated when the

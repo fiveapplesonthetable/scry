@@ -1354,18 +1354,23 @@ fn cmd_build_symbols(
             "build-symbols accepts at most one --build-{{gn,kbuild,cmake,cargo,kzip}} flag"
         );
     }
-    // `--build-kzip` is self-contained — it doesn't need a source root
-    // because the kzip itself carries every input path. Every other
-    // flavour drives libclang or rust-analyzer against a real tree.
-    let needs_source_root = build_kzip.is_none();
-    if needs_source_root && source_root.is_none() {
+    // --source-root is REQUIRED for every flavour, including
+    // --build-kzip. Earlier versions treated --build-kzip as
+    // self-contained, on the (wrong) assumption that the kzip's
+    // VName paths were absolute. They're corpus-relative — without
+    // a source root to prepend, the resulting clang_usrs / scip
+    // sidecars carry paths like `frameworks/base/...` while
+    // queries pass `/home/zim/dev/aosp/frameworks/base/...`, so
+    // every precision lookup misses with "uncovered TU".
+    if source_root.is_none() {
         anyhow::bail!(
-            "--source-root is required (only --build-kzip is allowed without it)"
+            "--source-root PATH is required. For --build-kzip this is the on-disk \
+             root that Kythe's corpus-relative paths resolve against (e.g. \
+             /home/zim/dev/aosp). Without it the precision sidecars are unusable \
+             from query time."
         );
     }
-    let source_root_or_dummy: PathBuf = source_root.clone()
-        .unwrap_or_else(|| PathBuf::from("/"));
-    let source_root: PathBuf = source_root.unwrap_or(source_root_or_dummy);
+    let source_root: PathBuf = source_root.unwrap();
 
     if let Some(build_dir) = build_gn.as_ref() {
         eprintln!("[build-symbols] gn build_dir: {}", build_dir.display());
@@ -1431,13 +1436,13 @@ fn cmd_build_symbols(
     } else if let Some(kzip_path) = build_kzip.as_ref() {
         let workers_override = if kzip_workers == 0 { None } else { Some(kzip_workers) };
         eprintln!(
-            "[build-symbols] kzip: {} (kythe-root: {}, resume={}, workers={})",
-            kzip_path.display(), kythe_root.display(), resume,
+            "[build-symbols] kzip: {} (kythe-root: {}, source-root: {}, resume={}, workers={})",
+            kzip_path.display(), kythe_root.display(), source_root.display(), resume,
             workers_override.map(|n| n.to_string())
                 .unwrap_or_else(|| "auto".to_string()),
         );
         let report = scry_kzip::build_packed_from_kzip(
-            kzip_path, &index_dir, &kythe_root, resume, workers_override,
+            kzip_path, &index_dir, &kythe_root, resume, workers_override, &source_root,
         )
             .with_context(|| format!("build packed sidecars from {}", kzip_path.display()))?;
         eprintln!(

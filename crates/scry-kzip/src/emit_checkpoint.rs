@@ -210,6 +210,14 @@ pub struct CheckpointManifest {
     /// Sorted `[(key, value)]` to keep JSON shape diff-friendly.
     pub env: Vec<(String, String)>,
     pub kythe_root: String,
+    /// Source root prepended to Kythe corpus-relative paths before
+    /// they hit the on-disk sidecar. Empty string when no root was
+    /// passed (legacy manifests / tests). Part of the fingerprint so
+    /// you can't accidentally resume a checkpoint built with one
+    /// source root into a process configured for another — the
+    /// resulting sidecar would carry mixed paths.
+    #[serde(default)]
+    pub source_root: String,
     /// All CU SHAs whose records have been appended to the log AND
     /// reflected in the manifest. The log itself is the source of
     /// truth on resume (this list may be stale by up to
@@ -223,22 +231,28 @@ impl CheckpointManifest {
         kzip: KzipFingerprint,
         env: Vec<(String, String)>,
         kythe_root: &Path,
+        source_root: Option<&Path>,
     ) -> Self {
         Self {
             version: MANIFEST_VERSION,
             kzip,
             env,
             kythe_root: kythe_root.display().to_string(),
+            source_root: source_root
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             done_shas: Vec::new(),
         }
     }
 
-    /// True if `other` covers the same kzip + env + kythe-root.
+    /// True if `other` covers the same kzip + env + kythe-root +
+    /// source-root.
     pub fn fingerprint_matches(&self, other: &Self) -> bool {
         self.version == other.version
             && self.kzip == other.kzip
             && self.env == other.env
             && self.kythe_root == other.kythe_root
+            && self.source_root == other.source_root
     }
 
     /// Human-readable summary of which fields disagree. Used in the
@@ -267,6 +281,12 @@ impl CheckpointManifest {
             diffs.push(format!(
                 "kythe_root (checkpoint={}, current={})",
                 self.kythe_root, other.kythe_root,
+            ));
+        }
+        if self.source_root != other.source_root {
+            diffs.push(format!(
+                "source_root (checkpoint={:?}, current={:?})",
+                self.source_root, other.source_root,
             ));
         }
         diffs.join("; ")
@@ -579,6 +599,7 @@ mod tests {
         ];
         let m = CheckpointManifest::fresh(
             fp.clone(), env.clone(), Path::new("/opt/kythe"),
+            Some(Path::new("/home/zim/dev/aosp")),
         );
         let path = dir.join("manifest.json");
         m.save_atomic(&path).unwrap();
@@ -586,25 +607,44 @@ mod tests {
         assert_eq!(m.kzip, m2.kzip);
         assert_eq!(m.env, m2.env);
         assert_eq!(m.kythe_root, m2.kythe_root);
+        assert_eq!(m.source_root, m2.source_root);
+        assert_eq!(m.source_root, "/home/zim/dev/aosp");
         assert_eq!(m.done_shas, m2.done_shas);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fingerprint mismatch surfaces a human-readable diff.
+    /// Fingerprint mismatch surfaces a human-readable diff. The
+    /// source_root field is part of the fingerprint too — flipping
+    /// it must be detected so a checkpoint built with one root
+    /// can't be silently mixed with a different root.
     #[test]
     fn fingerprint_diff_lists_changed_fields() {
         let env = vec![("SCRY_KZIP_LANGS".to_string(), "cxx".to_string())];
         let m_a = CheckpointManifest::fresh(
             KzipFingerprint { path: "/a".to_string(), size_bytes: 1, mtime_nanos: 1 },
-            env.clone(), Path::new("/k1"),
+            env.clone(), Path::new("/k1"), None,
         );
         let m_b = CheckpointManifest::fresh(
             KzipFingerprint { path: "/a".to_string(), size_bytes: 2, mtime_nanos: 1 },
-            env, Path::new("/k1"),
+            env.clone(), Path::new("/k1"), None,
         );
         assert!(!m_a.fingerprint_matches(&m_b));
         let diff = m_a.fingerprint_diff(&m_b);
         assert!(diff.contains("kzip"), "diff should mention kzip: {diff}");
+
+        // Source-root change alone must also be detected.
+        let m_c = CheckpointManifest::fresh(
+            KzipFingerprint { path: "/a".to_string(), size_bytes: 1, mtime_nanos: 1 },
+            env.clone(), Path::new("/k1"), Some(Path::new("/root/one")),
+        );
+        let m_d = CheckpointManifest::fresh(
+            KzipFingerprint { path: "/a".to_string(), size_bytes: 1, mtime_nanos: 1 },
+            env, Path::new("/k1"), Some(Path::new("/root/two")),
+        );
+        assert!(!m_c.fingerprint_matches(&m_d));
+        let diff_root = m_c.fingerprint_diff(&m_d);
+        assert!(diff_root.contains("source_root"),
+            "diff should mention source_root: {diff_root}");
     }
 
     /// `LogKind::for_indexer` mirrors the bucket routing in emit.rs.

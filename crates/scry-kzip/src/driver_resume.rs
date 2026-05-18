@@ -119,6 +119,7 @@ mod tests {
             },
             Vec::new(),
             Path::new("/k"),
+            None,
         )
     }
 
@@ -173,6 +174,7 @@ mod tests {
             },
             Vec::new(),
             Path::new("/k"),
+            None,
         );
         m_old.save_atomic(&dir.join("manifest.json")).unwrap();
         let m_new = CheckpointManifest::fresh(
@@ -181,6 +183,7 @@ mod tests {
             },
             Vec::new(),
             Path::new("/k"),
+            None,
         );
         let err = enforce_resume_policy(true, &dir, &m_new).unwrap_err();
         let msg = format!("{err:#}");

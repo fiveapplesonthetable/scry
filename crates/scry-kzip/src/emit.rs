@@ -128,7 +128,20 @@ impl CheckpointState {
 /// Routes per-CU `DecodedRecord`s into the right (cxx vs scip)
 /// bucket. Thread-safe: indexer dispatch runs across rayon workers,
 /// each calling `commit_cu` concurrently.
+///
+/// **Source root**. Kythe VName paths are corpus-relative (e.g.
+/// `frameworks/base/services/core/.../BroadcastQueueImpl.java`).
+/// scry's query layer expects absolute filesystem paths
+/// (`/home/zim/dev/aosp/frameworks/base/...`). Without an explicit
+/// source root, every precision lookup misses with "uncovered TU"
+/// because the abs_path on the SCIP/USR record never matches what
+/// the query passes in. `source_root` is the on-disk prefix to
+/// prepend to relative paths; paths that already start with `/`
+/// (e.g. `/kythe_builtins/`) are passed through unchanged — they're
+/// synthetic Kythe paths that don't exist on disk anyway and won't
+/// match any real query.
 pub struct PackedEmitter {
+    source_root: Option<PathBuf>,
     cxx: Mutex<Bucket>,
     scip: Mutex<Bucket>,
     /// `None` when the caller opted out of crash-safety (tests, ad-hoc
@@ -141,10 +154,11 @@ impl Default for PackedEmitter {
 }
 
 impl PackedEmitter {
-    /// Construct an in-memory-only emitter — no on-disk checkpoint.
-    /// Use for tests and for callers that don't need resume support.
+    /// Construct an in-memory-only emitter — no on-disk checkpoint,
+    /// no source root (paths stored verbatim, only useful for tests).
     pub fn new() -> Self {
         Self {
+            source_root: None,
             cxx: Mutex::new(Bucket::default()),
             scip: Mutex::new(Bucket::default()),
             checkpoint: None,
@@ -157,9 +171,43 @@ impl PackedEmitter {
     /// effect (see [`crate::driver::build_packed_from_kzip`]).
     pub fn with_checkpoint(checkpoint: CheckpointState) -> Self {
         Self {
+            source_root: None,
             cxx: Mutex::new(Bucket::default()),
             scip: Mutex::new(Bucket::default()),
             checkpoint: Some(checkpoint),
+        }
+    }
+
+    /// Builder: set the source root that absolutizes Kythe
+    /// corpus-relative paths before they hit the bucket. Without
+    /// this, every precision query against AOSP / kernel returns
+    /// "uncovered TU" because the abs_path on the record is
+    /// `frameworks/...` while the query has `/home/.../frameworks/...`.
+    pub fn with_source_root(mut self, source_root: PathBuf) -> Self {
+        self.source_root = Some(source_root);
+        self
+    }
+
+    /// Borrow the configured source root for fingerprinting /
+    /// diagnostics.
+    pub fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
+    }
+
+    /// Prepend `source_root` to `p` when `p` is corpus-relative.
+    /// Paths that already start with `/` (e.g. `/kythe_builtins/...`)
+    /// are returned unchanged — those are synthetic Kythe paths that
+    /// don't exist on disk and won't match any real query. Paths
+    /// stay borrowed when no transformation is needed (hot path).
+    fn absolutize<'a>(&self, p: &'a str) -> std::borrow::Cow<'a, str> {
+        match (self.source_root.as_ref(), p.starts_with('/')) {
+            (Some(root), false) => {
+                let mut s = root.to_string_lossy().into_owned();
+                if !s.ends_with('/') { s.push('/'); }
+                s.push_str(p);
+                std::borrow::Cow::Owned(s)
+            }
+            _ => std::borrow::Cow::Borrowed(p),
         }
     }
 
@@ -211,7 +259,8 @@ impl PackedEmitter {
             let mut b = bucket.lock().unwrap();
             for rec in records {
                 let role_byte = role_byte_of(rec.role);
-                b.record(&rec.file_path, rec.start, &rec.target_symbol, role_byte);
+                let abs = self.absolutize(&rec.file_path);
+                b.record(&abs, rec.start, &rec.target_symbol, role_byte);
             }
         }
         // Step 3: bookkeeping.
@@ -248,7 +297,8 @@ impl PackedEmitter {
             let mut b = self.cxx.lock().unwrap();
             let rep = cp.cxx_log.replay(|recs| {
                 for r in recs {
-                    b.record(&r.file_path, r.byte_offset, &r.symbol, r.role);
+                    let abs = self.absolutize(&r.file_path);
+                    b.record(&abs, r.byte_offset, &r.symbol, r.role);
                 }
             }).context("replay cxx record log")?;
             counts.cxx_cus = rep.cu_hashes.len();
@@ -264,7 +314,8 @@ impl PackedEmitter {
             let mut b = self.scip.lock().unwrap();
             let rep = cp.scip_log.replay(|recs| {
                 for r in recs {
-                    b.record(&r.file_path, r.byte_offset, &r.symbol, r.role);
+                    let abs = self.absolutize(&r.file_path);
+                    b.record(&abs, r.byte_offset, &r.symbol, r.role);
                 }
             }).context("replay scip record log")?;
             counts.scip_cus = rep.cu_hashes.len();
@@ -461,7 +512,86 @@ mod tests {
             },
             Vec::new(),
             Path::new("/k"),
+            None,
         )
+    }
+
+    /// Kythe paths are corpus-relative; the emitter must prepend the
+    /// configured source root before storing so query-time absolute
+    /// paths can match. Paths that already start with `/` (synthetic
+    /// Kythe paths like `/kythe_builtins/...`) are passed through
+    /// unchanged — they don't exist on disk and won't match any
+    /// real query, but we keep them for storage round-trip.
+    /// Without this, every precision lookup against AOSP returned 0
+    /// hits ("uncovered TU" for every file) regardless of corpus
+    /// coverage. Regression for that bug.
+    #[test]
+    fn absolutize_prepends_source_root_for_relative_only() {
+        let e = PackedEmitter::new().with_source_root(PathBuf::from("/home/zim/dev/aosp"));
+        assert_eq!(
+            &*e.absolutize("frameworks/base/services/core/X.java"),
+            "/home/zim/dev/aosp/frameworks/base/services/core/X.java",
+        );
+        // Trailing-slash safe.
+        let e2 = PackedEmitter::new().with_source_root(PathBuf::from("/home/zim/dev/aosp/"));
+        assert_eq!(
+            &*e2.absolutize("frameworks/base/X.java"),
+            "/home/zim/dev/aosp/frameworks/base/X.java",
+        );
+        // Absolute-prefixed Kythe paths pass through.
+        assert_eq!(&*e.absolutize("/kythe_builtins/include/stdint.h"),
+            "/kythe_builtins/include/stdint.h");
+        // No source root → no transformation.
+        let e3 = PackedEmitter::new();
+        assert_eq!(&*e3.absolutize("frameworks/base/X.java"), "frameworks/base/X.java");
+    }
+
+    /// End-to-end via commit_cu: the bucket row's abs_path field
+    /// must reflect the absolutized form.
+    #[test]
+    fn commit_cu_stores_absolutized_path() {
+        let e = PackedEmitter::new().with_source_root(PathBuf::from("/home/zim/dev/aosp"));
+        let r = dec(
+            "frameworks/base/services/core/X.java",
+            100, "kythe:java:X", Role::Decl,
+        );
+        e.commit_cu("cu-1", IndexerKind::JavaSource, &[r]).unwrap();
+        let out = tmp_dir("abs");
+        e.finalize(&out).unwrap();
+        let bytes = std::fs::read(out.join("scip_index.bin")).unwrap();
+        let abs = b"/home/zim/dev/aosp/frameworks/base/services/core/X.java";
+        let rel = b"frameworks/base/services/core/X.java";
+        // Sidecar should carry the absolute form, never the bare relative.
+        // (The relative form is a substring of the absolute, so just
+        // checking presence is ambiguous — check absence of a path that
+        // starts at a byte boundary right after a length prefix would
+        // be the strict version; here we settle for: the absolute path
+        // is present, and the source_root prefix is too.)
+        assert!(memmem(&bytes, abs).is_some(),
+            "absolutized path must appear in the sidecar");
+        // The bare relative path's first byte should be preceded by '/aosp/'
+        // every time (i.e. it never appears un-prefixed). We can verify
+        // this by counting: every occurrence of `rel` should be inside
+        // the abs string.
+        let rel_count = memmem_count(&bytes, rel);
+        let abs_count = memmem_count(&bytes, abs);
+        assert_eq!(rel_count, abs_count,
+            "every relative-path occurrence should be inside an absolutized one; \
+             rel={rel_count} abs={abs_count}");
+    }
+
+    fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() { return None; }
+        (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+    fn memmem_count(hay: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() { return 0; }
+        let mut i = 0; let mut n = 0;
+        while i + needle.len() <= hay.len() {
+            if &hay[i..i + needle.len()] == needle { n += 1; i += needle.len(); }
+            else { i += 1; }
+        }
+        n
     }
 
     #[test]

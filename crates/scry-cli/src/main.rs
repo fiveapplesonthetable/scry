@@ -2826,7 +2826,7 @@ fn cmd_callgraph(
         if !lexical && (clang_precise || scip_precise) {
             let raw_root = r.lookup_refs_exact(&name);
             let kept = apply_precision_filter(
-                &r, &name, raw_root, clang_precise, scip_precise,
+                &r, &name, raw_root, clang_precise, scip_precise, None,
             )?;
             Some(kept.into_iter().map(|rr| (rr.file_id, rr.byte_start)).collect())
         } else {
@@ -3037,7 +3037,7 @@ fn cmd_impact(
     let (_reach, clang_precise, scip_precise) =
         resolve_precision(lexical, false);
     let callers_precise = apply_precision_filter(
-        &r, &name, raw_callers, clang_precise, scip_precise,
+        &r, &name, raw_callers, clang_precise, scip_precise, None,
     )?;
     let mut callers: Vec<RefRecord> = callers_precise.into_iter()
         .filter(|rr| match r.display_path_cached(rr.file_id) {
@@ -3383,6 +3383,7 @@ pub(crate) fn apply_precision_filter(
     refs: Vec<RefRecord>,
     clang_precise: bool,
     scip_precise: bool,
+    defs_override: Option<Vec<SymbolRecord>>,
 ) -> Result<Vec<RefRecord>> {
     if !clang_precise && !scip_precise {
         return Ok(refs);
@@ -3392,7 +3393,15 @@ pub(crate) fn apply_precision_filter(
     // sits at the keyword for class/struct/typedef). 64 bytes covers
     // every real-world identifier without bridging adjacent decls.
     const WINDOW: u32 = 64;
-    let defs = r.lookup_exact(name);
+    // `defs_override` lets the caller narrow precision to a scoped
+    // def set (e.g. callers passing through `--def-in PATH` filter
+    // the defs to one class before we build def_usrs / def_syms).
+    // Without it, the filter pulls the full corpus-wide def list,
+    // which for common method names (`set`, `get`, `add`, ...) is
+    // hundreds of defs across unrelated classes — letting through
+    // refs to e.g. `ThreadLocal.set` when the user asked about
+    // `SystemProperties.set`, wherever the SCIP CU is missing.
+    let defs = defs_override.unwrap_or_else(|| r.lookup_exact(name));
 
     // Cached lazy accessors. Open is microseconds (header parse +
     // mmap calls); the lazy `abs_path → path_id` index is built on
@@ -3633,13 +3642,24 @@ fn cmd_ref(
     // (build-resolutions couldn't narrow them) pass through — we'd
     // rather over-include than silently drop the ones Layer 2
     // resolution didn't reach.
+    //
+    // `scoped_defs` carries the narrowed def set into
+    // `apply_precision_filter` below so the SCIP / clang USR identity
+    // check compares against only the in-scope defs, not the full
+    // corpus-wide def union. Without this, common method names
+    // (`set`, `get`, `add`, …) degenerate the filter into "is this
+    // any same-named def anywhere" — any uncovered CU then lets
+    // unrelated `Foo.set` / `Bar.set` calls through even when the
+    // user scoped to `SystemProperties.set`.
+    let mut scoped_defs: Option<Vec<SymbolRecord>> = None;
     let filtered = if let Some(def_path) = def_in.as_deref() {
-        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
-            .iter()
+        let defs_in_scope: Vec<SymbolRecord> = r.lookup_exact(&name)
+            .into_iter()
             .filter(|s| r.display_path_cached(s.file_id)
                 .is_some_and(|dp| dp.contains(def_path)))
-            .map(|s| s.id)
             .collect();
+        let target_ids: std::collections::HashSet<u64> =
+            defs_in_scope.iter().map(|s| s.id).collect();
         if target_ids.is_empty() {
             eprintln!(
                 "[scry] --def-in: no def of {name:?} found in any file containing \
@@ -3647,6 +3667,7 @@ fn cmd_ref(
             );
             filtered
         } else {
+            scoped_defs = Some(defs_in_scope);
             let before = filtered.len();
             let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
                 match rr.resolved_to {
@@ -3766,7 +3787,7 @@ fn cmd_ref(
         filtered
     };
     let filtered = apply_precision_filter(
-        &r, &name, filtered, clang_precise, scip_precise,
+        &r, &name, filtered, clang_precise, scip_precise, scoped_defs,
     )?;
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
     // --format count: just the totals, no per-hit rows. Pays off for
@@ -9048,7 +9069,7 @@ fn serve_callgraph(
     let root_precise_sites: Option<std::collections::HashSet<(u32, u32)>> =
         if clang_precise || scip_precise {
             let raw_root = r.lookup_refs_exact(name);
-            match apply_precision_filter(r, name, raw_root, clang_precise, scip_precise) {
+            match apply_precision_filter(r, name, raw_root, clang_precise, scip_precise, None) {
                 Ok(kept) => Some(
                     kept.into_iter().map(|rr| (rr.file_id, rr.byte_start)).collect()
                 ),
@@ -9180,7 +9201,7 @@ fn serve_impact(
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
     let callers_precise = if clang_precise || scip_precise {
-        apply_precision_filter(r, name, raw_callers, clang_precise, scip_precise)
+        apply_precision_filter(r, name, raw_callers, clang_precise, scip_precise, None)
             .unwrap_or_else(|_| r.lookup_refs_exact(name).into_iter()
                 .filter(|rr| rr.kind == scry_store::RefKind::Call).collect())
     } else {

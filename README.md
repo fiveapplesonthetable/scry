@@ -69,11 +69,12 @@ narrowing by default — no flags to remember.
 bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/master/scripts/install_indexers.sh)
 ```
 
-Installs libclang + JDK + Go + npm + the SCIP indexers for all
-seven languages (TypeScript, Python, Rust, Go, Java, Kotlin, C/C++).
+Installs libclang + JDK + Go + npm + the SCIP indexers for the
+polyglot languages (TypeScript, Python, Rust, Go, Java, C/C++).
+For AOSP Java/Kotlin/C++, scry consumes a Kythe kzip directly via
+`scry build-symbols --build-kzip PATH` — see [`docs/PIPELINE.md`].
 Idempotent. Drops binaries under `~/.local/bin` (override with
-`PREFIX=…`). Builds semanticdb-kotlinc from source via sbt because
-it's not on Maven Central. See [`scripts/install_indexers.sh`].
+`PREFIX=…`). See [`scripts/install_indexers.sh`].
 
 [`scripts/install_indexers.sh`]: scripts/install_indexers.sh
 

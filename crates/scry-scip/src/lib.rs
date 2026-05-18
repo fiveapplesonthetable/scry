@@ -67,8 +67,8 @@ pub fn import_scip(
 ///
 /// `append=false` (default for [`import_scip`]): replace the existing
 /// sidecar with the imported content. Use this when you've re-merged
-/// every input from scratch (e.g. the JVM pipeline that always produces
-/// one mega-SCIP from a fresh `scip-java index-semanticdb` pass).
+/// every input from scratch (e.g. one mega-SCIP rebuilt from all
+/// per-target shards).
 ///
 /// Append mode is what makes per-language indexer composition work:
 /// run scip-go, then rust-analyzer scip, then scip-python, etc. Each

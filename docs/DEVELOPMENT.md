@@ -610,100 +610,38 @@ test pinning the new behaviour.
 What's currently shipping vs what's missing for 100% Kythe-class
 symbol-identity coverage on the four reference corpora:
 
-| Language | Corpus      | Current | Gap to 100% | Blocker                                    |
-|----------|-------------|---------|-------------|--------------------------------------------|
-| C/C++/ObjC | Perfetto (GN)    | 100% real-failures-free (1349 missing-source TUs correctly classified as skipped) | none | — |
-| C        | Linux (Kbuild)    | ~97% (634 / 24,980 TUs `CXError_ASTReadError`) | 3% | classify the 634 by directory + dump representative `CXDiagnostic` per group; most are likely arch-specific include paths in the compdb |
-| Java     | AOSP (Soong)      | 92% OK + partial (1119 OK / 81 partial / 13 no-output of 1213) | 8% | modules whose ALL variants are unbuilt — needs `m droid` to materialise Soong intermediates |
-| Kotlin   | AOSP (Soong)      | ~89% (200 OK + 31 partial of 258, pre-variant-fallback) | 11% | same as Java + kotlinc 2.x codegen bugs (`Exception while generating code for`) we can't fix in our patch |
-| Rust     | scry (Cargo)     | 100% | none | — |
-| Rust     | AOSP             | not exercised | n/a | AOSP's Rust crates compile via Soong's `cargo` integration; bridge plumbing exists but no end-to-end run yet |
-| Go       | AOSP             | not exercised | n/a | no Go in AOSP root; would apply to a separate Go corpus |
-| TypeScript | scry-ui          | partial — `editors/vscode` works | unknown | full scry-ui workspace not yet indexed |
-| Python   | scry             | partial — one .py file missing on disk gets cleanly skipped | unknown | full Python corpus not yet exercised |
+| Language   | Corpus            | Path                          | Current                                                                          | Blocker to 100%                                                                                  |
+|------------|-------------------|-------------------------------|----------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| C/C++/ObjC | AOSP              | kzip (`xref_cxx`)             | every CU reachable in `build_kzip.bash` output                                   | unbuilt module variants — operator runs `m <module>` to expand the kzip                          |
+| C/C++/ObjC | Perfetto (GN)     | `compile_commands.json` → libclang | 100% real-failures-free (1349 missing-source TUs correctly classified as skipped) | — |
+| C          | Linux (Kbuild)    | `compile_commands.json` → libclang | ~97% (634 / 24,980 TUs `CXError_ASTReadError`)                              | classify the 634 by directory + dump representative `CXDiagnostic` per group; most are likely arch-specific include paths in the compdb. Alternative: run `cxx_extractor` over the same compdb to emit a kernel-wide kzip and ingest via `--build-kzip`. |
+| Java       | AOSP              | kzip (`xref_java`)            | every CU reachable in `build_kzip.bash` output                                   | unbuilt module variants — operator runs `m <module>` to expand the kzip                          |
+| Kotlin     | AOSP              | kzip (`xref_kotlin`)          | every CU reachable in `build_kzip.bash` output                                   | same as Java                                                                                     |
+| Rust       | scry              | `rust-analyzer scip`          | 100%                                                                             | — |
+| Rust       | AOSP              | kzip (`xref_rust`)            | not exercised                                                                    | needs end-to-end verification through the same kzip pipeline                                    |
+| Go         | AOSP              | n/a                           | not exercised                                                                    | no Go in AOSP root; would apply to a separate Go corpus                                          |
+| TypeScript | scry-ui           | `scip-typescript`             | partial — `editors/vscode` works                                                 | full scry-ui workspace not yet indexed                                                           |
+| Python     | scry              | `scip-python`                 | partial — one .py file missing on disk gets cleanly skipped                      | full Python corpus not yet exercised                                                             |
 
-The **only blocker for AOSP Java + Kotlin reaching 100%** is
-running `m droid` (or targeted `m <module>` for the specific
-failing modules) to materialise the Soong intermediates the
-build-symbols pipeline reads. scry's own bridge can't generate
-KAPT / AAPT2 / AIDL / aconfig stubs — that's Soong's job, and
-re-implementing it inside scry-bridge is explicitly out of scope
-(2-3 weeks of work, would conflict with the user's existing
-`out/soong/` state).
+The AOSP precision path is a single command:
+`scry build-symbols --build-kzip PATH.kzip`. The kzip is produced
+by `build_kzip.bash` (in `~/dev/aosp/build/soong/`), which wraps
+Soong's own compilation graph with Kythe extractors for **C, C++,
+ObjC, Java, Kotlin, and Rust**. scry drives the Kythe
+`kythe_indexer_{java,kotlin,cxx}` binaries against each CU in the
+kzip and writes packed sidecars (`clang_usrs.bin`,
+`scip_index.bin`) — no compiler re-invocation, no per-build-system
+ninja parsing, no compiler plugin.
 
-What this means in practice: every CALLER of any AOSP symbol that
-WAS reached during the build is precisely resolvable. The
-remaining 8% / 11% are modules where we have neither source nor
-classpath because the build never produced them.
+The kzip path generalises beyond Soong. Any C/C++ project with a
+`compile_commands.json` can be turned into a kzip by running
+Kythe's standalone `cxx_extractor`; the same ingest path applies.
+That's the planned upgrade for the Linux corpus — the current
+libclang path stays as a no-extra-toolchain default.
 
-### build-symbols: AOSP coverage ceiling without a full `m`
-
-Current AOSP pipeline ships every JVM-side fix that doesn't require
-re-running Soong's own codegen. Concretely (after commits
-`77062bf … aa3dd4c`):
-
-- ninja-variable expansion across all shards
-- `javacFlags` / `kotlincFlags` forwarders with surgical filtering
-- patched `semanticdb-kotlinc` (FirFileSymbol stderr noise)
-- `--patch-module=java.base=…` for libcore + ART
-- shell-aware quoted-blob handling for ErrorProne
-- AIDL / KAPT srcjar extraction, sibling `R.jar`/`aconfig` classpath
-- variant fallback (pick the variant whose `.rsp` files exist)
-- rule-name classifier: only `g.java.javac` / `g.java.kotlinc` produce
-  `JavacRule` / `KotlincRule`; sibling rules like
-  `g.java.javac-split-srcJars` whose first output also lives under
-  `…/javac/srcjarsNN.jar` no longer masquerade as javac compiles.
-  Recovers `framework-minus-apex` and the sharded javac modules whose
-  first-visited variant happened to be the split-srcjars rule.
-
-The remaining failures are modules whose entire variant set is
-unbuilt on disk (no `.rsp`, no `classpath.rsp`, no `gen/aidl/*`).
-For these, the only path to "0 failures" is materialising the
-Soong intermediates. Two options for the operator:
-
-1. **Targeted**:
-   ```sh
-   cd ~/dev/aosp && source build/envsetup.sh
-   lunch aosp_arm64-trunk_staging-userdebug
-   m PhotopickerLib SystemUI-core Launcher3QuickStepLib \
-     HealthConnectLibrary PermissionController-lib \
-     PlatformComposeSceneTransitionLayout
-   ```
-   ~30 min, ~5 GB additional `out/soong/` cost. Plugs ~20 specific
-   modules currently in `no-output`.
-
-2. **Full**:
-   ```sh
-   m droid
-   ```
-   ~2–4 h incremental, ~50–150 GB `out/soong/` cost depending on
-   lunch combo. Materialises every reachable variant.
-
-Out of scope: implementing AAPT2 / AIDL / KAPT / KSP / protoc /
-aconfig codegen pipelines inside scry-bridge ("become Soong"). The
-practical sequence is `m` first, scry build-symbols second.
-
-### Per-language partial-success classifier
-
-`tolerate_javac_errors=true` and `tolerate_kotlinc_errors=true`
-currently dump every PartialOnError compilation's first stderr line
-to the log. The classifier should split partials into:
-
-- **classpath-gap partial**: stderr contains `unresolved reference`
-  / `cannot find symbol` / `package X does not exist`. Plot of
-  resolved jars suggests these are missing-jar issues, not
-  scry-bridge bugs. Aggregate into one summary line per run.
-- **codegen partial**: stderr contains `Exception while generating
-  code for` or kotlinc 2.x FIR/IR error. Real plugin / compiler
-  bugs.
-- **source-error partial**: stderr contains a `.java:N:M: error:`
-  with a real syntactic / type-system fault from the user's code.
-  Real source defects — should never be tolerated, but currently
-  are.
-
-Splitting the partial bucket lets operators tell "20 module's worth
-of missing-codegen Hilt stubs" apart from "one source file has a
-genuine compile error".
+The only "missing CU" failure mode is a source file the build
+system never compiled. For AOSP, run `m <module>` or `m droid` to
+expand the kzip.
 
 ### Kernel 634 parse failures
 

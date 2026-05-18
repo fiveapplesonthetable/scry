@@ -19,11 +19,12 @@ format is canonical, so adding one is just a docs change.
 | **TypeScript**    | `scip-typescript`             | `npm i -D @sourcegraph/scip-typescript && npx scip-typescript index`              | Dogfooded against scry's CI fixture in v0.1.16. Outputs `index.scip`. |
 | **JavaScript**    | `scip-typescript`             | same as above; pass `.js` files via your `tsconfig.json`  | Same producer, allows JS via `allowJs: true`.                         |
 | **Python**        | `scip-python`                 | `npx @sourcegraph/scip-python index .`                    | Requires Python 3.8+ on PATH.                                         |
-| **Java**          | `scip-java`                   | `coursier launch com.sourcegraph:scip-java_2.13:0.10.0 -- index --build-tool gradle` | Works with Gradle / Maven / Bazel.                                    |
-| **Kotlin**        | `scip-kotlin`                 | `scip-kotlin --output index.scip src/`                    | https://github.com/sourcegraph/scip-kotlin                            |
+| **Java**          | Kythe kzip                    | `scry build-symbols --build-kzip PATH.kzip`               | scry's preferred path for AOSP / Bazel / anything Kythe-integrated. Falls back to `scip-java` for standalone Gradle / Maven projects. |
+| **Kotlin**        | Kythe kzip                    | `scry build-symbols --build-kzip PATH.kzip`               | scry's only reliable Kotlin path. Use kzip via a Kythe-aware build. |
 | **Go**            | `gopls`                       | `gopls scip ./...`                                        | Standard distribution; no extra install on most setups.               |
-| **Rust**          | `rust-analyzer`               | `rust-analyzer --output-scip index.scip`                  | Available in any `rustup component add rust-analyzer` install.        |
-| **C / C++ / ObjC** | `lsif-clang`                 | `lsif-clang --project-root=. compile_commands.json > index.scip`                  | Alternative to in-tree `scry clang-index`; useful when you already have lsif-clang in your pipeline. |
+| **Rust**          | `rust-analyzer`               | `rust-analyzer --output-scip index.scip`                  | Available in any `rustup component add rust-analyzer` install. For AOSP, Rust ships in the same kzip via Soong's `xref_rust`. |
+| **C / C++ / ObjC** | Kythe kzip                   | `scry build-symbols --build-kzip PATH.kzip`               | Preferred path. The kzip is produced by `cxx_extractor` (standalone, reads `compile_commands.json`) or by Soong's `xref_cxx` on AOSP. |
+| **C / C++ / ObjC (alt)** | `lsif-clang`           | `lsif-clang --project-root=. compile_commands.json > index.scip` | Use when you already have lsif-clang wired into a non-Kythe build. |
 | **Ruby**          | `scip-ruby`                   | `scip-ruby --index-file index.scip`                       | https://github.com/sourcegraph/scip-ruby                              |
 | **C#**            | `scip-dotnet`                 | `dotnet scip --output index.scip`                         | Preview as of 2026-05.                                                |
 

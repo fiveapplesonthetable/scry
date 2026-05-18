@@ -22,12 +22,12 @@
 #     - scip-python       (npm global)
 #     - rust-analyzer     (rustup component)
 #     - scip-go           (go install github.com/scip-code/scip-go)
-#     - scip-java         (GitHub release tarball)
-#     - gradle 8.10.2     (Apache distribution; needed by scip-java/kotlin)
+#     - scip-java         (GitHub release tarball; needs gradle on PATH
+#                          only if you point it at a Gradle project)
 #
-#   Built-from-source (~/scry-build/scip-kotlin):
-#     - sbt 1.10.5        (downloaded; needed to build scip-kotlin)
-#     - semanticdb-kotlinc  (sbt publishM2 → ~/.m2/repository)
+# AOSP Java/Kotlin/C++ precision uses the Kythe kzip pipeline
+# instead of per-language SCIP indexers — see docs/PIPELINE.md
+# and `scry build-symbols --build-kzip PATH`.
 #
 # After this script finishes:
 #   scry index <ROOT> -o <IDX>
@@ -123,90 +123,15 @@ install_scip_java() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Gradle (needed by scip-java + scip-kotlin paths)
-# ---------------------------------------------------------------------------
-install_gradle() {
-    if have gradle; then log "gradle already on PATH"; return; fi
-    log "installing gradle 8.10.2"
-    local zip="$BUILD_DIR/gradle-8.10.2-bin.zip"
-    curl -fsSL https://services.gradle.org/distributions/gradle-8.10.2-bin.zip -o "$zip"
-    unzip -q -o "$zip" -d "$BUILD_DIR"
-    ln -sf "$BUILD_DIR/gradle-8.10.2/bin/gradle" "$PREFIX/bin/gradle"
-}
-
-# ---------------------------------------------------------------------------
-# 7. sbt + scip-kotlin (semanticdb-kotlinc, built from source)
-# ---------------------------------------------------------------------------
-install_sbt_and_scip_kotlin() {
-    if ! have sbt; then
-        log "installing sbt 1.10.5"
-        local sbt_tgz="$BUILD_DIR/sbt.tgz"
-        curl -fsSL https://github.com/sbt/sbt/releases/download/v1.10.5/sbt-1.10.5.tgz \
-            -o "$sbt_tgz"
-        tar -xzf "$sbt_tgz" -C "$BUILD_DIR"
-        ln -sf "$BUILD_DIR/sbt/bin/sbt" "$PREFIX/bin/sbt"
-    fi
-    if [[ -d "$HOME/.m2/repository/com/sourcegraph/semanticdb-kotlinc" ]]; then
-        log "semanticdb-kotlinc already published to ~/.m2"
-        return
-    fi
-    log "cloning scip-kotlin + sbt publishM2 (this builds the Kotlin compiler plugin)"
-    local kt_src="$BUILD_DIR/scip-kotlin-src"
-    if [[ ! -d "$kt_src" ]]; then
-        git clone --depth 1 https://github.com/sourcegraph/scip-kotlin.git "$kt_src"
-    fi
-    # Patch: silence the spurious "unknown symbol kind FirFileSymbol"
-    # stderr noise upstream emits on Kotlin 2.x. The plugin already
-    # returned NONE for that case — it just printed first, which made
-    # scry-bridge mis-classify every kotlinc compilation containing
-    # a top-level fun/val as "partial / no output". The fix is one
-    # explicit `is FirFileSymbol -> SemanticdbSymbolDescriptor.NONE`
-    # arm before the catch-all in the `semanticdbDescriptor` cascade.
-    local cache_file="$kt_src/semanticdb-kotlinc/src/main/kotlin/com/sourcegraph/semanticdb_kotlinc/SymbolsCache.kt"
-    if [[ -f "$cache_file" ]] && ! grep -q "symbol is FirFileSymbol -> SemanticdbSymbolDescriptor.NONE" "$cache_file"; then
-        log "applying FirFileSymbol noise-suppression patch to $cache_file"
-        # Insert the explicit FirFileSymbol arm before the catch-all `else`
-        # that prints "unknown symbol kind …" to stderr.
-        python3 -c '
-import io, sys, re
-path = "'"$cache_file"'"
-src = open(path).read()
-needle = ("            symbol is FirVariableSymbol ->\n"
-          "                SemanticdbSymbolDescriptor(Kind.TERM, symbol.name.toString())\n"
-          "            else -> {\n"
-          "                err.println(\"unknown symbol kind ${symbol.javaClass.simpleName}\")")
-repl   = ("            symbol is FirVariableSymbol ->\n"
-          "                SemanticdbSymbolDescriptor(Kind.TERM, symbol.name.toString())\n"
-          "            // patched-by-scry-install: FirFileSymbol legitimately has no\n"
-          "            // SemanticDB descriptor (file-level container, not a declaration).\n"
-          "            // Returning NONE silently here matches the previous catch-all\n"
-          "            // behaviour minus the spurious stderr noise.\n"
-          "            symbol is FirFileSymbol -> SemanticdbSymbolDescriptor.NONE\n"
-          "            else -> {\n"
-          "                err.println(\"unknown symbol kind ${symbol.javaClass.simpleName}\")")
-if needle not in src:
-    sys.exit("patch needle not found; upstream may have refactored — skipping")
-open(path, "w").write(src.replace(needle, repl, 1))
-' || warn "patch could not be applied (upstream may have changed); proceeding anyway"
-    fi
-    (cd "$kt_src" && "$PREFIX/bin/sbt" publishM2)
-}
-
-# ---------------------------------------------------------------------------
 # Wrap-up: print a one-line status summary so the user knows what's wired.
 # ---------------------------------------------------------------------------
 summary() {
     log "---- indexer install summary ----"
-    for tool in scip-typescript scip-python rust-analyzer scip-go scip-java gradle sbt; do
-        if have "$tool"; then printf "  \033[32mOK\033[0m   %s -> %s\n" "$tool" "$(command -v "$tool")"
-        else printf "  \033[31mMISS\033[0m %s (not installed)\n" "$tool"
+    for tool in scip-typescript scip-python rust-analyzer scip-go scip-java; do
+        if have "$tool"; then printf "  OK   %s -> %s\n" "$tool" "$(command -v "$tool")"
+        else printf "  MISS %s (not installed)\n" "$tool"
         fi
     done
-    if [[ -d "$HOME/.m2/repository/com/sourcegraph/semanticdb-kotlinc" ]]; then
-        printf "  \033[32mOK\033[0m   semanticdb-kotlinc (~/.m2/repository/com/sourcegraph/semanticdb-kotlinc)\n"
-    else
-        printf "  \033[31mMISS\033[0m semanticdb-kotlinc (~/.m2)\n"
-    fi
     log "PATH still needs \$PREFIX/bin? Add to your shell rc:"
     echo "    export PATH=\"$PREFIX/bin:\$PATH\""
 }
@@ -216,6 +141,4 @@ install_npm_indexers
 install_rust_analyzer
 install_scip_go
 install_scip_java
-install_gradle
-install_sbt_and_scip_kotlin
 summary

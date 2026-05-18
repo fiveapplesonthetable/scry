@@ -245,7 +245,20 @@ pub fn run_indexer(
     kythe_root: &Path,
 ) -> Result<IndexerRun> {
     let bin = resolve_indexer(kythe_root, kind)?;
-    let mut cmd = build_command(&bin, kind, cu_kzip_path);
+    // JVM-based indexers need a writable temp directory to unpack the
+    // JDK system modules (`--system <jdk_image>` in the CU's compiler
+    // args). Without it, CompilationUnitPathFileManager.setSystemOption
+    // raises IllegalArgumentException and the indexer emits zero
+    // entries — silently, because java_indexer.jar still exits 0.
+    // We allocate one per CU under the same staging dir as `cu_kzip`
+    // so the dir lives on `/mnt/agent/tmp` (via `scry_tmp_dir`) and
+    // gets removed alongside the rest of the staging tree.
+    let jvm_tmp_dir = jvm_temp_dir_for(cu_kzip_path, unit_sha, kind);
+    if let Some(dir) = jvm_tmp_dir.as_ref() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("mkdir java_indexer temp_directory {}", dir.display()))?;
+    }
+    let mut cmd = build_command(&bin, kind, cu_kzip_path, jvm_tmp_dir.as_deref());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let t = std::time::Instant::now();
@@ -256,6 +269,12 @@ pub fn run_indexer(
     let exit_code = output.status.code().unwrap_or(-1);
     let stderr = output.stderr;
     let tail_start = stderr.len().saturating_sub(4096);
+    // Best-effort cleanup: the staging tree gets wiped at the end of
+    // the run regardless, this just keeps it from ballooning if a
+    // long phase 3 processes hundreds of thousands of java CUs.
+    if let Some(dir) = jvm_tmp_dir.as_ref() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     Ok(IndexerRun {
         kind,
         unit_sha: unit_sha.to_string(),
@@ -266,10 +285,32 @@ pub fn run_indexer(
     })
 }
 
+/// Per-CU `--temp_directory` path for JVM indexers, or `None` for
+/// indexers that don't take that flag. Sits next to `cu_kzip` in the
+/// staging dir so it inherits `/mnt/agent/tmp` from the caller.
+fn jvm_temp_dir_for(
+    cu_kzip: &Path,
+    unit_sha: &str,
+    kind: IndexerKind,
+) -> Option<PathBuf> {
+    match kind {
+        IndexerKind::JavaSource | IndexerKind::JvmBytecode => {
+            let parent = cu_kzip.parent()?;
+            Some(parent.join(format!("cu-{unit_sha}-jvm-tmp")))
+        }
+        _ => None,
+    }
+}
+
 /// Build the right `Command` for each indexer kind. Each indexer
 /// expects a slightly different argv form — see the per-binary help
 /// output for the source of truth.
-fn build_command(bin: &Path, kind: IndexerKind, cu_kzip: &Path) -> Command {
+fn build_command(
+    bin: &Path,
+    kind: IndexerKind,
+    cu_kzip: &Path,
+    jvm_tmp_dir: Option<&Path>,
+) -> Command {
     match kind {
         IndexerKind::Cxx | IndexerKind::Go => {
             // Both take the kzip as a positional argument and emit
@@ -279,14 +320,22 @@ fn build_command(bin: &Path, kind: IndexerKind, cu_kzip: &Path) -> Command {
             c
         }
         IndexerKind::JavaSource | IndexerKind::JvmBytecode => {
-            // `java -jar <indexer>.jar <kzip>`. We bound the JVM heap
-            // so a runaway CU can't claim the whole machine.
+            // `java -jar <indexer>.jar --temp_directory <dir> <kzip>`.
+            // The `--temp_directory` flag is mandatory whenever the
+            // CU's compiler args carry `--system <jdk_image>` (every
+            // modern AOSP build does) — without it java_indexer
+            // silently emits zero entries on those CUs. We bound the
+            // JVM heap at 2g so a runaway CU can't claim the whole
+            // machine.
             let mut c = Command::new("java");
             c.arg("-Xmx2g")
                 .arg("-jar")
                 .arg(bin)
-                .arg("--ignore_empty_kzip")
-                .arg(cu_kzip);
+                .arg("--ignore_empty_kzip");
+            if let Some(dir) = jvm_tmp_dir {
+                c.arg("--temp_directory").arg(dir);
+            }
+            c.arg(cu_kzip);
             c
         }
         IndexerKind::Proto => {
@@ -330,5 +379,66 @@ mod tests {
         let tmp = scry_bridge::scry_tmp_dir().join("any");
         let err = resolve_indexer(&tmp, IndexerKind::Skip("test reason")).unwrap_err();
         assert!(format!("{err}").contains("skipped"));
+    }
+
+    /// JVM kinds get a per-CU temp dir sibling to the cu_kzip; other
+    /// kinds skip the allocation entirely. The path encodes the unit
+    /// sha so concurrent workers don't collide.
+    #[test]
+    fn jvm_temp_dir_only_for_jvm_kinds() {
+        let cu = Path::new("/mnt/agent/tmp/staging/cu-abc123.kzip");
+        let sha = "abc123";
+        assert_eq!(
+            jvm_temp_dir_for(cu, sha, IndexerKind::JavaSource),
+            Some(PathBuf::from("/mnt/agent/tmp/staging/cu-abc123-jvm-tmp")),
+        );
+        assert_eq!(
+            jvm_temp_dir_for(cu, sha, IndexerKind::JvmBytecode),
+            Some(PathBuf::from("/mnt/agent/tmp/staging/cu-abc123-jvm-tmp")),
+        );
+        assert_eq!(jvm_temp_dir_for(cu, sha, IndexerKind::Cxx), None);
+        assert_eq!(jvm_temp_dir_for(cu, sha, IndexerKind::Go), None);
+        assert_eq!(jvm_temp_dir_for(cu, sha, IndexerKind::Proto), None);
+        assert_eq!(jvm_temp_dir_for(cu, sha, IndexerKind::TextProto), None);
+        assert_eq!(jvm_temp_dir_for(cu, sha, IndexerKind::Skip("x")), None);
+    }
+
+    /// Java indexer commands MUST include `--temp_directory` whenever
+    /// a tmp dir is provided. Regression test for the services.core
+    /// "empty" CU bug: without this flag, java_indexer.jar silently
+    /// returns zero entries for every CU whose compiler args include
+    /// `--system <jdk_image>` (i.e. every modern Java CU).
+    #[test]
+    fn java_command_includes_temp_directory() {
+        let bin = Path::new("/fake/java_indexer.jar");
+        let cu = Path::new("/mnt/agent/tmp/staging/cu-x.kzip");
+        let tmp = Path::new("/mnt/agent/tmp/staging/cu-x-jvm-tmp");
+        let cmd = build_command(bin, IndexerKind::JavaSource, cu, Some(tmp));
+        let args: Vec<String> = cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let pos = args.iter().position(|a| a == "--temp_directory")
+            .expect("--temp_directory must be present");
+        assert_eq!(args.get(pos + 1).map(String::as_str), Some(tmp.to_str().unwrap()),
+            "--temp_directory must be followed by the tmp dir path; got args: {args:?}");
+        assert!(args.iter().any(|a| a == "--ignore_empty_kzip"),
+            "--ignore_empty_kzip preserved");
+        assert!(args.last().map(String::as_str) == Some(cu.to_str().unwrap()),
+            "cu_kzip must come last (positional); got args: {args:?}");
+    }
+
+    /// Belt-and-suspenders: Cxx command stays unchanged (no
+    /// `--temp_directory`, just the positional kzip).
+    #[test]
+    fn cxx_command_has_no_temp_directory() {
+        let bin = Path::new("/fake/cxx_indexer");
+        let cu = Path::new("/mnt/agent/tmp/staging/cu-y.kzip");
+        let cmd = build_command(bin, IndexerKind::Cxx, cu, None);
+        let args: Vec<String> = cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--temp_directory"),
+            "cxx_indexer takes no --temp_directory; got args: {args:?}");
+        assert_eq!(args, vec![cu.to_string_lossy().into_owned()]);
     }
 }

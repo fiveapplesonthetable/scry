@@ -135,6 +135,42 @@ struct AnchorAccum {
 /// full buffer in one shot, which OOM'd the parent process on AOSP
 /// CUs whose `java_indexer` emits 10+ GB of entries (e.g.
 /// CarSystemUIRavenTests with 297 sources + 1084 classpath refs).
+/// Stream-decode raw Kythe `Entry` protos out of `reader`, calling
+/// `sink` once per Entry with a borrowed reference. The same true-
+/// streaming guarantees as [`decode_stream`] hold: peak memory is
+/// bounded to the largest single Entry (typically < 8 KB).
+///
+/// Used by Phase 5 (FQN-bridge importer) which needs to inspect both
+/// node facts and edges directly rather than going through the anchor
+/// accumulator that `decode_stream` collapses into.
+///
+/// Returns the total Entry count read for the per-CU log.
+pub fn walk_entries<R, F>(reader: R, mut sink: F) -> Result<u64>
+where
+    R: Read,
+    F: FnMut(&Entry),
+{
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
+    let mut total: u64 = 0;
+    let mut entry_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    loop {
+        let len = match read_varint_from(&mut reader)? {
+            Some(v) => v,
+            None => break,
+        };
+        entry_buf.resize(len as usize, 0);
+        reader.read_exact(&mut entry_buf)
+            .with_context(|| format!(
+                "truncated entry stream: wanted {len} bytes after frame {total}",
+            ))?;
+        let entry = Entry::parse_from_bytes(&entry_buf)
+            .with_context(|| format!("decode Entry #{total}"))?;
+        total += 1;
+        sink(&entry);
+    }
+    Ok(total)
+}
+
 pub fn decode_stream<R, F>(reader: R, mut sink: F) -> Result<u64>
 where
     R: Read,

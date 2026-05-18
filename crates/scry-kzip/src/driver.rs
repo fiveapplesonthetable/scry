@@ -83,6 +83,7 @@ use crate::emit_checkpoint::{
 // `DecodedRecord`s are produced by `crate::entries::decode_stream`,
 // which `run_indexer` calls internally; this file only handles the
 // already-decoded vector via `IndexerRun.decoded`.
+use crate::fqn_importer::build_fqn_sidecar;
 use crate::serving::build_kythe_serving_table;
 use crate::indexer::{
     build_per_cu_kzip, recommended_workers, resolve_indexer,
@@ -423,8 +424,9 @@ pub fn build_packed_from_kzip(
     // Optional Phase 4b: corpus-wide cross-CU resolution via
     // `kythe entrystream | kythe write_tables`. Only runs when the
     // operator opted in by setting `SCRY_KZIP_SERVING_DIR`. The
-    // serving LevelDB is consumed by the Phase 5 importer (separate
-    // task #93) to produce the FQN-canonical packed sidecar.
+    // serving LevelDB is for exploratory / debug use via the
+    // `kythe xrefs` / `kythe decor` CLIs — Phase 5 below produces
+    // the packed sidecar scry's query path actually consumes.
     if let (Some(entries_dir), Some(serving_dir)) =
         (serving_entries_dir.as_ref(), serving_dir_env.as_ref())
     {
@@ -440,9 +442,35 @@ pub fn build_packed_from_kzip(
             // valid and queriable; this only blocks cross-CU FQN
             // resolution. Log and continue so the build doesn't fail.
             eprintln!(
-                "[scry-kzip] phase 4b/6: serving table build FAILED ({e:#}); \
-                 phase-5 importer will not run",
+                "[scry-kzip] phase 4b/6: serving table build FAILED ({e:#})",
             );
+        }
+    }
+
+    // Phase 5: FQN-canonical packed sidecar. When phase 3 was tee'ing
+    // entries (SCRY_KZIP_SERVING_DIR set), walk those per-CU files in
+    // two streaming passes and emit `<out_dir>/scip_index_fqn.bin`
+    // keyed on JVM FQN strings. This is what the existing
+    // `build-resolutions` + `apply_precision_filter` query path
+    // consumes for cross-CU `--def-in` lookups.
+    if let Some(entries_dir) = serving_entries_dir.as_ref() {
+        eprintln!("[scry-kzip] phase 5/6: building FQN-canonical sidecar");
+        match build_fqn_sidecar(entries_dir, out_dir) {
+            Ok(report) => {
+                eprintln!(
+                    "[scry-kzip] phase 5/6: wrote {} ({} records, {} distinct FQNs, \
+                     {} skipped no-bridge)",
+                    report.sidecar_path.display(),
+                    report.canonical_records, report.distinct_fqns,
+                    report.skipped_no_bridge,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[scry-kzip] phase 5/6: FQN-sidecar build FAILED ({e:#}); \
+                     intra-CU sidecars from phase 4 remain valid",
+                );
+            }
         }
     }
 

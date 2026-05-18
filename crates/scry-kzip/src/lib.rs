@@ -42,6 +42,7 @@ mod driver_walk;
 pub mod emit;
 pub mod emit_checkpoint;
 pub mod entries;
+pub mod fqn_importer;
 pub mod indexer;
 pub mod proto;
 pub mod serving;

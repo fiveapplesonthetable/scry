@@ -1,0 +1,285 @@
+//! Spawn the right Kythe indexer for a per-CU kzip and collect the
+//! delimited Entry-proto stream off stdout.
+//!
+//! Why per-CU and not "process the whole kzip in one go": the
+//! Soong-emitted AOSP kzip ships **both** `root/pbunits/` (proto
+//! encoding) and `root/units/` (JSON encoding) for every CU. Every
+//! Kythe v0.0.75 indexer refuses such mixed-encoding kzips with
+//! `INVALID_ARGUMENT: Malformed kzip: multiple unit encodings but
+//! different entries`. Building a clean per-CU sub-kzip (just the
+//! one pbunit + its `root/files/<sha>` blobs, no JSON twin) is the
+//! cleanest workaround that doesn't require us to rewrite the
+//! upstream kzip on disk.
+//!
+//! Per-CU has a second upside: we can parallelise across CUs with
+//! rayon, and the JVM-based indexers (which open with a 200-300 MB
+//! resident set even for tiny inputs) get bounded concurrency via
+//! `num_cpus / 2` so we don't OOM mid-run.
+
+use crate::dispatch::IndexerKind;
+use anyhow::{anyhow, Context, Result};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Resolve a Kythe indexer binary. Two sources, in priority order:
+///   1. `SCRY_INDEXER_KYTHE_<NAME>` — per-binary override
+///      (e.g. `SCRY_INDEXER_KYTHE_CXX=/opt/bin/cxx_indexer`).
+///   2. `<kythe_root>/indexers/<name>` — the canonical layout
+///      shipped by the Kythe v0.0.75 release tarball.
+pub fn resolve_indexer(kythe_root: &Path, kind: IndexerKind) -> Result<PathBuf> {
+    let name = match kind {
+        IndexerKind::Cxx          => "cxx_indexer",
+        IndexerKind::JavaSource   => "java_indexer.jar",
+        IndexerKind::JvmBytecode  => "jvm_indexer.jar",
+        IndexerKind::Go           => "go_indexer",
+        IndexerKind::Proto        => "proto_indexer",
+        IndexerKind::TextProto    => "textproto_indexer",
+        IndexerKind::Skip(why) => return Err(anyhow!("indexer skipped: {why}")),
+    };
+    let env_key = format!(
+        "SCRY_INDEXER_KYTHE_{}",
+        name.trim_end_matches(".jar")
+            .to_ascii_uppercase(),
+    );
+    if let Some(val) = std::env::var_os(&env_key) {
+        let p = PathBuf::from(val);
+        if p.is_file() { return Ok(p); }
+    }
+    let p = kythe_root.join("indexers").join(name);
+    if !p.is_file() {
+        return Err(anyhow!(
+            "indexer binary missing: {} (override with {})",
+            p.display(), env_key,
+        ));
+    }
+    Ok(p)
+}
+
+/// Outcome of one indexer invocation. We keep stdout for the entry
+/// stream and the stderr tail for the per-language log file.
+pub struct IndexerRun {
+    pub kind: IndexerKind,
+    pub unit_sha: String,
+    /// Raw stdout — length-delimited Kythe Entry protos.
+    pub stdout: Vec<u8>,
+    /// Trimmed stderr (last 4 KiB) — diagnostics for the log file.
+    pub stderr_tail: Vec<u8>,
+    pub exit_code: i32,
+    pub wall_secs: f64,
+}
+
+impl IndexerRun {
+    /// Did the run actually produce a non-empty entries stream?
+    /// Indexers regularly fail on individual TUs but still emit
+    /// entries for the ones that succeeded — we treat any non-zero
+    /// stdout as "useful" and only count truly-empty runs as
+    /// failures.
+    pub fn produced_entries(&self) -> bool {
+        !self.stdout.is_empty()
+    }
+}
+
+/// Build a per-CU sub-kzip in `staging_dir` containing only the one
+/// pbunit + its referenced `root/files/<sha>` blobs (no JSON `units/`
+/// twin). Returns the path to the new kzip.
+///
+/// We use the `stored` (no-compress) zip mode and copy raw bytes
+/// straight from the source kzip — repacking is O(unit-size +
+/// inputs-size), not O(full-kzip).
+pub fn build_per_cu_kzip(
+    src_kzip: &Path,
+    unit_sha: &str,
+    staging_dir: &Path,
+) -> Result<PathBuf> {
+    use crate::proto::analysis::IndexedCompilation;
+    use protobuf::Message;
+
+    let src = File::open(src_kzip)
+        .with_context(|| format!("open source kzip {}", src_kzip.display()))?;
+    let mut zin = zip::ZipArchive::new(src)
+        .with_context(|| format!("read source kzip header {}", src_kzip.display()))?;
+
+    // Locate the pbunit (try `root/pbunits/<sha>` then `root/units/<sha>`).
+    let unit_entry_name = locate_unit_entry(&mut zin, unit_sha)?;
+
+    let mut unit_bytes = Vec::new();
+    zin.by_name(&unit_entry_name)
+        .with_context(|| format!("open pbunit {unit_entry_name}"))?
+        .read_to_end(&mut unit_bytes)
+        .with_context(|| format!("read pbunit {unit_entry_name}"))?;
+
+    // Decode the unit so we know which `root/files/<digest>` blobs
+    // the indexer is going to demand.
+    let indexed = IndexedCompilation::parse_from_bytes(&unit_bytes)
+        .with_context(|| format!("decode IndexedCompilation {unit_sha}"))?;
+    let cu = indexed
+        .unit
+        .into_option()
+        .ok_or_else(|| anyhow!("{unit_sha}: IndexedCompilation.unit absent"))?;
+    let mut wanted: Vec<String> = Vec::with_capacity(cu.required_input.len());
+    for fi in &cu.required_input {
+        if let Some(info) = fi.info.as_ref() {
+            if !info.digest.is_empty() {
+                wanted.push(format!("root/files/{}", info.digest));
+            }
+        }
+    }
+    // Dedup — kzips often list the same blob digest multiple times.
+    wanted.sort();
+    wanted.dedup();
+
+    // Write a per-CU kzip.
+    std::fs::create_dir_all(staging_dir)
+        .with_context(|| format!("mkdir staging {}", staging_dir.display()))?;
+    let out_path = staging_dir.join(format!("cu-{unit_sha}.kzip"));
+    let mut zout = zip::ZipWriter::new(
+        File::create(&out_path)
+            .with_context(|| format!("create per-CU kzip {}", out_path.display()))?,
+    );
+    let opts = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    // Top-level skeleton — some indexers (notably java_indexer.jar's
+    // Apache-Commons-zip reader) look for directory markers.
+    zout.add_directory("root/", opts).ok();
+    zout.add_directory("root/pbunits/", opts).ok();
+    zout.add_directory("root/files/", opts).ok();
+    zout.start_file(format!("root/pbunits/{unit_sha}"), opts)?;
+    zout.write_all(&unit_bytes)?;
+    let avail: std::collections::HashSet<String> = zin
+        .file_names()
+        .map(|s| s.to_string())
+        .collect();
+    for w in &wanted {
+        if !avail.contains(w) {
+            // Source kzip is missing the blob; skip — the indexer
+            // will report its own error if it actually needs it.
+            continue;
+        }
+        let mut buf = Vec::new();
+        zin.by_name(w)?.read_to_end(&mut buf)?;
+        zout.start_file(w, opts)?;
+        zout.write_all(&buf)?;
+    }
+    zout.finish()?;
+    Ok(out_path)
+}
+
+/// Find the in-zip entry name carrying this pbunit's bytes.
+fn locate_unit_entry(
+    zin: &mut zip::ZipArchive<File>,
+    unit_sha: &str,
+) -> Result<String> {
+    for cand in [
+        format!("root/pbunits/{unit_sha}"),
+        format!("root/units/{unit_sha}"),
+    ] {
+        if zin.by_name(&cand).is_ok() {
+            return Ok(cand);
+        }
+    }
+    Err(anyhow!("unit sha {unit_sha} not found in kzip"))
+}
+
+/// Spawn the indexer for one CU and capture (stdout, stderr).
+/// Honours per-binary env overrides (`SCRY_INDEXER_KYTHE_<NAME>`).
+///
+/// `cu_kzip_path` must be a CLEAN per-CU sub-kzip (built by
+/// [`build_per_cu_kzip`]) — feeding the upstream mixed-encoding
+/// AOSP kzip directly will trip every indexer's encoding-mismatch
+/// check.
+pub fn run_indexer(
+    cu_kzip_path: &Path,
+    unit_sha: &str,
+    kind: IndexerKind,
+    kythe_root: &Path,
+) -> Result<IndexerRun> {
+    let bin = resolve_indexer(kythe_root, kind)?;
+    let mut cmd = build_command(&bin, kind, cu_kzip_path);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let t = std::time::Instant::now();
+    let output = cmd
+        .output()
+        .with_context(|| format!("spawn {} on {}", bin.display(), cu_kzip_path.display()))?;
+    let wall_secs = t.elapsed().as_secs_f64();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stderr = output.stderr;
+    let tail_start = stderr.len().saturating_sub(4096);
+    Ok(IndexerRun {
+        kind,
+        unit_sha: unit_sha.to_string(),
+        stdout: output.stdout,
+        stderr_tail: stderr[tail_start..].to_vec(),
+        exit_code,
+        wall_secs,
+    })
+}
+
+/// Build the right `Command` for each indexer kind. Each indexer
+/// expects a slightly different argv form — see the per-binary help
+/// output for the source of truth.
+fn build_command(bin: &Path, kind: IndexerKind, cu_kzip: &Path) -> Command {
+    match kind {
+        IndexerKind::Cxx | IndexerKind::Go => {
+            // Both take the kzip as a positional argument and emit
+            // delimited Entry protos on stdout.
+            let mut c = Command::new(bin);
+            c.arg(cu_kzip);
+            c
+        }
+        IndexerKind::JavaSource | IndexerKind::JvmBytecode => {
+            // `java -jar <indexer>.jar <kzip>`. We bound the JVM heap
+            // so a runaway CU can't claim the whole machine.
+            let mut c = Command::new("java");
+            c.arg("-Xmx2g")
+                .arg("-jar")
+                .arg(bin)
+                .arg("--ignore_empty_kzip")
+                .arg(cu_kzip);
+            c
+        }
+        IndexerKind::Proto => {
+            // proto_indexer uses single-dash flags (gflags).
+            let mut c = Command::new(bin);
+            c.arg(format!("-index_file={}", cu_kzip.display()));
+            c
+        }
+        IndexerKind::TextProto => {
+            // textproto_indexer uses double-dash flags.
+            let mut c = Command::new(bin);
+            c.arg(format!("--index_file={}", cu_kzip.display()));
+            c
+        }
+        IndexerKind::Skip(_) => Command::new(bin),
+    }
+}
+
+/// Recommended worker count for parallel indexer dispatch. JVM-based
+/// indexers (Java, JVM-bytecode) keep a 200-300 MB resident set even
+/// for trivial inputs, so we cap at half the CPU count.
+pub fn recommended_workers() -> usize {
+    let n = num_cpus::get();
+    std::cmp::max(1, n / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_missing_indexer_errors() {
+        let tmp = scry_bridge::scry_tmp_dir().join(format!(
+            "scry-kzip-noindexer-{}", std::process::id()));
+        let err = resolve_indexer(&tmp, IndexerKind::Cxx).unwrap_err();
+        assert!(format!("{err}").contains("missing"));
+    }
+
+    #[test]
+    fn skip_kind_errors() {
+        let tmp = scry_bridge::scry_tmp_dir().join("any");
+        let err = resolve_indexer(&tmp, IndexerKind::Skip("test reason")).unwrap_err();
+        assert!(format!("{err}").contains("skipped"));
+    }
+}

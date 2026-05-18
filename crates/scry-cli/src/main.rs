@@ -940,6 +940,14 @@ enum Cmd {
         /// `--build-kzip`.
         #[arg(long)]
         resume: bool,
+        /// Phase-3 rayon worker count for `--build-kzip`. Default 0
+        /// = auto: `SCRY_KZIP_WORKERS` if set, else `num_cpus/2`
+        /// (the floor keeps JVM-based indexers — java, jvm-bytecode —
+        /// from OOM'ing the host at ~200-300 MB resident set each).
+        /// Set explicitly when you've measured the headroom and want
+        /// to push above the safe cap.
+        #[arg(long, default_value_t = 0)]
+        kzip_workers: usize,
     },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
@@ -1249,10 +1257,12 @@ fn main() -> Result<()> {
             source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
             build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
             no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
+            kzip_workers,
         } => cmd_build_symbols(
             source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
             build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
             no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
+            kzip_workers,
         ),
         Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
             cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
@@ -1318,6 +1328,7 @@ fn cmd_build_symbols(
     workers: usize,
     scip_out_dir: Option<PathBuf>,
     resume: bool,
+    kzip_workers: usize,
 ) -> Result<()> {
     use scry_bridge::{cmake, gn, kbuild, polyglot};
     let t_total = Instant::now();
@@ -1407,12 +1418,15 @@ fn cmd_build_symbols(
             "[build-symbols] cargo: skipping C-family step, polyglot pass will handle Rust"
         );
     } else if let Some(kzip_path) = build_kzip.as_ref() {
+        let workers_override = if kzip_workers == 0 { None } else { Some(kzip_workers) };
         eprintln!(
-            "[build-symbols] kzip: {} (kythe-root: {}, resume={})",
+            "[build-symbols] kzip: {} (kythe-root: {}, resume={}, workers={})",
             kzip_path.display(), kythe_root.display(), resume,
+            workers_override.map(|n| n.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
         );
         let report = scry_kzip::build_packed_from_kzip(
-            kzip_path, &index_dir, &kythe_root, resume,
+            kzip_path, &index_dir, &kythe_root, resume, workers_override,
         )
             .with_context(|| format!("build packed sidecars from {}", kzip_path.display()))?;
         eprintln!(

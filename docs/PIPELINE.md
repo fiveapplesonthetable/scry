@@ -175,6 +175,18 @@ Path filters apply only to runnable CUs; Skip-kind CUs (rust, kotlin
 without bytecode) are always counted in the per-language skip tally
 regardless of path scope so the summary stays accurate.
 
+#### Phase-3 parallelism (`--kzip-workers` / `SCRY_KZIP_WORKERS`)
+
+The phase-3 rayon pool defaults to `num_cpus/2`. That cap is set by
+the JVM-based indexers (`java`, `jvm_indexer`): each holds a
+200-300 MB resident set even on trivial inputs, so going wider tends
+to OOM the host before it goes faster. Override via the
+`--kzip-workers N` flag on `scry build-symbols --build-kzip`, or via
+`SCRY_KZIP_WORKERS=N` if you'd rather set it once for a session. The
+flag wins when both are set; `=0` or unset means "use the default".
+Push the override only after measuring per-worker RSS — the cap is a
+floor against OOM, not a performance ceiling.
+
 #### Resume semantics (`--resume`)
 
 A full AOSP kzip ingest is 3-12 hours of indexer work. A SIGTERM

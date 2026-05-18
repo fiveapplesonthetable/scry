@@ -126,11 +126,18 @@ pub struct LangReport {
 /// false` insists on a fresh checkpoint and refuses to overwrite one
 /// that already exists. See [`enforce_resume_policy`] for the
 /// three-state validator (fresh / mismatched / matched).
+///
+/// `workers` overrides the phase-3 rayon pool size. `None` falls back
+/// to `SCRY_KZIP_WORKERS` if set, then [`recommended_workers`] (capped
+/// at `num_cpus/2` to keep JVM-based indexers from OOM'ing the host).
+/// `Some(N)` is honored verbatim — callers who pass a value have
+/// taken responsibility for the resident-set arithmetic.
 pub fn build_packed_from_kzip(
     kzip: &Path,
     out_dir: &Path,
     kythe_root: &Path,
     resume: bool,
+    workers: Option<usize>,
 ) -> Result<KzipBuildReport> {
     let t_total = Instant::now();
     std::fs::create_dir_all(out_dir)
@@ -253,9 +260,13 @@ pub fn build_packed_from_kzip(
     }
 
     // Phase 3: per-CU indexer dispatch, streaming decode into the
-    // shared emitter. Rayon worker pool is capped at num_cpus/2 so
-    // JVM-based indexers don't OOM the host.
-    let workers = recommended_workers();
+    // shared emitter. Default pool size is capped at num_cpus/2 so
+    // JVM-based indexers don't OOM the host. Caller / env override
+    // wins when set — at that point the operator has chosen to take
+    // responsibility for the resident-set arithmetic.
+    let workers = workers
+        .or_else(parse_kzip_workers_env)
+        .unwrap_or_else(recommended_workers);
     eprintln!(
         "[scry-kzip] phase 3/6: running indexers with {} workers",
         workers,
@@ -382,6 +393,16 @@ fn parse_kzip_langs_env() -> Option<HashSet<String>> {
 /// malformed.
 fn parse_kzip_max_units_env() -> Option<usize> {
     std::env::var("SCRY_KZIP_MAX_UNITS").ok()?.parse::<usize>().ok()
+}
+
+/// Parse `SCRY_KZIP_WORKERS=N`. Override for the phase-3 rayon pool
+/// size when the caller hasn't passed `--kzip-workers`. Returns
+/// `None` if unset, malformed, or `=0` (zero means "use the default",
+/// not "spawn zero threads"). Out-of-range values are surfaced via
+/// the rayon pool builder, not pre-validated here.
+pub(crate) fn parse_kzip_workers_env() -> Option<usize> {
+    let n = std::env::var("SCRY_KZIP_WORKERS").ok()?.parse::<usize>().ok()?;
+    if n == 0 { None } else { Some(n) }
 }
 
 /// Parse `SCRY_KZIP_PATH_PREFIX=frameworks/base/,frameworks/native/`
@@ -568,4 +589,20 @@ mod tests {
         assert_eq!(allowed.len(), 3);
     }
 
+    /// `SCRY_KZIP_WORKERS=0` must collapse to `None` — zero would
+    /// give rayon a zero-thread pool, which builds but never makes
+    /// progress. The driver chains `.unwrap_or_else(recommended_workers)`
+    /// so `None` is the right "use the default" sentinel.
+    #[test]
+    fn kzip_workers_zero_collapses_to_none() {
+        fn rule(spec: &str) -> Option<usize> {
+            let n = spec.parse::<usize>().ok()?;
+            if n == 0 { None } else { Some(n) }
+        }
+        assert_eq!(rule("0"), None);
+        assert_eq!(rule(""), None);
+        assert_eq!(rule("notanumber"), None);
+        assert_eq!(rule("16"), Some(16));
+        assert_eq!(rule("72"), Some(72));
+    }
 }

@@ -78,6 +78,21 @@ pub const PATH_TABLE_ENTRY_LEN: usize = 12;
 pub const MAGIC_CLANG_USR: &[u8; 8] = b"SCRYUP01";
 pub const MAGIC_SCIP: &[u8; 8] = b"SCRYSP01";
 
+/// Per-record `kind` byte: 0 = decl, 1 = ref, 2 = call.
+pub const KIND_DECL: u8 = 0;
+pub const KIND_REF:  u8 = 1;
+pub const KIND_CALL: u8 = 2;
+
+/// Bitmask of allowed kinds passed to the `_kind`-suffixed window
+/// lookups. Bit i ⇔ kind i. Pick the mask that matches your query
+/// site: looking up the def-anchor at a known def → `KIND_MASK_DECL_ONLY`;
+/// looking up a ref-anchor at a call site → `KIND_MASK_REF_OR_CALL`
+/// (excluding decl avoids resolving an in-method call to the
+/// enclosing method's own def via the byte-offset window).
+pub const KIND_MASK_DECL_ONLY:   u8 = 1u8 << KIND_DECL;
+pub const KIND_MASK_REF_OR_CALL: u8 = (1u8 << KIND_REF) | (1u8 << KIND_CALL);
+pub const KIND_MASK_ANY:         u8 = KIND_MASK_DECL_ONLY | KIND_MASK_REF_OR_CALL;
+
 /// Mmap'd precision sidecar. Both variants (clang USR / SCIP) share
 /// the same code path; only the magic bytes differ.
 pub struct PrecisionPacked {
@@ -255,8 +270,30 @@ impl PrecisionPacked {
         byte_offset: u32,
         window: u32,
     ) -> Option<&str> {
+        self.symbol_for_window_kind(abs_path, byte_offset, window, KIND_MASK_ANY)
+    }
+
+    /// Same as [`symbol_for_window`] but only considers records whose
+    /// `kind` is allowed by `kind_mask` (bit 0 = decl, bit 1 = ref,
+    /// bit 2 = call). Use [`KIND_MASK_DECL_ONLY`] when looking up the
+    /// def-anchor at a known def site, and [`KIND_MASK_REF_OR_CALL`]
+    /// when looking up the ref-anchor at a call site — the unfiltered
+    /// "nearest in window" otherwise collapses an in-method call with
+    /// the enclosing method's decl, mis-attributing the ref to the
+    /// surrounding def (real case: `return Binder.clearCallingIdentity()`
+    /// on the line right after a `public long clearCallingIdentity() {`
+    /// def in AOSP's AMS::Injector wrapper resolved to the wrapper
+    /// itself because the unfiltered window picked the closer decl
+    /// anchor).
+    pub fn symbol_for_window_kind(
+        &self,
+        abs_path: &str,
+        byte_offset: u32,
+        window: u32,
+        kind_mask: u8,
+    ) -> Option<&str> {
         let &path_id = self.path_index().get(abs_path)?;
-        self.symbol_for_window_by_path_id(path_id, byte_offset, window)
+        self.symbol_for_window_by_path_id_kind(path_id, byte_offset, window, kind_mask)
     }
 
     /// Same as [`symbol_for_window`] but when the caller already
@@ -267,6 +304,18 @@ impl PrecisionPacked {
         path_id: u32,
         byte_offset: u32,
         window: u32,
+    ) -> Option<&str> {
+        self.symbol_for_window_by_path_id_kind(path_id, byte_offset, window, KIND_MASK_ANY)
+    }
+
+    /// Same as [`symbol_for_window_by_path_id`] but filters by kind
+    /// mask (see [`symbol_for_window_kind`]).
+    pub fn symbol_for_window_by_path_id_kind(
+        &self,
+        path_id: u32,
+        byte_offset: u32,
+        window: u32,
+        kind_mask: u8,
     ) -> Option<&str> {
         let (start, count) = self.path_records_range(path_id)?;
         if count == 0 { return None; }
@@ -284,9 +333,68 @@ impl PrecisionPacked {
         }
         let mut best: Option<(u32, u32)> = None;
         for i in left..slice_end {
-            let (bo, sid, _) = self.record(i as u32)?;
+            let (bo, sid, k) = self.record(i as u32)?;
             if bo > hi { break; }
+            if kind_mask & (1u8 << k) == 0 { continue; }
             let d = bo.abs_diff(byte_offset);
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, sid));
+            }
+        }
+        best.and_then(|(_, sid)| self.symbol(sid))
+    }
+
+    /// Span-based lookup: returns the symbol id of the record whose
+    /// `byte_offset` lies inside `[byte_start, byte_end]`, filtered
+    /// by `kind_mask`. Returns the record nearest `byte_start` (the
+    /// usual identifier-start anchor); ties prefer the earlier
+    /// record.
+    ///
+    /// Use this at REF sites where the ref's
+    /// `(byte_start, byte_end)` covers exactly the identifier the
+    /// tree-sitter ref points at: Kythe emits separate anchors for
+    /// EVERY identifier in a dotted access (e.g.
+    /// `Binder.clearCallingIdentity()` gets one ref-anchor at the
+    /// `Binder` receiver and another at the `clearCallingIdentity`
+    /// method name), and a fat byte-window picks the closer
+    /// receiver anchor instead of the intended method anchor. The
+    /// identifier span eliminates that bleed.
+    pub fn symbol_in_span_kind(
+        &self,
+        abs_path: &str,
+        byte_start: u32,
+        byte_end: u32,
+        kind_mask: u8,
+    ) -> Option<&str> {
+        let &path_id = self.path_index().get(abs_path)?;
+        self.symbol_in_span_by_path_id_kind(path_id, byte_start, byte_end, kind_mask)
+    }
+
+    /// `path_id`-keyed twin of [`symbol_in_span_kind`].
+    pub fn symbol_in_span_by_path_id_kind(
+        &self,
+        path_id: u32,
+        byte_start: u32,
+        byte_end: u32,
+        kind_mask: u8,
+    ) -> Option<&str> {
+        let (start, count) = self.path_records_range(path_id)?;
+        if count == 0 || byte_end < byte_start { return None; }
+        let slice_start = start as usize;
+        let slice_end = slice_start + count as usize;
+        let mut left = slice_start;
+        let mut right = slice_end;
+        while left < right {
+            let mid = (left + right) / 2;
+            let (bo, _, _) = self.record(mid as u32)?;
+            if bo < byte_start { left = mid + 1; } else { right = mid; }
+        }
+        let mut best: Option<(u32, u32)> = None;
+        for i in left..slice_end {
+            let (bo, sid, k) = self.record(i as u32)?;
+            if bo > byte_end { break; }
+            if kind_mask & (1u8 << k) == 0 { continue; }
+            let d = bo - byte_start;
             if best.map_or(true, |(bd, _)| d < bd) {
                 best = Some((d, sid));
             }
@@ -331,9 +439,41 @@ impl<'a> ByFileLookup<'a> {
         byte_offset: u32,
         window: u32,
     ) -> Option<&'a str> {
+        self.symbol_for_window_kind(file_id, byte_offset, window, KIND_MASK_ANY)
+    }
+
+    /// Same as [`symbol_for_window`] but only considers records whose
+    /// `kind` is allowed by `kind_mask`. See the standalone
+    /// `symbol_for_window_kind` on [`PrecisionPacked`] for the
+    /// rationale (lookup at a def site vs at a ref site need
+    /// different masks to avoid mutual misattribution).
+    pub fn symbol_for_window_kind(
+        &self,
+        file_id: u32,
+        byte_offset: u32,
+        window: u32,
+        kind_mask: u8,
+    ) -> Option<&'a str> {
         let pid = *self.path_ids.get(file_id as usize)?;
         if pid == u32::MAX { return None; }
-        self.packed.symbol_for_window_by_path_id(pid, byte_offset, window)
+        self.packed.symbol_for_window_by_path_id_kind(pid, byte_offset, window, kind_mask)
+    }
+
+    /// Span-based ref-site lookup; see standalone
+    /// [`PrecisionPacked::symbol_in_span_kind`] for rationale (the
+    /// fat byte-window picks Kythe's adjacent receiver-anchor
+    /// instead of the intended method anchor in dotted accesses
+    /// like `Binder.clearCallingIdentity()`).
+    pub fn symbol_in_span_kind(
+        &self,
+        file_id: u32,
+        byte_start: u32,
+        byte_end: u32,
+        kind_mask: u8,
+    ) -> Option<&'a str> {
+        let pid = *self.path_ids.get(file_id as usize)?;
+        if pid == u32::MAX { return None; }
+        self.packed.symbol_in_span_by_path_id_kind(pid, byte_start, byte_end, kind_mask)
     }
 
     /// True when the sidecar has any records for this file_id.
@@ -654,6 +794,47 @@ macro_rules! precision_sidecar_wrapper {
                 window: u32,
             ) -> Option<&'a str> {
                 self.inner.symbol_for_window(file_id, byte_offset, window)
+            }
+
+            /// Kind-filtered variant of [`Self::$lookup_fn`]. Use
+            /// `precision_packed::KIND_MASK_DECL_ONLY` when looking
+            /// up the def-anchor at a def site;
+            /// `precision_packed::KIND_MASK_REF_OR_CALL` when looking
+            /// up the ref-anchor at a call site (excluding decl
+            /// avoids resolving an in-method call to the enclosing
+            /// method's own def via the byte-offset window).
+            pub fn symbol_for_window_kind(
+                &self,
+                file_id: u32,
+                byte_offset: u32,
+                window: u32,
+                kind_mask: u8,
+            ) -> Option<&'a str> {
+                self.inner.symbol_for_window_kind(
+                    file_id, byte_offset, window, kind_mask,
+                )
+            }
+
+            /// Span-based variant. See
+            /// [`crate::precision_packed::ByFileLookup::symbol_in_span_kind`].
+            /// Use at ref sites where `[byte_start, byte_end]` is the
+            /// exact tree-sitter identifier span — Kythe emits a
+            /// separate ref-anchor for each identifier in dotted
+            /// accesses (e.g. both the receiver `Binder` and the
+            /// method `clearCallingIdentity` in
+            /// `Binder.clearCallingIdentity()`), and a fat byte-window
+            /// would pick the closer receiver anchor instead of the
+            /// intended method anchor.
+            pub fn symbol_in_span_kind(
+                &self,
+                file_id: u32,
+                byte_start: u32,
+                byte_end: u32,
+                kind_mask: u8,
+            ) -> Option<&'a str> {
+                self.inner.symbol_in_span_kind(
+                    file_id, byte_start, byte_end, kind_mask,
+                )
             }
 
             /// True when the sidecar has any records for this file_id.

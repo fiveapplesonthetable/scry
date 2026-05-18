@@ -6576,6 +6576,13 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     let mut scip_defs_indexed = 0u64;
     let mut cusr_defs_indexed = 0u64;
     if scip_lookup.is_some() || cusr_lookup.is_some() {
+        // Pass 2b uses KIND_MASK_DECL_ONLY so we only pick up
+        // def-anchors at def sites — pass 3 below uses the
+        // complementary KIND_MASK_REF_OR_CALL at ref sites. The
+        // unfiltered "closest in window" would otherwise let a call
+        // adjacent to its enclosing method's decl resolve to the
+        // surrounding def (e.g. `return Binder.clearCallingIdentity()`
+        // on the line right after a `clearCallingIdentity()` decl).
         for s in r.iter_symbols() {
             let cf = path_by_file_id.get(s.file_id as usize)
                 .and_then(|o| o.as_deref())
@@ -6583,7 +6590,10 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
                 .unwrap_or(false);
             if cf {
                 if let Some(cl) = cusr_lookup.as_ref() {
-                    if let Some(sym) = cl.usr_for_window(s.file_id, s.byte_start, KYTHE_WINDOW) {
+                    if let Some(sym) = cl.symbol_for_window_kind(
+                        s.file_id, s.byte_start, KYTHE_WINDOW,
+                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
+                    ) {
                         // First def wins. Multiple defs with the same
                         // USR happen in decl+def-split C++ headers /
                         // partial-class shapes; the first one is
@@ -6593,7 +6603,10 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
                     }
                 }
             } else if let Some(sl) = scip_lookup.as_ref() {
-                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, KYTHE_WINDOW) {
+                if let Some(sym) = sl.symbol_for_window_kind(
+                    s.file_id, s.byte_start, KYTHE_WINDOW,
+                    scry_store::precision_packed::KIND_MASK_DECL_ONLY,
+                ) {
                     scip_def_by_symbol.entry(sym.to_string())
                         .or_insert_with(|| { scip_defs_indexed += 1; s.id });
                 }
@@ -6646,12 +6659,22 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
             // (returning 0). No lexical heuristic, no guessing — the
             // `--lexical` query flag already exists for users who
             // want raw tree-sitter name matches with no narrowing.
+            // Look up the ref-anchor INSIDE the tree-sitter identifier
+            // span [byte_start, byte_end] — Kythe emits a separate
+            // ref-anchor for each identifier in a dotted access (the
+            // receiver AND the method name), so a fat byte-window picks
+            // the closer receiver anchor instead. Restricting to the
+            // identifier span the tree-sitter ref actually points at
+            // eliminates that bleed. KIND_MASK_REF_OR_CALL further
+            // rules out the enclosing method's own decl anchor when
+            // the call sits on the line right after the decl.
             let id = if cf {
                 match cusr_lookup.as_ref() {
                     Some(cl) if cl.covers_file_id(rr.file_id) => {
-                        match cl.usr_for_window(rr.file_id, rr.byte_start, KYTHE_WINDOW)
-                            .and_then(|sym| cusr_def_by_symbol.get(sym).copied())
-                        {
+                        match cl.symbol_in_span_kind(
+                            rr.file_id, rr.byte_start, rr.byte_end,
+                            scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
+                        ).and_then(|sym| cusr_def_by_symbol.get(sym).copied()) {
                             Some(kid) => kid,
                             None => {
                                 unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
@@ -6667,9 +6690,10 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
             } else {
                 match scip_lookup.as_ref() {
                     Some(sl) if sl.covers_file_id(rr.file_id) => {
-                        match sl.symbol_for_window(rr.file_id, rr.byte_start, KYTHE_WINDOW)
-                            .and_then(|sym| scip_def_by_symbol.get(sym).copied())
-                        {
+                        match sl.symbol_in_span_kind(
+                            rr.file_id, rr.byte_start, rr.byte_end,
+                            scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
+                        ).and_then(|sym| scip_def_by_symbol.get(sym).copied()) {
                             Some(kid) => kid,
                             None => {
                                 unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);

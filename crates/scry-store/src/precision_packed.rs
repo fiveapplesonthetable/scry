@@ -335,6 +335,18 @@ impl<'a> ByFileLookup<'a> {
         if pid == u32::MAX { return None; }
         self.packed.symbol_for_window_by_path_id(pid, byte_offset, window)
     }
+
+    /// True when the sidecar has any records for this file_id.
+    /// Lets callers distinguish "sidecar covers this file but says
+    /// nothing about this byte offset" (a meaningful unresolved) from
+    /// "sidecar doesn't cover this file at all" (legitimate fallback
+    /// to a different resolver).
+    pub fn covers_file_id(&self, file_id: u32) -> bool {
+        self.path_ids.get(file_id as usize)
+            .copied()
+            .map(|pid| pid != u32::MAX)
+            .unwrap_or(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +654,14 @@ macro_rules! precision_sidecar_wrapper {
                 window: u32,
             ) -> Option<&'a str> {
                 self.inner.symbol_for_window(file_id, byte_offset, window)
+            }
+
+            /// True when the sidecar has any records for this file_id.
+            /// Lets callers distinguish "sidecar covers this file but
+            /// says nothing about this byte offset" from "sidecar
+            /// doesn't cover this file at all".
+            pub fn covers_file_id(&self, file_id: u32) -> bool {
+                self.inner.covers_file_id(file_id)
             }
         }
 

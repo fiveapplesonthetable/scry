@@ -6624,6 +6624,87 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
               child_to_parents.len(), class_to_ancestors.len(),
               t2.elapsed().as_millis());
 
+    // --- Pass 2b: Kythe def-symbol reverse index. ---
+    //
+    // For each (file_id, byte_start) of a def, ask the SCIP / clang
+    // sidecar what Kythe-class symbol identity that def carries, and
+    // store `symbol-string → def_id`. The pass-3 ref loop then asks
+    // the SAME sidecar what symbol the call site carries and looks
+    // up the def directly — bypassing the heuristic for any ref that
+    // both SCIP/clang covers AND maps to a known def.
+    //
+    // This is the architectural fix to the "test mock shadows prod"
+    // class of bugs (e.g. `ActiveServices.java` calling
+    // `Binder.clearCallingIdentity()` got attributed to a test
+    // `TestInjector.clearCallingIdentity` by the same-package
+    // heuristic). Kythe knows the receiver type → emits the right
+    // symbol identity at the call site → no guesswork.
+    //
+    // Coverage falls back to the heuristic for files Kythe doesn't
+    // see (uncovered TU in the SCIP / clang sidecar) and for refs
+    // whose symbol doesn't map to any indexed def.
+    let t2b = Instant::now();
+    let path_by_file_id: Vec<Option<String>> = {
+        let n = r.file_count();
+        let mut v: Vec<Option<String>> = vec![None; n];
+        for fe in r.iter_files() {
+            v[fe.id as usize] = Some(fe.display_path());
+        }
+        v
+    };
+    let scip_idx = r.scip_index();
+    let cusr_idx = r.clang_usrs();
+    let scip_lookup = scip_idx.map(|sx| {
+        sx.precompute_by_file_ids(
+            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
+                p.as_deref().map(|s| (i as u32, s))
+            }),
+            path_by_file_id.len(),
+        )
+    });
+    let cusr_lookup = cusr_idx.map(|cx| {
+        cx.precompute_by_file_ids(
+            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
+                p.as_deref().map(|s| (i as u32, s))
+            }),
+            path_by_file_id.len(),
+        )
+    });
+    const KYTHE_WINDOW: u32 = 64;
+    let mut scip_def_by_symbol: HashMap<String, u64> = HashMap::new();
+    let mut cusr_def_by_symbol: HashMap<String, u64> = HashMap::new();
+    let mut scip_defs_indexed = 0u64;
+    let mut cusr_defs_indexed = 0u64;
+    if scip_lookup.is_some() || cusr_lookup.is_some() {
+        for s in r.iter_symbols() {
+            let cf = path_by_file_id.get(s.file_id as usize)
+                .and_then(|o| o.as_deref())
+                .map(is_c_family)
+                .unwrap_or(false);
+            if cf {
+                if let Some(cl) = cusr_lookup.as_ref() {
+                    if let Some(sym) = cl.usr_for_window(s.file_id, s.byte_start, KYTHE_WINDOW) {
+                        // First def wins. Multiple defs with the same
+                        // USR happen in decl+def-split C++ headers /
+                        // partial-class shapes; the first one is
+                        // arbitrary but stable across runs.
+                        cusr_def_by_symbol.entry(sym.to_string())
+                            .or_insert_with(|| { cusr_defs_indexed += 1; s.id });
+                    }
+                }
+            } else if let Some(sl) = scip_lookup.as_ref() {
+                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, KYTHE_WINDOW) {
+                    scip_def_by_symbol.entry(sym.to_string())
+                        .or_insert_with(|| { scip_defs_indexed += 1; s.id });
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[res] pass 2b (Kythe def-symbol index): {} SCIP defs, {} clang USR defs in {} ms",
+        scip_defs_indexed, cusr_defs_indexed, t2b.elapsed().as_millis(),
+    );
+
     // --- Pass 3: resolve every ref, write sidecar. ---
     //
     // Parallel resolution with rayon: collect refs into chunks of
@@ -6632,6 +6713,11 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     // ref_idx * 8, so ordering MUST be preserved — we collect chunks
     // sequentially from `iter_refs`, dispatch resolution in parallel,
     // and stream the results back in submission order.
+    //
+    // Each ref tries Kythe first (if a sidecar covers its file AND
+    // its call-site symbol points at an indexed def) → falls back to
+    // the lexical heuristic otherwise. Trust ordering: Kythe knows
+    // the receiver type, the heuristic only sees the method name.
     //
     // Memory: at peak we hold ~16 chunks × 64K refs × ~64B/ref ≈
     // ~64 MiB of input + ~16 chunks × 64K × 8B = ~8 MiB output.
@@ -6643,15 +6729,60 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     const CHUNK_SIZE: usize = 64 * 1024;
     let resolved_count = AtomicU64::new(0);
-    let narrowed_count = AtomicU64::new(0);
+    let unresolved_no_sidecar = AtomicU64::new(0);
+    let unresolved_kythe_blank = AtomicU64::new(0);
     let mut chunk: Vec<RefRecord> = Vec::with_capacity(CHUNK_SIZE);
     let process_chunk = |chunk: &mut Vec<RefRecord>, ow: &mut BufWriter<std::fs::File>| -> Result<()> {
         if chunk.is_empty() { return Ok(()); }
         let ids: Vec<u64> = chunk.par_iter().map(|rr| {
-            let mut local_narrowed = 0u64;
-            let id = resolve_one(rr, &by_name, &per_file_pkg, &per_file_imports,
-                                 &per_file_using_ns, &class_to_ancestors, &mut local_narrowed);
-            if local_narrowed > 0 { narrowed_count.fetch_add(local_narrowed, Ordering::Relaxed); }
+            let cf = path_by_file_id.get(rr.file_id as usize)
+                .and_then(|o| o.as_deref())
+                .map(is_c_family)
+                .unwrap_or(false);
+            // Resolution is sidecar-only. C-family → clang USR sidecar;
+            // everything else → SCIP. If the sidecar covers the file,
+            // its verdict is law: a symbol that maps to an indexed
+            // def resolves, anything else is honestly unresolved
+            // (returning 0). No lexical heuristic, no guessing — the
+            // `--lexical` query flag already exists for users who
+            // want raw tree-sitter name matches with no narrowing.
+            let id = if cf {
+                match cusr_lookup.as_ref() {
+                    Some(cl) if cl.covers_file_id(rr.file_id) => {
+                        match cl.usr_for_window(rr.file_id, rr.byte_start, KYTHE_WINDOW)
+                            .and_then(|sym| cusr_def_by_symbol.get(sym).copied())
+                        {
+                            Some(kid) => kid,
+                            None => {
+                                unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
+                                0
+                            }
+                        }
+                    }
+                    _ => {
+                        unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
+                        0
+                    }
+                }
+            } else {
+                match scip_lookup.as_ref() {
+                    Some(sl) if sl.covers_file_id(rr.file_id) => {
+                        match sl.symbol_for_window(rr.file_id, rr.byte_start, KYTHE_WINDOW)
+                            .and_then(|sym| scip_def_by_symbol.get(sym).copied())
+                        {
+                            Some(kid) => kid,
+                            None => {
+                                unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
+                                0
+                            }
+                        }
+                    }
+                    _ => {
+                        unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
+                        0
+                    }
+                }
+            };
             if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
             id
         }).collect();
@@ -6670,9 +6801,17 @@ pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
     drop(ow);
     std::fs::rename(&tmp, paths.ref_resolutions())?;
     let resolved_count = resolved_count.into_inner();
-    let narrowed_count = narrowed_count.into_inner();
-    eprintln!("[res] pass 3 (resolve {} refs, {} resolved, {} narrowed via Java context) in {} ms",
-              n_refs, resolved_count, narrowed_count, t3.elapsed().as_millis());
+    let unresolved_no_sidecar = unresolved_no_sidecar.into_inner();
+    let unresolved_kythe_blank = unresolved_kythe_blank.into_inner();
+    eprintln!(
+        "[res] pass 3 (resolve {} refs, {} resolved via Kythe sidecar; \
+         {} unresolved: {} in files Kythe didn't cover, {} where Kythe \
+         had no def-attribution for the call site) in {} ms",
+        n_refs, resolved_count,
+        unresolved_no_sidecar + unresolved_kythe_blank,
+        unresolved_no_sidecar, unresolved_kythe_blank,
+        t3.elapsed().as_millis(),
+    );
     eprintln!("[res] DONE. {} bytes written → {}",
         std::fs::metadata(paths.ref_resolutions()).map(|m| m.len()).unwrap_or(0),
         paths.ref_resolutions().display());
@@ -6764,12 +6903,25 @@ fn resolve_one(
         let my_pkg = per_file_pkg.get(&rr.file_id);
         let imports = per_file_imports.get(&rr.file_id);
 
+        // Same-package narrowing only commits when it's UNIQUE. With
+        // multiple same-package candidates the resolver previously
+        // returned the first one in iteration order, which silently
+        // picked test-mock classes over the real production class in
+        // packages where both live side-by-side (e.g.
+        // `com.android.server.am.ActiveServices` calling
+        // `Binder.clearCallingIdentity()` got attributed to
+        // `ServiceBindingOomAdjPolicyTest::TestInjector.clearCallingIdentity`
+        // instead of `android.os.Binder.clearCallingIdentity`).
+        // Fall through to the import-aware class match below — for
+        // `Binder.clearCallingIdentity()` it disambiguates via the
+        // explicit `import android.os.Binder;`.
         if let Some(pkg) = my_pkg {
-            for c in pool {
-                if c.pkg.as_deref() == Some(pkg.as_str()) {
-                    *narrowed += 1;
-                    return c.id;
-                }
+            let same_pkg: Vec<&&ResolveDef> = pool.iter()
+                .filter(|c| c.pkg.as_deref() == Some(pkg.as_str()))
+                .collect();
+            if same_pkg.len() == 1 {
+                *narrowed += 1;
+                return same_pkg[0].id;
             }
         }
         if let Some(imps) = imports {
@@ -10004,6 +10156,48 @@ mod tests {
         let r = mk_ref("Activity", FileKind::Java, 5);
         let mut n = 0u64;
         assert_eq!(resolve_one(&r, &by_name, &pkg, &HashMap::new(), &empty_ns(), &HashMap::new(), &mut n), 22);
+        assert_eq!(n, 1);
+    }
+
+    /// Same-package narrowing must NOT greedily pick the first
+    /// same-pkg candidate when multiple exist. Real bug from prod
+    /// `com.android.server.am.ActiveServices` calling
+    /// `Binder.clearCallingIdentity()`: the resolver previously
+    /// attributed it to `TestInjector.clearCallingIdentity` (test
+    /// mock in the same package) instead of `android.os.Binder.clearCallingIdentity`,
+    /// which broke `--def-in /android/os/Binder.java` strict-mode
+    /// queries and falsely showed prod refs targeting test code.
+    /// The fix: only commit same-pkg when UNIQUE; otherwise fall
+    /// through to the import-aware class match below.
+    #[test]
+    fn resolve_one_java_same_pkg_ambiguity_falls_through_to_import() {
+        fn mk_def_full(id: u64, lang: FileKind, pkg: &str, scope: &[&str]) -> ResolveDef {
+            ResolveDef {
+                id, file_id: 0, lang,
+                pkg: Some(pkg.to_string()),
+                scope_path: scope.iter().copied().map(String::from).collect(),
+            }
+        }
+        let mut by_name: HashMap<String, Vec<ResolveDef>> = HashMap::new();
+        by_name.insert("clearCallingIdentity".into(), vec![
+            // Two same-pkg candidates (prod + test mock) — the bug case.
+            mk_def_full(200, FileKind::Java, "com.android.server.am",
+                &["ActivityManagerService", "Injector"]),
+            mk_def_full(300, FileKind::Java, "com.android.server.am",
+                &["ServiceBindingOomAdjPolicyTest", "TestInjector"]),
+            // The real target — different package, imported explicitly.
+            mk_def_full(100, FileKind::Java, "android.os", &["Binder"]),
+        ]);
+        let mut pkg = HashMap::new();
+        pkg.insert(5u32, "com.android.server.am".to_string());
+        let mut imports = HashMap::new();
+        imports.insert(5u32, vec![("Binder".to_string(), Some("android.os".to_string()))]);
+        let r = mk_ref("clearCallingIdentity", FileKind::Java, 5);
+        let mut n = 0u64;
+        let got = resolve_one(&r, &by_name, &pkg, &imports, &empty_ns(), &HashMap::new(), &mut n);
+        assert_eq!(got, 100,
+            "ambiguous same-pkg should fall through to import-aware class match (android.os.Binder), \
+             not greedily pick a test mock in the caller's package");
         assert_eq!(n, 1);
     }
 

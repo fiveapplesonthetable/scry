@@ -421,41 +421,23 @@ pub fn build_packed_from_kzip(
     };
     write_summary_log(&logs_dir, kzip, &lang_reports_vec, &emit)?;
 
-    // Optional Phase 4b: corpus-wide cross-CU resolution via
-    // `kythe entrystream | kythe write_tables`. Only runs when the
-    // operator opted in by setting `SCRY_KZIP_SERVING_DIR`. The
-    // serving LevelDB is for exploratory / debug use via the
-    // `kythe xrefs` / `kythe decor` CLIs — Phase 5 below produces
-    // the packed sidecar scry's query path actually consumes.
-    if let (Some(entries_dir), Some(serving_dir)) =
-        (serving_entries_dir.as_ref(), serving_dir_env.as_ref())
-    {
-        let serving_path = PathBuf::from(serving_dir);
-        eprintln!(
-            "[scry-kzip] phase 4b/6: cross-CU serving table → {}",
-            serving_path.display(),
-        );
-        if let Err(e) = build_kythe_serving_table(
-            entries_dir, &serving_path, kythe_root,
-        ) {
-            // Non-fatal: the packed sidecars from phase 4 are still
-            // valid and queriable; this only blocks cross-CU FQN
-            // resolution. Log and continue so the build doesn't fail.
-            eprintln!(
-                "[scry-kzip] phase 4b/6: serving table build FAILED ({e:#})",
-            );
-        }
-    }
-
     // Phase 5: FQN-canonical packed sidecar. When phase 3 was tee'ing
     // entries (SCRY_KZIP_SERVING_DIR set), walk those per-CU files in
     // two streaming passes and emit `<out_dir>/scip_index_fqn.bin`
     // keyed on JVM FQN strings. This is what the existing
     // `build-resolutions` + `apply_precision_filter` query path
     // consumes for cross-CU `--def-in` lookups.
+    //
+    // Runs BEFORE the optional phase 4b LevelDB build below — phase
+    // 4b is for the external `kythe xrefs / decor` debugging CLIs
+    // and can take 30+ min on a large entries set, whereas phase 5
+    // is the load-bearing step for scry's own query path. Doing 5
+    // first means an operator who only cares about cross-CU
+    // resolution can Ctrl-C between the two phases and still have
+    // a valid scip_index_fqn.bin on disk.
     if let Some(entries_dir) = serving_entries_dir.as_ref() {
         eprintln!("[scry-kzip] phase 5/6: building FQN-canonical sidecar");
-        match build_fqn_sidecar(entries_dir, out_dir) {
+        match build_fqn_sidecar(entries_dir, out_dir, Some(source_root)) {
             Ok(report) => {
                 eprintln!(
                     "[scry-kzip] phase 5/6: wrote {} ({} records, {} distinct FQNs, \
@@ -471,6 +453,32 @@ pub fn build_packed_from_kzip(
                      intra-CU sidecars from phase 4 remain valid",
                 );
             }
+        }
+    }
+
+    // Optional Phase 4b: corpus-wide cross-CU resolution via
+    // `kythe entrystream | kythe write_tables`. Only runs when the
+    // operator opted in by setting `SCRY_KZIP_SERVING_DIR`. The
+    // serving LevelDB is for exploratory / debug use via the
+    // `kythe xrefs` / `kythe decor` CLIs — scry's own query path
+    // consumes phase 5's `scip_index_fqn.bin`, not the LevelDB.
+    if let (Some(entries_dir), Some(serving_dir)) =
+        (serving_entries_dir.as_ref(), serving_dir_env.as_ref())
+    {
+        let serving_path = PathBuf::from(serving_dir);
+        eprintln!(
+            "[scry-kzip] phase 6/6: cross-CU serving table → {}",
+            serving_path.display(),
+        );
+        if let Err(e) = build_kythe_serving_table(
+            entries_dir, &serving_path, kythe_root,
+        ) {
+            // Non-fatal: the packed sidecars from phase 4 + the FQN
+            // sidecar from phase 5 are still valid and queriable;
+            // only the optional `kythe xrefs/decor` LevelDB fails.
+            eprintln!(
+                "[scry-kzip] phase 6/6: serving table build FAILED ({e:#})",
+            );
         }
     }
 

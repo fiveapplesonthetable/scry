@@ -71,9 +71,19 @@ pub struct FqnImportReport {
 /// Build the FQN-canonical packed sidecar at
 /// `<out_dir>/scip_index_fqn.bin`. Walks every `cu-*.entries` file
 /// under `entries_dir` in two streaming passes.
+///
+/// `source_root`, when `Some`, is prepended to every corpus-relative
+/// anchor path before it lands in the sidecar — same convention as
+/// [`crate::emit::PackedEmitter::with_source_root`]. Without it,
+/// `apply_precision_filter` would miss every record because the
+/// query path passes absolute paths (`/home/zim/dev/aosp/...`) and
+/// Kythe entries carry corpus-relative ones (`frameworks/base/...`).
+/// Paths that already start with `/` (synthetic Kythe builtins) are
+/// left alone.
 pub fn build_fqn_sidecar(
     entries_dir: &Path,
     out_dir: &Path,
+    source_root: Option<&Path>,
 ) -> Result<FqnImportReport> {
     let t = Instant::now();
     std::fs::create_dir_all(out_dir)
@@ -105,12 +115,18 @@ pub fn build_fqn_sidecar(
     let (records, distinct_fqns, skipped) = emit_canonical_records(&entry_files, &bridges)
         .context("pass 2 (canonical record emit)")?;
 
+    // Absolutize paths once, up front, so the precision_packed::Record
+    // borrows stay simple. Same shape as [`crate::emit::PackedEmitter::absolutize`].
+    let abs_paths: Vec<String> = records.iter()
+        .map(|r| absolutize_path(&r.path, source_root))
+        .collect();
+
     // Write the packed sidecar. The Record<'a> takes string refs into
-    // the owned `records` Vec.
+    // the absolutized-paths Vec (and the symbol str into `records`).
     let sidecar_path = out_dir.join("scip_index_fqn.bin");
-    let pp_records: Vec<precision_packed::Record<'_>> = records.iter()
-        .map(|r| precision_packed::Record {
-            abs_path: &r.path,
+    let pp_records: Vec<precision_packed::Record<'_>> = records.iter().zip(abs_paths.iter())
+        .map(|(r, ap)| precision_packed::Record {
+            abs_path: ap,
             byte_offset: r.byte_offset,
             symbol: &r.symbol,
             kind: r.kind,
@@ -196,6 +212,23 @@ fn collect_named_bridges(entry_files: &[PathBuf]) -> Result<HashMap<String, Stri
         total_entries, entry_files.len(),
     );
     Ok(bridges)
+}
+
+/// Prepend `source_root` to `p` when `p` is corpus-relative; pass
+/// through unchanged when `p` already starts with `/` (synthetic
+/// Kythe builtins). Mirrors [`crate::emit::PackedEmitter::absolutize`]
+/// so both sidecars use one normalization rule and query-time
+/// `apply_precision_filter` covers them identically.
+fn absolutize_path(p: &str, source_root: Option<&Path>) -> String {
+    match (source_root, p.starts_with('/')) {
+        (Some(root), false) => {
+            let mut s = root.to_string_lossy().into_owned();
+            if !s.ends_with('/') { s.push('/'); }
+            s.push_str(p);
+            s
+        }
+        _ => p.to_string(),
+    }
 }
 
 /// Pass 2: walk entries again, decode anchors, look up target in
@@ -363,7 +396,7 @@ mod tests {
 
         // Run the importer.
         let out_dir = tmp.path().join("out");
-        let report = build_fqn_sidecar(&entries_dir, &out_dir)
+        let report = build_fqn_sidecar(&entries_dir, &out_dir, None)
             .expect("build_fqn_sidecar");
 
         // Bridges: two distinct source VNames mapped to one JVM FQN.
@@ -408,9 +441,37 @@ mod tests {
         std::fs::write(entries_dir.join("cu-x.entries"), &cu).unwrap();
 
         let out_dir = tmp.path().join("out");
-        let report = build_fqn_sidecar(&entries_dir, &out_dir).unwrap();
+        let report = build_fqn_sidecar(&entries_dir, &out_dir, None).unwrap();
         assert_eq!(report.named_bridges, 0);
         assert_eq!(report.canonical_records, 0);
         assert_eq!(report.skipped_no_bridge, 1);
+    }
+
+    /// A `source_root` prepends to corpus-relative paths and leaves
+    /// `/`-prefixed synthetic Kythe paths alone. Mirrors the
+    /// [`crate::emit::PackedEmitter`] convention so both sidecars use
+    /// the same query-time matching shape.
+    #[test]
+    fn source_root_absolutizes_relative_paths() {
+        let root = std::path::Path::new("/home/zim/dev/aosp");
+        assert_eq!(
+            absolutize_path("frameworks/base/core/java/android/os/Binder.java", Some(root)),
+            "/home/zim/dev/aosp/frameworks/base/core/java/android/os/Binder.java",
+        );
+        // Synthetic / already-absolute path passes through unchanged.
+        assert_eq!(
+            absolutize_path("/kythe_builtins/builtin", Some(root)),
+            "/kythe_builtins/builtin",
+        );
+        // No source_root leaves the path borrow'd-as-owned unchanged.
+        assert_eq!(
+            absolutize_path("frameworks/base/Binder.java", None),
+            "frameworks/base/Binder.java",
+        );
+        // Trailing slash on source_root tolerated (no double slash).
+        assert_eq!(
+            absolutize_path("frameworks/base/Binder.java", Some(std::path::Path::new("/home/zim/dev/aosp/"))),
+            "/home/zim/dev/aosp/frameworks/base/Binder.java",
+        );
     }
 }

@@ -2794,44 +2794,34 @@ fn cmd_callgraph(
         })
     } else { None };
 
-    // v0.1.43 — --def-in PATH narrows ROOT-LEVEL callers by the
-    // callee's def location. Same shape as cmd_ref's --def-in.
-    // Empty target set ⇒ diagnostic + no narrowing.
-    let root_def_target_ids: Option<std::collections::HashSet<u64>> =
-        def_in.as_deref().map(|p| {
-            let ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
-                .iter()
-                .filter(|s| r.display_path_cached(s.file_id)
-                    .is_some_and(|dp| dp.contains(p)))
-                .map(|s| s.id)
-                .collect();
-            if ids.is_empty() {
+    // Kythe-precise expansion uses `resolved_to` (written by
+    // build-resolutions exclusively from SCIP / clang USR symbol
+    // identity, no lexical heuristic) at every level of the tree.
+    // The root in-scope def set is whatever `--def-in` narrows the
+    // callee's defs to, or — when --def-in is absent — every def of
+    // the callee's bare name. Deeper levels recompute their in-scope
+    // set from the enclosing-function id of the parent call site.
+    //
+    // `--lexical` opts out of precision entirely (in_scope_def_ids
+    // = None at every level → expansion is pure name-match, same as
+    // the pre-Kythe behavior).
+    let in_scope_root_defs: Option<std::collections::HashSet<u64>> = if lexical {
+        None
+    } else {
+        let mut all = r.lookup_exact(&name);
+        if let Some(p) = def_in.as_deref() {
+            all.retain(|s| r.display_path_cached(s.file_id)
+                .is_some_and(|dp| dp.contains(p)));
+            if all.is_empty() {
                 eprintln!(
                     "[scry] --def-in: no def of {name:?} found in any file \
-                     containing {p:?}; root-level callers will not be narrowed.",
+                     containing {p:?}; precision filter would reject every \
+                     candidate. Pass `--lexical` to bypass.",
                 );
             }
-            ids
-        });
-
-    // Root-level precision filter (clang USR + SCIP symbol identity).
-    // Auto-engages when sidecars present unless --lexical was passed.
-    // Deeper recursion stays lexical because callee names at depth >0
-    // are caller-function names — those are def-style queries, not the
-    // same NAME the user asked about, and their precision answer would
-    // need a separate sidecar lookup per name (not free).
-    let (_reach_unused, clang_precise, scip_precise) =
-        resolve_precision(lexical, false);
-    let root_precise_sites: Option<std::collections::HashSet<(u32, u32)>> =
-        if !lexical && (clang_precise || scip_precise) {
-            let raw_root = r.lookup_refs_exact(&name);
-            let kept = apply_precision_filter(
-                &r, &name, raw_root, clang_precise, scip_precise, None,
-            )?;
-            Some(kept.into_iter().map(|rr| (rr.file_id, rr.byte_start)).collect())
-        } else {
-            None
-        };
+        }
+        Some(all.into_iter().map(|s| s.id).collect())
+    };
 
     /// One node in the callers tree. Children are callers of this
     /// function (i.e. parents on the call stack).
@@ -2845,33 +2835,39 @@ fn cmd_callgraph(
         callers: std::collections::BTreeMap<String, Node>,
     }
 
+    /// Per-level expansion. `in_scope_def_ids = Some(set)` requires
+    /// `resolved_to ∈ set` (Kythe-precise mode); `None` means the
+    /// user opted into `--lexical` and every name-matched ref is
+    /// kept. The grouping key for children is the enclosing
+    /// function's SymbolRecord id, NOT the bare function name — so
+    /// at the next level we recurse with `Some({that-id})` and only
+    /// follow refs that Kythe attributed to THAT specific function
+    /// def, not every same-named function across the corpus.
     #[allow(clippy::too_many_arguments)]
     fn expand(
         r: &StoreReader,
-        callee: &str,
+        callee_name: &str,
+        in_scope_def_ids: Option<&std::collections::HashSet<u64>>,
         depth_left: usize,
         in_prefix: &str,
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
-        // v0.1.43: root-level only. Some(set) ⇒ filter by Layer 2
-        // resolved_to ∈ set (with strict toggle). None ⇒ no filter
-        // (also the case for all non-root recursive levels).
-        root_def_target_ids: Option<&std::collections::HashSet<u64>>,
-        // Root-level precision filter: Some(set of (file_id, byte_start))
-        // ⇒ keep only refs whose site is in the set. None at deeper
-        // recursion levels (precision is not threaded down — see
-        // root_precise_sites computation in cmd_callgraph).
-        root_precise_sites: Option<&std::collections::HashSet<(u32, u32)>>,
         strict: bool,
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<u64>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
         if depth_left == 0 || *budget == 0 { return Default::default(); }
-        if !visited.insert(callee.to_string()) {
-            return Default::default();
-        }
-        let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
-        for rr in r.lookup_refs_exact(callee).into_iter() {
+        // Group by caller_def_id so we can recurse into the exact
+        // enclosing function (Kythe identity), not the bare name.
+        let mut by_caller_def: std::collections::BTreeMap<u64, (String, Node)>
+            = std::collections::BTreeMap::new();
+        // Bare-name fallback for refs where we couldn't resolve an
+        // enclosing function (e.g. top-level free function in C,
+        // file-level script). These can't recurse (no def-id) but
+        // we still surface them as leaf children.
+        let mut bare_name_leaves: std::collections::BTreeMap<String, Node>
+            = std::collections::BTreeMap::new();
+        for rr in r.lookup_refs_exact(callee_name).into_iter() {
             if rr.kind != scry_store::RefKind::Call { continue; }
             if !in_prefix.is_empty() || !not_in_prefix.is_empty() {
                 let Some(p) = r.display_path_cached(rr.file_id) else { continue };
@@ -2889,64 +2885,88 @@ fn cmd_callgraph(
                     }
                 }
             }
-            // Root-level --def-in / --strict filter (v0.1.43).
-            // Non-root recursive levels skip this branch because
-            // root_def_target_ids is None then.
-            if let Some(tids) = root_def_target_ids {
-                if !tids.is_empty() {
-                    match rr.resolved_to {
-                        Some(id) if !tids.contains(&id) => continue,
-                        None if strict => continue,
-                        _ => {}
+            // Kythe-precise filter: in precise mode (Some), the ref
+            // must resolve to one of the in-scope defs. In --lexical
+            // mode (None), every name-matched ref passes. Mixed:
+            // `--strict` without precision still drops Layer-2
+            // unresolveds even in lexical mode (preserves the
+            // pre-Kythe `--strict` semantics).
+            match (in_scope_def_ids, rr.resolved_to, strict) {
+                (Some(set), Some(id), _) if !set.contains(&id) => continue,
+                (Some(_), None, _) => continue, // unresolved in precise mode
+                (None, None, true) => continue, // strict + lexical = drop unresolveds
+                _ => {}
+            }
+            // Caller-side identity: the enclosing function symbol id.
+            // Fall back to scope_path (the enclosing class on Java)
+            // for sites with no per-function symbol; those become
+            // bare-name leaves with no further recursion.
+            let enc = r.enclosing_function(rr.file_id, rr.byte_start);
+            let path = r.file_display_path(rr.file_id).unwrap_or_default();
+            match enc {
+                Some(s) => {
+                    let entry = by_caller_def.entry(s.id)
+                        .or_insert_with(|| (s.name.clone(), Node::default()));
+                    entry.1.call_sites += 1;
+                    if entry.1.first_site.is_none() {
+                        entry.1.first_site = Some((path, rr.line, rr.col));
                     }
                 }
-            }
-            if root_def_target_ids.is_none() && strict && rr.resolved_to.is_none() {
-                continue;
-            }
-            // Root-level precision filter (clang USR / SCIP symbol
-            // identity). Only Some at the topmost call.
-            if let Some(sites) = root_precise_sites {
-                if !sites.contains(&(rr.file_id, rr.byte_start)) {
-                    continue;
+                None => {
+                    let bare = rr.scope_path.last().cloned()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let entry = bare_name_leaves.entry(bare).or_default();
+                    entry.call_sites += 1;
+                    if entry.first_site.is_none() {
+                        entry.first_site = Some((path, rr.line, rr.col));
+                    }
                 }
-            }
-            // Prefer the byte-range enclosing function (more accurate
-            // than scope_path.last() which reports the class on Java).
-            // Fall back to scope_path when file_symbols is missing.
-            let caller_name = r.enclosing_function(rr.file_id, rr.byte_start)
-                .map(|s| s.name)
-                .or_else(|| rr.scope_path.last().cloned());
-            let Some(caller_name) = caller_name else { continue };
-            let entry = out.entry(caller_name.clone()).or_default();
-            entry.call_sites += 1;
-            if entry.first_site.is_none() {
-                let path = r.file_display_path(rr.file_id).unwrap_or_default();
-                entry.first_site = Some((path, rr.line, rr.col));
             }
             *budget = budget.saturating_sub(1);
             if *budget == 0 { break; }
         }
-        // Recurse into each caller, expanding their callers. Pass
-        // None for root_def_target_ids / root_precise_sites so the
-        // narrowing only fires at the topmost level (we don't have
-        // per-frame def or per-name precision context).
-        for (caller_name, node) in &mut out {
-            node.callers = expand(
-                r, caller_name, depth_left - 1, in_prefix, not_in_prefix,
-                callee_modules, None, None, strict, visited, budget,
-            );
+        // Materialize the tree. Recurse only into entries that have
+        // a caller_def_id (so the next level can Kythe-filter by it);
+        // bare-name leaves stay as leaves. `visited` tracks
+        // caller_def_ids to break cycles (mutual recursion).
+        let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
+        for (caller_def_id, (caller_name, mut node)) in by_caller_def {
+            if visited.insert(caller_def_id) {
+                let next_scope: std::collections::HashSet<u64> =
+                    std::iter::once(caller_def_id).collect();
+                // In --lexical mode (None at this level) keep
+                // recursion lexical too — user opted out of precision
+                // for the whole tree.
+                let recurse_scope = in_scope_def_ids.map(|_| &next_scope);
+                node.callers = expand(
+                    r, &caller_name, recurse_scope,
+                    depth_left - 1, in_prefix, not_in_prefix,
+                    callee_modules, strict, visited, budget,
+                );
+                visited.remove(&caller_def_id);
+            }
+            // Merge into the by-name output (multiple def-ids may share
+            // a simple name across the corpus; their children stay
+            // distinct via separate first_site annotations).
+            let existing = out.entry(caller_name).or_default();
+            existing.call_sites += node.call_sites;
+            if existing.first_site.is_none() { existing.first_site = node.first_site; }
+            existing.callers.append(&mut node.callers);
         }
-        visited.remove(callee);
+        for (bare_name, node) in bare_name_leaves {
+            let existing = out.entry(bare_name).or_default();
+            existing.call_sites += node.call_sites;
+            if existing.first_site.is_none() { existing.first_site = node.first_site; }
+        }
         out
     }
 
     let mut budget = max_nodes;
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let prefix = in_.as_deref().unwrap_or("");
     let neg_prefix = not_in.as_deref().unwrap_or("");
-    let tree = expand(&r, &name, depth, prefix, neg_prefix, callee_modules.as_ref(),
-                      root_def_target_ids.as_ref(), root_precise_sites.as_ref(),
+    let tree = expand(&r, &name, in_scope_root_defs.as_ref(), depth,
+                      prefix, neg_prefix, callee_modules.as_ref(),
                       strict, &mut visited, &mut budget);
 
     if json {
@@ -8839,32 +8859,22 @@ fn serve_callgraph(
         })
     } else { None };
 
-    // Root-level --def-in target def-ids (v0.1.44). Daemon stays
-    // quiet on diagnostics; empty target set ⇒ no narrowing.
-    let root_def_target_ids: Option<std::collections::HashSet<u64>> =
-        def_in.map(|p| {
-            r.lookup_exact(name).iter()
-                .filter(|s| r.display_path_cached(s.file_id)
-                    .is_some_and(|dp| dp.contains(p)))
-                .map(|s| s.id)
-                .collect()
-        });
-
-    // Root-level precision filter — same shape as cmd_callgraph.
-    // Soft-fail on sidecar errors: a daemon shouldn't crash a single
-    // RPC because of a broken precision sidecar.
-    let root_precise_sites: Option<std::collections::HashSet<(u32, u32)>> =
-        if clang_precise || scip_precise {
-            let raw_root = r.lookup_refs_exact(name);
-            match apply_precision_filter(r, name, raw_root, clang_precise, scip_precise, None) {
-                Ok(kept) => Some(
-                    kept.into_iter().map(|rr| (rr.file_id, rr.byte_start)).collect()
-                ),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+    // Kythe-precise expansion at every level (same shape as
+    // cmd_callgraph). `--lexical` opt-out is signalled by neither
+    // clang_precise nor scip_precise being set — when both are
+    // false, callers got `--lexical` from the RPC, so we skip the
+    // resolved_to filter to match the CLI semantics.
+    let lexical_mode = !clang_precise && !scip_precise;
+    let in_scope_root_defs: Option<std::collections::HashSet<u64>> = if lexical_mode {
+        None
+    } else {
+        let mut all = r.lookup_exact(name);
+        if let Some(p) = def_in {
+            all.retain(|s| r.display_path_cached(s.file_id)
+                .is_some_and(|dp| dp.contains(p)));
+        }
+        Some(all.into_iter().map(|s| s.id).collect())
+    };
 
     #[derive(Debug, Default, serde::Serialize)]
     struct Node {
@@ -8876,21 +8886,22 @@ fn serve_callgraph(
     #[allow(clippy::too_many_arguments)]
     fn expand(
         r: &StoreReader,
-        callee: &str,
+        callee_name: &str,
+        in_scope_def_ids: Option<&std::collections::HashSet<u64>>,
         depth_left: usize,
         in_prefix: &str,
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
-        root_def_target_ids: Option<&std::collections::HashSet<u64>>,
-        root_precise_sites: Option<&std::collections::HashSet<(u32, u32)>>,
         strict: bool,
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<u64>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
         if depth_left == 0 || *budget == 0 { return Default::default(); }
-        if !visited.insert(callee.to_string()) { return Default::default(); }
-        let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
-        for rr in r.lookup_refs_exact(callee).into_iter() {
+        let mut by_caller_def: std::collections::BTreeMap<u64, (String, Node)>
+            = std::collections::BTreeMap::new();
+        let mut bare_name_leaves: std::collections::BTreeMap<String, Node>
+            = std::collections::BTreeMap::new();
+        for rr in r.lookup_refs_exact(callee_name).into_iter() {
             if rr.kind != scry_store::RefKind::Call { continue; }
             if !in_prefix.is_empty() || !not_in_prefix.is_empty() {
                 let Some(p) = r.display_path_cached(rr.file_id) else { continue };
@@ -8906,53 +8917,64 @@ fn serve_callgraph(
                     }
                 }
             }
-            // Root-level --def-in / --strict filter (v0.1.44).
-            if let Some(tids) = root_def_target_ids {
-                if !tids.is_empty() {
-                    match rr.resolved_to {
-                        Some(id) if !tids.contains(&id) => continue,
-                        None if strict => continue,
-                        _ => {}
+            match (in_scope_def_ids, rr.resolved_to, strict) {
+                (Some(set), Some(id), _) if !set.contains(&id) => continue,
+                (Some(_), None, _) => continue,
+                (None, None, true) => continue,
+                _ => {}
+            }
+            let enc = r.enclosing_function(rr.file_id, rr.byte_start);
+            let path = r.file_display_path(rr.file_id).unwrap_or_default();
+            match enc {
+                Some(s) => {
+                    let entry = by_caller_def.entry(s.id)
+                        .or_insert_with(|| (s.name.clone(), Node::default()));
+                    entry.1.call_sites += 1;
+                    if entry.1.first_site.is_none() {
+                        entry.1.first_site = Some((path, rr.line, rr.col));
                     }
                 }
-            }
-            if root_def_target_ids.is_none() && strict && rr.resolved_to.is_none() {
-                continue;
-            }
-            // Root-level precision (clang USR / SCIP). Only Some at
-            // the topmost call; deeper recursion stays lexical.
-            if let Some(sites) = root_precise_sites {
-                if !sites.contains(&(rr.file_id, rr.byte_start)) {
-                    continue;
+                None => {
+                    let bare = rr.scope_path.last().cloned()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let entry = bare_name_leaves.entry(bare).or_default();
+                    entry.call_sites += 1;
+                    if entry.first_site.is_none() {
+                        entry.first_site = Some((path, rr.line, rr.col));
+                    }
                 }
-            }
-            let caller_name = r.enclosing_function(rr.file_id, rr.byte_start)
-                .map(|s| s.name)
-                .or_else(|| rr.scope_path.last().cloned());
-            let Some(caller_name) = caller_name else { continue };
-            let entry = out.entry(caller_name.clone()).or_default();
-            entry.call_sites += 1;
-            if entry.first_site.is_none() {
-                let path = r.file_display_path(rr.file_id).unwrap_or_default();
-                entry.first_site = Some((path, rr.line, rr.col));
             }
             *budget = budget.saturating_sub(1);
             if *budget == 0 { break; }
         }
-        // Recurse without root filter — narrowing only applies at the
-        // top level (same limitation as cmd_callgraph).
-        for (caller_name, node) in &mut out {
-            node.callers = expand(r, caller_name, depth_left - 1, in_prefix, not_in_prefix,
-                callee_modules, None, None, strict, visited, budget);
+        let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
+        for (caller_def_id, (caller_name, mut node)) in by_caller_def {
+            if visited.insert(caller_def_id) {
+                let next_scope: std::collections::HashSet<u64> =
+                    std::iter::once(caller_def_id).collect();
+                let recurse_scope = in_scope_def_ids.map(|_| &next_scope);
+                node.callers = expand(r, &caller_name, recurse_scope,
+                    depth_left - 1, in_prefix, not_in_prefix,
+                    callee_modules, strict, visited, budget);
+                visited.remove(&caller_def_id);
+            }
+            let existing = out.entry(caller_name).or_default();
+            existing.call_sites += node.call_sites;
+            if existing.first_site.is_none() { existing.first_site = node.first_site; }
+            existing.callers.append(&mut node.callers);
         }
-        visited.remove(callee);
+        for (bare_name, node) in bare_name_leaves {
+            let existing = out.entry(bare_name).or_default();
+            existing.call_sites += node.call_sites;
+            if existing.first_site.is_none() { existing.first_site = node.first_site; }
+        }
         out
     }
 
     let mut budget = max_nodes;
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let tree = expand(r, name, depth, prefix, neg_prefix, callee_modules.as_ref(),
-                      root_def_target_ids.as_ref(), root_precise_sites.as_ref(),
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let tree = expand(r, name, in_scope_root_defs.as_ref(), depth,
+                      prefix, neg_prefix, callee_modules.as_ref(),
                       strict, &mut visited, &mut budget);
     serde_json::json!({
         "callee": name,

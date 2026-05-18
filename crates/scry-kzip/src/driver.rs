@@ -490,9 +490,30 @@ fn run_one_cu(
     }
     if !run.produced_entries() {
         // No entries: either a hard fail (exit != 0) or a clean
-        // run that produced no symbols (rare but possible).
-        if run.exit_code != 0 { counters.lock().unwrap().2 += 1; }
-        else { counters.lock().unwrap().1 += 1; }
+        // run that produced no symbols. The second branch hides a
+        // class of silent failures — `java_indexer.jar` exits 0
+        // even when javac aborts mid-parse with OutOfMemoryError or
+        // a SEVERE-logged IllegalStateException, just emits nothing.
+        // Detect those patterns in the stderr tail and reclassify
+        // as failed so the summary's "empty" bucket only contains
+        // genuinely empty CUs (no source, or all skipped).
+        let stderr_tail_str = String::from_utf8_lossy(&run.stderr_tail);
+        let silent_failure = run.exit_code == 0 && (
+            stderr_tail_str.contains("OutOfMemoryError")
+            || stderr_tail_str.contains("java.lang.IllegalStateException")
+            || stderr_tail_str.contains("SEVERE: Unexpected error")
+        );
+        if silent_failure {
+            log_to(log_file, format!(
+                "[{} {}/{}] silent-fail (exit=0 but stderr names OOM/SEVERE) — counting as failed\n",
+                label, seq, total,
+            ));
+        }
+        if run.exit_code != 0 || silent_failure {
+            counters.lock().unwrap().2 += 1;
+        } else {
+            counters.lock().unwrap().1 += 1;
+        }
         return;
     }
     // Decode the entries into a per-CU staging buffer first, then

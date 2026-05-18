@@ -320,15 +320,28 @@ fn build_command(
             c
         }
         IndexerKind::JavaSource | IndexerKind::JvmBytecode => {
-            // `java -jar <indexer>.jar --temp_directory <dir> <kzip>`.
+            // `java <heap> -jar <indexer>.jar --temp_directory <dir> <kzip>`.
             // The `--temp_directory` flag is mandatory whenever the
             // CU's compiler args carry `--system <jdk_image>` (every
             // modern AOSP build does) — without it java_indexer
-            // silently emits zero entries on those CUs. We bound the
-            // JVM heap at 2g so a runaway CU can't claim the whole
-            // machine.
+            // silently emits zero entries on those CUs.
+            //
+            // **Heap sizing.** Default `-Xmx8g`. Earlier `-Xmx2g` was
+            // chosen as a "conservative ceiling so one CU can't claim
+            // the host"; AOSP's services.core `am/` batch (Activity-
+            // ManagerService, BroadcastQueueImpl, BroadcastRecord,
+            // ProcessRecord ...) blows past 2g just building javac
+            // line maps and OOMs with `java.lang.OutOfMemoryError:
+            // Java heap space`. The wrapper exits 0 silently — the
+            // CU shows as "empty" in the summary, masking the bug.
+            // 8g handles every observed AOSP batch with margin.
+            // `SCRY_KZIP_JVM_HEAP=N` (e.g. `16g`) overrides for
+            // pathological corpora; 16 workers × 8g = 128 GB peak
+            // worst-case, comfortable on the 157 GiB host.
+            let heap = std::env::var("SCRY_KZIP_JVM_HEAP")
+                .unwrap_or_else(|_| "8g".to_string());
             let mut c = Command::new("java");
-            c.arg("-Xmx2g")
+            c.arg(format!("-Xmx{heap}"))
                 .arg("-jar")
                 .arg(bin)
                 .arg("--ignore_empty_kzip");

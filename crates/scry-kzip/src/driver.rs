@@ -314,8 +314,18 @@ fn walk_and_bucket(
     let mut yielded = 0usize;
     let mut dropped_by_include = 0usize;
     let mut dropped_by_exclude = 0usize;
+    let mut seen = 0usize;
+    let t_walk_phase = Instant::now();
     for unit_res in walker::walk_units_serial(kzip, langs_filter)? {
         let unit = unit_res.context("walk kzip units")?;
+        seen += 1;
+        if seen % 5000 == 0 {
+            eprintln!(
+                "[scry-kzip] phase 1/6: walked {} CUs ({:.1}s, {} bucketed, {} excluded, {} include-dropped)",
+                seen, t_walk_phase.elapsed().as_secs_f64(),
+                yielded, dropped_by_exclude, dropped_by_include,
+            );
+        }
         // Path filters apply only to CUs that would actually run an
         // indexer; Skip-kind CUs preserve their per-language skip
         // tally in the summary regardless of path scope.

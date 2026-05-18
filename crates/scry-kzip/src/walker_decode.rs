@@ -7,7 +7,7 @@
 
 use crate::proto::analysis::{CompilationUnit, IndexedCompilation};
 use crate::walker::{KzipArchive, KzipUnit, LangFilter, UnitEncoding, UnitEntry};
-use crate::walker_peek::peek_matches_filter;
+use crate::walker_peek::{peek_json_primary_path, peek_matches_filter, peek_unit_language};
 use anyhow::{anyhow, Context, Result};
 use protobuf::Message;
 use std::io::Read as _;
@@ -19,7 +19,13 @@ use std::path::Path;
 /// seen (the field lives in the first ~256 bytes of the JSON, well
 /// inside this cap); small enough that we don't pay for the multi-MB
 /// decompression of CUs the filter rejects.
-const PEEK_PREFIX_BYTES: usize = 4096;
+/// Bytes pulled from the start of each zip entry before deciding
+/// whether to full-decode. 4 KiB was enough for the language probe
+/// (lives near the front of every CU); 64 KiB also gives the
+/// primary_path probe room to find a `.cc` / `.java` past the
+/// classpath / header preamble. Bumping further raises decompress
+/// cost for every CU without much marginal hit-rate gain.
+const PEEK_PREFIX_BYTES: usize = 65536;
 
 /// Pull one entry's bytes out of `zip` and turn them into a
 /// `KzipUnit`. Honours the optional language pre-peek filter and
@@ -69,15 +75,38 @@ pub(crate) fn read_one_entry(
         {
             return Ok(None);
         }
-        // The cheap pre-peek above (`peek_matches_filter`) already
-        // dropped CUs whose language is outside `SCRY_KZIP_LANGS` —
-        // that's the bulk of the savings. Everything that survives
-        // needs full decode so `KzipUnit::primary_path` (which feeds
-        // `SCRY_KZIP_PATH_PREFIX` / `_EXCLUDE`) is populated from a
-        // real scan of `required_input`. An earlier optimization
-        // short-circuited the full decode for languages that didn't
-        // need `has_class_input`, but that left `primary_path` empty
-        // for cxx / java / etc. and silently disabled path filtering.
+        // Try to build a KzipUnit entirely from the peek buffer. The
+        // peek extracts language and primary_path; dispatch only needs
+        // `has_class_input` for kotlin, so if the peek language is not
+        // kotlin and we find a real source path in the peek window,
+        // we skip the multi-MB body decompress entirely. On the AOSP
+        // kzip this short-circuits ~99 % of CUs.
+        let peek_lang = peek_unit_language(&buf, entry.encoding).unwrap_or_default();
+        if can_skip_full_decode(&peek_lang) {
+            // Proto-encoded CUs in this kzip are go/kotlin/rust only;
+            // none of them benefit from this peek shortcut (go needs
+            // full decode for primary_path, kotlin is excluded by the
+            // guard above, rust is filtered earlier). Implement the
+            // peek-extract for JSON only.
+            if matches!(entry.encoding, UnitEncoding::Json) {
+                if let Some(primary) = peek_json_primary_path(&buf) {
+                    if !primary.is_empty() {
+                        let unit = KzipUnit {
+                            kzip_path: kzip.to_path_buf(),
+                            unit_sha: entry.sha.clone(),
+                            encoding: entry.encoding,
+                            language: peek_lang,
+                            has_class_input: false,
+                            primary_path: primary,
+                        };
+                        return Ok(Some(unit));
+                    }
+                }
+            }
+        }
+        // Full decode fallback: peek didn't pin down primary_path, or
+        // the language needs has_class_input (kotlin), or the body is
+        // proto-encoded (where we don't have a primary-path peeker).
         buf.reserve(total.saturating_sub(peek_len));
         zf.read_to_end(&mut buf)
             .with_context(|| format!("read kzip entry {}", entry.name))?;
@@ -95,6 +124,20 @@ pub(crate) fn read_one_entry(
         }
     }
     Ok(Some(unit))
+}
+
+/// Languages where dispatch and KzipUnit fields can be filled entirely
+/// from the cheap peek: `has_class_input` isn't consulted, the
+/// language string is already known, and primary_path can be
+/// extracted by a substring scan. Kotlin is excluded because its
+/// dispatch consults `has_class_input` (jvm_indexer vs Skip), which
+/// only the full decode knows. Empty language is excluded because
+/// we'd need `infer_language_from_inputs` to recover it.
+fn can_skip_full_decode(lang: &str) -> bool {
+    matches!(
+        lang,
+        "c++" | "c" | "objc" | "java" | "go" | "protobuf" | "proto" | "textproto" | "rust",
+    )
 }
 
 fn decode_proto_unit(

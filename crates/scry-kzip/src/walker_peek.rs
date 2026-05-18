@@ -275,6 +275,72 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+// -------------------------------------------------------- primary_path peek
+
+/// Best-effort primary-source-path probe for JSON-encoded units.
+/// Walks `bytes` looking for the first `"path":"..."` value whose
+/// suffix is a source-language extension (`.cc`, `.java`, `.kt`, etc.).
+/// AOSP cxx CUs put their `.cc` at `required_input[0]` so the match
+/// usually sits within the first ~1 KiB; Java CUs put classpath jars
+/// first and the first `.java` lives a few KiB in. A 32 KiB peek
+/// window covers both.
+///
+/// Returns:
+/// * `Some(path)` — first source-extension path found.
+/// * `Some(empty)` — peek scanned the window cleanly and found no
+///   source-extension path. Caller should treat this as "no primary
+///   path available without full decode" and either fall back or
+///   accept it as the CU having no compilable source (rare).
+/// * `None` — peek hit truncated / malformed bytes; caller should
+///   fall back to full decode.
+///
+/// Cost: O(bytes) one substring pass per `"path":` occurrence. On the
+/// AOSP kzip this is sub-millisecond per CU vs ~50-100 ms for a full
+/// proto3-JSON decode of the multi-MB body.
+pub(crate) fn peek_json_primary_path(bytes: &[u8]) -> Option<String> {
+    const KEY: &[u8] = b"\"path\"";
+    let mut cursor = 0;
+    while let Some(rel) = memmem(&bytes[cursor..], KEY) {
+        let value_start = cursor + rel + KEY.len();
+        // Skip whitespace then expect `:`.
+        let mut p = value_start;
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+        if bytes.get(p) != Some(&b':') { cursor = value_start; continue; }
+        p += 1;
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+        if bytes.get(p) != Some(&b'"') { cursor = value_start; continue; }
+        p += 1;
+        let str_start = p;
+        // Find closing quote. proto3-JSON path values are UTF-8 with
+        // standard JSON escapes; treat `\` followed by any byte as a
+        // 2-byte escape sequence so a literal `\"` inside the string
+        // doesn't terminate us prematurely.
+        while p < bytes.len() && bytes[p] != b'"' {
+            if bytes[p] == b'\\' && p + 1 < bytes.len() { p += 2; } else { p += 1; }
+        }
+        if p >= bytes.len() { return None; } // truncated
+        let raw = &bytes[str_start..p];
+        let value = std::str::from_utf8(raw).ok()?;
+        if is_source_extension(value) {
+            return Some(value.to_string());
+        }
+        cursor = p + 1;
+    }
+    Some(String::new())
+}
+
+/// Source-language file extensions. Kept in sync with
+/// `walker_decode::is_source_path`; duplicated here so `walker_peek`
+/// stays leaf-module (no cyclic import).
+fn is_source_extension(path: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".cc", ".cpp", ".cxx", ".c++", ".c", ".m", ".mm",
+        ".java", ".kt", ".go", ".rs",
+        ".proto", ".textpb", ".textproto",
+    ];
+    EXTS.iter().any(|e| path.ends_with(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

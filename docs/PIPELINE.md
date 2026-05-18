@@ -175,6 +175,67 @@ Path filters apply only to runnable CUs; Skip-kind CUs (rust, kotlin
 without bytecode) are always counted in the per-language skip tally
 regardless of path scope so the summary stays accurate.
 
+#### Resume semantics (`--resume`)
+
+A full AOSP kzip ingest is 3-12 hours of indexer work. A SIGTERM
+mid-phase-3 would otherwise discard every per-CU record committed so
+far (the in-memory `PackedEmitter` buckets only get written to
+`clang_usrs.bin` / `scip_index.bin` at phase 4). The driver checkpoints
+each successful CU's records to disk under
+`<out>/kythe-logs/checkpoint/`:
+
+```
+<out>/kythe-logs/checkpoint/
+   manifest.json           kzip + env fingerprint + done-shas
+   cxx.records.log         append-only framed bincode (cxx_indexer)
+   scip.records.log        append-only framed bincode (everything else)
+```
+
+Each frame is `[u64 cu_sha_hash][u32 record_count][u32 byte_len][bincode]`.
+On `--resume` the driver replays both logs into the in-memory buckets,
+seeds the done-shas set from the manifest (the source of truth — the
+log itself — covers any CUs that landed between the last manifest
+flush and the crash), and the walker skips matching SHAs in phase 1.
+Truncated tails (kill mid-write) are detected by the length prefix and
+discarded with a warning — the per-CU dedup key
+`(path, offset, symbol_id, role)` makes a re-processed CU idempotent.
+
+**Three-state validator** (enforced before phase 1):
+
+| `--out` has checkpoint | `--resume` | Behavior |
+|---|---|---|
+| no | absent | fresh run; create checkpoint as work progresses |
+| yes | absent | hard error: pass `--resume` or `rm -rf` the checkpoint |
+| no | present | hard error: no checkpoint at the given path |
+| yes, fingerprint mismatch | present | hard error: kzip / env differ from checkpoint |
+| yes, fingerprint matches | present | resume cleanly |
+
+Fingerprint = `(kzip path + size + mtime + SCRY_KZIP_LANGS +
+SCRY_KZIP_PATH_PREFIX + SCRY_KZIP_PATH_EXCLUDE + SCRY_KZIP_MAX_UNITS +
+kythe_root)`. Different fingerprint means the checkpoint covers a
+different slice of work; mixing them would silently produce a
+mixed-scope sidecar.
+
+**Why explicit-flag, no auto-resume:** production tools (kubelet,
+terraform, bazel) require explicit opt-in to continue a partial run.
+Auto-resume on fingerprint match would let a user re-run against the
+same out-dir and silently inherit half-finished state, then be
+confused when the result doesn't match a fresh run. The opt-in is one
+flag (`--resume`); the cost of forgetting it is one human-readable
+error.
+
+The checkpoint dir is **NOT** auto-deleted after a successful sidecar
+flush. Forensics (per-language CU progression, exact byte budgets,
+recovery) beats magic. `rm -rf <out>/kythe-logs/checkpoint/` when
+you're done with it.
+
+**Manifest flush cadence:** `SCRY_KZIP_CHECKPOINT_EVERY=N` (default
+100) controls how often `manifest.json` is re-flushed. The records
+logs are appended every CU regardless — this knob only affects how
+fresh the JSON manifest's `done_shas` list stays. A small value (e.g.
+5 for the integration test) makes the smoke loop verifiable; the
+default amortises the JSON write cost.
+
 The Kythe extractors see what the compiler sees: post-rewrite sources
 from protologsrc / jarjar / AAPT2 / hiddenAPI / AIDL / KAPT,
 variant-selected source sets, every javac shard, every flag. Soong's

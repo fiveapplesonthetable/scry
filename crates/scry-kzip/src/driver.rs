@@ -340,11 +340,17 @@ fn run_one_cu(
             counters.lock().unwrap().2 += 1;
         }
     }
-    if seq % 50 == 0 || seq == total {
-        let (ok, empty, failed) = *counters.lock().unwrap();
+    // Progress every 50 completions (not every 50th input index — with
+    // rayon, items finish out of order, so a `seq % 50` check would
+    // only fire when items #50, #100, ... happened to complete, which
+    // may be very late). Sum the counters and print on multiples of 50.
+    let _ = seq; // input-position-based progress would be misleading; see above
+    let (ok, empty, failed) = *counters.lock().unwrap();
+    let done = ok + empty + failed;
+    if done % 50 == 0 || done == total {
         eprintln!(
             "[scry-kzip] phase 3/6: {} progress {}/{} ({} ok, {} empty, {} failed)",
-            label, seq, total, ok, empty, failed,
+            label, done, total, ok, empty, failed,
         );
     }
 }

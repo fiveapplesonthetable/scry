@@ -50,7 +50,11 @@ pub struct KzipBuildReport {
 /// Per-language slice of the report.
 #[derive(Debug, Clone)]
 pub struct LangReport {
-    pub label: &'static str,
+    /// Distinct label per bucket. For runnable buckets this is the
+    /// `IndexerKind` label (`cxx`, `java`, …). For skip buckets it's
+    /// `skip-<source language>` so the summary shows separate
+    /// `skip-rust` and `skip-kotlin` rows.
+    pub label: String,
     pub cu_count: usize,
     pub indexer_ok: usize,
     pub indexer_empty: usize,
@@ -96,14 +100,19 @@ pub fn build_packed_from_kzip(
         );
     }
 
-    // Bucket by indexer kind. Skipped kinds get their own bucket so
-    // the summary still records "X CUs skipped (reason)".
-    let mut by_kind: HashMap<&'static str, BucketEntry> = HashMap::new();
+    // Bucket by (kind, language). The label keys runnable buckets;
+    // Skip buckets are keyed by the CU's source language so the
+    // summary distinguishes "1035 kotlin CUs skipped" from "2043
+    // rust CUs skipped" — they share the same IndexerKind::Skip
+    // variant but the user wants per-language diagnostics.
+    let mut by_kind: HashMap<String, BucketEntry> = HashMap::new();
     for unit in units {
         let kind = dispatch::choose_for(&unit);
-        let label = kind.label();
-        let entry = by_kind.entry(label).or_insert_with(|| BucketEntry {
-            label,
+        let key = match kind {
+            IndexerKind::Skip(_) => format!("skip-{}", unit.language),
+            _ => kind.label().to_string(),
+        };
+        let entry = by_kind.entry(key).or_insert_with(|| BucketEntry {
             kind,
             units: Vec::new(),
             skip_reason: match kind {
@@ -119,14 +128,14 @@ pub fn build_packed_from_kzip(
     eprintln!(
         "[scry-kzip] phase 2/6: dispatching {} kinds ({})",
         by_kind.len(),
-        by_kind.values().map(|b| format!("{}={}", b.label, b.units.len()))
+        by_kind.iter().map(|(k, b)| format!("{}={}", k, b.units.len()))
             .collect::<Vec<_>>().join(", "),
     );
-    for bucket in by_kind.values() {
+    for (key, bucket) in &by_kind {
         if !bucket.kind.is_runnable() { continue; }
         if let Err(e) = resolve_indexer(kythe_root, bucket.kind) {
             return Err(e).with_context(|| format!(
-                "resolve indexer for kind {}", bucket.label,
+                "resolve indexer for kind {}", key,
             ));
         }
     }
@@ -153,12 +162,12 @@ pub fn build_packed_from_kzip(
         .with_context(|| format!("mkdir staging {}", staging.display()))?;
 
     pool.install(|| {
-        for (label, bucket) in &by_kind {
+        for (display_label, bucket) in &by_kind {
             let t_lang = Instant::now();
-            let log_path = logs_dir.join(format!("{label}.log"));
+            let log_path = logs_dir.join(format!("{display_label}.log"));
             if !bucket.kind.is_runnable() {
                 lang_reports.lock().unwrap().push(LangReport {
-                    label: bucket.label,
+                    label: display_label.clone(),
                     cu_count: bucket.units.len(),
                     indexer_ok: 0,
                     indexer_empty: 0,
@@ -175,12 +184,12 @@ pub fn build_packed_from_kzip(
                 );
                 eprintln!(
                     "[scry-kzip] phase 3/6: {} ({} CUs skipped — {})",
-                    label, bucket.units.len(), bucket.skip_reason,
+                    display_label, bucket.units.len(), bucket.skip_reason,
                 );
                 continue;
             }
             eprintln!(
-                "[scry-kzip] phase 3/6: {} ({} CUs)", label, bucket.units.len(),
+                "[scry-kzip] phase 3/6: {} ({} CUs)", display_label, bucket.units.len(),
             );
             let log_file = Mutex::new(
                 std::fs::File::create(&log_path)
@@ -192,12 +201,12 @@ pub fn build_packed_from_kzip(
             bucket.units.par_iter().enumerate().for_each(|(i, unit)| {
                 run_one_cu(
                     unit, bucket.kind, &staging, kythe_root,
-                    &emitter, &log_file, &counters, i + 1, n_units, label,
+                    &emitter, &log_file, &counters, i + 1, n_units, display_label,
                 );
             });
             let (ok, empty, failed) = *counters.lock().unwrap();
             lang_reports.lock().unwrap().push(LangReport {
-                label: bucket.label,
+                label: display_label.clone(),
                 cu_count: n_units,
                 indexer_ok: ok,
                 indexer_empty: empty,
@@ -208,7 +217,7 @@ pub fn build_packed_from_kzip(
             });
             eprintln!(
                 "[scry-kzip] phase 3/6: {} done ({} ok, {} empty, {} failed in {:.1}s)",
-                label, ok, empty, failed, t_lang.elapsed().as_secs_f64(),
+                display_label, ok, empty, failed, t_lang.elapsed().as_secs_f64(),
             );
         }
     });
@@ -229,7 +238,7 @@ pub fn build_packed_from_kzip(
     eprintln!("[scry-kzip] phase 5/6: writing summary log");
     let lang_reports_vec: Vec<LangReport> = {
         let mut v = lang_reports.into_inner().unwrap();
-        v.sort_by_key(|r| r.label);
+        v.sort_by(|a, b| a.label.cmp(&b.label));
         v
     };
     write_summary_log(&logs_dir, kzip, &lang_reports_vec, &emit)?;
@@ -267,7 +276,6 @@ fn apply_env_filters(units: &mut Vec<KzipUnit>) {
 }
 
 struct BucketEntry {
-    label: &'static str,
     kind: IndexerKind,
     units: Vec<KzipUnit>,
     /// Populated only when kind is `Skip(_)`.

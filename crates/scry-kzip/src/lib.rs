@@ -44,6 +44,7 @@ pub mod emit_checkpoint;
 pub mod entries;
 pub mod indexer;
 pub mod proto;
+pub mod serving;
 pub mod walker;
 mod walker_decode;
 mod walker_peek;

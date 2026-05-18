@@ -259,6 +259,24 @@ pub fn run_indexer(
     kind: IndexerKind,
     kythe_root: &Path,
 ) -> Result<IndexerRun> {
+    run_indexer_with_sink(cu_kzip_path, unit_sha, kind, kythe_root, None)
+}
+
+/// Same as [`run_indexer`], plus an optional per-CU file path that
+/// receives a byte-for-byte copy of the indexer's stdout (the raw
+/// length-prefixed Kythe Entry proto stream). Used by the corpus-wide
+/// `write_tables` pipeline (phase 4) — the per-CU dumps get concatenated
+/// and fed into `kythe entrystream --unique --sort | kythe write_tables`.
+///
+/// When `entries_sink` is `None`, behaviour matches the original
+/// streaming-only path with zero per-byte overhead.
+pub fn run_indexer_with_sink(
+    cu_kzip_path: &Path,
+    unit_sha: &str,
+    kind: IndexerKind,
+    kythe_root: &Path,
+    entries_sink: Option<&Path>,
+) -> Result<IndexerRun> {
     let bin = resolve_indexer(kythe_root, kind)?;
     // JVM-based indexers need a writable temp directory to unpack the
     // JDK system modules (`--system <jdk_image>` in the CU's compiler
@@ -300,9 +318,34 @@ pub fn run_indexer(
     let mut decoded: Vec<DecodedRecord> = Vec::new();
     let counting = CountingReader::new(stdout_handle);
     let count_arc = counting.bytes_seen();
-    let entry_count_result = crate::entries::decode_stream(counting, |rec| {
-        decoded.push(rec);
-    });
+    // If a corpus-wide entries sink is configured, open the per-CU file
+    // and tee every byte the indexer emits into it as it streams. The
+    // tee writes one syscall per `Read::read`, which composes with
+    // BufWriter to amortise to a handful of writes per CU.
+    let entry_count_result: Result<u64> = if let Some(sink_path) = entries_sink {
+        // Don't leave stale data if a prior failed run hit this CU.
+        let file = File::create(sink_path)
+            .with_context(|| format!("create entries sink {}", sink_path.display()))?;
+        let buffered = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut tee = TeeReader::new(counting, buffered);
+        let res = crate::entries::decode_stream(&mut tee, |rec| {
+            decoded.push(rec);
+        });
+        // Flush BEFORE checking the decode result so the on-disk
+        // entries stay complete even if decode_stream errors out
+        // mid-stream. `into_inner` surfaces deferred flush errors
+        // (BufWriter's Drop swallows them).
+        if let Err(e) = tee.flush_sink() {
+            return Err(e).with_context(|| format!(
+                "flush entries sink {}", sink_path.display(),
+            ));
+        }
+        res
+    } else {
+        crate::entries::decode_stream(counting, |rec| {
+            decoded.push(rec);
+        })
+    };
 
     // Always wait — even on decode error — to reap the child.
     let status = child.wait()
@@ -415,6 +458,47 @@ impl<R: Read> Read for CountingReader<R> {
         let n = self.inner.read(buf)?;
         if n > 0 {
             *self.seen.lock().unwrap() += n as u64;
+        }
+        Ok(n)
+    }
+}
+
+/// `Read` wrapper that tees every byte to an additional `Write` sink as
+/// it streams through. We use this to capture the raw Kythe entry
+/// stream (length-prefixed proto frames) into a per-CU file for the
+/// later corpus-wide `entrystream | write_tables` pass, while
+/// `decode_stream` consumes the same stream for the per-CU packed
+/// sidecar. The tee adds one disk write per `read` and keeps peak
+/// memory bounded — the stream is never buffered in RAM.
+///
+/// Write errors are surfaced as `Read` errors so the indexer-driver
+/// loop falls into its existing error-handling path instead of silently
+/// dropping CU entries.
+struct TeeReader<R, W> {
+    inner: R,
+    sink: W,
+}
+
+impl<R: Read, W: Write> TeeReader<R, W> {
+    fn new(inner: R, sink: W) -> Self {
+        Self { inner, sink }
+    }
+}
+
+impl<R: Read, W: Write> TeeReader<R, std::io::BufWriter<W>> {
+    /// Flush the buffered sink, surfacing deferred I/O errors that
+    /// `BufWriter::Drop` would otherwise swallow. Call after the
+    /// reader drains, before the indexer-run result is returned.
+    fn flush_sink(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+impl<R: Read, W: Write> Read for TeeReader<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.sink.write_all(&buf[..n])?;
         }
         Ok(n)
     }

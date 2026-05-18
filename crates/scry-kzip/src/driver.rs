@@ -83,15 +83,17 @@ use crate::emit_checkpoint::{
 // `DecodedRecord`s are produced by `crate::entries::decode_stream`,
 // which `run_indexer` calls internally; this file only handles the
 // already-decoded vector via `IndexerRun.decoded`.
+use crate::serving::build_kythe_serving_table;
 use crate::indexer::{
-    build_per_cu_kzip, recommended_workers, resolve_indexer, run_indexer,
+    build_per_cu_kzip, recommended_workers, resolve_indexer,
+    run_indexer_with_sink,
 };
 use crate::walker::KzipUnit;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -308,6 +310,33 @@ pub fn build_packed_from_kzip(
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("mkdir staging {}", staging.display()))?;
 
+    // When `SCRY_KZIP_SERVING_DIR=<path>` is set, scry-kzip enables the
+    // optional corpus-wide cross-CU resolution pipeline: every indexer
+    // run also tees its raw stdout (length-prefixed Kythe Entry protos)
+    // into `<serving_entries_dir>/cu-<sha>.entries`, and after phase 4
+    // we run `kythe entrystream --unique --sort < cat(...) | kythe
+    // write_tables --out <serving_dir>` to produce a LevelDB serving
+    // table consumed by the phase-5 importer (separate task).
+    //
+    // The dir lives under the staging tree so it auto-cleans on
+    // unconfigured runs and lives on `/mnt/agent/tmp` (via
+    // `scry_tmp_dir()`); on configured runs the operator decides where
+    // the final serving LevelDB lands.
+    let serving_dir_env = std::env::var("SCRY_KZIP_SERVING_DIR").ok();
+    let serving_entries_dir: Option<PathBuf> = if serving_dir_env.is_some() {
+        let d = staging.join("entries");
+        std::fs::create_dir_all(&d)
+            .with_context(|| format!("mkdir entries-dir {}", d.display()))?;
+        eprintln!(
+            "[scry-kzip] phase 3/6: SCRY_KZIP_SERVING_DIR active — tee'ing per-CU \
+             entries to {}",
+            d.display(),
+        );
+        Some(d)
+    } else {
+        None
+    };
+
     pool.install(|| {
         for (display_label, bucket) in &by_kind {
             let t_lang = Instant::now();
@@ -349,6 +378,7 @@ pub fn build_packed_from_kzip(
                 run_one_cu(
                     unit, bucket.kind, &staging, kythe_root,
                     &emitter, &log_file, &counters, i + 1, n_units, display_label,
+                    serving_entries_dir.as_deref(),
                 );
             });
             let (ok, empty, failed) = *counters.lock().unwrap();
@@ -390,7 +420,35 @@ pub fn build_packed_from_kzip(
     };
     write_summary_log(&logs_dir, kzip, &lang_reports_vec, &emit)?;
 
-    // Best-effort cleanup of per-CU staging kzips.
+    // Optional Phase 4b: corpus-wide cross-CU resolution via
+    // `kythe entrystream | kythe write_tables`. Only runs when the
+    // operator opted in by setting `SCRY_KZIP_SERVING_DIR`. The
+    // serving LevelDB is consumed by the Phase 5 importer (separate
+    // task #93) to produce the FQN-canonical packed sidecar.
+    if let (Some(entries_dir), Some(serving_dir)) =
+        (serving_entries_dir.as_ref(), serving_dir_env.as_ref())
+    {
+        let serving_path = PathBuf::from(serving_dir);
+        eprintln!(
+            "[scry-kzip] phase 4b/6: cross-CU serving table → {}",
+            serving_path.display(),
+        );
+        if let Err(e) = build_kythe_serving_table(
+            entries_dir, &serving_path, kythe_root,
+        ) {
+            // Non-fatal: the packed sidecars from phase 4 are still
+            // valid and queriable; this only blocks cross-CU FQN
+            // resolution. Log and continue so the build doesn't fail.
+            eprintln!(
+                "[scry-kzip] phase 4b/6: serving table build FAILED ({e:#}); \
+                 phase-5 importer will not run",
+            );
+        }
+    }
+
+    // Best-effort cleanup of per-CU staging kzips. The serving dir
+    // (when configured) lives outside `staging`, so this doesn't
+    // touch it.
     let _ = std::fs::remove_dir_all(&staging);
 
     let wall_secs = t_total.elapsed().as_secs_f64();
@@ -487,6 +545,7 @@ fn run_one_cu(
     seq: usize,
     total: usize,
     label: &str,
+    entries_dir: Option<&Path>,
 ) {
     // Build the per-CU sub-kzip.
     let cu_kzip = match build_per_cu_kzip(&unit.kzip_path, &unit.unit_sha, staging) {
@@ -498,7 +557,17 @@ fn run_one_cu(
             return;
         }
     };
-    let run_res = run_indexer(&cu_kzip, &unit.unit_sha, kind, kythe_root);
+    // If a corpus-wide entries dir is configured, every byte the
+    // indexer emits also flows into a per-CU `.entries` file under it,
+    // for the later `entrystream | write_tables` cross-CU resolution
+    // pass. Keeping one file per CU (rather than appending to a shared
+    // file) avoids per-write mutex contention across the rayon pool.
+    let entries_sink: Option<PathBuf> =
+        entries_dir.map(|d| d.join(format!("cu-{}.entries", &unit.unit_sha)));
+    let run_res = run_indexer_with_sink(
+        &cu_kzip, &unit.unit_sha, kind, kythe_root,
+        entries_sink.as_deref(),
+    );
     let _ = std::fs::remove_file(&cu_kzip);
     let run = match run_res {
         Ok(r) => r,

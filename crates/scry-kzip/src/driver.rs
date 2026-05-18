@@ -70,7 +70,9 @@ use crate::emit::{EmitReport, PackedEmitter};
 use crate::emit_checkpoint::{
     self, CheckpointManifest, CHECKPOINT_SUBDIR, DEFAULT_MANIFEST_EVERY,
 };
-use crate::entries::{decode_stream, DecodedRecord};
+// `DecodedRecord`s are produced by `crate::entries::decode_stream`,
+// which `run_indexer` calls internally; this file only handles the
+// already-decoded vector via `IndexerRun.decoded`.
 use crate::indexer::{
     build_per_cu_kzip, recommended_workers, resolve_indexer, run_indexer,
 };
@@ -478,9 +480,9 @@ fn run_one_cu(
     };
     // Always note the run's exit/wall for the log.
     log_to(log_file, format!(
-        "[{} {}/{}] sha={} exit={} wall={:.2}s stdout={}B stderr_tail={}B\n",
+        "[{} {}/{}] sha={} exit={} wall={:.2}s stdout={}B entries={} records={} stderr_tail={}B\n",
         label, seq, total, &run.unit_sha, run.exit_code, run.wall_secs,
-        run.stdout.len(), run.stderr_tail.len(),
+        run.stdout_bytes, run.entry_count, run.decoded.len(), run.stderr_tail.len(),
     ));
     if !run.stderr_tail.is_empty() {
         log_to(log_file, format!(
@@ -489,23 +491,26 @@ fn run_one_cu(
         ));
     }
     if !run.produced_entries() {
-        // No entries: either a hard fail (exit != 0) or a clean
-        // run that produced no symbols. The second branch hides a
-        // class of silent failures — `java_indexer.jar` exits 0
-        // even when javac aborts mid-parse with OutOfMemoryError or
-        // a SEVERE-logged IllegalStateException, just emits nothing.
-        // Detect those patterns in the stderr tail and reclassify
-        // as failed so the summary's "empty" bucket only contains
-        // genuinely empty CUs (no source, or all skipped).
+        // No records: either a hard fail (exit != 0), a stream-decode
+        // error (already prepended to stderr_tail by run_indexer),
+        // or a clean run that produced no symbols. The third branch
+        // hides a class of silent failures — `java_indexer.jar`
+        // exits 0 even when javac aborts mid-parse with
+        // OutOfMemoryError or a SEVERE-logged IllegalStateException,
+        // just emits nothing. Detect those patterns in the stderr
+        // tail and reclassify as failed so the summary's "empty"
+        // bucket only contains genuinely empty CUs (no source,
+        // all skipped).
         let stderr_tail_str = String::from_utf8_lossy(&run.stderr_tail);
         let silent_failure = run.exit_code == 0 && (
             stderr_tail_str.contains("OutOfMemoryError")
             || stderr_tail_str.contains("java.lang.IllegalStateException")
             || stderr_tail_str.contains("SEVERE: Unexpected error")
+            || stderr_tail_str.contains("decode_stream error")
         );
         if silent_failure {
             log_to(log_file, format!(
-                "[{} {}/{}] silent-fail (exit=0 but stderr names OOM/SEVERE) — counting as failed\n",
+                "[{} {}/{}] silent-fail (exit=0 but stderr names OOM/SEVERE/decode-error) — counting as failed\n",
                 label, seq, total,
             ));
         }
@@ -516,23 +521,13 @@ fn run_one_cu(
         }
         return;
     }
-    // Decode the entries into a per-CU staging buffer first, then
-    // hand the complete batch to the emitter. The two-step path is
-    // what makes the per-CU on-disk record log atomic — the log
-    // append happens inside `commit_cu` only after the decode has
-    // succeeded, so a SIGKILL between CUs never logs partial state.
-    let mut staged: Vec<DecodedRecord> = Vec::new();
-    let decoded = decode_stream(&run.stdout[..], |rec| {
-        staged.push(rec);
-    });
-    if let Err(e) = decoded {
-        log_to(log_file, format!(
-            "[{} {}/{}] decode failed: {e}\n", label, seq, total,
-        ));
-        counters.lock().unwrap().2 += 1;
-        return;
-    }
-    if let Err(e) = emitter.commit_cu(&run.unit_sha, kind, &staged) {
+    // The IndexerRun already carries decoded records; commit them
+    // atomically. Stream decoding inside `run_indexer` lets peak
+    // per-CU memory stay bounded regardless of how many GB the
+    // indexer wrote to stdout — previously the parent buffered the
+    // full stdout in a Vec<u8> before decoding, which OOM'd on
+    // big CUs like CarSystemUIRavenTests (10+ GB of Kythe entries).
+    if let Err(e) = emitter.commit_cu(&run.unit_sha, kind, &run.decoded) {
         log_to(log_file, format!(
             "[{} {}/{}] checkpoint commit failed: {e}\n", label, seq, total,
         ));

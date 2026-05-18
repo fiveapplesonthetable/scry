@@ -17,6 +17,7 @@
 //! `num_cpus / 2` so we don't OOM mid-run.
 
 use crate::dispatch::IndexerKind;
+use crate::entries::DecodedRecord;
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -66,13 +67,26 @@ pub fn resolve_indexer(kythe_root: &Path, kind: IndexerKind) -> Result<PathBuf> 
     Ok(p)
 }
 
-/// Outcome of one indexer invocation. We keep stdout for the entry
-/// stream and the stderr tail for the per-language log file.
+/// Outcome of one indexer invocation. The decoded records are
+/// stream-parsed directly from the child's stdout pipe — we do NOT
+/// materialise the raw stdout bytes, because some AOSP java CUs
+/// (e.g. `CarSystemUIRavenTests` with 297 sources + 1000+ classpath
+/// refs) emit 10+ GB of length-delimited Kythe Entry protos and
+/// buffering that in the parent process is what was OOM'ing the
+/// run earlier. `stdout_bytes` records the count for the log line.
 pub struct IndexerRun {
     pub kind: IndexerKind,
     pub unit_sha: String,
-    /// Raw stdout — length-delimited Kythe Entry protos.
-    pub stdout: Vec<u8>,
+    /// Decoded records, stream-parsed from the child's stdout.
+    pub decoded: Vec<DecodedRecord>,
+    /// Number of length-delimited Entry protos we read off the wire.
+    /// Larger than `decoded.len()` — most Entries are fact/edge
+    /// fragments that fold into one `DecodedRecord`. Logged in the
+    /// per-CU summary line.
+    pub entry_count: u64,
+    /// Total bytes read off stdout. Pure diagnostic — useful for
+    /// spotting heavyweight CUs in the log.
+    pub stdout_bytes: u64,
     /// Trimmed stderr (last 4 KiB) — diagnostics for the log file.
     pub stderr_tail: Vec<u8>,
     pub exit_code: i32,
@@ -80,13 +94,14 @@ pub struct IndexerRun {
 }
 
 impl IndexerRun {
-    /// Did the run actually produce a non-empty entries stream?
-    /// Indexers regularly fail on individual TUs but still emit
-    /// entries for the ones that succeeded — we treat any non-zero
-    /// stdout as "useful" and only count truly-empty runs as
-    /// failures.
+    /// Did the run actually produce any decoded records? Indexers
+    /// regularly fail on individual TUs but still emit entries for
+    /// the ones that succeeded; we treat any non-zero decoded
+    /// vector as "useful". The driver classifies the residual
+    /// `(exit==0, decoded.is_empty())` case as either a genuine
+    /// empty CU or a silent failure depending on the stderr tail.
     pub fn produced_entries(&self) -> bool {
-        !self.stdout.is_empty()
+        !self.decoded.is_empty()
     }
 }
 
@@ -262,13 +277,62 @@ pub fn run_indexer(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let t = std::time::Instant::now();
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawn {} on {}", bin.display(), cu_kzip_path.display()))?;
+
+    // Drain stderr in a background thread to avoid blocking the
+    // child on its stderr pipe filling. We accumulate the LAST
+    // STDERR_TAIL_LIMIT bytes as a ring — Kythe indexers can emit
+    // many INFO lines per CU; we only need the tail for diagnosis.
+    let stderr_handle = child.stderr.take().expect("piped stderr");
+    let stderr_thread = std::thread::spawn(move || drain_stderr_tail(stderr_handle));
+
+    // Stream-decode stdout directly from the pipe. Each Entry proto
+    // is consumed and discarded immediately after `process_entry`
+    // folds it into the anchor accumulator, so peak per-CU memory
+    // stays bounded to the accumulator + the largest single Entry
+    // (~KB) — regardless of how many GB of entries the indexer
+    // emits. The previous `cmd.output()` path slurped the full
+    // stream into a Vec<u8>, which OOM'd the parent on AOSP CUs
+    // that emit 10+ GB of entries.
+    let stdout_handle = child.stdout.take().expect("piped stdout");
+    let mut decoded: Vec<DecodedRecord> = Vec::new();
+    let counting = CountingReader::new(stdout_handle);
+    let count_arc = counting.bytes_seen();
+    let entry_count_result = crate::entries::decode_stream(counting, |rec| {
+        decoded.push(rec);
+    });
+
+    // Always wait — even on decode error — to reap the child.
+    let status = child.wait()
+        .with_context(|| format!("wait for {}", bin.display()))?;
     let wall_secs = t.elapsed().as_secs_f64();
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stderr = output.stderr;
-    let tail_start = stderr.len().saturating_sub(4096);
+    let exit_code = status.code().unwrap_or(-1);
+    let stdout_bytes = *count_arc.lock().unwrap();
+    let stderr_tail = stderr_thread.join().unwrap_or_default();
+
+    // Surface decode errors as stderr-tail context; the driver's
+    // silent-fail detector then routes the CU to `failed`.
+    let entry_count = match entry_count_result {
+        Ok(n) => n,
+        Err(e) => {
+            let prefix = format!("scry-kzip decode_stream error: {e:#}\n");
+            let mut combined = prefix.into_bytes();
+            combined.extend_from_slice(&stderr_tail);
+            return Ok(IndexerRun {
+                kind,
+                unit_sha: unit_sha.to_string(),
+                decoded: Vec::new(),
+                entry_count: 0,
+                stdout_bytes,
+                stderr_tail: trim_tail(combined),
+                exit_code,
+                wall_secs,
+            });
+        }
+    };
+
     // Best-effort cleanup: the staging tree gets wiped at the end of
     // the run regardless, this just keeps it from ballooning if a
     // long phase 3 processes hundreds of thousands of java CUs.
@@ -278,11 +342,82 @@ pub fn run_indexer(
     Ok(IndexerRun {
         kind,
         unit_sha: unit_sha.to_string(),
-        stdout: output.stdout,
-        stderr_tail: stderr[tail_start..].to_vec(),
+        decoded,
+        entry_count,
+        stdout_bytes,
+        stderr_tail,
         exit_code,
         wall_secs,
     })
+}
+
+/// Cap retained stderr bytes per CU — the per-language `.log` file
+/// only needs the tail for human triage.
+const STDERR_TAIL_LIMIT: usize = 4096;
+
+/// Read `r` to EOF, returning only the final `STDERR_TAIL_LIMIT`
+/// bytes. Kythe indexers' INFO lines can total megabytes; the tail
+/// covers any final SEVERE / OOM stack we need for diagnosis.
+fn drain_stderr_tail<R: Read>(mut r: R) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(STDERR_TAIL_LIMIT);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n <= STDERR_TAIL_LIMIT {
+                    buf.extend_from_slice(&chunk[..n]);
+                } else {
+                    // Append and trim from the front so the tail stays
+                    // bounded — typical chunk size << limit so this
+                    // branch fires once per few-KB-of-stderr.
+                    buf.extend_from_slice(&chunk[..n]);
+                    let drop = buf.len() - STDERR_TAIL_LIMIT;
+                    buf.drain(..drop);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+/// Trim to the same tail invariant when an external caller already
+/// concatenated something onto the front.
+fn trim_tail(mut buf: Vec<u8>) -> Vec<u8> {
+    if buf.len() > STDERR_TAIL_LIMIT {
+        let drop = buf.len() - STDERR_TAIL_LIMIT;
+        buf.drain(..drop);
+    }
+    buf
+}
+
+/// `Read` wrapper that counts how many bytes have been seen.
+/// We thread one of these around the stdout pipe so the per-CU
+/// log can include the total stdout byte count without buffering
+/// the stream.
+struct CountingReader<R> {
+    inner: R,
+    seen: std::sync::Arc<std::sync::Mutex<u64>>,
+}
+
+impl<R: Read> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, seen: std::sync::Arc::new(std::sync::Mutex::new(0)) }
+    }
+    fn bytes_seen(&self) -> std::sync::Arc<std::sync::Mutex<u64>> {
+        self.seen.clone()
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            *self.seen.lock().unwrap() += n as u64;
+        }
+        Ok(n)
+    }
 }
 
 /// Per-CU `--temp_directory` path for JVM indexers, or `None` for

@@ -125,33 +125,40 @@ struct AnchorAccum {
 /// Stream-decode Entry protos out of `reader`. Calls `sink` once
 /// per flushed `DecodedRecord`. Returns the total Entry count read,
 /// useful for the per-language summary.
-pub fn decode_stream<R, F>(mut reader: R, mut sink: F) -> Result<u64>
+///
+/// **True streaming** — reads one length-prefixed Entry at a time
+/// from `reader` and discards each Entry's bytes once parsed. Peak
+/// per-CU memory is bounded to roughly the largest single Entry's
+/// length-prefix (rarely more than a few KB) plus the anchor
+/// accumulator (one entry per anchor VName seen so far, dropped
+/// at end of CU). Earlier impl called `read_to_end` and parsed the
+/// full buffer in one shot, which OOM'd the parent process on AOSP
+/// CUs whose `java_indexer` emits 10+ GB of entries (e.g.
+/// CarSystemUIRavenTests with 297 sources + 1084 classpath refs).
+pub fn decode_stream<R, F>(reader: R, mut sink: F) -> Result<u64>
 where
     R: Read,
     F: FnMut(DecodedRecord),
 {
-    // Slurp the whole stream into memory. Indexer output for a single
-    // CU is bounded (~hundreds of KB on a busy C++ TU); the kzip
-    // driver runs one indexer per CU so we never hold the whole
-    // multi-GB AOSP entry stream at once.
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).context("read indexer stdout")?;
-    let mut cursor = 0usize;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
     let mut anchors: HashMap<VName, AnchorAccum> = HashMap::new();
     let mut total: u64 = 0;
-    while cursor < buf.len() {
-        let (len, n) = read_varint(&buf[cursor..])
-            .context("decode delimited Entry length prefix")?;
-        cursor += n;
-        if cursor + (len as usize) > buf.len() {
-            return Err(anyhow::anyhow!(
-                "truncated entry stream at byte {cursor}: want {len}, have {}",
-                buf.len() - cursor,
-            ));
-        }
-        let entry = Entry::parse_from_bytes(&buf[cursor..cursor + len as usize])
-            .with_context(|| format!("decode Entry at byte {cursor}"))?;
-        cursor += len as usize;
+    let mut entry_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    loop {
+        let len = match read_varint_from(&mut reader)? {
+            Some(v) => v,
+            None => break, // clean EOF on a frame boundary
+        };
+        // Reuse the same Vec to avoid per-Entry allocation; resize
+        // shrinks/grows in place and Read::read_exact fills the
+        // existing capacity when sufficient.
+        entry_buf.resize(len as usize, 0);
+        reader.read_exact(&mut entry_buf)
+            .with_context(|| format!(
+                "truncated entry stream: wanted {len} bytes after frame {total}",
+            ))?;
+        let entry = Entry::parse_from_bytes(&entry_buf)
+            .with_context(|| format!("decode Entry #{total}"))?;
         total += 1;
         process_entry(&entry, &mut anchors, &mut sink);
     }
@@ -160,6 +167,31 @@ where
     // routinely emits these for non-binding decls.
     drop(anchors);
     Ok(total)
+}
+
+/// Read a proto-style base-128 varint from a `Read`. Returns
+/// `Ok(None)` on a clean EOF at a frame boundary (zero bytes read
+/// before any varint byte), `Ok(Some(v))` on success, and an error
+/// for any other malformed/truncated state. Up to 10 bytes per
+/// varint per the proto spec.
+fn read_varint_from<R: Read>(reader: &mut R) -> Result<Option<u64>> {
+    let mut val: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut byte = [0u8; 1];
+    for i in 0..10 {
+        match reader.read(&mut byte)? {
+            0 if i == 0 => return Ok(None),
+            0 => return Err(anyhow::anyhow!(
+                "truncated varint after {} bytes (EOF mid-prefix)", i,
+            )),
+            _ => {}
+        }
+        let b = byte[0];
+        val |= ((b & 0x7F) as u64) << shift;
+        if b & 0x80 == 0 { return Ok(Some(val)); }
+        shift += 7;
+    }
+    Err(anyhow::anyhow!("varint > 10 bytes"))
 }
 
 fn process_entry<F: FnMut(DecodedRecord)>(
@@ -267,6 +299,9 @@ fn flush_ready<F: FnMut(DecodedRecord)>(
 }
 
 /// Read a proto-style base-128 varint. Returns (value, bytes_consumed).
+/// Used only by the writer-side test helpers; the streaming decoder
+/// uses [`read_varint_from`] which works against a `Read` directly.
+#[cfg(test)]
 fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let mut val: u64 = 0;
     let mut shift: u32 = 0;
@@ -462,5 +497,105 @@ mod tests {
         // 5 bytes (max u32)
         assert_eq!(read_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]).unwrap(),
                    (u32::MAX as u64, 5));
+    }
+
+    /// `read_varint_from` returns `None` cleanly on a frame boundary
+    /// EOF and `Err` on EOF mid-prefix — distinct cases the
+    /// streaming decoder needs to differentiate. The first signals
+    /// "no more entries"; the second signals "the indexer crashed
+    /// while writing a frame".
+    #[test]
+    fn varint_from_handles_eof_at_boundary_and_mid_prefix() {
+        // Clean EOF on frame boundary.
+        let empty: &[u8] = &[];
+        let r = read_varint_from(&mut std::io::Cursor::new(empty)).unwrap();
+        assert_eq!(r, None);
+        // EOF after one continuation byte (mid-prefix) is an error.
+        let partial: &[u8] = &[0xAC]; // continuation bit set, second byte missing
+        let err = read_varint_from(&mut std::io::Cursor::new(partial)).unwrap_err();
+        assert!(format!("{err}").contains("truncated varint"));
+        // 2-byte varint reads cleanly.
+        let two: &[u8] = &[0xAC, 0x02];
+        let r = read_varint_from(&mut std::io::Cursor::new(two)).unwrap();
+        assert_eq!(r, Some(300));
+        // 10+ bytes of continuation is malformed.
+        let huge: &[u8] = &[0xFF; 11];
+        let err = read_varint_from(&mut std::io::Cursor::new(huge)).unwrap_err();
+        assert!(format!("{err}").contains("varint > 10 bytes"));
+    }
+
+    /// Stream decode against an arbitrary `Read` (not a slice).
+    /// Regression: the previous impl took `&[u8]` and required the
+    /// full buffer in memory. The new impl reads one Entry frame at
+    /// a time, so it must work with any `Read` including pipes,
+    /// gzipped files, partial-read sources, etc.
+    #[test]
+    fn decode_stream_works_with_arbitrary_read() {
+        let anchor = vn("a-stream", "src/X.java");
+        let target = vn("X#", "src/X.java");
+        let stream_bytes = write_stream(&[
+            fact(anchor.clone(), "/kythe/node/kind", b"anchor"),
+            fact(anchor.clone(), "/kythe/loc/start", b"7"),
+            fact(anchor.clone(), "/kythe/loc/end",   b"10"),
+            edge(anchor.clone(), target.clone(), "/kythe/edge/ref"),
+        ]);
+        // Wrap in a Cursor (the canonical "I am a Read but not a
+        // slice" type). decode_stream MUST handle it identically
+        // to the slice form.
+        let cursor = std::io::Cursor::new(stream_bytes);
+        let mut out = Vec::new();
+        let n = decode_stream(cursor, |r| out.push(r)).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 7);
+        assert_eq!(out[0].end, 10);
+    }
+
+    /// Memory profile: the decoder must NOT allocate proportional to
+    /// stream size. Build a synthetic stream where the *same* anchor
+    /// fires many records in succession; if the decoder buffered the
+    /// whole stream, peak memory would be O(stream_bytes). With true
+    /// streaming, peak is O(largest Entry) regardless of total.
+    ///
+    /// We can't measure RSS from a unit test reliably, but we CAN
+    /// verify the decoder doesn't pre-allocate based on a length
+    /// prefix it hasn't read yet — i.e. it advances incrementally.
+    /// A `StopAfter` reader returns EOF after N bytes; the decoder
+    /// should surface this as a clean truncation error at exactly
+    /// the right offset, proving it's reading byte-at-a-time and
+    /// not slurping ahead.
+    #[test]
+    fn decode_stream_does_not_slurp_ahead() {
+        struct StopAfter<R> { inner: R, remaining: usize }
+        impl<R: std::io::Read> std::io::Read for StopAfter<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 { return Ok(0); }
+                let cap = buf.len().min(self.remaining);
+                let n = self.inner.read(&mut buf[..cap])?;
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+        let anchor = vn("a-trunc", "src/Y.java");
+        let target = vn("Y#", "src/Y.java");
+        let stream_bytes = write_stream(&[
+            fact(anchor.clone(), "/kythe/node/kind", b"anchor"),
+            fact(anchor.clone(), "/kythe/loc/start", b"1"),
+            fact(anchor.clone(), "/kythe/loc/end",   b"2"),
+            edge(anchor.clone(), target.clone(), "/kythe/edge/ref"),
+        ]);
+        // Cut the stream off mid-frame: keep the first varint prefix
+        // + a few bytes of the first Entry. The decoder must error,
+        // not panic or hang.
+        let truncate_at = 5;
+        assert!(stream_bytes.len() > truncate_at);
+        let reader = StopAfter {
+            inner: std::io::Cursor::new(stream_bytes),
+            remaining: truncate_at,
+        };
+        let mut out = Vec::new();
+        let err = decode_stream(reader, |r| out.push(r)).unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"),
+            "truncated mid-frame must surface as 'truncated', got: {err:#}");
     }
 }

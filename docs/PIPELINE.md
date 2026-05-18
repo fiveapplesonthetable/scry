@@ -154,6 +154,23 @@ every `.java` source.
   whose primary source starts with any listed prefix. Evaluated
   BEFORE the include filter, so excludes win.
 
+**When to use which:**
+
+| Intent | Pick |
+|---|---|
+| Index one specific subtree (e.g. just `frameworks/base/`) | `PATH_PREFIX` alone — short, explicit |
+| Index "all platform code, skip third-party" | `PATH_EXCLUDE` alone — the third-party set is small + stable (`external/`, `prebuilts/`, `vendor/`, `kernel/`, `hardware/`, `device/`, `toolchain/`, `out/`), the platform set is large + grows over AOSP releases |
+| Subtree minus its generated noise (e.g. `frameworks/` but not `out/`) | Both — include narrows scope, exclude trims noise inside the included subtree |
+
+The two compose: a CU passes iff it's NOT under any exclude prefix
+AND (no includes set OR matches at least one include).
+
+Pure include alone forces enumeration of every wanted dir — fragile
+because new platform dirs added in future AOSP releases would be
+silently dropped. Pure exclude alone is the natural shape for "give
+me everything except a handful of known-noise prefixes" and survives
+codebase growth without maintenance.
+
 Path filters apply only to runnable CUs; Skip-kind CUs (rust, kotlin
 without bytecode) are always counted in the per-language skip tally
 regardless of path scope so the summary stays accurate.

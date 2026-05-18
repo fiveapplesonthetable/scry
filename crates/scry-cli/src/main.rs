@@ -870,9 +870,10 @@ enum Cmd {
     /// TypeScript / Python) over the source root regardless of the
     /// build type.
     BuildSymbols {
-        /// Source root.
+        /// Source root. Required for every flavour except `--build-kzip`
+        /// (the kzip already carries its own paths).
         #[arg(long, value_name = "PATH")]
-        source_root: PathBuf,
+        source_root: Option<PathBuf>,
         /// GN build out dir (the one containing `args.gn`).
         #[arg(long, value_name = "PATH", group = "build")]
         build_gn: Option<PathBuf>,
@@ -893,15 +894,24 @@ enum Cmd {
         build_cargo: bool,
         /// Path to an `all.kzip` produced by a Kythe extractor (AOSP
         /// via `build/soong/build_kzip.bash`, Bazel via the equivalent,
-        /// any custom Kythe pipeline). Stubbed for now.
+        /// any custom Kythe pipeline). Routes through `scry-kzip`,
+        /// which spawns the six Kythe v0.0.75 indexers per CU and
+        /// emits scry's packed sidecars directly.
         #[arg(long, value_name = "PATH", group = "build")]
         build_kzip: Option<PathBuf>,
+        /// Root of the Kythe release tree (the one containing
+        /// `indexers/cxx_indexer` etc.). Only used with `--build-kzip`.
+        #[arg(
+            long, value_name = "PATH",
+            default_value = "/mnt/agent/kythe-release/kythe-v0.0.75",
+        )]
+        kythe_root: PathBuf,
         /// Escape hatch: import a pre-built `.scip` file directly into
         /// the sidecar instead of running an indexer.
         #[arg(long, value_name = "PATH")]
         scip: Option<PathBuf>,
         /// Existing scry index dir.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, short = 'o', visible_alias = "out", value_name = "DIR")]
         index: Option<PathBuf>,
         /// Also run polyglot pass (Rust / Go / TS / Python). Implied
         /// when --build-cargo is set.
@@ -1232,11 +1242,11 @@ fn main() -> Result<()> {
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
         Cmd::BuildSymbols {
             source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
-            build_cargo, build_kzip, scip, index, with_polyglot,
+            build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
             no_rust, no_go, no_typescript, no_python, workers, scip_out_dir,
         } => cmd_build_symbols(
             source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
-            build_cargo, build_kzip, scip, index, with_polyglot,
+            build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
             no_rust, no_go, no_typescript, no_python, workers, scip_out_dir,
         ),
         Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
@@ -1284,7 +1294,7 @@ fn main() -> Result<()> {
 /// the source root.
 #[allow(clippy::too_many_arguments)]
 fn cmd_build_symbols(
-    source_root: PathBuf,
+    source_root: Option<PathBuf>,
     build_gn: Option<PathBuf>,
     gn_binary: Option<PathBuf>,
     build_kbuild: Option<PathBuf>,
@@ -1292,6 +1302,7 @@ fn cmd_build_symbols(
     cmake_binary: Option<PathBuf>,
     build_cargo: bool,
     build_kzip: Option<PathBuf>,
+    kythe_root: PathBuf,
     scip: Option<PathBuf>,
     index: Option<PathBuf>,
     with_polyglot: bool,
@@ -1315,6 +1326,18 @@ fn cmd_build_symbols(
             "build-symbols accepts at most one --build-{{gn,kbuild,cmake,cargo,kzip}} flag"
         );
     }
+    // `--build-kzip` is self-contained — it doesn't need a source root
+    // because the kzip itself carries every input path. Every other
+    // flavour drives libclang or rust-analyzer against a real tree.
+    let needs_source_root = build_kzip.is_none();
+    if needs_source_root && source_root.is_none() {
+        anyhow::bail!(
+            "--source-root is required (only --build-kzip is allowed without it)"
+        );
+    }
+    let source_root_or_dummy: PathBuf = source_root.clone()
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let source_root: PathBuf = source_root.unwrap_or(source_root_or_dummy);
 
     if let Some(build_dir) = build_gn.as_ref() {
         eprintln!("[build-symbols] gn build_dir: {}", build_dir.display());
@@ -1377,10 +1400,16 @@ fn cmd_build_symbols(
         eprintln!(
             "[build-symbols] cargo: skipping C-family step, polyglot pass will handle Rust"
         );
-    } else if build_kzip.is_some() {
-        anyhow::bail!(
-            "--build-kzip ingest will land in v0.1.67; pass the all.kzip to \
-             scip-java --kzip directly for now"
+    } else if let Some(kzip_path) = build_kzip.as_ref() {
+        eprintln!(
+            "[build-symbols] kzip: {} (kythe-root: {})",
+            kzip_path.display(), kythe_root.display(),
+        );
+        let report = scry_kzip::build_packed_from_kzip(kzip_path, &index_dir, &kythe_root)
+            .with_context(|| format!("build packed sidecars from {}", kzip_path.display()))?;
+        eprintln!(
+            "[build-symbols] kzip done: {} clang USRs, {} SCIP records in {:.1}s",
+            report.emit.cxx_records, report.emit.scip_records, report.wall_secs,
         );
     }
 

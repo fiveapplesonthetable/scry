@@ -153,6 +153,18 @@ every `.java` source.
 * `SCRY_KZIP_PATH_EXCLUDE=external/,prebuilts/,out/` — drop CUs
   whose primary source starts with any listed prefix. Evaluated
   BEFORE the include filter, so excludes win.
+* `SCRY_KZIP_STRIP_WRAPPERS=out/soong/.intermediates/,...` — build-
+  system staging prefixes peeled off `primary_path` before include /
+  exclude matching. Defaults to `out/soong/.intermediates/`. Required
+  because Soong stages every CU that consumes generated sources
+  (KAPT / AIDL / aconfig / R.java srcjars — including
+  `services.core.unboosted`) under this directory, so the CU's primary
+  path becomes `out/soong/.intermediates/<module-repo-path>/<module>/<arch>/...`.
+  A plain `frameworks/base/` filter rejects those paths even though
+  the module's repo path right after the wrapper is exactly that.
+  Peeling the wrapper restores the intended semantics. Override when
+  Soong's `OUT_DIR` is redirected or a different Kythe extractor
+  (Bazel, custom) uses another layout. Set to a single `,` to disable.
 
 **When to use which:**
 
@@ -186,6 +198,22 @@ to OOM the host before it goes faster. Override via the
 flag wins when both are set; `=0` or unset means "use the default".
 Push the override only after measuring per-worker RSS — the cap is a
 floor against OOM, not a performance ceiling.
+
+#### JVM heap (`SCRY_KZIP_JVM_HEAP`)
+
+`java_indexer.jar` and `jvm_indexer.jar` run with `-Xmx8g` by default.
+Sized for the heaviest AOSP CUs (`services.core.unboosted`,
+`framework-minus-apex`, `CarSystemUIRavenTests` — 300–500+ source
+files each, thousands of classpath jars, javac type-resolution + Kythe
+entry emission held in heap simultaneously). The 2 GB historical
+default silently OOM'd those CUs: the JVM exited 0 with the truncated
+output, the indexer recorded "0 entries", and the missing symbols only
+surfaced downstream as zero-hit precision queries against the affected
+modules. Override per session with e.g. `SCRY_KZIP_JVM_HEAP=12g`. The
+driver also matches stderr for `OutOfMemoryError`, `IllegalStateException`,
+and the `SEVERE: Unexpected error` lines that Kythe emits before a
+silent abort — surfacing them as explicit run-time errors instead of
+silent zero-record CUs.
 
 #### Resume semantics (`--resume`)
 
@@ -223,10 +251,10 @@ discarded with a warning — the per-CU dedup key
 | yes, fingerprint matches | present | resume cleanly |
 
 Fingerprint = `(kzip path + size + mtime + SCRY_KZIP_LANGS +
-SCRY_KZIP_PATH_PREFIX + SCRY_KZIP_PATH_EXCLUDE + SCRY_KZIP_MAX_UNITS +
-kythe_root)`. Different fingerprint means the checkpoint covers a
-different slice of work; mixing them would silently produce a
-mixed-scope sidecar.
+SCRY_KZIP_PATH_PREFIX + SCRY_KZIP_PATH_EXCLUDE +
+SCRY_KZIP_STRIP_WRAPPERS + SCRY_KZIP_MAX_UNITS + kythe_root)`.
+Different fingerprint means the checkpoint covers a different slice
+of work; mixing them would silently produce a mixed-scope sidecar.
 
 **Why explicit-flag, no auto-resume:** production tools (kubelet,
 terraform, bazel) require explicit opt-in to continue a partial run.
@@ -310,8 +338,8 @@ For Rust / Go / TypeScript / Python projects:
   rust-analyzer, gopls, scip-typescript, scip-python over the
   matching subtrees of `--source-root`.
 
-Per-language SCIP is imported into the same `scip_index.bin` via the
-internal scip-import path.
+Per-language SCIP is packed into the same `scip_index.bin` via the
+shared internal importer used by `--scip FILE`.
 
 ### 2d. Escape hatch — `--scip FILE`
 

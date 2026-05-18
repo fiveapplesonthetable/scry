@@ -354,7 +354,7 @@ enum Cmd {
     /// Equivalent to running `build-offsets`, `build-file-symbols`,
     /// `build-trigrams`, `build-resolutions` (always), plus
     /// `build-modgraph` for each `--build-<kind> ROOT` flag passed,
-    /// plus `scip-import` for each `--scip FILE` flag passed.
+    /// plus `build-symbols --scip FILE` for each `--scip` flag passed.
     /// Reports per-stage timings.
     ///
     /// Hidden — `scry index` runs every finalize stage end-to-end.
@@ -383,11 +383,11 @@ enum Cmd {
         /// SCIP index file to import.
         #[arg(long, value_name = "PATH")]
         scip: Option<PathBuf>,
-        /// `scry clang-index` input: compile_commands.json. Set
-        /// alongside this you can pass `--clang-root` to filter.
+        /// compile_commands.json forwarded to `build-symbols`.
+        /// Set alongside this you can pass `--clang-root` to filter.
         #[arg(long, value_name = "PATH")]
         clang_compile_commands: Option<PathBuf>,
-        /// Optional `--root` to pass to scry clang-index.
+        /// Optional `--root` forwarded to `build-symbols`.
         #[arg(long, value_name = "PATH")]
         clang_root: Option<PathBuf>,
         /// Build-output directory to walk for compile_commands.json
@@ -939,7 +939,7 @@ enum Cmd {
         /// Skip Python during the polyglot pass.
         #[arg(long)]
         no_python: bool,
-        /// Workers for clang-index. 0 = auto (one per CPU).
+        /// Workers for the libclang USR pass. 0 = auto (one per CPU).
         #[arg(long, default_value_t = 0)]
         workers: usize,
         /// Per-target `.scip` files (polyglot only).

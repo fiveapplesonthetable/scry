@@ -166,13 +166,20 @@ $ scip-go                                                # Go
 $ scip-python index .                                    # Python
 $ scip-java index --build-tool gradle                    # Java
 
-# 3. Tell scry where the build outputs live. finalize auto-discovers
-#    compile_commands.json + *.scip and runs clang-index + scip-import.
-$ scry finalize --index ./idx --build-out ~/dev/myproject/build
+# 3. Layer the precision sidecars onto the base index. One command
+#    per route:
+#      a) Kythe-integrated build (AOSP, Bazel, custom kzip pipeline):
+$ scry build-symbols --build-kzip ./all.kzip --source-root . --index ./idx
+#      b) Pre-built SCIP file from any other producer:
+$ scry build-symbols --scip ./index.scip --index ./idx
+#      c) Native non-kzip builds:
+$ scry build-symbols --build-cmake ./build --index ./idx     # CMake
+$ scry build-symbols --build-gn ./out --index ./idx          # GN
+$ scry build-symbols --build-kbuild ./build --index ./idx    # Kbuild
 
-# 4. Query. Build symbols narrow automatically.
+# 4. Query. Precision narrows automatically.
 $ scry callers Foo --index ./idx
-[scry] --scip-precise: 18 → 7 refs after SCIP symbol identity filter (2 def symbols)
+[scry] precise (clang_usrs + scip_index): 18 → 7 refs (clang: 0 id-mismatch, 0 uncovered TU; SCIP: 11 id-mismatch, 0 uncovered TU; 0 def USRs, 2 def SCIP symbols)
 # 7 surviving call sites; 11 name-match false positives dropped.
 
 # To opt out and see the raw tree-sitter name match:
@@ -182,10 +189,10 @@ $ scry callers Foo --index ./idx --lexical
 `--lexical` is the single user-facing knob. Behind it, two
 auto-engaged filters run when their sidecar is present:
 
-| Sidecar              | Filter            | Built by                          | Languages covered                         |
-|----------------------|-------------------|-----------------------------------|-------------------------------------------|
-| `clang_usrs.bin`     | clang USR identity | `scry clang-index` (libclang)     | C / C++ / ObjC                            |
-| `scip_index.bin`     | SCIP symbol identity | `scry scip-import`               | Java, Kotlin, Rust, Go, TS, Python, etc.  |
+| Sidecar              | Filter               | Built by                                  | Languages covered                         |
+|----------------------|----------------------|-------------------------------------------|-------------------------------------------|
+| `clang_usrs.bin`     | clang USR identity   | `scry build-symbols --build-{gn,cmake,kbuild,kzip}` | C / C++ / ObjC                            |
+| `scip_index.bin`     | SCIP symbol identity | `scry build-symbols --build-kzip` or `--scip` | Java, Kotlin, Rust, Go, TS, Python, etc.  |
 
 A third filter, **`--reachable`**, narrows by build-graph module
 visibility (e.g. "drop callers in modules that can't link the
@@ -217,9 +224,9 @@ ref-extractor mis-attributes get the correct answer.
 Note: `--precise` predates the default-on build-symbol precision
 above and is now mainly useful when you don't have a precomputed
 clang USR sidecar but DO have clangd + a live compile_commands
-nearby. For batch / repeated queries, `scry clang-index` + the
-default-on `--clang-precise` filter is faster (no per-query
-clangd warmup) and produces identical narrowing.
+nearby. For batch / repeated queries, `scry build-symbols --build-{gn,cmake,kbuild}`
++ the default-on clang USR filter is faster (no per-query clangd
+warmup) and produces identical narrowing.
 
 ```sh
 $ scry callers transact --precise --index /mnt/agent/scry-index --limit 5

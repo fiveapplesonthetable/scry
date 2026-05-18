@@ -692,7 +692,7 @@ The packed sidecar layout is shared between `clang_usrs.bin` and
 `scip_index.bin`; only the magic bytes differ (`SCRYUP01` /
 `SCRYSP01`). Old bincode-format sidecars are rejected at open time
 with a `bad magic` error — they need to be re-generated through
-`scry clang-index` / `scry scip-import` once after upgrading.
+`scry build-symbols` once after upgrading.
 
 ### File split: scry-cli main.rs
 

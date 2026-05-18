@@ -565,10 +565,11 @@ Why "sidecar" instead of "extend the main index":
   files and rewrites `symbols.bin` / `refs.bin`. The sidecars
   stay valid because they're keyed by `(abs_path, byte_offset)`
   — only the parts of them whose source moved need a rebuild,
-  and that rebuild happens via the per-sidecar command (e.g.
-  `scry clang-index` when `compile_commands.json` changes,
-  `scry scip-import` when `*.scip` changes). The core never
-  forces an across-the-board rebuild.
+  and that rebuild happens via `scry build-symbols` (e.g.
+  `--build-{gn,cmake,kbuild}` when `compile_commands.json`
+  changes, `--build-kzip` when the Kythe kzip is regenerated,
+  `--scip FILE` when an external `*.scip` changes). The core
+  never forces an across-the-board rebuild.
 
 - **Independent versioning.** Each sidecar checks its own
   version header on open: mismatched version → "absent" status
@@ -591,8 +592,8 @@ Current sidecars (all optional; `scry health` reports each):
 | `file_refs.bin` + `_offsets.bin` | `scry build-file-refs`        | `scry uses NAME` (refs-in-file)  |
 | `ref_resolutions.bin`      | `scry build-resolutions`          | Layer-2 resolved_to per ref      |
 | `module_graph.json`        | `scry build-modgraph`             | `--reachable` filter             |
-| `clang_usrs.bin`           | `scry clang-index`                | `--clang-precise` (default-on)   |
-| `scip_index.bin`           | `scry scip-import`                | `--scip-precise` (default-on)    |
+| `clang_usrs.bin`           | `scry build-symbols --build-{gn,cmake,kbuild,kzip}` | clang USR identity (default-on)  |
+| `scip_index.bin`           | `scry build-symbols --build-kzip` or `--scip`       | SCIP symbol identity (default-on) |
 
 `scry finalize` is the one-stop runner: it invokes each builder
 in order, skipping the ones whose input isn't available
@@ -614,25 +615,30 @@ base, both optional and both consumed as separate on-disk
 sidecars in the index dir:
 
 - **Path B (`clang_usrs.bin`)** — per-translation-unit libclang
-  parse driven by `scry clang-index <compile_commands.json>`.
-  Emits one `UsrRecord{ abs_path, byte_offset, usr_id, kind }`
-  per declaration / reference cursor in the TU. The clang USR
-  is a globally unique mangled identifier for the symbol — same
+  parse driven by `scry build-symbols --build-{gn,cmake,kbuild}
+  <build-out-dir>` (also populated when a kzip's cxx CUs are
+  ingested via `--build-kzip`). Emits one
+  `UsrRecord{ abs_path, byte_offset, usr_id, kind }` per
+  declaration / reference cursor in the TU. The clang USR is
+  a globally unique mangled identifier for the symbol — same
   USR for the def of `strdup` and every call site to it across
   every translation unit, regardless of which Soong module the
   call sits in. Coverage: C, C++, Objective-C.
 
 - **Path C (`scip_index.bin`)** — generic SCIP protobuf ingest
-  driven by `scry scip-import <index.scip>`. SCIP
+  driven by `scry build-symbols --scip <index.scip>` (or
+  populated directly from kzip's jvm / go / proto / textproto
+  indexers under `--build-kzip`). SCIP
   (https://github.com/sourcegraph/scip) is the Sourcegraph
   successor to Kythe-the-format; one indexer per language
   emits a single .scip file. Same record shape as Path B
   (`ScipRecord{ abs_path, byte_offset, symbol_id, role }`)
   but the symbol IDs are SCIP-formatted strings. Coverage:
-  every language with a SCIP producer — Java (`scip-java`),
-  Kotlin (`scip-kotlin`), Rust (`rust-analyzer scip`),
-  Go (`scip-go`), TypeScript (`scip-typescript`), Python
-  (`scip-python`), and others.
+  every language with a SCIP producer — Java (Kythe
+  `java_indexer` or `scip-java`), Kotlin (Kythe via kzip),
+  Rust (`rust-analyzer scip` or Soong's `xref_rust` in a kzip),
+  Go (`gopls scip` or Kythe `go_indexer`), TypeScript
+  (`scip-typescript`), Python (`scip-python`), and others.
 
 Both sidecars are mmap'd into a `(path, byte_offset) → symbol_id`
 index at query time. Lookup is O(1). When a `ref` / `callers`

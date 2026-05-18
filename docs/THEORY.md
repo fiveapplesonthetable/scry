@@ -2694,18 +2694,23 @@ per-TU structured symbol IDs, and a separate join that uses
 them. Both come in as separate on-disk sidecars next to the
 mmap'd index:
 
-- **Path B**: `scry clang-index` drives libclang per TU from a
-  `compile_commands.json`. Emits `clang_usrs.bin` — a packed
-  table of `(abs_path, byte_offset, usr_id, kind)`. The USR
-  string is libclang's globally unique mangled identifier; the
-  same USR appears at the def of `strdup` AND at every call
+- **Path B**: `scry build-symbols --build-{gn,cmake,kbuild,kzip}`
+  drives libclang per TU from the build's `compile_commands.json`
+  (or, for `--build-kzip`, runs Kythe's `cxx_indexer` per CU and
+  packs the entries equivalently). Emits `clang_usrs.bin` — a
+  packed table of `(abs_path, byte_offset, usr_id, kind)`. The
+  USR string is libclang's globally unique mangled identifier;
+  the same USR appears at the def of `strdup` AND at every call
   site to it across the whole corpus.
 
-- **Path C**: `scry scip-import` ingests a SCIP protobuf
-  index emitted by any SCIP producer (`scip-java`, `scip-kotlin`,
-  `rust-analyzer scip`, `scip-go`, `scip-typescript`, `scip-python`).
-  Same record shape as Path B (`scip_index.bin`), but symbol IDs
-  are SCIP-formatted strings.
+- **Path C**: `scry build-symbols --scip FILE` ingests a SCIP
+  protobuf index emitted by any external SCIP producer
+  (`scip-typescript`, `gopls scip`, `rust-analyzer scip`,
+  `scip-python`, ...) — or `--build-kzip` populates the same
+  sidecar directly from Kythe's `java_indexer`, `jvm_indexer`,
+  `go_indexer`, `proto_indexer`, `textproto_indexer`. Same record
+  shape as Path B (`scip_index.bin`), but symbol IDs are
+  SCIP-formatted strings.
 
 Both sidecars are built once per source-tree change (or once per
 build for Path B's compile_commands.json). At query time scry

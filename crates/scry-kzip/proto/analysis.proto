@@ -1,0 +1,65 @@
+// Minimal subset of kythe/proto/analysis.proto needed by scry-kzip.
+// Sourced from https://raw.githubusercontent.com/kythe/kythe/master/kythe/proto/analysis.proto
+// Trimmed: removed AnalysisRequest/AnalysisOutput/AnalysisResult/KzipInfo/
+// FilesRequest/FileData/CompilationBundle and the imports of
+// google/protobuf/{any,timestamp}.proto + kythe/proto/storage.proto so this
+// proto compiles standalone with a tiny embedded VName/FileInfo.
+//
+// Field numbers and types match upstream exactly so the wire format is the
+// same as a full Kythe build.
+
+syntax = "proto3";
+
+package kythe.proto;
+
+// VName (subset; the fields we read).
+message VName {
+  string signature = 1;
+  string corpus = 2;
+  string root = 3;
+  string path = 4;
+  string language = 5;
+}
+
+// FileInfo: path + sha256 digest.
+message FileInfo {
+  string path = 1;
+  string digest = 2;
+}
+
+// CompilationUnit: the thing we extract per Java/Kotlin compile.
+message CompilationUnit {
+  VName v_name = 1;
+  reserved 2;
+  repeated FileInput required_input = 3;
+  bool has_compile_errors = 4;
+  repeated string argument = 5;
+  repeated string source_file = 6;
+  string output_key = 7;
+  string working_directory = 8;
+  string entry_context = 9;
+
+  message FileInput {
+    VName v_name = 1;
+    FileInfo info = 2;
+    reserved 3;
+    // details (any) at field 4 — we skip it (proto3 lets unknown fields slide).
+  }
+
+  message Env {
+    string name = 1;
+    string value = 2;
+  }
+  repeated Env environment = 10;
+  // details (any) at field 11 — skipped.
+}
+
+// IndexedCompilation: the message stored at root/pbunits/<sha> in a kzip.
+message IndexedCompilation {
+  CompilationUnit unit = 1;
+  Index index = 2;
+
+  message Index {
+    repeated string revisions = 1;
+  }
+}

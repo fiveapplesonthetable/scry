@@ -1,0 +1,29 @@
+[package]
+name = "scry-kzip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+rayon = { workspace = true }
+protobuf = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+walkdir = "2"
+num_cpus = "1"
+scry-bridge = { path = "../scry-bridge" }
+scry-store = { path = "../scry-store" }
+
+[build-dependencies]
+protobuf-codegen = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

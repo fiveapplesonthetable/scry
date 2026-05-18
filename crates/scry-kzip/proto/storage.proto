@@ -1,0 +1,45 @@
+// Minimal subset of kythe/proto/storage.proto needed to stream Entry
+// records out of the various Kythe indexer binaries.
+//
+// Trimmed: we keep `VName` and `Entry`; the request / reply / shard /
+// rewrite-rule messages used by the (deprecated) GraphStore RPC service
+// are omitted. Field numbers + types match upstream so the wire format
+// is identical.
+//
+// `analysis.proto` already declares its own VName / FileInfo (also
+// trimmed). Both messages live in different Rust modules at runtime
+// (`storage` and `analysis`) so there is no symbol collision — the
+// two VNames are wire-compatible.
+
+syntax = "proto3";
+
+package kythe.proto.storage;
+
+// VName — vector name. See kythe.io/docs/kythe-storage.html for the
+// formal definition. Wire-compatible with the analysis-side VName.
+message VName {
+  string signature = 1;
+  string corpus    = 2;
+  string root      = 3;
+  string path      = 4;
+  string language  = 5;
+}
+
+// Entry associates a single fact with a graph object (node or edge).
+// Indexers emit a Stream-of-Entry protos to stdout in length-delimited
+// format (varint length + Entry bytes per record).
+message Entry {
+  // Source node of the fact.
+  VName source = 1;
+
+  // For edges: (edge_kind, target) are both populated; fact_name is
+  // typically "/" (edge marker) with empty fact_value. For node facts,
+  // edge_kind + target are empty.
+  string edge_kind = 2;
+  VName  target    = 3;
+
+  // Fact name; conventional values include "/kythe/node/kind",
+  // "/kythe/loc/start", "/kythe/loc/end", "/kythe/subkind", ...
+  string fact_name  = 4;
+  bytes  fact_value = 5;
+}

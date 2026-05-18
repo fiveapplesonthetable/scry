@@ -203,17 +203,11 @@ enum Cmd {
         /// and graceful fallback to lexical-only on uncovered code.
         #[arg(long)]
         lexical: bool,
-        // Below are the individual precision-filter knobs from
-        // v0.1.12–v0.1.16. They still work but are hidden from
-        // --help since the single `--lexical` flag covers the
-        // 95 % case; users who want fine-grained control can still
-        // pass them explicitly.
+        // Build-graph reachability filter. Hidden here for now —
+        // promoted in a follow-up commit to mirror --reachable on
+        // callgraph / impact.
         #[arg(long, hide = true)]
         reachable: bool,
-        #[arg(long, hide = true)]
-        clang_precise: bool,
-        #[arg(long, hide = true)]
-        scip_precise: bool,
         /// Keep only refs whose enclosing scope_path contains
         /// SCOPE as an exact segment. Example:
         /// `--scope BroadcastQueueImpl` drops every ref outside
@@ -280,13 +274,11 @@ enum Cmd {
         /// `scry ref --lexical` for the full explanation.
         #[arg(long)]
         lexical: bool,
-        // Hidden back-compat: individual precision knobs.
+        // Build-graph reachability filter. Hidden here for now —
+        // promoted in a follow-up commit to mirror --reachable on
+        // callgraph / impact.
         #[arg(long, hide = true)]
         reachable: bool,
-        #[arg(long, hide = true)]
-        clang_precise: bool,
-        #[arg(long, hide = true)]
-        scip_precise: bool,
         /// Keep only callers whose enclosing scope_path contains
         /// SCOPE as an exact segment. Big win on hub functions:
         /// `scry callers traceBegin --scope BroadcastQueueImpl`
@@ -1217,17 +1209,17 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, not_in, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, not_in, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, lexical, reachable, clang_precise, scip_precise, scope, def_in, strict } => {
+        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, lexical, reachable, scope, def_in, strict } => {
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, reachable, clang_precise, scip_precise);
+                resolve_precision(lexical, reachable);
             cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
-        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, lexical, reachable, clang_precise, scip_precise, scope, def_in, strict, format } => {
+        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, lexical, reachable, scope, def_in, strict, format } => {
             if precise {
                 return cmd_callers_precise(name, index, lang, in_, not_in, limit, json);
             }
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, reachable, clang_precise, scip_precise);
+                resolve_precision(lexical, reachable);
             cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
@@ -2792,7 +2784,7 @@ fn cmd_callgraph(
     // same NAME the user asked about, and their precision answer would
     // need a separate sidecar lookup per name (not free).
     let (_reach_unused, clang_precise, scip_precise) =
-        resolve_precision(lexical, false, false, false);
+        resolve_precision(lexical, false);
     let root_precise_sites: Option<std::collections::HashSet<(u32, u32)>> =
         if !lexical && (clang_precise || scip_precise) {
             let raw_root = r.lookup_refs_exact(&name);
@@ -3006,7 +2998,7 @@ fn cmd_impact(
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
     let (_reach, clang_precise, scip_precise) =
-        resolve_precision(lexical, false, false, false);
+        resolve_precision(lexical, false);
     let callers_precise = apply_precision_filter(
         &r, &name, raw_callers, clang_precise, scip_precise,
     )?;
@@ -3305,19 +3297,18 @@ fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bo
 /// would crush the per-query latency the user expects from a
 /// grep-class tool. `--lexical` turns everything off, leaving
 /// pure tree-sitter name match.
+///
+/// Returns `(reachable, clang_precise, scip_precise)`. The latter
+/// two booleans gate which sidecar `apply_precision_filter` will
+/// consult; they're not surfaced as standalone CLI flags because
+/// the user choice is binary: precise-by-default or `--lexical`.
 fn resolve_precision(
     lexical: bool,
     explicit_reachable: bool,
-    _explicit_clang: bool,
-    _explicit_scip: bool,
 ) -> (bool, bool, bool) {
     if lexical {
         return (false, false, false);
     }
-    // Cheap filters auto-engage; expensive reachability is opt-in.
-    // `_explicit_clang` / `_explicit_scip` are accepted from older
-    // hidden flags but ignored — clang+scip are already on by
-    // default. Setting them again is a no-op.
     (explicit_reachable, true, true)
 }
 
@@ -7643,10 +7634,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar. Opt-in (not default) because the module graph is ~256MB and adds ~50-500ms to first query in a process."},
                 "lexical": {"type": "boolean", "default": false,
                     "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever their sidecars are present, dropping name-collision false positives across C/C++/ObjC + Java/Kotlin/Rust/Go/TS/Python. Set true to see raw name-match results (debugging / want-everything mode)."},
-                "clang_precise": {"type": "boolean", "default": true,
-                    "description": "Filter refs by clang USR identity (C/C++/ObjC). DEFAULTS TO TRUE: auto-engages whenever the clang_usrs.bin sidecar is present (`scry build-symbols --build-{gn,kbuild,cmake} DIR` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
-                "scip_precise": {"type": "boolean", "default": true,
-                    "description": "Filter refs by SCIP symbol identity (any language with a SCIP indexer: Java / Kotlin / Rust / Go / TS / Python). DEFAULTS TO TRUE: auto-engages whenever the scip_index.bin sidecar is present (`scry build-symbols --scip FILE.scip` produces it). No-op when the sidecar is absent. Set false (or pass `lexical: true`) to suppress."},
                 "scope": {"type": "string",
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
                 "def_in": {"type": "string",
@@ -7678,10 +7665,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present. Opt-in."},
                 "lexical": {"type": "boolean", "default": false,
                     "description": "Same as on `ref` — opt out of all auto-engaged precision filters and return raw name-match callers."},
-                "clang_precise": {"type": "boolean", "default": true,
-                    "description": "Same as on `ref` — clang USR identity filter; auto-engages when sidecar present."},
-                "scip_precise": {"type": "boolean", "default": true,
-                    "description": "Same as on `ref` — SCIP symbol identity filter; auto-engages when sidecar present."},
                 "scope": {"type": "string",
                     "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
                 "def_in": {"type": "string",
@@ -7750,10 +7733,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "reachable": {"type": "boolean", "default": false},
                 "lexical": {"type": "boolean", "default": false,
                     "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters on the ROOT level whenever the sidecars are present. Deeper recursion stays lexical (walker doesn't track per-name precision context)."},
-                "clang_precise": {"type": "boolean", "default": true,
-                    "description": "Filter root-level callers by clang USR identity (C/C++/ObjC). Auto-on when sidecar present; pass `lexical: true` to suppress."},
-                "scip_precise": {"type": "boolean", "default": true,
-                    "description": "Filter root-level callers by SCIP symbol identity. Auto-on when sidecar present; pass `lexical: true` to suppress."},
                 "def_in": {"type": "string",
                     "description": "Substring of the def-site file path for the ROOT callee. Same shape as `ref --def-in`. Narrows ONLY the topmost level — deeper recursive levels are not filtered because the walker doesn't track per-frame def context."},
                 "strict": {"type": "boolean", "default": false,
@@ -7783,10 +7762,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "Build-graph reachability filter on callers leg only."},
                 "lexical": {"type": "boolean", "default": false,
                     "description": "Use lexical (tree-sitter) name match only for the callers leg. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever the sidecars are present."},
-                "clang_precise": {"type": "boolean", "default": true,
-                    "description": "Filter callers by clang USR identity (C/C++/ObjC). Auto-on when sidecar present; pass `lexical: true` to suppress."},
-                "scip_precise": {"type": "boolean", "default": true,
-                    "description": "Filter callers by SCIP symbol identity. Auto-on when sidecar present; pass `lexical: true` to suppress."},
                 "def_in": {"type": "string",
                     "description": "Narrow the callers portion by def-site path (same as `ref --def-in`). Doesn't affect the subclass walk."},
                 "strict": {"type": "boolean", "default": false,
@@ -8422,12 +8397,8 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_clang = args.get("clang_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_scip = args.get("scip_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
+                resolve_precision(lexical, explicit_reachable);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -8439,12 +8410,8 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_clang = args.get("clang_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_scip = args.get("scip_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
+                resolve_precision(lexical, explicit_reachable);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -8466,12 +8433,8 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_clang = args.get("clang_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_scip = args.get("scip_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
+                resolve_precision(lexical, explicit_reachable);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable,
@@ -8488,12 +8451,8 @@ fn serve_one_request<W: std::io::Write>(
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_clang = args.get("clang_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_scip = args.get("scip_precise")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable, explicit_clang, explicit_scip);
+                resolve_precision(lexical, explicit_reachable);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes,

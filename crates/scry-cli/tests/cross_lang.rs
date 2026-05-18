@@ -72,12 +72,13 @@ fn extract_v1_count(status: &str) -> usize {
         .and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-/// Helper: run `scry ref NAME --scip-precise --index DIR` and capture
-/// stdout + stderr. Returns (stdout_string, stderr_string, exit_ok).
+/// Helper: run `scry ref NAME --index DIR` and capture stdout +
+/// stderr. SCIP precision auto-engages from the sidecar — no flag
+/// needed. Returns (stdout_string, stderr_string, exit_ok).
 fn run_scip_precise_ref(idx: &Path, name: &str) -> (String, String, bool) {
     let r = Command::new(scry_bin())
-        .args(["ref", name, "--scip-precise", "--index"]).arg(idx)
-        .output().expect("spawn scry ref --scip-precise");
+        .args(["ref", name, "--index"]).arg(idx)
+        .output().expect("spawn scry ref");
     (
         String::from_utf8_lossy(&r.stdout).into_owned(),
         String::from_utf8_lossy(&r.stderr).into_owned(),
@@ -156,16 +157,16 @@ export function pet(a: Animal): string { return a.speak(); }
     assert!(n_syms >= 5,
         "scip-typescript should produce >= 5 symbols from the fixture; got: {status}");
 
-    // Precision filter is engaged: --scip-precise narrows refs to
-    // those whose SCIP symbol matches a def's SCIP symbol. Even when
-    // the count doesn't change (single def, single ref), the filter
-    // log line proves the SCIP sidecar was consulted on every ref.
+    // Precision filter is engaged by default: narrows refs to those
+    // whose SCIP symbol matches a def's SCIP symbol. Even when the
+    // count doesn't change (single def, single ref), the filter log
+    // line proves the SCIP sidecar was consulted on every ref.
     // This is the Kythe-level identity check: a ref's structured
     // symbol must equal the def's structured symbol.
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
-    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(ok, "scry ref speak failed: {stderr}");
     assert!(stderr.contains("[scry] precise ("),
-        "--scip-precise should emit a diagnostic line proving the filter \
+        "default precision should emit a diagnostic line proving the filter \
          was engaged; got stderr:\n{stderr}");
     assert!(stderr.contains("def SCIP symbols"),
         "filter output should mention the identity filter step; got:\n{stderr}");
@@ -177,8 +178,9 @@ export function pet(a: Animal): string { return a.speak(); }
 /// into two crates with refs to both, but indexes scry over only
 /// one of them; SCIP (via rust-analyzer) still covers both. The
 /// indexed crate calls into BOTH defs of `speak` — one is in scry's
-/// def set, one is not. `--scip-precise` must drop the out-of-scope
-/// ref because its SCIP symbol is not in scry's def_syms set.
+/// def set, one is not. Default-on SCIP precision must drop the
+/// out-of-scope ref because its SCIP symbol is not in scry's
+/// def_syms set.
 ///
 /// This is the test that proves Kythe-level identity narrowing
 /// actually fires, as distinct from "the filter ran without dropping
@@ -219,11 +221,11 @@ fn rust_scip_precise_narrows_by_symbol_identity() {
     // rust-analyzer scip covers the whole Cargo project → SCIP has
     // both Wolf::speak's and Cat::speak's symbols.
     //
-    // scry ref speak --scip-precise:
+    // scry ref speak (precision auto-engaged):
     //   def_syms = { Wolf::speak's SCIP symbol }   (only def scry has)
     //   ref to w.speak() → SCIP says Wolf::speak  → kept
     //   ref to c.speak() → SCIP says Cat::speak   → NOT in def_syms → DROPPED
-    //   Expected: 2 baseline refs → 1 after --scip-precise. Narrowing.
+    //   Expected: 2 baseline refs → 1 after precision. Narrowing.
     let base = temp_dir("rust-narrow");
     let src = base.join("src");
     let calls = src.join("calls");
@@ -298,21 +300,21 @@ pub fn main_call() -> (String, String) {
         "Rust ref extraction should see 2 (call rs) refs to `speak` in the \
          fixture (w.speak + c.speak). Got {baseline_count}. stdout:\n{baseline_stdout}");
 
-    // With --scip-precise (default behavior — also auto-engaged):
+    // Precision auto-engages from the SCIP sidecar (no flag needed).
     // c.speak() must drop because its SCIP symbol (Cat::speak) is
     // NOT in scry's def_syms set (only the local Wolf::speak is
     // in scry's index). Expected: 2 → 1 refs.
     let r = Command::new(scry_bin())
-        .args(["ref", "speak", "--kind", "call", "--scip-precise", "--index"]).arg(&idx)
-        .output().expect("spawn scry ref --scip-precise");
+        .args(["ref", "speak", "--kind", "call", "--index"]).arg(&idx)
+        .output().expect("spawn scry ref");
     let stdout = String::from_utf8_lossy(&r.stdout);
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(),
-        "scry ref --scip-precise failed: {stderr}");
+        "scry ref failed: {stderr}");
     let diag = stderr.lines()
         .find(|l| l.contains("[scry] precise (") && l.contains("→"))
         .unwrap_or("").to_string();
-    eprintln!("--scip-precise diagnostic: {diag}");
+    eprintln!("precise diagnostic: {diag}");
     assert!(!diag.is_empty(),
         "precision must emit a '[scry] precise (sidecar): N → M refs ...' \
          diagnostic; got stderr:\n{stderr}");
@@ -320,7 +322,7 @@ pub fn main_call() -> (String, String) {
         .filter(|l| l.contains("(call rs)")).count();
     eprintln!("after precise: {precise_count} (call rs) refs");
     assert!(precise_count < baseline_count,
-        "--scip-precise MUST drop the cross-module Cat::speak ref \
+        "precision MUST drop the cross-module Cat::speak ref \
          (Kythe-level identity narrowing). \
          baseline: {baseline_count}, precise: {precise_count}.\n\
          diag: {diag}");
@@ -409,7 +411,7 @@ repositories { mavenCentral() }
         "scip_index health should be 'v1, …'; got: {status}");
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
-    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(ok, "scry ref speak failed: {stderr}");
     assert!(stderr.contains("[scry] precise ("),
         "precision filter should be engaged on Java refs; got stderr:\n{stderr}");
 
@@ -485,7 +487,7 @@ pub fn pet<S: Speak>(s: &S) -> &'static str { s.speak() }
         "rust-analyzer should produce >= 3 symbols (Speak/Dog/pet); got: {status}");
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
-    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(ok, "scry ref speak failed: {stderr}");
     assert!(stderr.contains("[scry] precise ("),
         "filter should be engaged; got stderr:\n{stderr}");
 
@@ -554,7 +556,7 @@ func Pet(a Animal) string { return a.Speak() }
         "scip_index health should be 'v1, …'; got: {status}");
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "Speak");
-    assert!(ok, "scry ref Speak --scip-precise failed: {stderr}");
+    assert!(ok, "scry ref Speak failed: {stderr}");
     assert!(stderr.contains("[scry] precise ("),
         "filter should be engaged; got stderr:\n{stderr}");
 
@@ -631,7 +633,7 @@ def pet(a: Animal) -> str:
         "scip-python should produce >= 3 symbols (Animal/Dog/pet); got: {status}");
 
     let (_stdout, stderr, ok) = run_scip_precise_ref(&idx, "speak");
-    assert!(ok, "scry ref speak --scip-precise failed: {stderr}");
+    assert!(ok, "scry ref speak failed: {stderr}");
     assert!(stderr.contains("[scry] precise ("),
         "filter should be engaged; got stderr:\n{stderr}");
 

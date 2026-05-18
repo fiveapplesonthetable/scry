@@ -8,8 +8,9 @@
 //! Path B (scry-clang) ships in-tree per-TU libclang precision for
 //! C/C++/ObjC. Path C (this crate) takes pre-built SCIP indexes for
 //! any language and projects them into the same sidecar shape so
-//! `scry ref --scip-precise` can drop name-collision noise without
-//! us needing per-language indexers.
+//! `scry ref` can drop name-collision noise (precision auto-engages
+//! from the sidecar — opt out with `--lexical`) without us needing
+//! per-language indexers.
 //!
 //! ## Pipeline
 //!

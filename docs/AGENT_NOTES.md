@@ -171,11 +171,13 @@ The remaining gap is type precision: scry's heuristic resolver
 might tag a call to `MyOtherInterface.transact()` as a callers-of
 `Binder.transact` hit. The Layer 2 resolution sidecar narrows
 this with package + import context (~89% of references on the
-live index are uniquely resolved); the remaining ambiguity is
-where I'd reach for `clangd` or `scip-java` if precision really
-mattered. For "give me a representative sample of who calls
-this", scry is correct enough that I act on its output without
-verification.
+live index are uniquely resolved). For full type precision, run
+`scry build-symbols --build-kzip PATH.kzip` to attach the Kythe
+sidecars — that gives Code-Search-class accuracy across all six
+indexer languages (C/C++/ObjC, Java, Kotlin/JVM, Go, proto,
+textproto) without leaving scry. For "give me a representative
+sample of who calls this", scry is correct enough that I act on
+its output without verification.
 
 ### Where scry is *less* accurate than `rg`
 
@@ -497,12 +499,14 @@ language-specific tooling beats scry.
 ### When precision matters more than speed
 
 For "find every place that *exactly* shadows the JDK
-`Object.hashCode` method", scry's heuristic resolution is wrong
-~10-20% of the time. The right tool is `scip-java` + a SCIP-
-reader, or `IntelliJ` with its full semantic engine. scry's
-opt-in SCIP integration (DESIGN.md §13) would close this gap
-when configured; without it, treat scry as "98% accurate, ask
-the IDE for the rest".
+`Object.hashCode` method", scry's bare heuristic resolution
+is wrong ~10-20% of the time. With Kythe sidecars attached
+(`scry build-symbols --build-kzip PATH.kzip`), scry resolves at
+Code-Search precision across all six indexer languages — the
+ref-side `--strict` filter drops everything that doesn't match
+the def's structured symbol identity. Without the sidecars,
+treat bare scry as "98% accurate, ask the IDE for the rest";
+with them, the IDE detour goes away.
 
 ### Long-form code understanding
 

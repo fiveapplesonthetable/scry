@@ -110,24 +110,34 @@ scry callers close --format by-def --limit 10                    # histogram by 
 
 ### Per-language build-symbol setup (one-time)
 
-Generate the indexer artifact, then point `--build-out` at it.
+For **Kythe-integrated builds** (AOSP via Soong, Bazel, any pipeline
+that ships Kythe extractors) the one path that covers every language
+is `--build-kzip`:
 
-| Language          | One-line command                                                  | Output            |
-|-------------------|-------------------------------------------------------------------|-------------------|
-| C / C++ (CMake)   | `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .`             | `build/compile_commands.json` |
-| C / C++ (Make)    | `bear -- make`                                                    | `./compile_commands.json` |
-| C / C++ (AOSP)    | `SOONG_GEN_COMPDB=1 m nothing`                                    | `out/soong/development/ide/compdb/compile_commands.json` |
-| Java (Gradle)     | `scip-java index --build-tool gradle`                             | `./index.scip`    |
-| Kotlin            | `scip-kotlin --output index.scip src/`                            | `./index.scip`    |
-| Rust              | `rust-analyzer scip .`                                            | `./index.scip`    |
-| TypeScript        | `scip-typescript index`                                           | `./index.scip`    |
-| Go                | `scip-go`                                                         | `./index.scip`    |
-| Python            | `scip-python index .`                                             | `./index.scip`    |
+```sh
+scry build-symbols --build-kzip PATH.kzip --source-root /path/to/src -o ./idx
+```
 
-Then: `scry finalize --index ./idx --build-out <dir containing the artifact>`.
-Auto-discovery picks up at most one `compile_commands.json` and one
-`*.scip` per index; if you have multiple, pass `--clang-compile-commands`
-or `--scip` explicitly. Full per-language recipes + the architecture
+This drives the six Kythe v0.0.75 indexers (`cxx`, `java`, `jvm`, `go`,
+`proto`, `textproto`) and emits scry's packed sidecars directly. It's
+the preferred path on AOSP because the compiler wrappers capture the
+exact inputs every compile sees.
+
+For **standalone projects** (single CMake / Gradle / Cargo workspace
+with no Kythe extractor), generate a per-language artifact and let
+`build-symbols` consume it:
+
+| Language          | One-line command                                                  | scry invocation                                     |
+|-------------------|-------------------------------------------------------------------|-----------------------------------------------------|
+| C / C++ (CMake)   | `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .`             | `scry build-symbols --build-cmake build`            |
+| C / C++ (Make)    | `bear -- make` (writes `compile_commands.json` to CWD)            | `scry build-symbols --build-cmake .` (the flag accepts any dir with a `compile_commands.json`) |
+| C / C++ (AOSP)    | `SOONG_GEN_COMPDB=1 m nothing`                                    | `scry build-symbols --build-gn out/soong/development/ide/compdb` |
+| Linux kernel      | (use the kernel's `gen_compile_commands.py`)                      | `scry build-symbols --build-kbuild <build-dir>`    |
+| Rust              | (rust-analyzer auto-runs)                                         | `scry build-symbols --build-cargo`                  |
+| Go / TS / Python  | (auto via polyglot pass)                                          | `scry build-symbols --with-polyglot`                |
+
+`build-symbols` writes its sidecars directly into the index dir given
+by `-o` / `--index`. Full per-language recipes + the architecture
 narrative live in [`docs/BUILD_AWARE.md`].
 
 Times above are warm-cache P50 on the live AOSP + Linux index

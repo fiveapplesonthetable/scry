@@ -34,8 +34,8 @@ pub fn scry_tmp_dir() -> std::path::PathBuf {
 /// Resolve an indexer binary by name. Two sources, in priority
 /// order:
 ///   1. `$SCRY_INDEXER_<NAME>` — per-binary override (e.g.
-///      `SCRY_INDEXER_SCIP_JAVA=/opt/sg/bin/scip-java`). Dashes in
-///      `name` map to underscores.
+///      `SCRY_INDEXER_RUST_ANALYZER=/opt/ra/bin/rust-analyzer`).
+///      Dashes in `name` map to underscores.
 ///   2. The first match on `$PATH`.
 ///
 /// If neither resolves, the bare `name` is returned so the eventual

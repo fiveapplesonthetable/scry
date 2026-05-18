@@ -106,9 +106,11 @@ pub(crate) fn cmd_finalize(
     //
     // Coverage by artifact:
     //   compile_commands.json  →  C / C++ / ObjC (consumed by libclang)
-    //   *.scip                 →  Java         (scip-java)
-    //                             Kotlin       (scip-java / scip-kotlin)
-    //                             Rust         (rust-analyzer scip)
+    //   *.kzip                 →  Java / Kotlin / C++ / Go / proto / textproto
+    //                             (Kythe extractor output — preferred for
+    //                              AOSP / Bazel / any Kythe-integrated build,
+    //                              consumed via `scry build-symbols --build-kzip`)
+    //   *.scip                 →  Rust         (rust-analyzer scip)
     //                             TypeScript   (scip-typescript)
     //                             Go           (scip-go)
     //                             Python       (scip-python)

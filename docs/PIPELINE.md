@@ -106,6 +106,40 @@ which trip jvm_indexer's missing-JarDetails check, so those skip
 too). Per-language CU counts and skip reasons land in
 `<index>/kythe-logs/summary.txt`.
 
+#### Unit encodings in the kzip
+
+AOSP-style kzips carry compilation units in **two** encodings:
+
+* `root/pbunits/<sha>` — binary proto (`IndexedCompilation`). Newer
+  extractors (go_extractor, kotlinc plugin, rust_extractor) write this.
+* `root/units/<sha>`   — proto3-JSON of the same `IndexedCompilation`.
+  cxx_extractor and the historic java_extractor write this; Soong's
+  `merge_zips` preserves both encodings rather than transcoding.
+
+scry's walker reads both sub-trees and dedups by SHA (proto wins on
+collision). Both encoding paths feed the same `KzipUnit` shape; every
+downstream stage (dispatch, indexer, entries, emit) is encoding-
+agnostic. JSON parsing lives only in `walker.rs` (plus the per-CU
+sub-kzip builder in `indexer.rs`, which re-serializes JSON units to
+proto before handing them to a Kythe indexer — every v0.0.75 indexer
+rejects mixed-encoding kzips with `multiple unit encodings but
+different entries`).
+
+The walker has two paths chosen by the driver based on
+`SCRY_KZIP_MAX_UNITS`:
+
+* unset → parallel walk (rayon, one `ZipArchive` per worker via
+  `for_each_init`). With ~100 K JSON units in an AOSP kzip the JSON
+  decode dominates; parallel cuts phase 1 from minutes to seconds.
+* set   → serial streaming iterator with early break, so smoke runs
+  capped at N units don't pay full-walk cost.
+
+In both paths, when `SCRY_KZIP_LANGS` is set a cheap pre-peek over the
+raw unit bytes (manual proto-varint walk for proto, serde with a
+minimal shape for JSON) extracts `v_name.language` and short-circuits
+CUs that don't match the filter — saving the full decode cost on the
+~90 %+ of CUs the smoke / scoped runs ignore.
+
 The Kythe extractors see what the compiler sees: post-rewrite sources
 from protologsrc / jarjar / AAPT2 / hiddenAPI / AIDL / KAPT,
 variant-selected source sets, every javac shard, every flag. Soong's

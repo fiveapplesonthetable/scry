@@ -192,7 +192,8 @@ auto-engaged filters run when their sidecar is present:
 | Sidecar              | Filter               | Built by                                  | Languages covered                         |
 |----------------------|----------------------|-------------------------------------------|-------------------------------------------|
 | `clang_usrs.bin`     | clang USR identity   | `scry build-symbols --build-{gn,cmake,kbuild,kzip}` | C / C++ / ObjC                            |
-| `scip_index.bin`     | SCIP symbol identity | `scry build-symbols --build-kzip` or `--scip` | Java, Kotlin, Rust, Go, TS, Python, etc.  |
+| `scip_index.bin`     | Kythe SCIP / VName identity | `scry build-symbols --build-kzip` or `--scip` | Java, Kotlin, Rust, Go, TS, Python, etc.  |
+| `scip_index_fqn.bin` | JVM-FQN cross-CU bridge | `scry build-symbols --build-kzip` with `SCRY_KZIP_SERVING_DIR=<dir>` | Java / Kotlin cross-compilation-unit |
 
 A third filter, **`--reachable`**, narrows by build-graph module
 visibility (e.g. "drop callers in modules that can't link the
@@ -205,6 +206,49 @@ clang USR uniqueness: a call to `strdup` in
 `bionic/libc/foo.c` has the same USR as `strdup`'s def in
 `bionic/libc/upstream-openbsd/.../strdup.c`. The filter links
 them across modules without scry needing per-module bookkeeping.
+
+### Cross-CU Java resolution
+
+By default, Kythe's `java_indexer` emits anchor records per
+compilation unit, and the source-level VName for
+`Binder.clearCallingIdentity()` differs between
+`Binder.java`'s own CU (where it's a def) and a caller's CU
+like `services.core` (where it's resolved against
+`framework.jar` bytecode). Without a cross-CU join, strict
+queries like
+`scry callers clearCallingIdentity --def-in /android/os/Binder.java --in services/core`
+return zero hits — the def-side and ref-side symbol IDs don't
+match.
+
+scry handles this by reading the `/kythe/edge/named` edges that
+`java_indexer` emits (the indexer-side handle to JVM canonical
+FQNs) and lifting them into `scip_index_fqn.bin`. To enable:
+
+```sh
+$ SCRY_KZIP_SERVING_DIR=/tmp/serving \
+  scry build-symbols --build-kzip ./all.kzip \
+    --source-root /home/zim/dev/aosp \
+    --index ./idx
+# Output includes:
+#   ./idx/scip_index.bin       (per-CU anchors)
+#   ./idx/scip_index_fqn.bin   (jvm-FQN canonical, cross-CU)
+```
+
+`SCRY_KZIP_SERVING_DIR` tees each indexer's stdout for Phase 5's
+2-pass FQN importer (Pass 1: collect named-edge bridges; Pass 2:
+emit anchors keyed on JVM FQN). The companion sidecar is
+consulted alongside the main one by both `build-resolutions`
+and the query-time precision filter — a ref matches if its
+call-site symbol lands in **either** projection of the def.
+After Phase 5 runs, queries like the Binder one above resolve
+**1320 hits across services/core** on the live AOSP corpus.
+
+The Kythe v0.0.75 indexers also need four small patches for
+AOSP-specific edge cases (Java 21 bytecode reading + classpath
+auto-derivation); see [`KYTHE_JVM_INDEXER_REBUILD.md`] for
+the patches, build procedure, and why each is needed.
+
+[`KYTHE_JVM_INDEXER_REBUILD.md`]: KYTHE_JVM_INDEXER_REBUILD.md
 
 For per-language one-line setup recipes (AOSP/Soong, CMake,
 Cargo, Gradle, etc.) see [`BUILD_AWARE.md`].

@@ -643,70 +643,83 @@ The only "missing CU" failure mode is a source file the build
 system never compiled. For AOSP, run `m <module>` or `m droid` to
 expand the kzip.
 
-### Cross-CU Java resolution is out of scope until `write_tables` lands
+### Cross-CU Java resolution — how it works
 
-scry's Kythe ingest is per-CU. Each `java_indexer.jar` run sees one
-compilation unit's sources + its classpath jars, emits anchors, and
-hands the entry stream off to `decode_stream` which writes packed
-records keyed on a single `target_symbol` derived from the anchor's
-target VName. Intra-CU and intra-package resolution work as expected:
-`scry callers setDeliveryState --in BroadcastQueueImpl --strict`
-returns the ten BroadcastQueueImpl→BroadcastQueueImpl call sites.
+`scry callers clearCallingIdentity --def-in /android/os/Binder.java --in services/core --strict`
+resolves **1320 hits** against the live AOSP index. The mechanism has
+three load-bearing components; this section is the canonical writeup
+of why each is necessary.
 
-What does **not** work today: a `--strict --def-in /android/os/Binder.java`
-query for cross-CU callers like `services.core` → `Binder.clearCallingIdentity`.
-The reason is structural, not a bug:
+**1. Patched Kythe indexers** (`docs/KYTHE_JVM_INDEXER_REBUILD.md`).
+The stock Kythe v0.0.75 `java_indexer` cannot read Java 21 bytecode
+(ASM 9.1 bundled, `KytheClassVisitor` capped at ASM7) and silently
+drops `JavaDetails`-missing CUs onto a path with no classpath. AOSP
+fails on both: framework.jar ships at class major version 65, and
+services.core's CU has no `JavaDetails` extension. Four patches:
 
-- When `AMS.java` (in services.core's CU) calls `Binder.clearCallingIdentity()`,
-  Binder is resolved against `framework.jar` (turbine bytecode on
-  classpath), not against `Binder.java` source. The call edge's
-  target VName is a path-less, language="java" VName whose
-  signature is an opaque hash unrelated to anything in Binder.java's
-  standalone CU.
-- When `Binder.java` is indexed standalone (as a member of the
-  framework module), `java_indexer` emits a `defines/binding` edge
-  to a source-VName whose signature is *also* an opaque hash, **plus**
-  a `named` edge to a JVM-domain VName whose signature is the
-  fully-qualified `android.os.Binder.clearCallingIdentity()J`.
-- Services.core's entry stream contains **zero** `named` edges to
-  that JVM FQN — the bridge between the two opaque hashes only
-  exists in upstream Kythe's `write_tables` post-processor, which
-  joins the cross-CU graph after the fact.
+- **#1** bumps ASM 9.1 → 9.7.1.
+- **#2** raises `ASM_API_LEVEL` from ASM7 to ASM9.
+- **#3** adds `--default_corpus` so jvm_indexer's VNames align with
+  java_indexer's.
+- **#4** (load-bearing) derives `CLASS_PATH` from `!CLASS_PATH_JAR!`
+  entries in `required_input` when `JavaDetails` is missing. Without
+  it, services.core's javac can't resolve Binder against bytecode,
+  field.sym becomes a placeholder `ClassSymbol`, and the bridge
+  edge is never emitted. With it, services.core emits **1209**
+  `named` edges to JVM FQNs of `android.os.Binder.*` (was 0).
+
+**2. Phase 5 — FQN-canonical sidecar** (`crates/scry-kzip/src/fqn_importer.rs`).
+When `SCRY_KZIP_SERVING_DIR=<dir>` is set on a `--build-kzip` run,
+phase 3 tees every per-CU indexer's stdout to `<dir>/cu-<sha>.entries`.
+Phase 5 then runs a 2-pass streaming importer over those files:
+
+- **Pass 1** — walk every Entry, collect `/kythe/edge/named` edges
+  whose target VName has `language=jvm`. Build a deduplicated
+  `HashMap<source_vname_string → jvm_fqn_string>` of "bridges".
+- **Pass 2** — re-walk every Entry via `decode_stream`'s anchor-fold;
+  for each anchor record whose target appears in the bridge map,
+  emit a `precision_packed::Record` keyed on the JVM FQN instead of
+  the per-CU opaque hash. Records without a bridge are skipped
+  (already captured by `scip_index.bin`).
+
+Output: `<index>/scip_index_fqn.bin`. Disk-streamed, peak memory is
+bounded to the bridge map (~1M entries → ~200 MB) plus the decode
+accumulator. Tests: `fqn_importer::tests::two_cu_bridge_resolves_through_jvm_fqn`
+and `anchor_without_bridge_is_skipped`.
+
+**3. Reader wiring**
+(`crates/scry-store/src/lib.rs::StoreReader::scip_index_fqn`,
+`crates/scry-cli/src/main.rs::cmd_build_resolutions`,
+`apply_precision_filter`). Both the resolution and the query-time
+precision filter consult **both** sidecars: the main `scip_index.bin`
+(source-level Kythe VName signatures) and `scip_index_fqn.bin`
+(canonical JVM FQNs). The two namespaces are disjoint by construction
+(`kythe:java:` vs `kythe:jvm:`), so a single `HashMap<String, def_id>`
+holds both safely. Pass 3 short-circuits — main first, FQN as fall-
+through — so refs that the main sidecar already resolves don't pay
+the second lookup. Counters: build-resolutions reports
+`SCIP defs / SCIP-FQN defs / clang USR defs` separately.
+
+**Empirical verification.** Live AOSP test-agent index, May 2026:
+
+| Query | Lexical | Strict | Resolution |
+|---|---|---|---|
+| `clearCallingIdentity --def-in /android/os/Binder.java --in services/core` | 1523 | **1320** | 87% cross-CU |
+| `setDeliveryState --in BroadcastQueueImpl` (regression) | 15 | **15** | 100% same-CU |
+| `getCallingUid --def-in /android/os/Binder.java --in services/core` | 1480 | **1480** | 97% cross-CU |
 
 Two false leads worth recording so we don't re-walk them:
 
 1. Kythe v0.0.75 `java_indexer.jar` does **not** emit
-   `/kythe/edge/callableas` edges (the supposed call→method-def
-   indirection). Verified empirically on Binder.java's CU (22,943
-   entries, 1055 path-less call/ref targets, zero callableas edges)
-   and services.core's CU (5.6M entries, 249,558 path-less call/ref
-   targets, zero callableas edges). Commit `ef36d7b` tried to
-   exploit this; the rewrite map stayed empty for every CU. Reverted
-   in `04fe2a2`.
-2. The "lexical receiver-class match" fallback (the old pre-`36513db`
-   behaviour) is the **wrong** answer here. It produces false
-   positives on `Class.method` shadowing (e.g. `MockBinder` tests,
-   `AMS::Injector.clearCallingIdentity()`), which is why the
-   build-resolutions pass was made Kythe-only.
-
-The proper fix has three moving parts and is not in scope for a
-single session:
-
-- Run `jvm_indexer.jar` on the `framework.jar` CU (and equivalents),
-  routing `.class`-bearing JVM CUs to it. Today the dispatcher only
-  routes language="kotlin"+has_class_input there.
-- Emit anchor records using the **JVM FQN** as `target_symbol`
-  whenever the anchor's target has an in-CU `named`-edge to a
-  jvm-language VName. Falls back to the existing path-anchored VName
-  string otherwise.
-- Either run Kythe's `write_tables` and consume the resulting
-  graphstore, **or** build the cross-CU FQN-bridge inside
-  `build-resolutions` (collect every CU's `named` map, join at the
-  pass-2b def-symbol-index step).
-
-Returning zero hits for genuinely cross-CU strict queries is the
-**correct** behaviour for the current pipeline — silently fabricating
-hits via name-match would violate the precision contract.
+   `/kythe/edge/callableas` edges. Verified empirically on Binder.java
+   (22,943 entries, zero callableas) and services.core (5.6M entries,
+   zero callableas). Commit `ef36d7b` tried to exploit them; reverted
+   in `04fe2a2`. The `named`-edge bridge is the only cross-CU surface
+   the indexers ship.
+2. The pre-`36513db` "lexical receiver-class match" heuristic is
+   wrong: it false-positives on `Class.method` shadowing (`MockBinder`
+   tests, `AMS::Injector.clearCallingIdentity()`). The Kythe-only
+   resolution path is structurally correct.
 
 ### Kernel 634 parse failures
 

@@ -94,9 +94,18 @@ build_kzip.bash (Soong)        any Kythe-aware build
    │      into scry's packed sidecar format — no SCIP intermediate.
    │
    ▼  packed sidecars
-   clang_usrs.bin   (cxx_indexer output)
-   scip_index.bin   (java + jvm + go + proto + textproto output)
+   clang_usrs.bin       (cxx_indexer output)
+   scip_index.bin       (java + jvm + go + proto + textproto output)
+   scip_index_fqn.bin   (optional: cross-CU Java FQN bridge, Phase 5)
 ```
+
+`scip_index_fqn.bin` only materializes when `SCRY_KZIP_SERVING_DIR=<dir>`
+is set. It carries one anchor record per `language=java` ↔ `language=jvm`
+named-edge in the corpus, keyed on the canonical JVM FQN. This is what
+lets `services.core → Binder.clearCallingIdentity` resolve across CUs
+without joining Kythe's `write_tables` graph at query time — see
+`docs/DEVELOPMENT.md` § "Cross-CU Java resolution" and
+`crates/scry-kzip/src/fqn_importer.rs`.
 
 The Kythe v0.0.75 public release does not ship a Rust indexer or a
 source-level Kotlin indexer; CUs labeled `rust` are skipped and
@@ -296,6 +305,52 @@ build/soong/build_kzip.bash
 The script invokes Soong's `xref_{cxx,java,kotlin,rust}` phony
 targets, which run with Kythe extractors wrapping each compile, then
 calls `merge_zips` to pack everything into one all.kzip.
+
+#### Phase 5 — cross-CU FQN sidecar (opt-in)
+
+Setting `SCRY_KZIP_SERVING_DIR=<dir>` flips two switches in the
+driver:
+
+1. **Phase 3 tees** every per-CU indexer's stdout to
+   `<staging>/entries/cu-<sha>.entries` while still streaming it
+   through `decode_stream` for the main packed sidecars.
+2. **Phase 5** runs `fqn_importer::build_fqn_sidecar` over the
+   tee'd entry files in two streaming passes:
+   - **Pass 1** scans every `Entry` and records each
+     `/kythe/edge/named` edge that points at a `language=jvm`
+     target VName, building a deduplicated map
+     `source_vname_string → jvm_fqn_string`. This is the cross-CU
+     bridge the upstream Kythe `write_tables` post-processor would
+     otherwise compute over its LevelDB graph.
+   - **Pass 2** re-streams the entry files, this time through
+     `decode_stream`'s anchor accumulator. For each anchor whose
+     target appears in the bridge map, emit a record keyed on the
+     JVM FQN string; anchors without a bridge are skipped (already
+     covered by `scip_index.bin`).
+
+   Output: `<index>/scip_index_fqn.bin`. Phase 5 runs **before**
+   the optional Phase 6 LevelDB build below — the FQN sidecar is the
+   load-bearing artifact for scry's own query path, so an operator
+   who Ctrl-C's between phases still ends up with a working sidecar.
+
+   Peak memory is bounded to the bridge map (~1M entries on AOSP-
+   scale → ~200 MB) plus the decode accumulator. Source files:
+   `crates/scry-kzip/src/fqn_importer.rs`; entry-walker:
+   `crates/scry-kzip/src/entries.rs::walk_entries`; standalone
+   driver for re-running against pre-tee'd entries:
+   `crates/scry-kzip/examples/fqn_import.rs`.
+
+#### Phase 6 — Kythe LevelDB serving table (opt-in, debug)
+
+When `SCRY_KZIP_SERVING_DIR=<dir>` is set, Phase 6 also runs
+`kythe entrystream --unique --sort | kythe write_tables` over the
+tee'd entries to produce a LevelDB serving table at `<dir>/`. This
+artifact is for the external `kythe xrefs` / `kythe decor` CLIs
+(useful when debugging Kythe-side bugs); **scry's own query path
+does not consume it**. Phase 6 can take 30+ min on a large entries
+set — Phase 5 runs first so this is non-blocking for the query
+critical path. Source: `crates/scry-kzip/src/serving.rs`. Failures
+are logged but non-fatal.
 
 ### 2b. compile_commands-based builds — `--build-{gn,kbuild,cmake}`
 

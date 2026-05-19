@@ -82,11 +82,15 @@ Idempotent. Drops binaries under `~/.local/bin` (override with
 # 1. Index the source tree.
 scry index ~/dev/myproject -o ./idx
 
-# 2. (Optional, per-build) Tell scry where the build outputs live.
-#    `scry finalize --build-out PATH` auto-discovers
-#    compile_commands.json (libclang USRs) and *.scip (SCIP
-#    symbols) and runs the per-TU indexer + sidecar import.
-scry finalize --index ./idx --build-out ~/dev/myproject/build
+# 2. (Optional, per-build) Layer indexer-backed precision sidecars
+#    onto the index. One flag per build flavour:
+scry build-symbols --build-cmake build       --index ./idx   # CMake / Make (libclang)
+scry build-symbols --build-kbuild build      --index ./idx   # Linux kernel
+scry build-symbols --build-gn   out          --index ./idx   # GN
+scry build-symbols --build-kzip all.kzip --source-root . --index ./idx  # AOSP / Bazel / Kythe
+scry build-symbols --build-cargo             --index ./idx   # Rust workspace
+# Or import an existing .scip file from any SCIP producer:
+scry build-symbols --scip ./index.scip --index ./idx
 
 # 3. Query. Build symbols narrow automatically when sidecars exist.
 scry def ActivityManagerService --kind class --index ./idx

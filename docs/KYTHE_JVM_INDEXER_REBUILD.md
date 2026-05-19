@@ -48,10 +48,13 @@ version 65, which the stock `jvm_indexer.jar`'s bundled ASM 9.1 and
 `KytheClassVisitor.ASM_API_LEVEL = ASM7` both reject (`Unsupported class file
 major version 65`, then `Records requires ASM8`).
 
-## The three patches
+## The four patches
 
-All three live in our Kythe fork at `/mnt/agent/dev/kythe`. Each is the smallest
-upstream-shaped change that fixes the problem cleanly.
+All four live in our Kythe fork at `/mnt/agent/dev/kythe` and are also pinned
+in `kythe-patches/` at the scry repo root as numbered `.patch` files. Each is
+the smallest upstream-shaped change that fixes the problem cleanly. Patches
+1–3 address the Java-21-bytecode reading gap; Patch 4 is the load-bearing one
+that wires classpath visibility for cross-CU resolution.
 
 ### Patch 1 — `external.bzl`: bump bundled ASM
 

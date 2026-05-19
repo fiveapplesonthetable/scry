@@ -2730,20 +2730,33 @@ Crucially scry does NOT compute the structured IDs itself.
 That's where Kythe's complexity lives — per-language compiler
 plumbing, schema, verifier, build integration. scry stays small
 by treating the indexer artifact as just another file in the
-build output, walked by `scry finalize --build-out PATH` and
-ingested into the canonical sidecar shape. The complexity
-budget for "be Kythe-class precise for N languages" collapses
-from "implement N indexers" to "consume N indexer outputs in
-a shared on-disk format" — same value, two orders of magnitude
-less code.
+build output, ingested by `scry build-symbols --build-{gn,kbuild,
+cmake,cargo,kzip}` into the canonical sidecar shape. The
+complexity budget for "be Kythe-class precise for N languages"
+collapses from "implement N indexers" to "consume N indexer
+outputs in a shared on-disk format" — same value, two orders
+of magnitude less code.
+
+The one place scry does add post-processing on top of Kythe
+output is the **cross-CU JVM bridge** (`scip_index_fqn.bin`).
+Kythe's per-CU indexer is correct but the cross-CU join lives
+in Kythe's own `write_tables` LevelDB serving layer, which
+adds 30+ min of post-processing and a separate query API. scry
+shortcuts this by reading the same `/kythe/edge/named` edges
+the indexer already emits, lifting `language=java` ↔
+`language=jvm` mappings into a packed sidecar that the query
+path consumes directly — see § 12.X (or
+`crates/scry-kzip/src/fqn_importer.rs` for the 2-pass
+streaming implementation).
 
 This is also why precision is default-on: the only thing the
 filter costs is one hash lookup per candidate ref, and if the
 sidecar isn't present the filter no-ops gracefully. There's
-nothing to "turn on" — you point `scry finalize` at the build
-dir once, and every subsequent query gets the structured
-narrowing. `--lexical` exists as an opt-out for "show me
-everything" workflows; the default workflow needs no flags.
+nothing to "turn on" — you point `scry build-symbols
+--build-kzip PATH` at the kzip once, and every subsequent
+query gets the structured narrowing. `--lexical` exists as
+an opt-out for "show me everything" workflows; the default
+workflow needs no flags.
 
 ---
 

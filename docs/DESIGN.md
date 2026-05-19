@@ -594,13 +594,22 @@ Current sidecars (all optional; `scry health` reports each):
 | `module_graph.json`        | `scry build-modgraph`             | `--reachable` filter             |
 | `clang_usrs.bin`           | `scry build-symbols --build-{gn,cmake,kbuild,kzip}` | clang USR identity (default-on)  |
 | `scip_index.bin`           | `scry build-symbols --build-kzip` or `--scip`       | SCIP symbol identity (default-on) |
+| `scip_index_fqn.bin`       | `scry build-symbols --build-kzip` (with `SCRY_KZIP_SERVING_DIR=<dir>`) | JVM-FQN cross-CU bridge (Java/Kotlin) |
 
-`scry finalize` is the one-stop runner: it invokes each builder
-in order, skipping the ones whose input isn't available
-(`--build-soong /path`, `--build-out /path`, `--scip FILE`,
-`--clang-compile-commands FILE`). After `scry finalize`, the
-sidecars are all in place and every query auto-engages whatever
-precision the data supports.
+`scip_index_fqn.bin` is a companion to `scip_index.bin`: same packed
+format, but its records are keyed on canonical JVM FQN strings
+(`kythe:jvm:<corpus>###<fqn>`) lifted from `/kythe/edge/named` edges,
+not on the per-CU Kythe SCIP signature. Resolution and the precision
+filter consult both — a ref matches if its call-site symbol is in
+**either** sidecar's def-symbol set. This is what makes cross-CU
+Java calls (`services.core → Binder.clearCallingIdentity`) resolve
+without joining Kythe's `write_tables` graph at query time. The
+two namespaces are disjoint by construction (`kythe:java:` vs
+`kythe:jvm:` prefixes from `VName::to_symbol_string`), so merging
+into one in-memory map can't collide. See
+`docs/DEVELOPMENT.md` § "Cross-CU Java resolution" for the
+mechanism and `crates/scry-kzip/src/fqn_importer.rs` for the
+2-pass streaming importer.
 
 ## 8.5 Build-symbol precision (Path B / Path C)
 
@@ -657,15 +666,14 @@ A third filter, `--reachable`, narrows by Soong/Bazel/Kernel
 module-graph visibility; it stays explicit opt-in because the
 256MB AOSP module graph + Warshall closure costs ~30s cold.
 
-**Auto-discovery:** `scry finalize --index DIR --build-out PATH`
-walks each indexed source root + each `--build-out PATH`
-looking for `compile_commands.json` and `*.scip` artifacts.
-Source roots honor `.gitignore` (vendored artifacts skip);
-`--build-out` paths walk verbatim because build outputs
-typically live in gitignored dirs (`out/soong`, `build/`,
-`target/`). One cc.json and one *.scip per index — multiple
-discovered candidates warn and skip, so user must pass
-`--clang-compile-commands` / `--scip` explicitly to disambiguate.
+**Sidecar producers:** `scry build-symbols --build-{gn,kbuild,cmake,cargo,kzip}`
+runs the language-appropriate indexer flow and writes the
+matching sidecars into `--index DIR`. The `--build-kzip` path
+drives the six Kythe v0.0.75 indexers from a single
+`build_kzip.bash` artifact (and is the canonical path for
+AOSP / Bazel); the others wrap `compile_commands.json` /
+rust-analyzer / scip-* per language. `--scip FILE` is the
+escape hatch when you already have a SCIP file from elsewhere.
 
 ## 9. CLI surface (concrete)
 

@@ -106,6 +106,44 @@ pub struct DecodedRecord {
     pub role: Role,
 }
 
+/// Outcome of one [`decode_stream`] call.
+///
+/// Beyond the streamed `DecodedRecord`s (delivered via the caller's
+/// sink), the decoder also returns:
+///
+/// * `entry_count` — total length-delimited Entry protos consumed.
+///   Used by the per-CU log line for spotting heavyweight CUs.
+/// * `completes_bridges` — for every `/kythe/edge/completes` (or
+///   `/kythe/edge/completes/uniquely`) edge seen in this stream, a
+///   mapping `defn_symbol → decl_symbol` (both rendered via
+///   [`VName::to_symbol_string`]).
+///
+/// **Why `completes_bridges` exists.** The C++ indexer (`cxx_indexer`)
+/// emits two distinct VNames for the same function: one anchored at
+/// the definition (`Foo.cpp`) and one anchored at the forward decl in
+/// the header (`Foo.h`). Call sites in OTHER translation units always
+/// carry the **header** VName as their target — they only ever see the
+/// declaration. Scry's tree-sitter pre-scan, however, only finds the
+/// `.cpp` definition (the header lacks a body), so resolution registers
+/// the DEFN VName in `cusr_def_by_symbol` and call sites carrying the
+/// DECL VName never resolve.
+///
+/// `cxx_indexer` exposes the DEFN↔DECL identity explicitly through the
+/// `completes` / `completes/uniquely` edges, with the definition as the
+/// source and the declaration as the target. We collect those edges
+/// here and the caller rewrites every record's `target_symbol` from
+/// DEFN to DECL post-decode so the in-memory map is keyed on the same
+/// VName the call sites carry.
+///
+/// Bridges are scoped to one `decode_stream` call (one CU) — the same
+/// DEFN may map to different DECLs across CUs and the per-CU rewrite
+/// avoids cross-CU contamination.
+#[derive(Debug, Default)]
+pub struct DecodeOutcome {
+    pub entry_count: u64,
+    pub completes_bridges: HashMap<String, String>,
+}
+
 /// Per-anchor accumulator. Each Kythe anchor needs four facts
 /// (`/kythe/node/kind = "anchor"`, `/kythe/loc/start`, `/kythe/loc/end`)
 /// plus at least one out-edge before we can emit. We flush as soon
@@ -122,19 +160,6 @@ struct AnchorAccum {
     pending: Vec<(VName, Role)>,
 }
 
-/// Stream-decode Entry protos out of `reader`. Calls `sink` once
-/// per flushed `DecodedRecord`. Returns the total Entry count read,
-/// useful for the per-language summary.
-///
-/// **True streaming** — reads one length-prefixed Entry at a time
-/// from `reader` and discards each Entry's bytes once parsed. Peak
-/// per-CU memory is bounded to roughly the largest single Entry's
-/// length-prefix (rarely more than a few KB) plus the anchor
-/// accumulator (one entry per anchor VName seen so far, dropped
-/// at end of CU). Earlier impl called `read_to_end` and parsed the
-/// full buffer in one shot, which OOM'd the parent process on AOSP
-/// CUs whose `java_indexer` emits 10+ GB of entries (e.g.
-/// CarSystemUIRavenTests with 297 sources + 1084 classpath refs).
 /// Stream-decode raw Kythe `Entry` protos out of `reader`, calling
 /// `sink` once per Entry with a borrowed reference. The same true-
 /// streaming guarantees as [`decode_stream`] hold: peak memory is
@@ -171,14 +196,33 @@ where
     Ok(total)
 }
 
-pub fn decode_stream<R, F>(reader: R, mut sink: F) -> Result<u64>
+/// Stream-decode `Entry` protos out of `reader`, folding anchor facts
+/// (`/kythe/node/kind`, `/kythe/loc/{start,end}`) and out-edges
+/// (`defines/binding`, `defines`, `ref`, `ref/call`, `ref/writes`,
+/// `ref/imports`) into one [`DecodedRecord`] per `(anchor, target,
+/// role)` triple via the `sink` callback.
+///
+/// **True streaming** — reads one length-prefixed Entry at a time
+/// from `reader` and discards each Entry's bytes once parsed. Peak
+/// per-CU memory is bounded to roughly the largest single Entry's
+/// length-prefix (rarely more than a few KB) plus the anchor
+/// accumulator (one entry per anchor VName seen so far, dropped
+/// at end of CU). Earlier impl called `read_to_end` and parsed the
+/// full buffer in one shot, which OOM'd the parent process on AOSP
+/// CUs whose `java_indexer` emits 10+ GB of entries (e.g.
+/// CarSystemUIRavenTests with 297 sources + 1084 classpath refs).
+///
+/// Returns a [`DecodeOutcome`] carrying the total Entry count plus the
+/// per-CU DEFN→DECL `completes` bridge table (always non-empty for
+/// `cxx_indexer` streams, empty for every other Kythe v0.0.75 indexer).
+pub fn decode_stream<R, F>(reader: R, mut sink: F) -> Result<DecodeOutcome>
 where
     R: Read,
     F: FnMut(DecodedRecord),
 {
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
     let mut anchors: HashMap<VName, AnchorAccum> = HashMap::new();
-    let mut total: u64 = 0;
+    let mut outcome = DecodeOutcome::default();
     let mut entry_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
         let len = match read_varint_from(&mut reader)? {
@@ -191,18 +235,37 @@ where
         entry_buf.resize(len as usize, 0);
         reader.read_exact(&mut entry_buf)
             .with_context(|| format!(
-                "truncated entry stream: wanted {len} bytes after frame {total}",
+                "truncated entry stream: wanted {len} bytes after frame {} ",
+                outcome.entry_count,
             ))?;
         let entry = Entry::parse_from_bytes(&entry_buf)
-            .with_context(|| format!("decode Entry #{total}"))?;
-        total += 1;
-        process_entry(&entry, &mut anchors, &mut sink);
+            .with_context(|| format!("decode Entry #{}", outcome.entry_count))?;
+        outcome.entry_count += 1;
+        process_entry(&entry, &mut anchors, &mut outcome.completes_bridges, &mut sink);
     }
     // Drop the accumulator. Any anchors that didn't accumulate
     // start + end + at least one edge are incomplete — Kythe
     // routinely emits these for non-binding decls.
     drop(anchors);
-    Ok(total)
+    Ok(outcome)
+}
+
+/// Rewrite each record's `target_symbol` from a definition VName to its
+/// declaration VName when a `completes` bridge exists. See
+/// [`DecodeOutcome::completes_bridges`] for the rationale.
+///
+/// Records whose target has no bridge entry pass through unchanged.
+/// O(records) time, O(1) allocations per rewrite (one `String` swap).
+pub fn apply_completes_bridges(
+    records: &mut [DecodedRecord],
+    bridges: &HashMap<String, String>,
+) {
+    if bridges.is_empty() { return; }
+    for rec in records.iter_mut() {
+        if let Some(decl) = bridges.get(&rec.target_symbol) {
+            rec.target_symbol = decl.clone();
+        }
+    }
 }
 
 /// Read a proto-style base-128 varint from a `Read`. Returns
@@ -233,6 +296,7 @@ fn read_varint_from<R: Read>(reader: &mut R) -> Result<Option<u64>> {
 fn process_entry<F: FnMut(DecodedRecord)>(
     entry: &Entry,
     anchors: &mut HashMap<VName, AnchorAccum>,
+    completes_bridges: &mut HashMap<String, String>,
     sink: &mut F,
 ) {
     let Some(source) = entry.source.as_ref() else { return };
@@ -263,34 +327,65 @@ fn process_entry<F: FnMut(DecodedRecord)>(
             }
             _ => {} // facts we don't need
         }
-    } else {
-        // Edge. We only care about anchors-to-targets.
+        return;
+    }
+    // Edge. First, the `completes` family — DEFN↔DECL identity edges
+    // emitted by cxx_indexer. Source = definition VName, target =
+    // declaration VName. We collect these as a per-CU rewrite table so
+    // the caller can fold DEFN-keyed records onto the DECL VName that
+    // call sites in other TUs actually carry. See
+    // [`DecodeOutcome::completes_bridges`] for the full rationale.
+    //
+    // Edge variants we honour:
+    //   /kythe/edge/completes
+    //   /kythe/edge/completes/uniquely
+    //   /kythe/edge/completes.<ordinal>          (multi-edge form)
+    //   /kythe/edge/completes/uniquely.<ordinal>
+    //
+    // The source and target VNames must be non-empty — Kythe sometimes
+    // emits placeholder edges with one end empty; those carry no useful
+    // identity and would alias unrelated DEFNs together.
+    if entry.edge_kind == "/kythe/edge/completes"
+        || entry.edge_kind == "/kythe/edge/completes/uniquely"
+        || entry.edge_kind.starts_with("/kythe/edge/completes.")
+        || entry.edge_kind.starts_with("/kythe/edge/completes/uniquely.")
+    {
         let Some(target) = entry.target.as_ref() else { return };
         let target_vn = VName::from_proto(target);
-        if target_vn.is_empty() { return; }
-        let role = match entry.edge_kind.as_str() {
-            // defines/binding is the canonical decl edge. defines (no
-            // /binding) covers non-binding decls (e.g. forward decls).
-            s if s == "/kythe/edge/defines/binding"
-                || s.starts_with("/kythe/edge/defines/binding.")
-                || s == "/kythe/edge/defines"
-                || s.starts_with("/kythe/edge/defines.") => Role::Decl,
-            s if s == "/kythe/edge/ref/call"
-                || s.starts_with("/kythe/edge/ref/call.") => Role::Call,
-            s if s == "/kythe/edge/ref"
-                || s.starts_with("/kythe/edge/ref.")
-                || s == "/kythe/edge/ref/writes"
-                || s.starts_with("/kythe/edge/ref/writes.")
-                || s == "/kythe/edge/ref/imports"
-                || s.starts_with("/kythe/edge/ref/imports.") => Role::Ref,
-            _ => return,
-        };
-        let a = anchors.entry(source_vn.clone()).or_default();
-        if let Some(rec) = make_record(&source_vn, a, &target_vn, role) {
-            sink(rec);
-        } else {
-            a.pending.push((target_vn, role));
-        }
+        if source_vn.is_empty() || target_vn.is_empty() { return; }
+        // Same DEFN → DECL rewrite if seen twice; HashMap insertion is
+        // idempotent for identical values. If the indexer ever emitted
+        // a conflicting DECL for the same DEFN (it never does in v0.0.75)
+        // last-write-wins, which still produces a single canonical key.
+        completes_bridges.insert(source_vn.to_symbol_string(), target_vn.to_symbol_string());
+        return;
+    }
+    // Edge. We only care about anchors-to-targets.
+    let Some(target) = entry.target.as_ref() else { return };
+    let target_vn = VName::from_proto(target);
+    if target_vn.is_empty() { return; }
+    let role = match entry.edge_kind.as_str() {
+        // defines/binding is the canonical decl edge. defines (no
+        // /binding) covers non-binding decls (e.g. forward decls).
+        s if s == "/kythe/edge/defines/binding"
+            || s.starts_with("/kythe/edge/defines/binding.")
+            || s == "/kythe/edge/defines"
+            || s.starts_with("/kythe/edge/defines.") => Role::Decl,
+        s if s == "/kythe/edge/ref/call"
+            || s.starts_with("/kythe/edge/ref/call.") => Role::Call,
+        s if s == "/kythe/edge/ref"
+            || s.starts_with("/kythe/edge/ref.")
+            || s == "/kythe/edge/ref/writes"
+            || s.starts_with("/kythe/edge/ref/writes.")
+            || s == "/kythe/edge/ref/imports"
+            || s.starts_with("/kythe/edge/ref/imports.") => Role::Ref,
+        _ => return,
+    };
+    let a = anchors.entry(source_vn.clone()).or_default();
+    if let Some(rec) = make_record(&source_vn, a, &target_vn, role) {
+        sink(rec);
+    } else {
+        a.pending.push((target_vn, role));
     }
 }
 
@@ -424,8 +519,9 @@ mod tests {
             edge(anchor.clone(), target.clone(), "/kythe/edge/defines/binding"),
         ]);
         let mut out = Vec::new();
-        let n = decode_stream(&stream[..], |r| out.push(r)).unwrap();
-        assert_eq!(n, 4);
+        let outcome = decode_stream(&stream[..], |r| out.push(r)).unwrap();
+        assert_eq!(outcome.entry_count, 4);
+        assert!(outcome.completes_bridges.is_empty());
         assert_eq!(out.len(), 1);
         let r = &out[0];
         assert_eq!(r.file_path, "src/Foo.java");
@@ -509,8 +605,9 @@ mod tests {
     #[test]
     fn empty_input_decodes_cleanly() {
         let mut out = Vec::new();
-        let n = decode_stream(&[][..], |r| out.push(r)).unwrap();
-        assert_eq!(n, 0);
+        let outcome = decode_stream(&[][..], |r| out.push(r)).unwrap();
+        assert_eq!(outcome.entry_count, 0);
+        assert!(outcome.completes_bridges.is_empty());
         assert!(out.is_empty());
     }
 
@@ -580,8 +677,8 @@ mod tests {
         // to the slice form.
         let cursor = std::io::Cursor::new(stream_bytes);
         let mut out = Vec::new();
-        let n = decode_stream(cursor, |r| out.push(r)).unwrap();
-        assert_eq!(n, 4);
+        let outcome = decode_stream(cursor, |r| out.push(r)).unwrap();
+        assert_eq!(outcome.entry_count, 4);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].start, 7);
         assert_eq!(out[0].end, 10);
@@ -633,5 +730,120 @@ mod tests {
         let err = decode_stream(reader, |r| out.push(r)).unwrap_err();
         assert!(format!("{err:#}").contains("truncated"),
             "truncated mid-frame must surface as 'truncated', got: {err:#}");
+    }
+
+    /// C++ `/kythe/edge/completes/uniquely` edges build a DEFN→DECL
+    /// rewrite table so callers can canonicalise records keyed on the
+    /// `.cpp` definition VName onto the `.h` declaration VName that
+    /// other TUs' call sites carry.
+    ///
+    /// Simulated layout (one CU, matching cxx_indexer's actual output):
+    ///
+    ///   Foo.cpp:100-110   defines/binding → def_vname     (the body)
+    ///   Foo.h:50-60       defines/binding → decl_vname    (the proto)
+    ///   def_vname         completes/uniquely → decl_vname (identity)
+    ///   Caller.cpp:200-210 ref/call         → decl_vname  (call site)
+    ///
+    /// After [`apply_completes_bridges`] the Foo.cpp record's
+    /// `target_symbol` is rewritten from def_vname to decl_vname so all
+    /// three records collapse onto a single canonical key — which is
+    /// exactly the VName that scry's tree-sitter pre-scan also surfaces
+    /// for the header decl, restoring resolution for cross-TU calls.
+    #[test]
+    fn completes_edge_rewrites_defn_to_decl() {
+        let def_vname    = vn("FOO_DEF_SIG",  "frameworks/native/Foo.cpp");
+        let decl_vname   = vn("FOO_DECL_SIG", "frameworks/native/include/Foo.h");
+        let anchor_def   = vn("anchor-def",   "frameworks/native/Foo.cpp");
+        let anchor_decl  = vn("anchor-decl",  "frameworks/native/include/Foo.h");
+        let anchor_call  = vn("anchor-call",  "frameworks/native/Caller.cpp");
+
+        let stream = write_stream(&[
+            // Foo.cpp definition anchor binds the DEFN VName.
+            fact(anchor_def.clone(),  "/kythe/node/kind", b"anchor"),
+            fact(anchor_def.clone(),  "/kythe/loc/start", b"100"),
+            fact(anchor_def.clone(),  "/kythe/loc/end",   b"110"),
+            edge(anchor_def.clone(),  def_vname.clone(),  "/kythe/edge/defines/binding"),
+            // Foo.h declaration anchor binds the DECL VName.
+            fact(anchor_decl.clone(), "/kythe/node/kind", b"anchor"),
+            fact(anchor_decl.clone(), "/kythe/loc/start", b"50"),
+            fact(anchor_decl.clone(), "/kythe/loc/end",   b"60"),
+            edge(anchor_decl.clone(), decl_vname.clone(), "/kythe/edge/defines/binding"),
+            // The identity edge: DEFN completes DECL.
+            edge(def_vname.clone(),   decl_vname.clone(), "/kythe/edge/completes/uniquely"),
+            // Call site in another TU references the DECL VName.
+            fact(anchor_call.clone(), "/kythe/node/kind", b"anchor"),
+            fact(anchor_call.clone(), "/kythe/loc/start", b"200"),
+            fact(anchor_call.clone(), "/kythe/loc/end",   b"210"),
+            edge(anchor_call.clone(), decl_vname.clone(), "/kythe/edge/ref/call"),
+        ]);
+
+        let mut records: Vec<DecodedRecord> = Vec::new();
+        let outcome = decode_stream(&stream[..], |r| records.push(r)).unwrap();
+
+        // The completes edge is collected, no DecodedRecord emitted
+        // for it (it's an edge between non-anchor VNames).
+        let def_sym  = VName::from_proto(&def_vname).to_symbol_string();
+        let decl_sym = VName::from_proto(&decl_vname).to_symbol_string();
+        assert_eq!(outcome.completes_bridges.len(), 1, "one DEFN→DECL bridge");
+        assert_eq!(outcome.completes_bridges.get(&def_sym), Some(&decl_sym));
+
+        // Three records: Foo.cpp def, Foo.h decl, Caller.cpp call.
+        assert_eq!(records.len(), 3, "got: {records:#?}");
+
+        // Sort by file+start so the assertions are order-independent.
+        // Lex order: "Caller.cpp" < "Foo.cpp" < "include/Foo.h".
+        records.sort_by(|a, b| (a.file_path.as_str(), a.start).cmp(&(b.file_path.as_str(), b.start)));
+        let caller_call  = &records[0]; // Caller.cpp:200
+        let foo_cpp_def  = &records[1]; // Foo.cpp:100
+        let foo_h_decl   = &records[2]; // include/Foo.h:50
+
+        assert_eq!(foo_cpp_def.file_path, "frameworks/native/Foo.cpp");
+        assert_eq!(foo_cpp_def.start, 100);
+        assert_eq!(foo_cpp_def.role, Role::Decl);
+        assert_eq!(foo_cpp_def.target_symbol, def_sym,
+            "pre-rewrite, Foo.cpp def anchor still carries DEFN VName");
+
+        assert_eq!(foo_h_decl.file_path, "frameworks/native/include/Foo.h");
+        assert_eq!(foo_h_decl.start, 50);
+        assert_eq!(foo_h_decl.target_symbol, decl_sym);
+
+        assert_eq!(caller_call.file_path, "frameworks/native/Caller.cpp");
+        assert_eq!(caller_call.start, 200);
+        assert_eq!(caller_call.role, Role::Call);
+        assert_eq!(caller_call.target_symbol, decl_sym);
+
+        // Apply the bridge: Foo.cpp DEFN record gets rewritten onto DECL.
+        apply_completes_bridges(&mut records, &outcome.completes_bridges);
+        assert_eq!(records[1].target_symbol, decl_sym,
+            "after rewrite, Foo.cpp DEFN target collapses onto DECL VName");
+        // Decl + call records are already DECL-keyed, must be unchanged.
+        assert_eq!(records[0].target_symbol, decl_sym);
+        assert_eq!(records[2].target_symbol, decl_sym);
+
+        // All three records share a target_symbol — a HashSet keyed on
+        // it would collapse them. This is the property cusr_def_by_symbol
+        // relies on to resolve cross-TU C++ calls.
+        let unique_targets: std::collections::HashSet<&str> =
+            records.iter().map(|r| r.target_symbol.as_str()).collect();
+        assert_eq!(unique_targets.len(), 1);
+    }
+
+    /// An empty `completes_bridges` map is a no-op — `apply_completes_bridges`
+    /// must early-out instead of iterating records, since the C++ case is
+    /// the only language that emits `completes` edges (java/go/proto/textproto
+    /// streams produce empty bridge maps).
+    #[test]
+    fn apply_completes_bridges_no_op_when_empty() {
+        let mut records = vec![
+            DecodedRecord {
+                file_path: "src/Foo.java".into(),
+                start: 0, end: 3,
+                target_symbol: "kythe:java:test#####Foo#".into(),
+                role: Role::Decl,
+            },
+        ];
+        let before = records[0].target_symbol.clone();
+        apply_completes_bridges(&mut records, &HashMap::new());
+        assert_eq!(records[0].target_symbol, before);
     }
 }

@@ -17,7 +17,7 @@
 //! `num_cpus / 2` so we don't OOM mid-run.
 
 use crate::dispatch::IndexerKind;
-use crate::entries::DecodedRecord;
+use crate::entries::{apply_completes_bridges, DecodeOutcome, DecodedRecord};
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -322,7 +322,7 @@ pub fn run_indexer_with_sink(
     // and tee every byte the indexer emits into it as it streams. The
     // tee writes one syscall per `Read::read`, which composes with
     // BufWriter to amortise to a handful of writes per CU.
-    let entry_count_result: Result<u64> = if let Some(sink_path) = entries_sink {
+    let outcome_result: Result<DecodeOutcome> = if let Some(sink_path) = entries_sink {
         // Don't leave stale data if a prior failed run hit this CU.
         let file = File::create(sink_path)
             .with_context(|| format!("create entries sink {}", sink_path.display()))?;
@@ -357,8 +357,8 @@ pub fn run_indexer_with_sink(
 
     // Surface decode errors as stderr-tail context; the driver's
     // silent-fail detector then routes the CU to `failed`.
-    let entry_count = match entry_count_result {
-        Ok(n) => n,
+    let outcome = match outcome_result {
+        Ok(o) => o,
         Err(e) => {
             let prefix = format!("scry-kzip decode_stream error: {e:#}\n");
             let mut combined = prefix.into_bytes();
@@ -375,6 +375,21 @@ pub fn run_indexer_with_sink(
             });
         }
     };
+    let entry_count = outcome.entry_count;
+
+    // Rewrite C++ definition VNames onto declaration VNames using the
+    // per-CU `/kythe/edge/completes` bridge table. The cxx_indexer emits
+    // distinct VNames for a function's `.cpp` body and its `.h` forward
+    // decl; call sites in other TUs always reference the DECL VName
+    // (they only see the header), while the body's `defines/binding`
+    // anchor on the `.cpp` carries the DEFN VName. Without the rewrite,
+    // scry's tree-sitter pre-scan (which only finds the `.cpp` body, no
+    // header has a body) registers DEFN in `cusr_def_by_symbol` and the
+    // DECL-keyed call sites never resolve.
+    //
+    // For non-C++ streams (java/go/proto/textproto) the bridge map is
+    // empty and `apply_completes_bridges` early-returns — zero overhead.
+    apply_completes_bridges(&mut decoded, &outcome.completes_bridges);
 
     // Best-effort cleanup: the staging tree gets wiped at the end of
     // the run regardless, this just keeps it from ballooning if a

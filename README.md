@@ -58,45 +58,19 @@ scry man | gzip > /usr/local/share/man/man1/scry.1.gz
 
 ## Quickstart
 
-Two simple commands cover the index → query loop. Build-symbol
-precision (clang USRs / SCIP symbols) auto-engages whenever the
-corresponding sidecar is present, so you get Kythe-class identity
-narrowing by default — no flags to remember.
-
-### One-line install of every indexer scry consumes
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/fiveapplesonthetable/scry/master/scripts/install_indexers.sh)
-```
-
-Installs libclang + JDK + Go + npm + the SCIP indexers for the
-polyglot languages (TypeScript, Python, Rust, Go, Java, C/C++).
-For AOSP Java/Kotlin/C++, scry consumes a Kythe kzip directly via
-`scry build-symbols --build-kzip PATH` — see [`docs/PIPELINE.md`].
-Idempotent. Drops binaries under `~/.local/bin` (override with
-`PREFIX=…`). See [`scripts/install_indexers.sh`].
-
-[`scripts/install_indexers.sh`]: scripts/install_indexers.sh
+scry is **tree-sitter only**: one `index` command builds the index, then you
+query it. (For Kythe-grade *semantic* precision on the AOSP C++/Java slice —
+compiler-resolved def/ref/callers — use the companion tool `scry2`; scry is
+the broad, fast, lexical layer over every language + build/platform format.)
 
 ```sh
 # 1. Index the source tree.
 scry index ~/dev/myproject -o ./idx
 
-# 2. (Optional, per-build) Layer indexer-backed precision sidecars
-#    onto the index. One flag per build flavour:
-scry build-symbols --build-cmake build       --index ./idx   # CMake / Make (libclang)
-scry build-symbols --build-kbuild build      --index ./idx   # Linux kernel
-scry build-symbols --build-gn   out          --index ./idx   # GN
-scry build-symbols --build-kzip all.kzip --source-root . --index ./idx  # AOSP / Bazel / Kythe
-scry build-symbols --build-cargo             --index ./idx   # Rust workspace
-# Or import an existing .scip file from any SCIP producer:
-scry build-symbols --scip ./index.scip --index ./idx
-
-# 3. Query. Build symbols narrow automatically when sidecars exist.
+# 2. Query.
 scry def ActivityManagerService --kind class --index ./idx
 scry callers transact --lang Java --limit 10 --index ./idx
-scry ref Foo --index ./idx                           # auto-narrows by USR/SCIP
-scry callers Foo --lexical --index ./idx             # opt out → tree-sitter only
+scry ref Foo --index ./idx
 scry grep ZygoteInit --index ./idx                   # 580 ms; rg: 21.2 s (36×)
 ```
 
@@ -106,43 +80,9 @@ scry grep ZygoteInit --index ./idx                   # 580 ms; rg: 21.2 s (36×)
 scry subclasses Activity --in frameworks/base/                  # type hierarchy
 scry impact bindService                                          # callers + subclasses + files
 scry callgraph bindService --depth 3                             # recursive caller tree
-scry callers bindService --reachable                             # build-graph pruned
-scry callers close --def-in PerfettoTrace.java                   # which def to follow
-scry callers close --strict                                      # only confidently-resolved
+scry callers bindService --reachable                             # build-graph pruned (module_graph.json)
 scry callers close --format by-def --limit 10                    # histogram by callee def
 ```
-
-### Per-language build-symbol setup (one-time)
-
-For **Kythe-integrated builds** (AOSP via Soong, Bazel, any pipeline
-that ships Kythe extractors) the one path that covers every language
-is `--build-kzip`:
-
-```sh
-scry build-symbols --build-kzip PATH.kzip --source-root /path/to/src -o ./idx
-```
-
-This drives the six Kythe v0.0.75 indexers (`cxx`, `java`, `jvm`, `go`,
-`proto`, `textproto`) and emits scry's packed sidecars directly. It's
-the preferred path on AOSP because the compiler wrappers capture the
-exact inputs every compile sees.
-
-For **standalone projects** (single CMake / Gradle / Cargo workspace
-with no Kythe extractor), generate a per-language artifact and let
-`build-symbols` consume it:
-
-| Language          | One-line command                                                  | scry invocation                                     |
-|-------------------|-------------------------------------------------------------------|-----------------------------------------------------|
-| C / C++ (CMake)   | `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .`             | `scry build-symbols --build-cmake build`            |
-| C / C++ (Make)    | `bear -- make` (writes `compile_commands.json` to CWD)            | `scry build-symbols --build-cmake .` (the flag accepts any dir with a `compile_commands.json`) |
-| C / C++ (AOSP)    | `SOONG_GEN_COMPDB=1 m nothing`                                    | `scry build-symbols --build-gn out/soong/development/ide/compdb` |
-| Linux kernel      | (use the kernel's `gen_compile_commands.py`)                      | `scry build-symbols --build-kbuild <build-dir>`    |
-| Rust              | (rust-analyzer auto-runs)                                         | `scry build-symbols --build-cargo`                  |
-| Go / TS / Python  | (auto via polyglot pass)                                          | `scry build-symbols --with-polyglot`                |
-
-`build-symbols` writes its sidecars directly into the index dir given
-by `-o` / `--index`. Full per-language recipes + the architecture
-narrative live in [`docs/BUILD_AWARE.md`].
 
 Times above are warm-cache P50 on the live AOSP + Linux index
 (1,009,166 files, 70.4 GB source). The `rg` comparison is `rg -j4
@@ -180,9 +120,7 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
 | [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
 | [`docs/MCP.md`]              | Model Context Protocol integration — wire shape, error semantics, client recipes (Claude Desktop / Cursor / Continue / custom) |
-| [`docs/SCIP_PRODUCERS.md`]   | which SCIP indexers scry's `scip-import` consumes (Java / Kotlin / Go / Rust / TS / Python / Ruby / C#), with the exact CLI per producer |
-| [`docs/BUILD_AWARE.md`]      | per-language Quick start: how to wire `compile_commands.json` / SCIP into scry, plus the v0.1.12 design narrative |
-| [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (transformer embeddings, in-place incremental writer, persistent clangd) plus a measured-and-rejected io_uring write-up |
+| [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (transformer embeddings, in-place incremental writer) plus a measured-and-rejected io_uring write-up |
 
 [`docs/USAGE.md`]: docs/USAGE.md
 [`docs/BENCHMARKS.md`]: docs/BENCHMARKS.md
@@ -204,9 +142,9 @@ source languages, with a per-file 60 s parse budget enforced via the
 the AOSP-specific formats). Definitions and references are collected
 with scope paths and blake3-hashed for stable ids. A streaming finalize
 pass builds the per-record byte-offset sidecars, the FSTs over symbol
-and ref names, the file → symbol-ids reverse index, the trigram FST
-for grep, and the Layer 2 ref-to-def resolution sidecar — all written
-to `.tmp/` and atomically renamed into place. The `StoreReader`
+and ref names, the file → symbol-ids reverse index, and the trigram FST
+for grep — all written to `.tmp/` and atomically renamed into place.
+The `StoreReader`
 `mmap`s every sidecar; queries decode one record at a time without
 loading the full 10 GB columnar payload.
 

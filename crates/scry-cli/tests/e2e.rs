@@ -1955,10 +1955,9 @@ public class Hit {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// v0.1.28 — Java import refs must store the FULL qualified path,
-/// not just the trailing identifier. Without the package side,
-/// `cmd_build_resolutions`'s import-aware narrowing rule can never
-/// fire (it needs (pkg, simple) to match candidate FQNs).
+/// Java import refs must store the FULL qualified path, not just the
+/// trailing identifier, so an import is searchable by its fully-qualified
+/// name via `scry ref "android.os.PerfettoTrace" --kind import`.
 ///
 /// Indexes one file with `import android.os.PerfettoTrace;` and
 /// asserts the Import ref's name is the full "android.os.PerfettoTrace".

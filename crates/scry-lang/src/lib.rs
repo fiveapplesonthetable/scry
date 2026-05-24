@@ -1941,9 +1941,9 @@ mod tests {
 
     /// Regression for the BroadcastQueueImpl mBroadcastConsumerSkip
     /// bug: bare-identifier field reads — `helper(mFoo, true)`,
-    /// `obj.mFoo`, `mFoo.bar()`, `x = mFoo` — used to be invisible
-    /// to `scry ref --lexical` because the Java refs query only
-    /// captured method_invocation / object_creation / extends /
+    /// `obj.mFoo`, `mFoo.bar()`, `x = mFoo` — must be visible
+    /// to `scry ref` even though the Java refs query primarily
+    /// captures method_invocation / object_creation / extends /
     /// imports. AOSP services.core leans heavily on this pattern
     /// (functional-interface fields passed to dispatch helpers); the
     /// agent eval flagged it.

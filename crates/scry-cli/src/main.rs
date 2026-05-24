@@ -3,8 +3,6 @@
 #![forbid(unsafe_code)]
 
 mod build_adapter;
-mod clangd;
-mod finalize;
 mod health;
 
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
@@ -193,22 +191,9 @@ enum Cmd {
         /// Mutually exclusive with --json.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
-        /// Use lexical (tree-sitter) name match only — skip the
-        /// compiler-backed precision filters that auto-engage when
-        /// the clang USR / SCIP symbol sidecars are present.
-        /// Default behavior: precision filters are ON whenever
-        /// their sidecar exists, so you get Kythe-class structured
-        /// narrowing for free wherever the build produced an
-        /// indexer artifact (`compile_commands.json` / `*.scip`),
-        /// and graceful fallback to lexical-only on uncovered code.
-        ///
-        /// Composes orthogonally with `--strict`: `--lexical`
-        /// chooses HOW refs are matched (compiler symbol identity
-        /// vs tree-sitter name), `--strict` chooses WHICH matched
-        /// refs survive (require Layer 2 resolution vs allow
-        /// unresolved). `--lexical --strict` is a coherent
-        /// "name-match only, but drop the ones the resolver
-        /// couldn't pin to a def" query.
+        /// Accepted for compatibility and is a no-op: scry matches by
+        /// tree-sitter name (lexical) only. (There are no compiler-backed
+        /// precision sidecars — that's `scry2`'s job.)
         #[arg(long)]
         lexical: bool,
         /// Compose with build-graph reachability: drop refs whose
@@ -226,18 +211,10 @@ enum Cmd {
         /// class matching use `--in` on the file path instead.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
-        /// Narrow which definition of NAME the refs must point at,
-        /// by path substring of the def's file. Useful for
-        /// overloaded names like `close()` where the index has
-        /// many distinct defs across the corpus:
-        ///   `scry ref close --def-in PerfettoTrace.java`
-        /// keeps only refs whose Layer 2 resolution (resolved_to)
-        /// points at a def in PerfettoTrace.java. Refs that
-        /// couldn't be resolved (resolved_to=None) pass through —
-        /// we'd rather over-include than silently drop the
-        /// unresolved ones. Build the resolutions sidecar via
-        /// `scry build-resolutions` (or `scry finalize`) for the
-        /// strongest narrowing.
+        /// Narrow refs by the def's file path, via each ref's resolved_to
+        /// link. scry is tree-sitter only and has no resolution sidecar,
+        /// so resolved_to is null and refs pass through unnarrowed — use
+        /// `--in PATH` / `--scope CLASS` for path/class narrowing instead.
         #[arg(long, value_name = "PATH")]
         def_in: Option<String>,
         /// Strict mode: drop refs whose Layer 2 resolution didn't
@@ -254,14 +231,7 @@ enum Cmd {
         strict: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
-    /// callHierarchy/incomingCalls.
-    ///
-    /// With --precise: route to clangd via LSP for type-aware C++
-    /// resolution. Closes the 10-20% accuracy gap on overloaded
-    /// method names by asking the real compiler instead of relying
-    /// on scry's heuristic name match. Requires `clangd` on PATH
-    /// and a `compile_commands.json` somewhere in the file's
-    /// ancestry; errors with an actionable message otherwise.
+    /// callHierarchy/incomingCalls. Tree-sitter name match.
     Callers {
         name: String,
         #[arg(long)]
@@ -278,12 +248,6 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
-        /// Use clangd for precise (type-aware) reference resolution.
-        /// C++ only today (clangd is C++-shaped). Falls back to the
-        /// heuristic path with a clear error if clangd or
-        /// compile_commands.json are missing.
-        #[arg(long)]
-        precise: bool,
         /// Use lexical (tree-sitter) name match only. See
         /// `scry ref --lexical` for the full explanation.
         #[arg(long)]
@@ -348,62 +312,6 @@ enum Cmd {
         /// Cap total output size in bytes (drops lowest-ranked results).
         #[arg(long)]
         budget: Option<usize>,
-    },
-    /// One-shot post-finalize pipeline: rebuilds every sidecar
-    /// scry's query path knows how to use, in one command.
-    /// Equivalent to running `build-offsets`, `build-file-symbols`,
-    /// `build-trigrams`, `build-resolutions` (always), plus
-    /// `build-modgraph` for each `--build-<kind> ROOT` flag passed,
-    /// plus `build-symbols --scip FILE` for each `--scip` flag passed.
-    /// Reports per-stage timings.
-    ///
-    /// Hidden — `scry index` runs every finalize stage end-to-end.
-    /// Call this directly only when partial rebuilds are needed.
-    #[clap(hide = true)]
-    Finalize {
-        #[arg(long, value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Soong project root → write `module_graph.json`.
-        #[arg(long, value_name = "PATH")]
-        build_soong: Option<PathBuf>,
-        /// Linux kernel project root → write `module_graph.json`
-        /// (overrides build_soong if both are set; only one
-        /// module_graph fits per index).
-        #[arg(long, value_name = "PATH")]
-        build_kernel: Option<PathBuf>,
-        /// GN project root.
-        #[arg(long, value_name = "PATH")]
-        build_gn: Option<PathBuf>,
-        /// Bazel project root.
-        #[arg(long, value_name = "PATH")]
-        build_bazel: Option<PathBuf>,
-        /// Cargo workspace root.
-        #[arg(long, value_name = "PATH")]
-        build_cargo: Option<PathBuf>,
-        /// SCIP index file to import.
-        #[arg(long, value_name = "PATH")]
-        scip: Option<PathBuf>,
-        /// compile_commands.json forwarded to `build-symbols`.
-        /// Set alongside this you can pass `--clang-root` to filter.
-        #[arg(long, value_name = "PATH")]
-        clang_compile_commands: Option<PathBuf>,
-        /// Optional `--root` forwarded to `build-symbols`.
-        #[arg(long, value_name = "PATH")]
-        clang_root: Option<PathBuf>,
-        /// Build-output directory to walk for compile_commands.json
-        /// and `*.scip` artifacts during auto-discovery. Repeatable.
-        /// Unlike walking the indexed source roots (which honors
-        /// .gitignore), `--build-out` paths are walked verbatim —
-        /// most build systems write outputs to gitignored dirs
-        /// (`out/soong/...`, `build/`, `target/`, `.gradle/`), so
-        /// the standard walker can't see them by default. Use this
-        /// flag to point at e.g. `out/soong/development/ide/compdb`
-        /// or your CMake build dir.
-        #[arg(long = "build-out", value_name = "PATH")]
-        build_out: Vec<PathBuf>,
-        /// Workers passed through to the sub-commands.
-        #[arg(long, default_value_t = 16)]
-        workers: usize,
     },
     /// Outgoing edges from NAME's body: what does NAME call /
     /// reference? Symmetric counterpart to `scry callers NAME`.
@@ -863,103 +771,6 @@ enum Cmd {
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
     },
-    /// `scry build-symbols` — Kythe-class symbol-identity sidecars.
-    ///
-    /// One command, one explicit `--build-{gn,kbuild,cmake,cargo,kzip}`
-    /// flag, produces the matching sidecars:
-    ///   - GN     → clang USRs from `compile_commands.json`.
-    ///   - Kbuild → same (kernel C), via the kernel's
-    ///              `scripts/clang-tools/gen_compile_commands.py`.
-    ///   - CMake  → same; `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
-    ///   - Cargo  → polyglot pass only (Rust via rust-analyzer scip).
-    ///   - Kzip   → ingest an `all.kzip` produced by a Kythe extractor
-    ///              (e.g. AOSP via `build/soong/build_kzip.bash`).
-    ///
-    /// `--scip FILE` imports a pre-built SCIP index into the sidecar.
-    /// `--with-polyglot` also runs the polyglot pass (Rust / Go /
-    /// TypeScript / Python) over the source root regardless of the
-    /// build type.
-    BuildSymbols {
-        /// Source root. Required for every flavour except `--build-kzip`
-        /// (the kzip already carries its own paths).
-        #[arg(long, value_name = "PATH")]
-        source_root: Option<PathBuf>,
-        /// GN build out dir (the one containing `args.gn`).
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_gn: Option<PathBuf>,
-        /// Path to the `gn` binary. Defaults to `gn` on PATH.
-        #[arg(long, value_name = "PATH")]
-        gn_binary: Option<PathBuf>,
-        /// Linux kernel build out dir (the one containing `.config`).
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_kbuild: Option<PathBuf>,
-        /// CMake build out dir (the one containing `CMakeCache.txt`).
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_cmake: Option<PathBuf>,
-        /// Path to the `cmake` binary. Defaults to `cmake` on PATH.
-        #[arg(long, value_name = "PATH")]
-        cmake_binary: Option<PathBuf>,
-        /// Cargo workspace — runs polyglot pass only.
-        #[arg(long, group = "build")]
-        build_cargo: bool,
-        /// Path to an `all.kzip` produced by a Kythe extractor (AOSP
-        /// via `build/soong/build_kzip.bash`, Bazel via the equivalent,
-        /// any custom Kythe pipeline). Routes through `scry-kzip`,
-        /// which spawns the six Kythe v0.0.75 indexers per CU and
-        /// emits scry's packed sidecars directly.
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_kzip: Option<PathBuf>,
-        /// Root of the Kythe release tree (the one containing
-        /// `indexers/cxx_indexer` etc.). Only used with `--build-kzip`.
-        #[arg(
-            long, value_name = "PATH",
-            default_value = "/mnt/agent/kythe-release/kythe-v0.0.75",
-        )]
-        kythe_root: PathBuf,
-        /// Escape hatch: import a pre-built `.scip` file directly into
-        /// the sidecar instead of running an indexer.
-        #[arg(long, value_name = "PATH")]
-        scip: Option<PathBuf>,
-        /// Existing scry index dir.
-        #[arg(long, short = 'o', visible_alias = "out", value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Also run polyglot pass (Rust / Go / TS / Python). Implied
-        /// when --build-cargo is set.
-        #[arg(long)]
-        with_polyglot: bool,
-        /// Skip Rust during the polyglot pass.
-        #[arg(long)]
-        no_rust: bool,
-        /// Skip Go during the polyglot pass.
-        #[arg(long)]
-        no_go: bool,
-        /// Skip TypeScript during the polyglot pass.
-        #[arg(long)]
-        no_typescript: bool,
-        /// Skip Python during the polyglot pass.
-        #[arg(long)]
-        no_python: bool,
-        /// Workers for the libclang USR pass. 0 = auto (one per CPU).
-        #[arg(long, default_value_t = 0)]
-        workers: usize,
-        /// Per-target `.scip` files (polyglot only).
-        #[arg(long, value_name = "PATH")]
-        scip_out_dir: Option<PathBuf>,
-        /// Resume from existing checkpoint at <out_dir>/kythe-logs/checkpoint/.
-        /// Errors if no checkpoint exists or its fingerprint doesn't
-        /// match the current kzip + env. Only meaningful with
-        /// `--build-kzip`.
-        #[arg(long)]
-        resume: bool,
-        /// Phase-3 rayon worker count for `--build-kzip`. Default 0
-        /// = auto: `SCRY_KZIP_WORKERS` if set, else `num_cpus/2`
-        /// (the floor keeps JVM-based indexers — java, jvm-bytecode —
-        /// from OOM'ing the host at ~200-300 MB resident set each).
-        /// Set explicitly when you've measured the headroom and want
-        /// to push above the safe cap.
-        #[arg(long, default_value_t = 0)]
-        kzip_workers: usize,
-    },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
     /// hundreds of ms). Sequential parallel read of every file in
@@ -1026,10 +837,6 @@ enum Cmd {
     /// name-match for everything else). Writes ref_resolutions.bin;
     /// the reader honors it automatically on get_ref.
     #[clap(hide = true)]
-    BuildResolutions {
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
     /// Compute and store per-file blake3 content digests
     /// (file_digests.bin) for an existing index. The digest is what
     /// `scry index --incremental` reads to decide which files actually
@@ -1240,10 +1047,7 @@ fn main() -> Result<()> {
                 resolve_precision(lexical, reachable);
             cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
-        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, lexical, reachable, scope, def_in, strict, format } => {
-            if precise {
-                return cmd_callers_precise(name, index, lang, in_, not_in, limit, json);
-            }
+        Cmd::Callers { name, index, lang, in_, not_in, limit, json, lexical, reachable, scope, def_in, strict, format } => {
             let (reachable, clang_precise, scip_precise) =
                 resolve_precision(lexical, reachable);
             cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
@@ -1264,30 +1068,12 @@ fn main() -> Result<()> {
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
-        Cmd::BuildSymbols {
-            source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
-            build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
-            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
-            kzip_workers,
-        } => cmd_build_symbols(
-            source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
-            build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
-            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
-            kzip_workers,
-        ),
         Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
             cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
         Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json } =>
             cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json),
         Cmd::Uses { name, index, in_, not_in, kind, strict, format, limit, json } =>
             cmd_uses(name, index, in_, not_in, kind, strict, format, limit, json),
-        Cmd::Finalize {
-            index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
-            scip, clang_compile_commands, clang_root, build_out, workers,
-        } => finalize::cmd_finalize(
-            index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
-            scip, clang_compile_commands, clang_root, build_out, workers,
-        ),
         Cmd::Subclasses { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
             cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
@@ -1301,7 +1087,6 @@ fn main() -> Result<()> {
         Cmd::BuildOffsets { index } => cmd_build_offsets(index),
         Cmd::BuildFileSymbols { index } => cmd_build_file_symbols(index),
         Cmd::BuildFileRefs { index } => cmd_build_file_refs(index),
-        Cmd::BuildResolutions { index } => cmd_build_resolutions(index),
         Cmd::BuildDigests { index, workers } => cmd_build_digests(index, workers),
         Cmd::Compact { index } => cmd_compact(index),
         Cmd::IndexDiff { roots, index, profile, verbose, workers, json } =>
@@ -1312,229 +1097,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// `scry build-symbols` — Kythe-class symbol-identity sidecars.
-///
-/// Takes one explicit `--build-{gn,kbuild,cmake,cargo,kzip}` flag,
-/// or `--scip FILE` to import a pre-built SCIP index. Optional
-/// `--with-polyglot` runs the Rust/Go/TS/Python polyglot pass over
-/// the source root.
-#[allow(clippy::too_many_arguments)]
-fn cmd_build_symbols(
-    source_root: Option<PathBuf>,
-    build_gn: Option<PathBuf>,
-    gn_binary: Option<PathBuf>,
-    build_kbuild: Option<PathBuf>,
-    build_cmake: Option<PathBuf>,
-    cmake_binary: Option<PathBuf>,
-    build_cargo: bool,
-    build_kzip: Option<PathBuf>,
-    kythe_root: PathBuf,
-    scip: Option<PathBuf>,
-    index: Option<PathBuf>,
-    with_polyglot: bool,
-    no_rust: bool,
-    no_go: bool,
-    no_typescript: bool,
-    no_python: bool,
-    workers: usize,
-    scip_out_dir: Option<PathBuf>,
-    resume: bool,
-    kzip_workers: usize,
-) -> Result<()> {
-    use scry_bridge::{cmake, gn, kbuild, polyglot};
-    let t_total = Instant::now();
-    let index_dir = index.clone().unwrap_or_else(default_index_dir);
-    let n_build_flags = build_gn.is_some() as u32
-        + build_kbuild.is_some() as u32
-        + build_cmake.is_some() as u32
-        + build_kzip.is_some() as u32
-        + build_cargo as u32;
-    if n_build_flags > 1 {
-        anyhow::bail!(
-            "build-symbols accepts at most one --build-{{gn,kbuild,cmake,cargo,kzip}} flag"
-        );
-    }
-    // --source-root is REQUIRED for every flavour, including
-    // --build-kzip. Earlier versions treated --build-kzip as
-    // self-contained, on the (wrong) assumption that the kzip's
-    // VName paths were absolute. They're corpus-relative — without
-    // a source root to prepend, the resulting clang_usrs / scip
-    // sidecars carry paths like `frameworks/base/...` while
-    // queries pass `/home/zim/dev/aosp/frameworks/base/...`, so
-    // every precision lookup misses with "uncovered TU".
-    if source_root.is_none() {
-        anyhow::bail!(
-            "--source-root PATH is required. For --build-kzip this is the on-disk \
-             root that Kythe's corpus-relative paths resolve against (e.g. \
-             /home/zim/dev/aosp). Without it the precision sidecars are unusable \
-             from query time."
-        );
-    }
-    let source_root: PathBuf = source_root.unwrap();
-
-    if let Some(build_dir) = build_gn.as_ref() {
-        eprintln!("[build-symbols] gn build_dir: {}", build_dir.display());
-        let cc = match gn::locate_compile_commands(build_dir)? {
-            Some(cc) => {
-                eprintln!("[build-symbols] gn: reusing existing {}", cc.display());
-                cc
-            }
-            None => {
-                let bin = gn_binary.unwrap_or_else(|| PathBuf::from("gn"));
-                eprintln!(
-                    "[build-symbols] gn: regenerating compile_commands.json via `{} gen --export-compile-commands {}`",
-                    bin.display(), build_dir.display(),
-                );
-                gn::regenerate_compile_commands(&bin, &source_root, build_dir)?
-            }
-        };
-        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
-    } else if let Some(build_dir) = build_kbuild.as_ref() {
-        eprintln!("[build-symbols] kbuild build_dir: {}", build_dir.display());
-        if !kbuild::looks_like_kernel_source(&source_root) {
-            anyhow::bail!(
-                "{} doesn't look like a Linux kernel source tree \
-                 (expected Makefile + Kconfig + scripts/ at top level)",
-                source_root.display(),
-            );
-        }
-        let cc = match kbuild::locate_compile_commands(build_dir)? {
-            Some(cc) => {
-                eprintln!("[build-symbols] kbuild: reusing existing {}", cc.display());
-                cc
-            }
-            None => {
-                eprintln!(
-                    "[build-symbols] kbuild: regenerating compile_commands.json via gen_compile_commands.py"
-                );
-                kbuild::regenerate_compile_commands(&source_root, build_dir)?
-            }
-        };
-        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
-    } else if let Some(build_dir) = build_cmake.as_ref() {
-        eprintln!("[build-symbols] cmake build_dir: {}", build_dir.display());
-        let cc = match cmake::locate_compile_commands(build_dir)? {
-            Some(cc) => {
-                eprintln!("[build-symbols] cmake: reusing existing {}", cc.display());
-                cc
-            }
-            None => {
-                let bin = cmake_binary.unwrap_or_else(|| PathBuf::from("cmake"));
-                eprintln!(
-                    "[build-symbols] cmake: regenerating compile_commands.json via {}",
-                    bin.display(),
-                );
-                cmake::regenerate_compile_commands(&bin, build_dir)?
-            }
-        };
-        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
-    } else if build_cargo {
-        // No C-family step; polyglot pass handles Rust via rust-analyzer scip.
-        eprintln!(
-            "[build-symbols] cargo: skipping C-family step, polyglot pass will handle Rust"
-        );
-    } else if let Some(kzip_path) = build_kzip.as_ref() {
-        let workers_override = if kzip_workers == 0 { None } else { Some(kzip_workers) };
-        eprintln!(
-            "[build-symbols] kzip: {} (kythe-root: {}, source-root: {}, resume={}, workers={})",
-            kzip_path.display(), kythe_root.display(), source_root.display(), resume,
-            workers_override.map(|n| n.to_string())
-                .unwrap_or_else(|| "auto".to_string()),
-        );
-        let report = scry_kzip::build_packed_from_kzip(
-            kzip_path, &index_dir, &kythe_root, resume, workers_override, &source_root,
-        )
-            .with_context(|| format!("build packed sidecars from {}", kzip_path.display()))?;
-        eprintln!(
-            "[build-symbols] kzip done: {} clang USRs, {} SCIP records in {:.1}s",
-            report.emit.cxx_records, report.emit.scip_records, report.wall_secs,
-        );
-    } else if resume {
-        anyhow::bail!("--resume is only meaningful with --build-kzip");
-    }
-
-    if let Some(scip_path) = scip.as_ref() {
-        let t = Instant::now();
-        scry_scip::import_scip(scip_path, &index_dir, Some(source_root.as_path()))
-            .with_context(|| format!("import scip {}", scip_path.display()))?;
-        eprintln!(
-            "[build-symbols] imported scip {} in {:.2}s",
-            scip_path.display(), t.elapsed().as_secs_f64(),
-        );
-    }
-
-    // Cargo always needs the polyglot pass since it's pure-Rust.
-    if with_polyglot || build_cargo {
-        let mut kinds: Vec<polyglot::PolyglotKind> = Vec::new();
-        if !no_rust       { kinds.push(polyglot::PolyglotKind::Rust); }
-        if !no_go         { kinds.push(polyglot::PolyglotKind::Go); }
-        if !no_typescript { kinds.push(polyglot::PolyglotKind::TypeScript); }
-        if !no_python     { kinds.push(polyglot::PolyglotKind::Python); }
-        if kinds.is_empty() {
-            anyhow::bail!("polyglot pass requested but every language was disabled");
-        }
-        eprintln!(
-            "[build-symbols] polyglot pass over {} ({})",
-            source_root.display(),
-            kinds.iter().map(|k| k.label()).collect::<Vec<_>>().join(", "),
-        );
-        let targets = polyglot::discover(&source_root, &kinds)
-            .context("discover polyglot project roots")?;
-        if targets.is_empty() {
-            eprintln!("[build-symbols] polyglot: no targets discovered");
-        } else {
-            let mut cfg = polyglot::PolyglotConfig::default();
-            if let Some(p) = scip_out_dir { cfg.scip_out_dir = p; }
-            let report = polyglot::run(&targets, &cfg).context("polyglot dispatch")?;
-            eprintln!(
-                "[build-symbols] polyglot: {} OK, {} failed ({} .scip files)",
-                report.ok, report.failed, report.scip_files.len(),
-            );
-            if report.failed > 0 {
-                anyhow::bail!(
-                    "{} of {} polyglot targets failed to index",
-                    report.failed, report.ok + report.failed,
-                );
-            }
-            for shard in &report.scip_files {
-                scry_scip::import_scip_with_mode(
-                    shard, &index_dir, Some(source_root.as_path()), true,
-                ).with_context(|| format!("import polyglot scip {}", shard.display()))?;
-            }
-        }
-    }
-
-    eprintln!(
-        "[build-symbols] ALL STAGES OK in {:.2}s",
-        t_total.elapsed().as_secs_f64(),
-    );
-    Ok(())
-}
-
-/// Run libclang USR extraction over `compile_commands.json`. Shared
-/// by the gn / kbuild / cmake arms of `cmd_build_symbols`.
-fn run_clang_on_cc(
-    compile_commands: &Path,
-    source_root: &Path,
-    index_dir: &Path,
-    workers: usize,
-) -> Result<()> {
-    let t = Instant::now();
-    scry_clang::build_clang_usrs(
-        compile_commands, index_dir, Some(source_root), workers,
-        4 * 1024 * 1024,
-    )?;
-    eprintln!(
-        "[build-symbols] clang USRs landed in {} in {:.2}s",
-        index_dir.join("clang_usrs.bin").display(),
-        t.elapsed().as_secs_f64(),
-    );
-    Ok(())
-}
-
-/// Emit a shell-completion script for `shell` to stdout. Wraps
-/// `clap_complete::generate` against the live `Args` derivation —
-/// no manual sync needed when subcommands or flags change.
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
     use clap::CommandFactory;
     let mut cmd = Cli::command();
@@ -3363,10 +2925,11 @@ fn resolve_precision(
     lexical: bool,
     explicit_reachable: bool,
 ) -> (bool, bool, bool) {
-    if lexical {
-        return (false, false, false);
-    }
-    (explicit_reachable, true, true)
+    // scry is tree-sitter only: there are no build-symbol precision
+    // sidecars (clang USR / SCIP) to engage, so precision is always off.
+    // `--lexical` is accepted as a documented no-op (this is the only mode).
+    let _ = lexical;
+    (explicit_reachable, false, false)
 }
 
 /// Apply build-symbol precision filtering (clang USR + SCIP symbol
@@ -3398,263 +2961,18 @@ fn resolve_precision(
 /// `clang_usrs.bin`, while still refusing to silently degrade to
 /// tree-sitter when nothing precision-grade exists.
 pub(crate) fn apply_precision_filter(
-    r: &StoreReader,
-    name: &str,
+    _r: &StoreReader,
+    _name: &str,
     refs: Vec<RefRecord>,
-    clang_precise: bool,
-    scip_precise: bool,
-    defs_override: Option<Vec<SymbolRecord>>,
+    _clang_precise: bool,
+    _scip_precise: bool,
+    _defs_override: Option<Vec<SymbolRecord>>,
 ) -> Result<Vec<RefRecord>> {
-    if !clang_precise && !scip_precise {
-        return Ok(refs);
-    }
-    // Window covers the offset drift between tree-sitter (identifier
-    // position) and the indexer's cursor position (clang sometimes
-    // sits at the keyword for class/struct/typedef). 64 bytes covers
-    // every real-world identifier without bridging adjacent decls.
-    const WINDOW: u32 = 64;
-    // `defs_override` lets the caller narrow precision to a scoped
-    // def set (e.g. callers passing through `--def-in PATH` filter
-    // the defs to one class before we build def_usrs / def_syms).
-    // Without it, the filter pulls the full corpus-wide def list,
-    // which for common method names (`set`, `get`, `add`, ...) is
-    // hundreds of defs across unrelated classes — letting through
-    // refs to e.g. `ThreadLocal.set` when the user asked about
-    // `SystemProperties.set`, wherever the SCIP CU is missing.
-    let defs = defs_override.unwrap_or_else(|| r.lookup_exact(name));
-
-    // Cached lazy accessors. Open is microseconds (header parse +
-    // mmap calls); the lazy `abs_path → path_id` index is built on
-    // first lookup. Daemon (`serve` / `mcp`) pays both once at
-    // startup, CLI pays per process.
-    let cusr_opt: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
-        r.clang_usrs()
-    } else {
-        None
-    };
-    let sidx_opt: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
-        r.scip_index()
-    } else {
-        None
-    };
-    // JVM-FQN canonical companion sidecar — see [`StorePaths::scip_index_fqn`].
-    // Gated on the same --scip-precise switch as the main SCIP
-    // sidecar; both feed `def_syms` independently and the ref-side
-    // verdict accepts EITHER side's match. This is the cross-CU
-    // bridge: when a def-side anchor and a ref-side call site
-    // project the same JVM entity onto two different symbol-string
-    // namespaces (the language=java VName signature vs the
-    // bridged `jvm:...` FQN), the FQN sidecar carries both anchors
-    // keyed on the same canonical FQN, so the def_syms ∩ ref-side
-    // lookup succeeds.
-    let sidx_fqn_opt: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
-        r.scip_index_fqn()
-    } else {
-        None
-    };
-
-    if cusr_opt.is_none() && sidx_opt.is_none() && sidx_fqn_opt.is_none() {
-        anyhow::bail!(
-            "precision query but no precision sidecars at {} (looked for \
-             clang_usrs.bin and scip_index.bin). Run \
-             `scry build-symbols --build-gn DIR` (or `--build-kbuild` / \
-             `--build-cmake` for the equivalent compile_commands.json \
-             producer) and / or `scry build-symbols --scip FILE.scip` \
-             against `--index DIR` first, or pass `--lexical` to opt \
-             into tree-sitter name match.",
-            r.paths.clang_usrs().parent().map(|p| p.display().to_string())
-                .unwrap_or_default(),
-        );
-    }
-
-    // Build a per-file_id cache of (display_path, is_c_family) so the
-    // per-ref filter loop below avoids reallocating both on every
-    // record. On AOSP+kernel scale this loop fires for 100k+ refs;
-    // hoisting display_path turns the inner cost from "string alloc
-    // + HashMap<String> hash + strcmp" into "Vec::get + bool check".
-    let n_files = r.file_count();
-    let mut path_by_id: Vec<Option<(String, bool)>> = vec![None; n_files];
-    for fe in r.iter_files() {
-        let p = fe.display_path();
-        let cf = is_c_family(&p);
-        path_by_id[fe.id as usize] = Some((p, cf));
-    }
-    // Drive the sidecar precompute step from the same cache so each
-    // sidecar's per-file lookup table is also file_id-indexed.
-    let cusr_lookup = cusr_opt.map(|cusr| {
-        cusr.precompute_by_file_ids(
-            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
-                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
-            }),
-            n_files,
-        )
-    });
-    let sidx_lookup = sidx_opt.map(|sidx| {
-        sidx.precompute_by_file_ids(
-            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
-                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
-            }),
-            n_files,
-        )
-    });
-    let sidx_fqn_lookup = sidx_fqn_opt.map(|sidx| {
-        sidx.precompute_by_file_ids(
-            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
-                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
-            }),
-            n_files,
-        )
-    });
-
-    // Gather def identities once per sidecar. Empty sets are fine:
-    // they signal "this name has no defs the sidecar attributes to a
-    // symbol", which then forces every ref in that family to drop
-    // (Kythe parity — no def attribution means no ref attribution).
-    let def_usrs: std::collections::HashSet<String> = match &cusr_lookup {
-        Some(cl) => defs.iter()
-            .filter_map(|s| {
-                let (_, cf) = path_by_id.get(s.file_id as usize)?.as_ref()?;
-                if !cf { return None; }
-                cl.usr_for_window(s.file_id, s.byte_start, WINDOW)
-                    .map(str::to_string)
-            })
-            .collect(),
-        None => Default::default(),
-    };
-    // Def-side symbol identities. Pull from BOTH the main SCIP sidecar
-    // (source-level language=java VName signatures) AND the FQN
-    // companion (canonical `jvm:` FQNs). Both go into one set — the
-    // two namespaces are disjoint by construction (`jvm:` prefix vs
-    // the Kythe SCIP signature shape), so there's no collision.
-    // Carrying both lets the ref-side filter below accept a match
-    // against either projection of the same def.
-    let def_syms: std::collections::HashSet<String> = {
-        let mut set: std::collections::HashSet<String> = Default::default();
-        if let Some(sl) = sidx_lookup.as_ref() {
-            for s in defs.iter() {
-                let Some((_, cf)) = path_by_id.get(s.file_id as usize).and_then(|o| o.as_ref())
-                else { continue; };
-                if *cf { continue; }
-                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, WINDOW) {
-                    set.insert(sym.to_string());
-                }
-            }
-        }
-        if let Some(sl) = sidx_fqn_lookup.as_ref() {
-            for s in defs.iter() {
-                let Some((_, cf)) = path_by_id.get(s.file_id as usize).and_then(|o| o.as_ref())
-                else { continue; };
-                if *cf { continue; }
-                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, WINDOW) {
-                    set.insert(sym.to_string());
-                }
-            }
-        }
-        set
-    };
-
-    let before = refs.len();
-    let mut c_dropped_uncov = 0usize;
-    let mut c_dropped_id = 0usize;
-    let mut s_dropped_uncov = 0usize;
-    let mut s_dropped_id = 0usize;
-    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
-        let Some((_, c_family)) = path_by_id
-            .get(rr.file_id as usize).and_then(|o| o.as_ref())
-        else { return false; };
-        if *c_family {
-            // C-family ref: clang sidecar owns the verdict.
-            let Some(cl) = cusr_lookup.as_ref() else {
-                c_dropped_uncov += 1;
-                return false;
-            };
-            match cl.usr_for_window(rr.file_id, rr.byte_start, WINDOW) {
-                Some(u) => {
-                    let ok = def_usrs.contains(u);
-                    if !ok { c_dropped_id += 1; }
-                    ok
-                }
-                None => {
-                    c_dropped_uncov += 1;
-                    false
-                }
-            }
-        } else {
-            // Non-C ref: SCIP sidecar owns the verdict. Try the main
-            // sidecar first, then the JVM-FQN companion — a match
-            // against either def_syms projection keeps the ref.
-            // "Uncovered TU" only fires when NEITHER sidecar covers
-            // the file_id; "id mismatch" fires when at least one
-            // looked up a symbol but none was in def_syms. Counters
-            // are charged once per ref, no double-counting.
-            let main_covers = sidx_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-            let fqn_covers = sidx_fqn_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-            if !main_covers && !fqn_covers {
-                s_dropped_uncov += 1;
-                return false;
-            }
-            let from_main = if main_covers {
-                sidx_lookup.as_ref()
-                    .and_then(|sl| sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW))
-                    .filter(|s| def_syms.contains(*s))
-            } else { None };
-            if from_main.is_some() {
-                return true;
-            }
-            let from_fqn = if fqn_covers {
-                sidx_fqn_lookup.as_ref()
-                    .and_then(|sl| sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW))
-                    .filter(|s| def_syms.contains(*s))
-            } else { None };
-            if from_fqn.is_some() {
-                true
-            } else {
-                s_dropped_id += 1;
-                false
-            }
-        }
-    }).collect();
-
-    // Always log when precision was engaged — quiet success is
-    // indistinguishable from quiet pass-through, and we want users
-    // (and tests) to be able to see that strict-precise actually ran.
-    let sidecars = match (cusr_opt.is_some(), sidx_opt.is_some(), sidx_fqn_opt.is_some()) {
-        (true,  true,  true)  => "clang_usrs + scip_index + scip_index_fqn",
-        (true,  true,  false) => "clang_usrs + scip_index",
-        (true,  false, false) => "clang_usrs",
-        (false, true,  true)  => "scip_index + scip_index_fqn",
-        (false, true,  false) => "scip_index",
-        (false, false, true)  => "scip_index_fqn",
-        // FQN-only without main is supported (the bridge can carry
-        // both decl and ref anchors on its own); listed for completeness.
-        (true,  false, true)  => "clang_usrs + scip_index_fqn",
-        // unreachable: bailed above when ALL of (cusr, sidx) are None.
-        // sidx_fqn_opt alone doesn't trip the bail, but the bail
-        // intentionally requires at least one of cusr/sidx to be present.
-        (false, false, false) => "(none)",
-    };
-    eprintln!(
-        "[scry] precise ({sidecars}): {before} → {} refs (clang: {} id-mismatch, \
-         {} uncovered TU; SCIP: {} id-mismatch, {} uncovered TU; \
-         {} def USRs, {} def SCIP symbols)",
-        kept.len(),
-        c_dropped_id, c_dropped_uncov,
-        s_dropped_id, s_dropped_uncov,
-        def_usrs.len(), def_syms.len(),
-    );
-    Ok(kept)
+    // scry is tree-sitter only: no precision sidecars exist, so this is a
+    // pass-through. Callers always pass clang_precise = scip_precise = false.
+    Ok(refs)
 }
 
-/// File-path classifier used by [`apply_precision_filter`] to decide
-/// which precision sidecar owns a given ref. C/C++/ObjC live in the
-/// clang USR sidecar; everything else lives in SCIP.
-fn is_c_family(path: &str) -> bool {
-    matches!(
-        path.rsplit('.').next().unwrap_or(""),
-        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx"
-        | "ipp" | "inl" | "m" | "mm"
-    )
-}
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_ref(
@@ -6412,141 +5730,6 @@ fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// callers --precise (clangd-driven, type-aware C++ references)
-// ---------------------------------------------------------------------------
-//
-// Flow:
-//   1. Look up NAME via scry's heuristic path to find a definition
-//      site (file + line + column).
-//   2. Spawn clangd, send initialize + didOpen for that file.
-//   3. Send textDocument/references at the definition position.
-//   4. Map LSP Locations back to scry file_ids via path.
-//   5. Emit using the same format as `cmd_callers` so the caller
-//      doesn't see a different shape just because they passed
-//      --precise.
-//
-// Falls back to the heuristic path with a clear error when clangd
-// or compile_commands.json is missing.
-fn cmd_callers_precise(
-    name: String,
-    index: Option<PathBuf>,
-    _lang: Option<String>,
-    in_: Option<String>,
-    not_in: Option<String>,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let t = Instant::now();
-    if !clangd::clangd_available() {
-        anyhow::bail!(
-            "clangd not on PATH. --precise requires clangd for type-aware C++ \
-             reference resolution.\n\
-             Install: apt install clangd  (Debian/Ubuntu)\n\
-             Or rerun without --precise for the heuristic path."
-        );
-    }
-    let r = open_index(index)?;
-
-    // 1. Pick the definition site to anchor the references query at.
-    // We prefer a C++ Function/Method/Class definition matching the
-    // name, since clangd is C++-shaped. If we can't find one, fall
-    // back to the first match of any kind.
-    let candidates = r.lookup_exact(&name);
-    let def_site = candidates.iter()
-        .find(|s| matches!(s.lang, FileKind::Cpp | FileKind::Header | FileKind::HeaderCpp))
-        .or_else(|| candidates.first())
-        .ok_or_else(|| anyhow::anyhow!("no definitions of '{name}' in the index"))?;
-    let def_path = r.file_display_path(def_site.file_id)
-        .ok_or_else(|| anyhow::anyhow!("def file_id {} out of range", def_site.file_id))?;
-    let def_path = PathBuf::from(def_path);
-
-    // 2. Discover compile_commands.json; clangd needs it for C++
-    // resolution. If missing, error early — clangd would otherwise
-    // run but every reference would come back wrong.
-    let cc_dir = clangd::find_compile_commands(&def_path)
-        .ok_or_else(|| anyhow::anyhow!(
-            "no compile_commands.json found above {}\n\
-             Generate one via `bear -- m` or your build system's equivalent.",
-            def_path.display(),
-        ))?;
-    eprintln!("[precise] clangd OK; compile_commands.json under {}",
-        cc_dir.display());
-
-    // 3. Spawn clangd, didOpen the definition file, query references.
-    let mut session = clangd::ClangdSession::start(Some(&cc_dir))
-        .with_context(|| "starting clangd session")?;
-    let lang_id = match def_site.lang {
-        FileKind::C => "c",
-        _ => "cpp",
-    };
-    session.did_open(&def_path, lang_id)?;
-    // Clangd accepts 0-based char positions; def_site.col is 1-based.
-    let char_0 = def_site.col.saturating_sub(1);
-    let locs = session.references(&def_path, def_site.line, char_0, /* include_decl */ false)?;
-    eprintln!("[precise] clangd returned {} locations in {} ms",
-        locs.len(), t.elapsed().as_millis());
-
-    // 4. Build a (path -> file_id) lookup so we can map LSP results
-    // back to scry's path display + lang.
-    let in_prefix = in_.as_deref();
-    let not_in_prefix = not_in.as_deref();
-    let by_path: std::collections::HashMap<String, FileKind> =
-        r.iter_files().map(|fe| (fe.display_path(), fe.kind)).collect();
-    let mut emitted = 0usize;
-    if !json {
-        for loc in &locs {
-            let p = match loc.fs_path() { Some(p) => p, None => continue };
-            let p_str = p.display().to_string();
-            if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
-            let lang = by_path.get(&p_str).map(|k| k.as_str()).unwrap_or("?");
-            println!("{}:{}:{}  (ref-precise {})  {}",
-                p_str, loc.line, loc.character, lang, name);
-            emitted += 1;
-            if emitted >= limit { break; }
-        }
-    } else {
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        for loc in &locs {
-            let p = match loc.fs_path() { Some(p) => p, None => continue };
-            let p_str = p.display().to_string();
-            if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
-            let lang = by_path.get(&p_str).map(|k| k.as_str()).unwrap_or("?");
-            let obj = serde_json::json!({
-                "name": name,
-                "ref_kind": "call",
-                "lang": lang,
-                "path": p_str,
-                "line": loc.line,
-                "col": loc.character,
-                "precise": true,
-            });
-            writeln!(out, "{}", obj)?;
-            emitted += 1;
-            if emitted >= limit { break; }
-        }
-    }
-    log_query(&r, "callers-precise", &name, locs.len(), emitted, t);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// compact (rewrite the index dropping tombstoned records)
-// ---------------------------------------------------------------------------
-//
-// Reads the current index, builds a remap from old file_id → new file_id
-// (compacted; tombstoned ids removed), streams every symbol/ref through,
-// re-emits with the remapped file_id. The trigram FST + name FSTs need
-// rebuilding from the surviving postings, which dominates the cost.
-//
-// For v1 this is a placeholder that errors clearly when there are
-// tombstones; the full rebuild is a non-trivial standalone change.
-// The expected use pattern is "incremental + occasional full rebuild
-// via `scry index` overwriting the dir" — `compact` is the in-place
-// alternative for very-large indexes where the full rebuild is
-// expensive.
 fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     let index_dir = index.unwrap_or_else(default_index_dir);
     let paths = scry_store::StorePaths::new(index_dir.clone());
@@ -6574,310 +5757,6 @@ fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     let _ = paths.tombstones();
     Ok(())
 }
-
-pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
-    use std::collections::HashMap;
-    use std::io::{BufWriter, Write};
-    let index_dir = index.unwrap_or_else(default_index_dir);
-    eprintln!("[res] target index: {}", index_dir.display());
-    let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = StoreReader::open(&index_dir)?;
-    let n_refs = r.n_refs();
-    let n_syms = r.n_symbols();
-    if n_refs == 0 {
-        eprintln!("[res] no refs to resolve — skipping");
-        return Ok(());
-    }
-    eprintln!("[res] {} symbols, {} refs", n_syms, n_refs);
-
-
-    // --- Pass 2b: Kythe def-symbol reverse index. ---
-    //
-    // For each (file_id, byte_start) of a def, ask the SCIP / clang
-    // sidecar what Kythe-class symbol identity that def carries, and
-    // store `symbol-string → def_id`. The pass-3 ref loop then asks
-    // the SAME sidecar what symbol the call site carries and looks
-    // up the def directly — bypassing the heuristic for any ref that
-    // both SCIP/clang covers AND maps to a known def.
-    //
-    // This is the architectural fix to the "test mock shadows prod"
-    // class of bugs (e.g. `ActiveServices.java` calling
-    // `Binder.clearCallingIdentity()` got attributed to a test
-    // `TestInjector.clearCallingIdentity` by the same-package
-    // heuristic). Kythe knows the receiver type → emits the right
-    // symbol identity at the call site → no guesswork.
-    //
-    // Coverage falls back to the heuristic for files Kythe doesn't
-    // see (uncovered TU in the SCIP / clang sidecar) and for refs
-    // whose symbol doesn't map to any indexed def.
-    let t2b = Instant::now();
-    let path_by_file_id: Vec<Option<String>> = {
-        let n = r.file_count();
-        let mut v: Vec<Option<String>> = vec![None; n];
-        for fe in r.iter_files() {
-            v[fe.id as usize] = Some(fe.display_path());
-        }
-        v
-    };
-    let scip_idx = r.scip_index();
-    let scip_fqn_idx = r.scip_index_fqn();
-    let cusr_idx = r.clang_usrs();
-    let scip_lookup = scip_idx.map(|sx| {
-        sx.precompute_by_file_ids(
-            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
-                p.as_deref().map(|s| (i as u32, s))
-            }),
-            path_by_file_id.len(),
-        )
-    });
-    // JVM-FQN canonical companion. Same precompute shape as the
-    // regular SCIP sidecar — both contribute defs and ref lookups
-    // independently in pass 2b / pass 3. The FQN sidecar carries
-    // anchors keyed by language=jvm canonical FQNs (the bridge
-    // target of language=java VNames), which is what lets
-    // cross-CU Java refs resolve when the ref-side CU compiled
-    // against bytecode rather than source.
-    let scip_fqn_lookup = scip_fqn_idx.map(|sx| {
-        sx.precompute_by_file_ids(
-            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
-                p.as_deref().map(|s| (i as u32, s))
-            }),
-            path_by_file_id.len(),
-        )
-    });
-    let cusr_lookup = cusr_idx.map(|cx| {
-        cx.precompute_by_file_ids(
-            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
-                p.as_deref().map(|s| (i as u32, s))
-            }),
-            path_by_file_id.len(),
-        )
-    });
-    const KYTHE_WINDOW: u32 = 64;
-    // Both sidecars feed a single string→def_id map. JVM-FQN
-    // canonical symbols (`jvm:android.os.Binder#clearCallingIdentity:()J`)
-    // and language=java VName signatures from the Kythe entries live
-    // in disjoint symbol-string namespaces by construction (the FQN
-    // sidecar's strings always start with `jvm:`, the main sidecar's
-    // strings carry the Kythe SCIP signature shape), so merging into
-    // one map can't collide. Pass 3 then asks BOTH sidecars for the
-    // call-site's symbol and accepts the first one that maps to an
-    // indexed def.
-    let mut scip_def_by_symbol: HashMap<String, u64> = HashMap::new();
-    let mut cusr_def_by_symbol: HashMap<String, u64> = HashMap::new();
-    let mut scip_defs_indexed = 0u64;
-    let mut scip_fqn_defs_indexed = 0u64;
-    let mut cusr_defs_indexed = 0u64;
-    if scip_lookup.is_some() || scip_fqn_lookup.is_some() || cusr_lookup.is_some() {
-        // Pass 2b uses KIND_MASK_DECL_ONLY so we only pick up
-        // def-anchors at def sites — pass 3 below uses the
-        // complementary KIND_MASK_REF_OR_CALL at ref sites. The
-        // unfiltered "closest in window" would otherwise let a call
-        // adjacent to its enclosing method's decl resolve to the
-        // surrounding def (e.g. `return Binder.clearCallingIdentity()`
-        // on the line right after a `clearCallingIdentity()` decl).
-        for s in r.iter_symbols() {
-            let cf = path_by_file_id.get(s.file_id as usize)
-                .and_then(|o| o.as_deref())
-                .map(is_c_family)
-                .unwrap_or(false);
-            if cf {
-                if let Some(cl) = cusr_lookup.as_ref() {
-                    if let Some(sym) = cl.symbol_for_window_kind(
-                        s.file_id, s.byte_start, KYTHE_WINDOW,
-                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                    ) {
-                        // First def wins. Multiple defs with the same
-                        // USR happen in decl+def-split C++ headers /
-                        // partial-class shapes; the first one is
-                        // arbitrary but stable across runs.
-                        cusr_def_by_symbol.entry(sym.to_string())
-                            .or_insert_with(|| { cusr_defs_indexed += 1; s.id });
-                    }
-                }
-            } else {
-                if let Some(sl) = scip_lookup.as_ref() {
-                    if let Some(sym) = sl.symbol_for_window_kind(
-                        s.file_id, s.byte_start, KYTHE_WINDOW,
-                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                    ) {
-                        scip_def_by_symbol.entry(sym.to_string())
-                            .or_insert_with(|| { scip_defs_indexed += 1; s.id });
-                    }
-                }
-                if let Some(sl) = scip_fqn_lookup.as_ref() {
-                    if let Some(sym) = sl.symbol_for_window_kind(
-                        s.file_id, s.byte_start, KYTHE_WINDOW,
-                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                    ) {
-                        scip_def_by_symbol.entry(sym.to_string())
-                            .or_insert_with(|| { scip_fqn_defs_indexed += 1; s.id });
-                    }
-                }
-            }
-        }
-    }
-    eprintln!(
-        "[res] pass 2b (Kythe def-symbol index): {} SCIP defs, {} SCIP-FQN defs, {} clang USR defs in {} ms",
-        scip_defs_indexed, scip_fqn_defs_indexed, cusr_defs_indexed, t2b.elapsed().as_millis(),
-    );
-
-    // --- Pass 3: resolve every ref, write sidecar. ---
-    //
-    // Parallel resolution with rayon: collect refs into chunks of
-    // ~64K, resolve each chunk on a worker, then write chunks back
-    // out in iteration order. The sidecar format is byte_offset =
-    // ref_idx * 8, so ordering MUST be preserved — we collect chunks
-    // sequentially from `iter_refs`, dispatch resolution in parallel,
-    // and stream the results back in submission order.
-    //
-    // Each ref tries Kythe first (if a sidecar covers its file AND
-    // its call-site symbol points at an indexed def) → falls back to
-    // the lexical heuristic otherwise. Trust ordering: Kythe knows
-    // the receiver type, the heuristic only sees the method name.
-    //
-    // Memory: at peak we hold ~16 chunks × 64K refs × ~64B/ref ≈
-    // ~64 MiB of input + ~16 chunks × 64K × 8B = ~8 MiB output.
-    // Well within budget.
-    let t3 = Instant::now();
-    let tmp = paths.ref_resolutions().with_extension("bin.tmp");
-    let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let resolved_count = AtomicU64::new(0);
-    let unresolved_no_sidecar = AtomicU64::new(0);
-    let unresolved_kythe_blank = AtomicU64::new(0);
-    let mut chunk: Vec<RefRecord> = Vec::with_capacity(CHUNK_SIZE);
-    let process_chunk = |chunk: &mut Vec<RefRecord>, ow: &mut BufWriter<std::fs::File>| -> Result<()> {
-        if chunk.is_empty() { return Ok(()); }
-        let ids: Vec<u64> = chunk.par_iter().map(|rr| {
-            let cf = path_by_file_id.get(rr.file_id as usize)
-                .and_then(|o| o.as_deref())
-                .map(is_c_family)
-                .unwrap_or(false);
-            // Resolution is sidecar-only. C-family → clang USR sidecar;
-            // everything else → SCIP. If the sidecar covers the file,
-            // its verdict is law: a symbol that maps to an indexed
-            // def resolves, anything else is honestly unresolved
-            // (returning 0). No lexical heuristic, no guessing — the
-            // `--lexical` query flag already exists for users who
-            // want raw tree-sitter name matches with no narrowing.
-            // Look up the ref-anchor INSIDE the tree-sitter identifier
-            // span [byte_start, byte_end] — Kythe emits a separate
-            // ref-anchor for each identifier in a dotted access (the
-            // receiver AND the method name), so a fat byte-window picks
-            // the closer receiver anchor instead. Restricting to the
-            // identifier span the tree-sitter ref actually points at
-            // eliminates that bleed. KIND_MASK_REF_OR_CALL further
-            // rules out the enclosing method's own decl anchor when
-            // the call sits on the line right after the decl.
-            let id = if cf {
-                match cusr_lookup.as_ref() {
-                    Some(cl) if cl.covers_file_id(rr.file_id) => {
-                        match cl.symbol_in_span_kind(
-                            rr.file_id, rr.byte_start, rr.byte_end,
-                            scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                        ).and_then(|sym| cusr_def_by_symbol.get(sym).copied()) {
-                            Some(kid) => kid,
-                            None => {
-                                unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
-                                0
-                            }
-                        }
-                    }
-                    _ => {
-                        unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
-                        0
-                    }
-                }
-            } else {
-                // Try the regular SCIP sidecar first (language=java
-                // VName symbol-strings). If that's blank for this
-                // ref — the common cause is a cross-CU call where
-                // the def-side CU and ref-side CU disagree on the
-                // canonical Java signature — fall through to the
-                // JVM-FQN companion sidecar. Both writers use
-                // disjoint symbol-string namespaces, so the
-                // string→def_id lookup picks the right side
-                // automatically.
-                //
-                // "Covered" semantics: a file is covered if EITHER
-                // sidecar has anchor data for it. That way refs in
-                // services.core (only the FQN sidecar carries the
-                // cross-CU bridge entries) don't get accounted as
-                // unresolved_no_sidecar just because the regular
-                // sidecar doesn't reach them.
-                let scip_covers = scip_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-                let fqn_covers = scip_fqn_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-                if !scip_covers && !fqn_covers {
-                    unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
-                    0
-                } else {
-                    let from_scip = if scip_covers {
-                        scip_lookup.as_ref().and_then(|sl| {
-                            sl.symbol_in_span_kind(
-                                rr.file_id, rr.byte_start, rr.byte_end,
-                                scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                            ).and_then(|sym| scip_def_by_symbol.get(sym).copied())
-                        })
-                    } else { None };
-                    let resolved = from_scip.or_else(|| {
-                        if !fqn_covers { return None; }
-                        scip_fqn_lookup.as_ref().and_then(|sl| {
-                            sl.symbol_in_span_kind(
-                                rr.file_id, rr.byte_start, rr.byte_end,
-                                scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                            ).and_then(|sym| scip_def_by_symbol.get(sym).copied())
-                        })
-                    });
-                    match resolved {
-                        Some(kid) => kid,
-                        None => {
-                            unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
-                            0
-                        }
-                    }
-                }
-            };
-            if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
-            id
-        }).collect();
-        for id in ids { ow.write_all(&id.to_le_bytes())?; }
-        chunk.clear();
-        Ok(())
-    };
-    for rr in r.iter_refs() {
-        chunk.push(rr);
-        if chunk.len() >= CHUNK_SIZE {
-            process_chunk(&mut chunk, &mut ow)?;
-        }
-    }
-    process_chunk(&mut chunk, &mut ow)?;
-    ow.flush()?;
-    drop(ow);
-    std::fs::rename(&tmp, paths.ref_resolutions())?;
-    let resolved_count = resolved_count.into_inner();
-    let unresolved_no_sidecar = unresolved_no_sidecar.into_inner();
-    let unresolved_kythe_blank = unresolved_kythe_blank.into_inner();
-    eprintln!(
-        "[res] pass 3 (resolve {} refs, {} resolved via Kythe sidecar; \
-         {} unresolved: {} in files Kythe didn't cover, {} where Kythe \
-         had no def-attribution for the call site) in {} ms",
-        n_refs, resolved_count,
-        unresolved_no_sidecar + unresolved_kythe_blank,
-        unresolved_no_sidecar, unresolved_kythe_blank,
-        t3.elapsed().as_millis(),
-    );
-    eprintln!("[res] DONE. {} bytes written → {}",
-        std::fs::metadata(paths.ref_resolutions()).map(|m| m.len()).unwrap_or(0),
-        paths.ref_resolutions().display());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// build-trigrams (standalone — add trigram index to an existing index)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn cmd_build_trigrams(
     index: Option<PathBuf>,
@@ -8754,32 +7633,10 @@ fn serve_ref(
     } else {
         None
     };
-    // Cached lazy accessors. The StoreReader OnceLock caches keep
-    // both sidecars in RAM after the first daemon query, so per-
-    // request decode cost is paid once at startup.
-    const PRECISE_WINDOW: u32 = 64;
-    let cusr: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
-        r.clang_usrs()
-    } else {
-        None
-    };
-    let def_usrs: Option<std::collections::HashSet<String>> = cusr.map(|c| {
-        r.lookup_exact(name).iter().filter_map(|s| {
-            let p = r.display_path_cached(s.file_id)?;
-            c.usr_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
-        }).collect()
-    });
-    let sidx: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
-        r.scip_index()
-    } else {
-        None
-    };
-    let def_scip: Option<std::collections::HashSet<String>> = sidx.map(|c| {
-        r.lookup_exact(name).iter().filter_map(|s| {
-            let p = r.display_path_cached(s.file_id)?;
-            c.symbol_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
-        }).collect()
-    });
+    // scry is tree-sitter only: there are no precision sidecars, so the
+    // build-symbol def-identity sets are always empty and the precision
+    // filter below is a pass-through.
+    let _ = (clang_precise, scip_precise);
     let by_def = format == Some("by-def");
     let paths_only = format == Some("paths");
     // by-def + paths both need to see ALL surviving refs to build their
@@ -8828,27 +7685,6 @@ fn serve_ref(
                     }
                 }
                 // Unattributed caller: pass through (same as CLI).
-            }
-        }
-        // Clang USR identity filter (Path B). Sites without a clang
-        // record pass through (non-C/C++ or uncovered TU).
-        if let (Some(c), Some(usrs)) = (cusr, def_usrs.as_ref()) {
-            if !usrs.is_empty() {
-                if let Some(p) = r.display_path_cached(rr.file_id) {
-                    if let Some(u) = c.usr_for_window(p, rr.byte_start, PRECISE_WINDOW) {
-                        if !usrs.contains(u) { continue; }
-                    }
-                }
-            }
-        }
-        // SCIP symbol identity filter (Path C).
-        if let (Some(c), Some(syms)) = (sidx, def_scip.as_ref()) {
-            if !syms.is_empty() {
-                if let Some(p) = r.display_path_cached(rr.file_id) {
-                    if let Some(s) = c.symbol_for_window(p, rr.byte_start, PRECISE_WINDOW) {
-                        if !syms.contains(s) { continue; }
-                    }
-                }
             }
         }
         if by_def {

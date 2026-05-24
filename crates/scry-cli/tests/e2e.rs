@@ -240,17 +240,8 @@ fn synthetic_tree_roundtrip() {
             "grep should hit Binder.java's transact() definition, got {:?}",
             hits.iter().map(|h| h["path"].clone()).collect::<Vec<_>>());
 
-    // 6. Run build-resolutions + assert Java refs get resolved_to set.
-    // This pins the Layer 2 sidecar end-to-end — apply_resolution_override
-    // in get_ref + the build-resolutions writer + the JSON serializer
-    // all have to work together for resolved_to to show up.
-    let out = Command::new(scry_bin())
-        .args(["build-resolutions", "--index"])
-        .arg(&idx)
-        .output()
-        .expect("spawn scry build-resolutions");
-    assert!(out.status.success(),
-            "scry build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
+    // 6. scry is tree-sitter only: there is no precision/resolution sidecar,
+    // so every Java ref's resolved_to must be null. Assert that contract.
     // --lexical: synthetic Java/AOSP fixture, no precision sidecars.
     let out = Command::new(scry_bin())
         .args(["callers", "transact", "--lexical", "--index"])
@@ -1157,48 +1148,6 @@ public class Binder {
     assert!(!any_binder,
             "tombstoned Binder.java symbols must not appear in def results: {hits:?}");
 
-    // 11. `scry callers --precise` clangd integration. Two cases:
-    //  - clangd not on PATH (the common one in CI / fresh dev hosts):
-    //    the command must exit non-zero with an actionable message
-    //    instead of segfaulting or hanging.
-    //  - clangd present: smoke that the LSP client can complete
-    //    a session against a minimal compile_commands.json.
-    let clangd_ok = Command::new("clangd").arg("--version").output()
-        .map(|o| o.status.success()).unwrap_or(false);
-    if !clangd_ok {
-        // The interesting test case for environments without clangd:
-        // we assert the bail-out message is what the docs promise.
-        let out = Command::new(scry_bin())
-            .args(["callers", "Binder", "--precise", "--index"]).arg(&idx)
-            .output().expect("scry callers --precise");
-        assert!(!out.status.success(),
-                "scry callers --precise should error when clangd missing");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("clangd not on PATH"),
-                "error message should mention clangd; got: {stderr}");
-        assert!(stderr.contains("apt install clangd"),
-                "error message should include install hint; got: {stderr}");
-    } else {
-        // clangd present — smoke the absence-of-compile-commands path.
-        // (Generating a real compile_commands.json for the synthetic
-        // tree is out of scope; the test just confirms we error out
-        // with the right message instead of spawning into a broken
-        // clangd session.)
-        let out = Command::new(scry_bin())
-            .args(["callers", "Binder", "--precise", "--index"]).arg(&idx)
-            .output().expect("scry callers --precise (clangd present)");
-        // Either it errored on compile_commands missing OR it
-        // succeeded (unlikely on the synthetic tree without a real
-        // build). Both are acceptable; what matters is it didn't
-        // hang or panic.
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(stderr.contains("compile_commands.json")
-                    || stderr.contains("clangd"),
-                    "if --precise errored, message should explain why; got: {stderr}");
-        }
-    }
-
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
     std::fs::remove_dir_all(&base).ok();
@@ -1422,76 +1371,6 @@ fn unix_serve_concurrent_stress() {
 // asserts that scry fails CLEANLY (non-zero exit, recognizable error
 // message) without panicking or hanging — regardless of whether clangd
 // is present on the test runner.
-// ===========================================================================
-
-#[test]
-fn callers_precise_malformed_compile_commands() {
-    use std::process::Command;
-    use std::time::{Duration, Instant};
-
-    let base = scry_store::scry_tmp_dir().join(format!("scry-bad-cc-{}", std::process::id()));
-    let src = base.join("src");
-    let idx = base.join("idx");
-    std::fs::create_dir_all(&src).unwrap();
-    // Index needs a C++ symbol so callers_precise has something to
-    // anchor on. Without one it errors with "no definitions of ..."
-    // before ever touching compile_commands.json.
-    std::fs::write(src.join("a.cpp"),
-        "class Widget { public: void poke() {} };\n").unwrap();
-    // Deliberately malformed JSON — not even close to valid.
-    std::fs::write(src.join("compile_commands.json"),
-        "{ this is not json at all }").unwrap();
-    let out = Command::new(scry_bin())
-        .args(["index"]).arg(&src).arg("-o").arg(&idx)
-        .args(["--workers", "2"])
-        .output().expect("index for cc test");
-    assert!(out.status.success(),
-            "index failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    // Run with a wall-clock guard. If `scry callers --precise` were
-    // to hang on clangd parsing the malformed JSON, this loop would
-    // time out and we'd kill the child.
-    let start = Instant::now();
-    let mut child = Command::new(scry_bin())
-        .args(["callers", "Widget", "--precise", "--index"]).arg(&idx)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn().expect("spawn callers --precise");
-    let mut exit_code = None;
-    while start.elapsed() < Duration::from_secs(30) {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => { exit_code = Some(s); break; }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    if exit_code.is_none() {
-        child.kill().ok();
-        panic!("`scry callers --precise` hung > 30 s on malformed compile_commands.json");
-    }
-    let out = child.wait_with_output().expect("collect output");
-    // Either we don't have clangd (error mentions clangd) or we do
-    // but the malformed cc.json prevented success — in both cases
-    // exit must be non-zero and stderr must explain why.
-    assert!(!out.status.success(),
-            "scry should NOT succeed on malformed compile_commands.json");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr);
-    assert!(
-        combined.contains("clangd")
-            || combined.contains("compile_commands")
-            || combined.contains("precise")
-            || combined.contains("no definitions"),
-        "error message should explain failure cleanly; got:\n{combined}",
-    );
-
-    std::fs::remove_dir_all(&base).ok();
-}
-
-// ===========================================================================
-// Parse-budget integration: set SCRY_PARSE_TIMEOUT_MS=1 (one
-// millisecond) on a synthetic pathological C++ file. The per-file
-// parse must time out, scry index must skip the file cleanly, and
-// the run as a whole must succeed (not panic, not hang).
 // ===========================================================================
 
 #[test]
@@ -2261,11 +2140,6 @@ public class B {
         .output().expect("spawn scry index");
     assert!(out.status.success(),
             "index failed: {}", String::from_utf8_lossy(&out.stderr));
-    let out = Command::new(scry_bin())
-        .args(["build-resolutions", "--index"]).arg(&idx)
-        .output().expect("spawn scry build-resolutions");
-    assert!(out.status.success(),
-            "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // Daemon: send a callers-by-def request + a stats request.
     let mut child = Command::new(scry_bin())
@@ -2310,20 +2184,18 @@ public class B {
         "no SCIP / clang USR sidecar → all by-def groups must be in the unresolved bucket; got {} resolved: {:?}",
         resolved_groups.len(), resolved_groups);
 
-    // (2) stats includes the v0.1.42 refs_resolved + refs_resolved_pct.
+    // (2) stats: scry is tree-sitter only, so there is no resolutions
+    // sidecar and `refs_resolved` is null (the field is only populated by
+    // the removed Kythe-derived build-resolutions pass). `refs` itself is
+    // always a real count.
     let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(r2["id"], 2);
     let stats = &r2["result"];
-    assert!(stats["refs_resolved"].is_number(),
-        "stats.refs_resolved should be a number once build-resolutions ran; got {:?}",
+    assert!(stats["refs_resolved"].is_null(),
+        "no resolutions sidecar (tree-sitter only) → refs_resolved must be null; got {:?}",
         stats["refs_resolved"]);
-    assert!(stats["refs_resolved_pct"].is_number(),
-        "stats.refs_resolved_pct should be a number; got {:?}",
-        stats["refs_resolved_pct"]);
-    let resolved = stats["refs_resolved"].as_u64().unwrap();
-    let total = stats["refs"].as_u64().unwrap();
-    assert!(resolved <= total,
-        "refs_resolved ({resolved}) must not exceed refs ({total})");
+    assert!(stats["refs"].is_number(),
+        "stats.refs should always be a number; got {:?}", stats["refs"]);
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -2867,199 +2739,3 @@ public class Cat extends Animal {}
 
     std::fs::remove_dir_all(&base).ok();
 }
-
-/// `scry finalize` auto-discovers compile_commands.json inside
-/// indexed roots and stages a clang-index run on it without the
-/// user passing --clang-compile-commands. This test uses a REAL
-/// C++ TU (not an empty `[]` placeholder) so the full Path B
-/// pipeline executes end-to-end: discovery → stage queue → libclang
-/// parse → USR sidecar on disk → `scry health` reports it.
-///
-/// libclang detection: if libclang isn't available in the test
-/// environment, the new soft-fail contract means finalize succeeds
-/// with a warning and no sidecar gets written. In that case the
-/// test asserts the warning path; it does NOT silently pass and
-/// does NOT incorrectly fail.
-#[test]
-fn finalize_auto_discovers_real_compile_commands() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = scry_store::scry_tmp_dir().join(format!("scry-autodisc-{nanos}"));
-    let src = base.join("src");
-    let idx = base.join("index");
-    std::fs::create_dir_all(&src).unwrap();
-
-    // Real C++ TU: a class with a definition + a free function that
-    // calls into it. Three USR-producing cursors guarantee a non-
-    // trivial sidecar when libclang processes the file.
-    std::fs::write(src.join("widget.h"), r#"#pragma once
-namespace demo {
-class Widget {
-public:
-    Widget();
-    int poke(int x) const;
-};
-int kick(const Widget& w);
-}
-"#).unwrap();
-    std::fs::write(src.join("widget.cpp"), r#"#include "widget.h"
-namespace demo {
-Widget::Widget() {}
-int Widget::poke(int x) const { return x + 1; }
-int kick(const Widget& w) { return w.poke(41); }
-}
-"#).unwrap();
-
-    // Valid compile_commands.json — single TU, absolute directory,
-    // relative file, plain c++17 args. clang-sys will parse this.
-    let cc_json = format!(
-        r#"[{{
-  "directory": "{dir}",
-  "file": "widget.cpp",
-  "arguments": ["clang++", "-std=c++17", "-c", "widget.cpp"]
-}}]
-"#,
-        dir = src.display(),
-    );
-    std::fs::write(src.join("compile_commands.json"), cc_json).unwrap();
-
-    let out = Command::new(scry_bin())
-        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
-        .output().expect("spawn index");
-    assert!(out.status.success(),
-        "index failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let out = Command::new(scry_bin())
-        .args(["finalize", "--index"]).arg(&idx)
-        .output().expect("spawn finalize");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(),
-        "finalize failed: stderr={stderr}");
-    assert!(stderr.contains("clang USR sidecar (auto:"),
-        "finalize stderr should log the auto clang-index stage; got:\n{stderr}");
-    assert!(stderr.contains("compile_commands.json"),
-        "finalize stderr should name the discovered compile_commands.json; \
-         got:\n{stderr}");
-    assert!(stderr.contains("ALL STAGES OK"),
-        "finalize should report ALL STAGES OK even when libclang is absent; \
-         got:\n{stderr}");
-
-    // Distinguish "libclang worked" from "libclang unavailable, soft-failed".
-    let libclang_failed = stderr.contains("auto clang USR sidecar failed");
-    let health_out = Command::new(scry_bin())
-        .args(["health", "--index"]).arg(&idx).arg("--json")
-        .output().expect("spawn health");
-    assert!(health_out.status.success(),
-        "health failed: {}", String::from_utf8_lossy(&health_out.stderr));
-    let v: serde_json::Value = serde_json::from_slice(&health_out.stdout)
-        .expect("health --json output should parse");
-    // `scry health --json` keys checks by `artifact`. There are two
-    // clang_usrs entries: one for the raw file presence ("clang_usrs.bin"),
-    // and one for the open+decode summary ("clang_usrs"). We want the
-    // latter — it carries the "v1, N USRs, M records" status line.
-    let cu = v["checks"].as_array().expect("checks array").iter()
-        .find(|c| c["artifact"] == "clang_usrs").expect("clang_usrs check present")
-        .clone();
-    let status = cu["status"].as_str().unwrap_or("").to_string();
-
-    if libclang_failed {
-        // Soft-fail contract: warning in stderr, sidecar absent,
-        // health reports "absent".
-        assert!(
-            status.contains("absent"),
-            "libclang-absent path: clang_usrs status should be 'absent'; got: {status}",
-        );
-    } else {
-        // Happy path: libclang parsed the TU, sidecar exists with
-        // > 0 USRs from the Widget class + methods + kick().
-        assert!(
-            status.starts_with("v1,"),
-            "libclang-present path: clang_usrs status should be 'v1, …'; got: {status}",
-        );
-        // Extract "v1, N USRs, M records" and assert N > 0.
-        let n_usrs: usize = status
-            .strip_prefix("v1, ").and_then(|s| s.split(' ').next())
-            .and_then(|s| s.parse().ok()).unwrap_or(0);
-        assert!(n_usrs > 0,
-            "libclang-present path: sidecar should have > 0 USRs from the \
-             C++ fixture; got: {status}");
-    }
-
-    std::fs::remove_dir_all(&base).ok();
-}
-
-/// Mimics the Soong/CMake-out-of-tree layout: source has no
-/// compile_commands.json, but the build dir (which is gitignored
-/// in real projects) does. The source-root walker (which honors
-/// .gitignore) misses it; `--build-out <path>` walks the build
-/// dir verbatim and picks it up.
-#[test]
-fn finalize_build_out_discovers_cc_json_in_gitignored_dir() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = scry_store::scry_tmp_dir().join(format!("scry-build-out-{nanos}"));
-    let src = base.join("src");
-    let out = base.join("out/build/compdb");
-    let idx = base.join("index");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::create_dir_all(&out).unwrap();
-
-    // Source tree has the .cpp but no cc.json. .gitignore would
-    // hide `out/` in a real project; this test makes that hiding
-    // even stricter by putting `out/` outside the indexed root
-    // entirely.
-    std::fs::write(src.join("widget.h"), r#"#pragma once
-namespace demo {
-class Widget { public: Widget(); int poke(int x) const; };
-}
-"#).unwrap();
-    std::fs::write(src.join("widget.cpp"), r#"#include "widget.h"
-namespace demo {
-Widget::Widget() {}
-int Widget::poke(int x) const { return x + 1; }
-}
-"#).unwrap();
-
-    // cc.json lives in the build dir, pointing back at the source
-    // tree (out-of-tree build pattern).
-    let cc_json = format!(
-        r#"[{{"directory": "{src}", "file": "widget.cpp", "arguments": ["clang++", "-std=c++17", "-c", "widget.cpp"]}}]"#,
-        src = src.display(),
-    );
-    std::fs::write(out.join("compile_commands.json"), cc_json).unwrap();
-
-    let r = Command::new(scry_bin())
-        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
-        .output().expect("spawn index");
-    assert!(r.status.success(),
-        "index failed: {}", String::from_utf8_lossy(&r.stderr));
-
-    // First: confirm that WITHOUT --build-out, source-root
-    // discovery finds nothing (since cc.json isn't in `src/`).
-    let r = Command::new(scry_bin())
-        .args(["finalize", "--index"]).arg(&idx)
-        .output().expect("spawn finalize (no build-out)");
-    let stderr_noflag = String::from_utf8_lossy(&r.stderr);
-    assert!(r.status.success(),
-        "finalize (no flag) failed: {stderr_noflag}");
-    assert!(!stderr_noflag.contains("clang USR sidecar (auto:"),
-        "without --build-out, auto clang-index should NOT fire \
-         (cc.json is outside indexed roots); got:\n{stderr_noflag}");
-
-    // Then: with --build-out pointing at the build dir, auto
-    // discovery picks it up.
-    let r = Command::new(scry_bin())
-        .args(["finalize", "--index"]).arg(&idx)
-        .args(["--build-out"]).arg(&out)
-        .output().expect("spawn finalize --build-out");
-    let stderr_with = String::from_utf8_lossy(&r.stderr);
-    assert!(r.status.success(),
-        "finalize --build-out failed: {stderr_with}");
-    assert!(stderr_with.contains("clang USR sidecar (auto:"),
-        "--build-out should make auto clang-index fire; got:\n{stderr_with}");
-    assert!(stderr_with.contains(&out.display().to_string()),
-        "--build-out auto stage should name the build-out path; got:\n{stderr_with}");
-
-    std::fs::remove_dir_all(&base).ok();
-}
-

@@ -179,10 +179,9 @@ pub enum RefKind {
     Import = 4,
     InheritFrom = 5,
     /// C++ `using namespace X;` directive. Same wire shape as Import
-    /// (name = the namespace text, e.g. "android::base"); separated
-    /// from Import so the Layer 2 resolver can route C++ refs through
-    /// the namespace-narrowing path instead of the package-narrowing
-    /// path (Java / Kotlin).
+    /// (name = the namespace text, e.g. "android::base"); kept as a
+    /// distinct kind so queries can tell a namespace directive apart
+    /// from an import.
     UsingNamespace = 6,
 }
 
@@ -531,9 +530,9 @@ pub struct GrepExplain {
 /// format change in a primary file, breaking schema change in a record.
 ///
 /// Sidecar additions are NOT bumps: every sidecar (file_symbols, lazy
-/// offsets, trigram postings, ref_resolutions, file_digests, chunks,
-/// embeddings) is opened with `.exists()` first, and missing-sidecar
-/// degrades gracefully to the eager / unfiltered path.
+/// offsets, trigram postings, file_digests, chunks) is opened with
+/// `.exists()` first, and missing-sidecar degrades gracefully to the
+/// eager / unfiltered path.
 ///
 /// Mismatch handling today: readers do not refuse to open higher versions.
 /// The version field is informational; the per-command stale-index warning
@@ -624,22 +623,6 @@ impl StorePaths {
     /// JSON parse AND the 1.4M-file HashMap attribution loop.
     /// Bound to mtime+size of module_graph.json + files_packed.bin.
     pub fn module_graph_full(&self) -> PathBuf { self.root.join("module_graph_full.bin") }
-    /// Optional Path B sidecar: per-symbol clang USRs from
-    /// `scry-clang-index`. Present when the user has run the helper
-    /// against a compile_commands.json. v0.1.13+.
-    pub fn clang_usrs(&self) -> PathBuf { self.root.join("clang_usrs.bin") }
-    /// Optional Path C sidecar: per-occurrence SCIP symbol IDs
-    /// imported from external SCIP tools (scip-java, gopls,
-    /// rust-analyzer, …) via `scry scip-import`. v0.1.16+.
-    pub fn scip_index(&self) -> PathBuf { self.root.join("scip_index.bin") }
-    /// Optional companion sidecar: per-occurrence canonical JVM FQN
-    /// symbols produced by [`scry_kzip::fqn_importer`]. Holds the
-    /// language=jvm bridge canonicalized form of `scip_index.bin`'s
-    /// language=java VNames — lets cross-CU Java refs resolve when
-    /// the def-side and ref-side CUs disagree on the language=java
-    /// signature (the usual cause: classpath bytecode visibility).
-    /// Read alongside `scip_index.bin` by `build-resolutions`.
-    pub fn scip_index_fqn(&self) -> PathBuf { self.root.join("scip_index_fqn.bin") }
     /// file_id → list of symbol indices. Packed: per file_id (in order),
     /// a u32 count followed by `count` u32 indices into symbols.bin.
     pub fn file_symbols(&self) -> PathBuf { self.root.join("file_symbols.bin") }
@@ -655,10 +638,6 @@ impl StorePaths {
     /// of scanning all 63M.
     pub fn file_refs(&self) -> PathBuf { self.root.join("file_refs.bin") }
     pub fn file_refs_offsets(&self) -> PathBuf { self.root.join("file_refs_offsets.bin") }
-    /// Per-ref resolution overrides: packed u64-LE per ref_idx; 0 = unresolved,
-    /// other values are the resolved definition's id (matches SymbolRecord.id).
-    /// Produced by `scry build-resolutions`; reader honors it on get_ref().
-    pub fn ref_resolutions(&self) -> PathBuf { self.root.join("ref_resolutions.bin") }
     /// Per-file content digest: packed `[u8; 32]` per file_id (blake3).
     /// Indexed parallel to `files_packed.bin`. Used by `scry index --incremental`
     /// to detect which files actually changed between two index builds.
@@ -1792,10 +1771,6 @@ pub struct StoreReader {
     /// scanning all 63M refs.
     pub file_refs_mmap: Option<memmap2::Mmap>,
     pub file_refs_offsets_mmap: Option<memmap2::Mmap>,
-    /// Per-ref resolved-def-id overrides. Indexed by ref_idx; 0 ⇒
-    /// unresolved (use the RefRecord's own resolved_to, which may also
-    /// be None). Built post-finalize via `scry build-resolutions`.
-    pub ref_resolutions_mmap: Option<memmap2::Mmap>,
     /// Per-file blake3 content digest (packed `[u8; 32]` per file_id).
     /// Powers `scry index --incremental` change detection. Present when
     /// `scry build-digests` has run against this index; absent otherwise.
@@ -1966,13 +1941,6 @@ impl StoreReader {
             (None, None)
         };
         tick!("file_refs");
-        // Per-ref resolution overrides (Layer 2 sidecar). Optional.
-        let ref_resolutions_mmap = if paths.ref_resolutions().exists() {
-            Some(safe_mmap(&paths.ref_resolutions())?)
-        } else {
-            None
-        };
-        tick!("ref_resolutions");
         // Per-file blake3 digests (for incremental change detection).
         // Optional sidecar; absence means we can't do `--incremental`.
         let file_digests_mmap = if paths.file_digests().exists() {
@@ -1999,7 +1967,6 @@ impl StoreReader {
             lazy_symbols, lazy_refs,
             file_symbols_mmap, file_symbols_offsets_mmap,
             file_refs_mmap, file_refs_offsets_mmap,
-            ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
             module_graph_cell: std::sync::OnceLock::new(),
             display_paths_cell: std::sync::OnceLock::new(),
@@ -2275,31 +2242,6 @@ impl StoreReader {
         (m[byte] >> bit) & 1 == 1
     }
 
-    /// Apply the resolution sidecar override to a RefRecord, if present.
-    /// 0 in the sidecar = "no override; keep the record's own resolved_to".
-    pub fn apply_resolution_override(&self, ref_idx: u32, r: &mut RefRecord) {
-        let m = match self.ref_resolutions_mmap.as_ref() { Some(m) => m, None => return };
-        let o = (ref_idx as usize) * 8;
-        if o + 8 > m.len() { return; }
-        let id = match m[o..o + 8].try_into() {
-            Ok(b) => u64::from_le_bytes(b),
-            Err(_) => return,
-        };
-        if id != 0 { r.resolved_to = Some(id); }
-    }
-
-    /// Count refs that the Layer 2 resolutions sidecar attributes to
-    /// a specific def. Streams the mmap 8 bytes at a time, counting
-    /// non-zero u64 entries. Returns None if the sidecar isn't
-    /// present (no `scry build-resolutions` was run).
-    ///
-    /// On a 506 MB sidecar (~63 M refs) this is ~0.5 s — cheap enough
-    /// to call from `scry stats`. v0.1.41.
-    pub fn count_resolved_refs(&self) -> Option<u64> {
-        let m = self.ref_resolutions_mmap.as_ref()?;
-        Some(m.chunks_exact(8).filter(|c| *c != [0u8; 8]).count() as u64)
-    }
-
     /// Function/method-like symbol whose source body encloses
     /// `byte_offset` in `file_id`. Used by `scry callgraph` to
     /// attribute a ref site to its containing routine.
@@ -2373,9 +2315,7 @@ impl StoreReader {
     }
 
     /// Iterate every ref record, transparently using the lazy mmap
-    /// path. Same de-duplication motive as iter_symbols. Note this
-    /// does NOT apply the resolution sidecar — callers that want
-    /// resolved_to overrides should go through get_ref(idx).
+    /// path. Same de-duplication motive as iter_symbols.
     pub fn iter_refs(&self) -> Box<dyn Iterator<Item = RefRecord> + '_> {
         if let Some(lz) = self.lazy_refs.as_ref() {
             Box::new(lz.iter())
@@ -2409,16 +2349,14 @@ impl StoreReader {
             self.symbols.get(idx as usize).cloned()
         }
     }
-    /// Get a RefRecord by index, filtering tombstones and applying the
-    /// Layer 2 resolution sidecar override. Same dual as get_symbol.
+    /// Get a RefRecord by index, filtering tombstones. Same dual as
+    /// get_symbol.
     pub fn get_ref(&self, idx: u32) -> Option<RefRecord> {
-        let mut rec = self.get_ref_raw(idx)?;
+        let rec = self.get_ref_raw(idx)?;
         if self.is_tombstoned(rec.file_id) { return None; }
-        self.apply_resolution_override(idx, &mut rec);
         Some(rec)
     }
-    /// Raw RefRecord access without tombstone filtering or resolution
-    /// override application.
+    /// Raw RefRecord access without tombstone filtering.
     pub fn get_ref_raw(&self, idx: u32) -> Option<RefRecord> {
         if let Some(l) = self.lazy_refs.as_ref() {
             l.get(idx as usize)

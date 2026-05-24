@@ -58,7 +58,6 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         // linear scan; missing here would silently hide that.
         ("file_refs.bin",        paths.file_refs()),
         ("file_refs_offsets.bin", paths.file_refs_offsets()),
-        ("ref_resolutions.bin",  paths.ref_resolutions()),
         ("file_digests.bin",     paths.file_digests()),
         ("tombstones.bin",       paths.tombstones()),
         // Build-system module graph (used by --reachable). Has its own
@@ -122,25 +121,6 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         },
     };
     checks.push(Check { name: "module_graph", status: mg_status, required: false, ok: true });
-
-    // Layer 2 resolution coverage (v0.1.59). Surface the resolved/total
-    // ratio so users know up-front whether `--def-in` / `--strict` will
-    // be useful on this index.
-    let resolution_status = match StoreReader::open(&index_dir).ok()
-        .and_then(|r| r.count_resolved_refs().map(|n| (n, r.n_refs())))
-    {
-        None => "absent (scry is tree-sitter only; no resolution sidecar — \
-                 resolved_to is always null)".to_string(),
-        Some((_, 0)) => "no refs in index (sidecar dimension unknown)".to_string(),
-        Some((resolved, total)) => {
-            let pct = (resolved as f64) * 100.0 / (total as f64);
-            format!("v1, {resolved}/{total} refs resolved ({pct:.1}%)")
-        }
-    };
-    checks.push(Check {
-        name: "refs_resolved", status: resolution_status,
-        required: false, ok: true,
-    });
 
     // Version-skew check.
     let manifest_version = std::fs::read_to_string(paths.manifest()).ok()

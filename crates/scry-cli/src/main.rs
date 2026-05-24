@@ -191,11 +191,6 @@ enum Cmd {
         /// Mutually exclusive with --json.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
-        /// Accepted for compatibility and is a no-op: scry matches by
-        /// tree-sitter name (lexical) only. (There are no compiler-backed
-        /// precision sidecars — that's `scry2`'s job.)
-        #[arg(long)]
-        lexical: bool,
         /// Compose with build-graph reachability: drop refs whose
         /// owning module can't transitively reach a definition of
         /// NAME per the Soong/GN/kernel module graph. No-op if the
@@ -211,24 +206,6 @@ enum Cmd {
         /// class matching use `--in` on the file path instead.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
-        /// Narrow refs by the def's file path, via each ref's resolved_to
-        /// link. scry is tree-sitter only and has no resolution sidecar,
-        /// so resolved_to is null and refs pass through unnarrowed — use
-        /// `--in PATH` / `--scope CLASS` for path/class narrowing instead.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop refs whose Layer 2 resolution didn't
-        /// land on a specific def (resolved_to=None). With --def-in
-        /// PATH, also drops refs resolving to a def outside PATH —
-        /// no permissive over-include. Useful when you want HIGH
-        /// PRECISION at the cost of recall: only refs the resolver
-        /// can confidently attribute survive. Without --def-in,
-        /// just shows refs that resolved to ANY specific def.
-        ///
-        /// Composes orthogonally with `--lexical`: see that flag's
-        /// help for the matrix.
-        #[arg(long)]
-        strict: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
     /// callHierarchy/incomingCalls. Tree-sitter name match.
@@ -248,10 +225,6 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
-        /// Use lexical (tree-sitter) name match only. See
-        /// `scry ref --lexical` for the full explanation.
-        #[arg(long)]
-        lexical: bool,
         /// Compose with build-graph reachability: drop callers whose
         /// owning module can't transitively reach a definition of
         /// NAME per the Soong/GN/kernel module graph. Same semantics
@@ -267,15 +240,6 @@ enum Cmd {
         /// drops the 1400+ traceBegin sites outside that class.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
-        /// Narrow which definition of NAME the callers must target,
-        /// by path substring of the def's file. See `scry ref
-        /// --def-in` for the full description.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop callers whose Layer 2 resolution didn't
-        /// land on a specific def. See `scry ref --strict`.
-        #[arg(long)]
-        strict: bool,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -338,12 +302,6 @@ enum Cmd {
         /// Default: all kinds.
         #[arg(long, short = 'k')]
         kind: Option<String>,
-        /// Strict mode: drop outgoing edges whose Layer 2 resolution
-        /// didn't pin a target def. Useful for "what does NAME call
-        /// that we know the target of?" — strips out unresolved
-        /// calls that the heuristic resolver couldn't attribute.
-        #[arg(long)]
-        strict: bool,
         /// Compact output. `count` emits just `N edges`. `paths`
         /// emits deduped sorted file paths of the outgoing refs —
         /// "which files does NAME touch?". Same shape as on ref /
@@ -388,25 +346,6 @@ enum Cmd {
         /// whose owning module can reach NAME's module.
         #[arg(long)]
         reachable: bool,
-        /// Narrow ROOT-LEVEL callers by callee location — same shape
-        /// as `scry ref --def-in PATH`. Only NAME's callers whose
-        /// Layer 2 resolution points at a def in PATH (or whose
-        /// resolution is None, permissively) are walked. Deeper
-        /// levels are not narrowed because the callgraph walker
-        /// doesn't track per-frame def context.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop root-level callers whose Layer 2
-        /// resolution didn't land on a specific def. See
-        /// `scry ref --strict`.
-        #[arg(long)]
-        strict: bool,
-        /// Use lexical (tree-sitter) name match only. Default
-        /// auto-engages clang USR + SCIP symbol identity filters
-        /// when their sidecars are present (root level only —
-        /// deeper recursion stays lexical). See `scry ref --lexical`.
-        #[arg(long)]
-        lexical: bool,
         #[arg(long)]
         json: bool,
     },
@@ -434,23 +373,6 @@ enum Cmd {
         /// Build-graph reachability filter on callers; off by default.
         #[arg(long)]
         reachable: bool,
-        /// Narrow the CALLERS portion of impact by callee location —
-        /// same shape as `scry ref --def-in PATH`. Doesn't affect the
-        /// subclass walk (subclasses are about the type, not the
-        /// method). Use when impact is being asked about ONE specific
-        /// `close()` overload, not every method named close.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop callers whose Layer 2 resolution didn't
-        /// land on a specific def. See `scry ref --strict`.
-        #[arg(long)]
-        strict: bool,
-        /// Use lexical (tree-sitter) name match only. Default
-        /// auto-engages clang USR + SCIP symbol identity filters
-        /// on the callers leg when their sidecars are present.
-        /// See `scry ref --lexical`.
-        #[arg(long)]
-        lexical: bool,
         #[arg(long, default_value = "200")]
         limit: usize,
         #[arg(long)]
@@ -475,13 +397,6 @@ enum Cmd {
         /// Walk the hierarchy this many levels deep. 0 = direct only.
         #[arg(long, default_value_t = 0)]
         depth: usize,
-        /// Accepted as a no-op for consistency with ref/callers/impact —
-        /// `subclasses` walks tree-sitter `InheritFrom` refs from the
-        /// modgraph and does not consult the precision sidecars, so
-        /// `--lexical` has no effect here. Lets scripts pass the flag
-        /// uniformly across query subcommands.
-        #[arg(long, hide = true)]
-        lexical: bool,
         /// Compact output. `count` emits `N subclasses` only. `paths`
         /// emits deduped sorted file paths of the children — useful
         /// for "which files define a subtype of X?" agent queries.
@@ -830,13 +745,6 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Layer 2 ref-to-def resolution: per-ref override sidecar produced
-    /// by walking the index ONCE post-finalize. For each unresolved or
-    /// ambiguous ref, narrow candidates using language-specific context
-    /// (Java today: same package + explicit imports; same fallback to
-    /// name-match for everything else). Writes ref_resolutions.bin;
-    /// the reader honors it automatically on get_ref.
-    #[clap(hide = true)]
     /// Compute and store per-file blake3 content digests
     /// (file_digests.bin) for an existing index. The digest is what
     /// `scry index --incremental` reads to decide which files actually
@@ -892,9 +800,9 @@ enum Cmd {
     /// Validate the on-disk index: confirm every required artifact
     /// exists and is non-empty, the manifest is parseable, the lazy
     /// sidecars round-trip a small sample of records, and the
-    /// optional sidecars (file_symbols, ref_resolutions, file_digests,
-    /// trigrams, chunks/embeddings) are either present-and-valid or
-    /// absent (each has its own build subcommand). Reports the state
+    /// optional sidecars (file_symbols, file_digests, trigrams) are
+    /// either present-and-valid or absent (each has its own build
+    /// subcommand). Reports the state
     /// of each. Exits non-zero on any required-artifact failure.
     Health {
         #[arg(long)]
@@ -1042,16 +950,10 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, not_in, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, not_in, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, lexical, reachable, scope, def_in, strict } => {
-            let (reachable, clang_precise, scip_precise) =
-                (reachable, false, false);
-            cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
-        }
-        Cmd::Callers { name, index, lang, in_, not_in, limit, json, lexical, reachable, scope, def_in, strict, format } => {
-            let (reachable, clang_precise, scip_precise) =
-                (reachable, false, false);
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
-        }
+        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, reachable, scope } =>
+            cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, scope),
+        Cmd::Callers { name, index, lang, in_, not_in, limit, json, reachable, scope, format } =>
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, scope),
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
         Cmd::Outline { path, index, json, limit, with_snippets } =>
@@ -1068,13 +970,13 @@ fn main() -> Result<()> {
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
-        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
-            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
-        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json } =>
-            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json),
-        Cmd::Uses { name, index, in_, not_in, kind, strict, format, limit, json } =>
-            cmd_uses(name, index, in_, not_in, kind, strict, format, limit, json),
-        Cmd::Subclasses { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
+        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, limit, json } =>
+            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, limit, json),
+        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, json } =>
+            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, json),
+        Cmd::Uses { name, index, in_, not_in, kind, format, limit, json } =>
+            cmd_uses(name, index, in_, not_in, kind, format, limit, json),
+        Cmd::Subclasses { name, index, in_, not_in, depth, format, limit, json } =>
             cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
             cmd_diff(since, in_, verbose, limit, index, json),
@@ -1311,10 +1213,11 @@ fn cmd_index(
     // (file enumeration), parse (tree-sitter + symbol extraction with
     // streaming chunk flushes), and finalize-write (the in-memory
     // writer commits its packed sidecars and manifest).
-    // build-resolutions / build-trigrams / build-digests live in
-    // `scry finalize`, not here. Each phase brackets one terse start
-    // line and a one-line done summary so operators can grep
-    // `^\[index\] phase ` for a milestone trace.
+    // The optional sidecar builders (build-file-symbols / build-file-refs
+    // / build-trigrams / build-digests) are separate subcommands, not part
+    // of this path. Each phase brackets one terse start line and a
+    // one-line done summary so operators can grep `^\[index\] phase ` for
+    // a milestone trace.
     const N_PHASES: u32 = 3;
     let t_phase_walk = Instant::now();
     eprintln!("[index] phase 1/{N_PHASES}: walk source roots ({} root{})",
@@ -2337,9 +2240,6 @@ fn cmd_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
-    def_in: Option<String>,
-    strict: bool,
-    lexical: bool,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
@@ -2356,35 +2256,6 @@ fn cmd_callgraph(
         })
     } else { None };
 
-    // Kythe-precise expansion uses `resolved_to` (written by
-    // build-resolutions exclusively from SCIP / clang USR symbol
-    // identity, no lexical heuristic) at every level of the tree.
-    // The root in-scope def set is whatever `--def-in` narrows the
-    // callee's defs to, or — when --def-in is absent — every def of
-    // the callee's bare name. Deeper levels recompute their in-scope
-    // set from the enclosing-function id of the parent call site.
-    //
-    // `--lexical` opts out of precision entirely (in_scope_def_ids
-    // = None at every level → expansion is pure name-match, same as
-    // the pre-Kythe behavior).
-    let in_scope_root_defs: Option<std::collections::HashSet<u64>> = if lexical {
-        None
-    } else {
-        let mut all = r.lookup_exact(&name);
-        if let Some(p) = def_in.as_deref() {
-            all.retain(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(p)));
-            if all.is_empty() {
-                eprintln!(
-                    "[scry] --def-in: no def of {name:?} found in any file \
-                     containing {p:?}; precision filter would reject every \
-                     candidate. Pass `--lexical` to bypass.",
-                );
-            }
-        }
-        Some(all.into_iter().map(|s| s.id).collect())
-    };
-
     /// One node in the callers tree. Children are callers of this
     /// function (i.e. parents on the call stack).
     #[derive(Debug, Default, serde::Serialize)]
@@ -2397,24 +2268,18 @@ fn cmd_callgraph(
         callers: std::collections::BTreeMap<String, Node>,
     }
 
-    /// Per-level expansion. `in_scope_def_ids = Some(set)` requires
-    /// `resolved_to ∈ set` (Kythe-precise mode); `None` means the
-    /// user opted into `--lexical` and every name-matched ref is
-    /// kept. The grouping key for children is the enclosing
-    /// function's SymbolRecord id, NOT the bare function name — so
-    /// at the next level we recurse with `Some({that-id})` and only
-    /// follow refs that Kythe attributed to THAT specific function
-    /// def, not every same-named function across the corpus.
+    /// Per-level expansion. Every name-matched call ref (after path +
+    /// reachability filters) is kept; children are grouped by the
+    /// enclosing function's SymbolRecord id so recursion follows the
+    /// exact call site, and `visited` breaks mutual-recursion cycles.
     #[allow(clippy::too_many_arguments)]
     fn expand(
         r: &StoreReader,
         callee_name: &str,
-        in_scope_def_ids: Option<&std::collections::HashSet<u64>>,
         depth_left: usize,
         in_prefix: &str,
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
-        strict: bool,
         visited: &mut std::collections::HashSet<u64>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
@@ -2446,18 +2311,6 @@ fn cmd_callgraph(
                         }
                     }
                 }
-            }
-            // Kythe-precise filter: in precise mode (Some), the ref
-            // must resolve to one of the in-scope defs. In --lexical
-            // mode (None), every name-matched ref passes. Mixed:
-            // `--strict` without precision still drops Layer-2
-            // unresolveds even in lexical mode (preserves the
-            // pre-Kythe `--strict` semantics).
-            match (in_scope_def_ids, rr.resolved_to, strict) {
-                (Some(set), Some(id), _) if !set.contains(&id) => continue,
-                (Some(_), None, _) => continue, // unresolved in precise mode
-                (None, None, true) => continue, // strict + lexical = drop unresolveds
-                _ => {}
             }
             // Caller-side identity: the enclosing function symbol id.
             // Fall back to scope_path (the enclosing class on Java)
@@ -2494,16 +2347,10 @@ fn cmd_callgraph(
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for (caller_def_id, (caller_name, mut node)) in by_caller_def {
             if visited.insert(caller_def_id) {
-                let next_scope: std::collections::HashSet<u64> =
-                    std::iter::once(caller_def_id).collect();
-                // In --lexical mode (None at this level) keep
-                // recursion lexical too — user opted out of precision
-                // for the whole tree.
-                let recurse_scope = in_scope_def_ids.map(|_| &next_scope);
                 node.callers = expand(
-                    r, &caller_name, recurse_scope,
+                    r, &caller_name,
                     depth_left - 1, in_prefix, not_in_prefix,
-                    callee_modules, strict, visited, budget,
+                    callee_modules, visited, budget,
                 );
                 visited.remove(&caller_def_id);
             }
@@ -2527,9 +2374,9 @@ fn cmd_callgraph(
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let prefix = in_.as_deref().unwrap_or("");
     let neg_prefix = not_in.as_deref().unwrap_or("");
-    let tree = expand(&r, &name, in_scope_root_defs.as_ref(), depth,
+    let tree = expand(&r, &name, depth,
                       prefix, neg_prefix, callee_modules.as_ref(),
-                      strict, &mut visited, &mut budget);
+                      &mut visited, &mut budget);
 
     if json {
         println!("{}", serde_json::json!({
@@ -2562,7 +2409,7 @@ fn cmd_callgraph(
             println!("  (no callers found)");
             // v0.1.54 — typo hint when nothing matched. Gated on
             // no narrowing flags (same logic as cmd_def / cmd_ref).
-            if in_.is_none() && not_in.is_none() && def_in.is_none() {
+            if in_.is_none() && not_in.is_none() {
                 if let Some(hint) = suggest_similar(&r, &name) {
                     eprintln!("[scry] {hint}");
                 }
@@ -2600,63 +2447,23 @@ fn cmd_impact(
     not_in: Option<String>,
     subclass_depth: usize,
     reachable: bool,
-    def_in: Option<String>,
-    strict: bool,
-    lexical: bool,
     limit: usize,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
     let r = open_index(index)?;
 
-    // Callers — lookup_refs_exact, filter by kind=call, then apply
-    // build-symbol precision (auto-on when sidecars are present —
-    // `lexical` opt-out skips it) and path filters.
+    // Callers — lookup_refs_exact, filter by kind=call, then path filters.
     let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(&name)
         .into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
-    let callers_precise = raw_callers;
-    let mut callers: Vec<RefRecord> = callers_precise.into_iter()
+    let mut callers: Vec<RefRecord> = raw_callers.into_iter()
         .filter(|rr| match r.display_path_cached(rr.file_id) {
             Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => in_.is_none() && not_in.is_none(),
         })
         .collect();
-    // v0.1.45 — narrow callers by callee location (same as ref --def-in).
-    // Doesn't affect subclasses (which are about the type, not the method).
-    if let Some(def_path) = def_in.as_deref() {
-        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
-            .iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(def_path)))
-            .map(|s| s.id)
-            .collect();
-        if target_ids.is_empty() {
-            eprintln!(
-                "[scry] impact --def-in: no def of {name:?} found in any file \
-                 containing {def_path:?}; callers will not be narrowed.",
-            );
-        } else {
-            let before = callers.len();
-            callers.retain(|rr| match rr.resolved_to {
-                Some(id) => target_ids.contains(&id),
-                None => !strict,
-            });
-            eprintln!(
-                "[scry] impact --def-in {def_path:?}{}: {} → {} callers",
-                if strict { " --strict" } else { "" },
-                before, callers.len(),
-            );
-        }
-    } else if strict {
-        let before = callers.len();
-        callers.retain(|rr| rr.resolved_to.is_some());
-        eprintln!(
-            "[scry] impact --strict: {} → {} callers (unresolved dropped)",
-            before, callers.len(),
-        );
-    }
     if reachable {
         if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(&name);
@@ -2718,7 +2525,7 @@ fn cmd_impact(
         // narrowed the search. Helps users who typo the name (the no-op
         // shape would otherwise be silently confusing).
         if callers.is_empty() && subclasses.is_empty()
-            && in_.is_none() && not_in.is_none() && def_in.is_none()
+            && in_.is_none() && not_in.is_none()
         {
             if let Some(hint) = suggest_similar(&r, &name) {
                 eprintln!("[scry] {hint}");
@@ -2918,11 +2725,7 @@ fn cmd_ref(
     json: bool,
     format: Option<String>,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
     scope: Option<String>,
-    def_in: Option<String>,
-    strict: bool,
 ) -> Result<()> {
     if let Some(f) = format.as_deref() {
         if !matches!(f, "count" | "by-def" | "paths") {
@@ -2974,103 +2777,6 @@ fn cmd_ref(
             true
         })
         .collect();
-    // --def-in PATH: only keep refs whose resolved_to points at a
-    // def whose file path contains PATH. Refs with resolved_to=None
-    // (build-resolutions couldn't narrow them) pass through — we'd
-    // rather over-include than silently drop the ones Layer 2
-    // resolution didn't reach.
-    //
-    // `scoped_defs` carries the narrowed def set into
-    // `apply_precision_filter` below so the SCIP / clang USR identity
-    // check compares against only the in-scope defs, not the full
-    // corpus-wide def union. Without this, common method names
-    // (`set`, `get`, `add`, …) degenerate the filter into "is this
-    // any same-named def anywhere" — any uncovered CU then lets
-    // unrelated `Foo.set` / `Bar.set` calls through even when the
-    // user scoped to `SystemProperties.set`.
-    let mut scoped_defs: Option<Vec<SymbolRecord>> = None;
-    let filtered = if let Some(def_path) = def_in.as_deref() {
-        let defs_in_scope: Vec<SymbolRecord> = r.lookup_exact(&name)
-            .into_iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(def_path)))
-            .collect();
-        let target_ids: std::collections::HashSet<u64> =
-            defs_in_scope.iter().map(|s| s.id).collect();
-        if target_ids.is_empty() {
-            eprintln!(
-                "[scry] --def-in: no def of {name:?} found in any file containing \
-                 {def_path:?}; returning all refs unfiltered.",
-            );
-            filtered
-        } else {
-            scoped_defs = Some(defs_in_scope);
-            let before = filtered.len();
-            let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
-                match rr.resolved_to {
-                    Some(id) => target_ids.contains(&id),
-                    // Strict mode (v0.1.34): drop unresolved instead of
-                    // permissively keeping them. Trades recall for
-                    // precision — only refs the resolver could confidently
-                    // attribute to PATH survive.
-                    None => !strict,
-                }
-            }).collect();
-            let resolved_kept = kept.iter().filter(|rr| rr.resolved_to.is_some()).count();
-            let unresolved = kept.len() - resolved_kept;
-            if strict {
-                eprintln!(
-                    "[scry] --def-in {def_path:?} --strict: {} → {} refs \
-                     ({} resolved to a def in scope; unresolved dropped)",
-                    before, kept.len(), resolved_kept,
-                );
-            } else if resolved_kept == 0 {
-                // v0.1.48 — special-case the "0 resolved" diagnostic.
-                // The generic message ("pass --strict to drop unresolved")
-                // is misleading here — strict would just return 0 hits,
-                // which doesn't help the user. The real issue is one of:
-                //   (a) the def has no callers in the corpus,
-                //   (b) the resolver couldn't attribute any caller to it
-                //       (typical for Java method dispatch without
-                //        receiver-type inference — `obj.foo()` calls
-                //        often resolve to an interface or parent class
-                //        method, not the override),
-                //   (c) the build-resolutions sidecar is stale.
-                eprintln!(
-                    "[scry] --def-in {def_path:?}: {} → {} refs (0 resolved to a \
-                     def in scope, all {} permissively kept). The over-include \
-                     is the best the heuristic resolver can do — receiver-type \
-                     inference would be needed to confidently attribute callers \
-                     to a specific override of {name:?}. Try \
-                     `scry callers {name} --format by-def` to see which defs \
-                     the callers actually resolve to.",
-                    before, kept.len(), unresolved,
-                );
-            } else {
-                eprintln!(
-                    "[scry] --def-in {def_path:?}: {} → {} refs ({} resolved to a \
-                     def in scope, {} unresolved-but-kept; pass --strict to drop \
-                     unresolved, or run `scry build-resolutions` for tighter narrowing)",
-                    before, kept.len(), resolved_kept, unresolved,
-                );
-            }
-            kept
-        }
-    } else if strict {
-        // --strict without --def-in: drop refs the resolver couldn't
-        // attribute to any specific def. Useful for "show me only the
-        // confidently-resolved call sites of X".
-        let before = filtered.len();
-        let kept: Vec<RefRecord> = filtered.into_iter()
-            .filter(|rr| rr.resolved_to.is_some()).collect();
-        eprintln!(
-            "[scry] --strict: {} → {} refs (unresolved dropped)",
-            before, kept.len(),
-        );
-        kept
-    } else {
-        filtered
-    };
     // --reachable: drop refs whose owning module can't transitively
     // reach any module that defines the name, per the Soong / GN /
     // kernel module-graph sidecar. No-op without the sidecar
@@ -3123,7 +2829,6 @@ fn cmd_ref(
     } else {
         filtered
     };
-    let _ = &scoped_defs;
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
     // --format count: just the totals, no per-hit rows. Pays off for
     // "how many callers does X have?" agent queries — one short line
@@ -3158,7 +2863,7 @@ fn cmd_ref(
     if filtered.is_empty()
         && in_.is_none() && not_in.is_none()
         && lang.is_none()
-        && scope.is_none() && def_in.is_none()
+        && scope.is_none()
     {
         if let Some(hint) = suggest_similar(&r, &name) {
             eprintln!("[scry] {hint}");
@@ -3168,7 +2873,8 @@ fn cmd_ref(
     Ok(())
 }
 
-/// Histogram of refs grouped by their Layer 2 resolved_to target.
+/// Histogram of refs grouped by their resolved_to target (Layer-1
+/// name match; null on streaming indexes that skip the resolve pass).
 /// Human format: `<count>  → file:line [scope]` per group,
 /// descending by count, capped at `limit` groups. Unresolved refs
 /// are bucketed into a single `<unresolved>` row at the bottom.
@@ -3318,14 +3024,6 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
         *by_kind.entry(s.kind).or_default() += 1;
     }
 
-    // Resolution sidecar coverage (v0.1.41). None ⇒ sidecar absent
-    // (no `scry build-resolutions` was run).
-    let resolved_count = r.count_resolved_refs();
-    let total_refs = r.manifest.stats.refs;
-    let resolved_pct = resolved_count.map(|n|
-        if total_refs == 0 { 0.0 }
-        else { (n as f64) * 100.0 / (total_refs as f64) });
-
     if json {
         let by_lang_map: serde_json::Map<String, serde_json::Value> = by_lang.iter()
             .map(|(k, c)| (k.as_str().to_string(), serde_json::json!(c)))
@@ -3347,8 +3045,6 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
             "bytes_total":     r.manifest.stats.bytes_total,
             "symbols":         r.manifest.stats.symbols,
             "refs":            r.manifest.stats.refs,
-            "refs_resolved":   resolved_count,
-            "refs_resolved_pct": resolved_pct,
             "elapsed_ms":      r.manifest.stats.elapsed_ms,
             "by_lang":         serde_json::Value::Object(by_lang_map),
             "by_kind":         serde_json::Value::Object(by_kind_map),
@@ -3369,12 +3065,6 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
     println!("bytes-total:  {}", human_bytes(r.manifest.stats.bytes_total));
     println!("symbols:      {}", r.manifest.stats.symbols);
     println!("refs:         {}", r.manifest.stats.refs);
-    match (resolved_count, resolved_pct) {
-        (Some(n), Some(p)) => println!("refs-resolved: {n} ({p:.1}%)"),
-        _ => println!(
-            "refs-resolved: <no sidecar — run `scry build-resolutions` to enable>",
-        ),
-    }
     println!("elapsed-ms:   {}", r.manifest.stats.elapsed_ms);
 
     println!("\nby language:");
@@ -4317,7 +4007,7 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
     eprintln!("\n{} refs (showing {})", refs.len(), refs.len().min(limit));
 }
 
-/// Render the `→ def:...` suffix for a ref whose Layer 2 resolution
+/// Render the `→ def:...` suffix for a ref whose Layer-1 resolution
 /// picked a specific def. Shows the def's filename + line + scope so
 /// users can SEE which class's method the ref targets — the previous
 /// `→ def:707c64fb...` hex id was unintelligible and made it
@@ -4901,7 +4591,6 @@ fn cmd_uses(
     in_: Option<String>,
     not_in: Option<String>,
     kind: Option<String>,
-    strict: bool,
     format: Option<String>,
     limit: usize,
     json: bool,
@@ -4973,20 +4662,7 @@ fn cmd_uses(
         }
     }
 
-    // v0.1.49 — --strict drops outgoing edges the resolver couldn't
-    // attribute to a specific def. Useful for "show me only the
-    // outgoing calls whose target we KNOW", filtering out the noise
-    // of unresolved heuristic-only matches.
-    if strict {
-        let before = out_refs.len();
-        out_refs.retain(|rr| rr.resolved_to.is_some());
-        eprintln!(
-            "[scry] uses --strict: {} → {} edges (unresolved dropped)",
-            before, out_refs.len(),
-        );
-    }
-
-    // v0.1.57 — --format paths / count on uses (symmetric with ref/callers).
+    // --format paths / count on uses (symmetric with ref/callers).
     match format.as_deref() {
         Some("count") => {
             println!("{} edges", out_refs.len());
@@ -5042,17 +4718,6 @@ fn next_function_byte_start(
 }
 
 // ---------------------------------------------------------------------------
-// build-resolutions (Layer 2 ref→def resolution sidecar)
-// ---------------------------------------------------------------------------
-
-/// One-shot pass over the finalized index producing a u64-LE per-ref
-/// override (`ref_resolutions.bin`). Algorithm:
-///   1. Walk symbols once → name → Vec<(sym_idx, sym_id, file_id, lang)>
-///      and per_file_pkg (Java only) from kind=Package symbols.
-///   2. Walk refs once → for each ref, narrow candidates with the
-///      file's package + imports, fall back to plain name match, write
-///      the chosen def's u64 id to the sidecar (or 0 if unresolved).
-// ---------------------------------------------------------------------------
 // build-digests (per-file blake3 content digest sidecar)
 // ---------------------------------------------------------------------------
 //
@@ -5098,7 +4763,7 @@ fn cmd_build_digests(index: Option<PathBuf>, workers: usize) -> Result<()> {
     eprintln!("[digests] hashed in {} ms", t.elapsed().as_millis());
 
     // Write to .tmp then atomic-rename — same pattern as
-    // build-file-symbols / build-resolutions.
+    // build-file-symbols.
     let tmp = paths.file_digests().with_extension("bin.tmp");
     {
         use std::io::{BufWriter, Write};
@@ -5275,7 +4940,7 @@ fn cmd_index_diff(
 //   - True append-only writes preserving old file_ids. The new index
 //     reassigns file_ids 0..N sequentially; readers re-open and see
 //     the new mapping. (No external state depends on file_id stability.)
-//   - Re-run build-resolutions or build-file-symbols. The user can
+//   - Re-run build-file-symbols / build-file-refs. The user can
 //     invoke them post-incremental if they need the sidecars.
 fn cmd_index_incremental(
     roots: Vec<PathBuf>,
@@ -6463,14 +6128,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar. Opt-in (not default) because the module graph is ~256MB and adds ~50-500ms to first query in a process."},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever their sidecars are present, dropping name-collision false positives across C/C++/ObjC + Java/Kotlin/Rust/Go/TS/Python. Set true to see raw name-match results (debugging / want-everything mode)."},
                 "scope": {"type": "string",
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
-                "def_in": {"type": "string",
-                    "description": "Substring of the def-site file path. Keeps only refs whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` disambiguates `close` when many unrelated classes also define `close`. Refs whose resolved_to is None pass through (over-include rather than silently drop). No-op without a build-resolutions sidecar."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop refs whose Layer 2 resolution didn't land on a specific def (resolved_to=None). With `def_in`, also drops the permissive over-include — only refs the resolver confidently attributed to the target survive. Without `def_in`, shows only refs that resolved to some specific def."},
                 "format": {"type": "string", "enum": ["by-def", "paths"],
                     "description": "Output mode. `by-def` returns a histogram array `[{count, def: {path, line, col, scope, kind, id}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files contain refs to X?`. Without `format`, returns the per-ref JSONL stream."},
             })),
@@ -6480,10 +6139,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "Find call sites of NAME (shorthand for `ref` with \
              kind=call). For 'does X get called anywhere?' or 'how \
              many?', pass `format: 'count'` — it returns just `N \
-             callers` and costs almost nothing. Build-symbol \
-             precision filters (clang USRs / SCIP symbols) \
-             auto-engage when their sidecars are present; pass \
-             `lexical: true` for raw name-match. Set `reachable: \
+             callers` and costs almost nothing. Set `reachable: \
              true` for build-graph pruning (extra ~50-500ms cost).",
             obj(&["name"], serde_json::json!({
                 "name": {"type": "string"},
@@ -6494,14 +6150,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present. Opt-in."},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Same as on `ref` — opt out of all auto-engaged precision filters and return raw name-match callers."},
                 "scope": {"type": "string",
                     "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
-                "def_in": {"type": "string",
-                    "description": "Substring of the def-site file path. Keeps only callers whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` cuts through cases where many classes share a method name like `close`. Callers whose resolved_to is None pass through. No-op without a build-resolutions sidecar."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include — only callers the resolver confidently attributed survive. Trades recall for precision."},
                 "format": {"type": "string", "enum": ["by-def", "paths"],
                     "description": "Output mode. `by-def` returns a histogram array `[{count, def: {...}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last — invaluable for polymorphic names like `close`, `onCreate`, `transact`. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files call X?`."},
             })),
@@ -6537,8 +6187,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "kind":  {"type": "string",
                     "description": "Filter by ref kind: call, type, field, import, inherit, using-ns. Default: all."},
                 "limit": limit_prop,
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop outgoing edges whose Layer 2 resolution didn't pin a target. Use for `what does NAME call that we KNOW the target of?` — strips heuristic-only matches the resolver couldn't attribute."},
                 "format": {"type": "string", "enum": ["count", "paths"],
                     "description": "Optional. `count` returns `{count: N}` — cheapest probe for `how many edges`. `paths` returns a deduped sorted array of file paths — `which files does NAME touch?`. Without `format`, returns per-ref JSONL stream."},
             })),
@@ -6550,11 +6198,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
              levels via `enclosing_function` resolution (more \
              accurate than scope_path for Java/Kotlin where the \
              scope is the class). `--max-nodes` caps total expansion \
-             on hub functions (logger, assert, etc.). Root-level \
-             callers are auto-filtered by clang USR + SCIP symbol \
-             identity when those sidecars are present; pass \
-             `lexical: true` to opt out and see the raw name-match \
-             tree.",
+             on hub functions (logger, assert, etc.).",
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
@@ -6562,12 +6206,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "depth": {"type": "integer", "minimum": 1, "default": 3},
                 "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
                 "reachable": {"type": "boolean", "default": false},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters on the ROOT level whenever the sidecars are present. Deeper recursion stays lexical (walker doesn't track per-name precision context)."},
-                "def_in": {"type": "string",
-                    "description": "Substring of the def-site file path for the ROOT callee. Same shape as `ref --def-in`. Narrows ONLY the topmost level — deeper recursive levels are not filtered because the walker doesn't track per-frame def context."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop root-level callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include."},
             })),
         ),
         tool(
@@ -6577,11 +6215,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
              Returns counts (callers, subclasses, files_touched) plus \
              the up-to-`limit` instances of each. Use this as a \
              pre-flight check before refactors: small counts → safe \
-             rename; large counts → split the change. The callers \
-             leg auto-engages clang USR + SCIP symbol identity \
-             filters (sidecar-gated); pass `lexical: true` to opt \
-             out. Subclasses leg is identity-based already \
-             (type-hierarchy lookup).",
+             rename; large counts → split the change.",
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
@@ -6591,12 +6225,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "BFS depth for the subclass leg of the impact set."},
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Build-graph reachability filter on callers leg only."},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Use lexical (tree-sitter) name match only for the callers leg. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever the sidecars are present."},
-                "def_in": {"type": "string",
-                    "description": "Narrow the callers portion by def-site path (same as `ref --def-in`). Doesn't affect the subclass walk."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop callers whose Layer 2 resolution didn't land on a specific def."},
             })),
         ),
         tool(
@@ -6691,12 +6319,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
         tool(
             "stats",
             "Index metadata: size, file/symbol/ref counts, freshness, \
-             scry_version, and Layer 2 resolution coverage \
-             (`refs_resolved` + `refs_resolved_pct`, both null when \
-             the build-resolutions sidecar isn't present). No \
-             arguments. Useful as a first probe before harder \
-             queries — the resolution percentage tells you how much \
-             of the call-graph the resolver has nailed down.",
+             and scry_version. No arguments. Useful as a first probe \
+             before harder queries.",
             serde_json::json!({
                 "type": "object", "properties": serde_json::json!({}),
             }),
@@ -7224,30 +6848,18 @@ fn serve_one_request<W: std::io::Write>(
             serve_fuzzy_with_distance(reader, arg_str("substr"), in_, not_in, dist, limit)
         }
         "ref"     => {
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                (explicit_reachable, false, false);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
+            serve_ref(reader, arg_str("name"), lang, kind, in_, not_in, limit, reachable, scope, format)
         }
         "callers" => {
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                (explicit_reachable, false, false);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, not_in, limit, reachable, scope, format)
         }
         "subclasses" => {
             let depth = args.get("depth")
@@ -7260,16 +6872,9 @@ fn serve_one_request<W: std::io::Write>(
             let depth = args.get("subclass_depth")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(2);
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                (explicit_reachable, false, false);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable,
-                         clang_precise, scip_precise, def_in, strict, limit)
+            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable, limit)
         }
         "callgraph" => {
             let depth = args.get("depth")
@@ -7278,21 +6883,13 @@ fn serve_one_request<W: std::io::Write>(
             let max_nodes = args.get("max_nodes")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(200);
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                (explicit_reachable, false, false);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes,
-                            reachable, clang_precise, scip_precise, def_in, strict)
+            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes, reachable)
         }
         "uses" => {
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_uses(reader, arg_str("name"), in_, not_in, kind, strict, format, limit)
+            serve_uses(reader, arg_str("name"), in_, not_in, kind, format, limit)
         }
         "grep"    => {
             let ci = args.get("case_insensitive")
@@ -7532,23 +7129,9 @@ fn serve_ref(
     not_in: Option<&str>,
     limit: usize,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
     scope: Option<&str>,
-    def_in: Option<&str>,
-    strict: bool,
     format: Option<&str>,
 ) -> serde_json::Value {
-    // --def-in PATH: precompute the target def id set. Empty target
-    // set ⇒ no filtering (matches cmd_ref's "over-include rather than
-    // silently drop" policy; daemon stays quiet on diagnostics).
-    let def_target_ids: Option<std::collections::HashSet<u64>> = def_in.map(|p| {
-        r.lookup_exact(name).iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(p)))
-            .map(|s| s.id)
-            .collect()
-    });
     // Precompute the callee module set ONCE if --reachable + sidecar.
     // Same shape as cmd_ref's filter. No graph or no defs → no filter
     // (callers pass through unchanged; the daemon doesn't emit a
@@ -7563,10 +7146,6 @@ fn serve_ref(
     } else {
         None
     };
-    // scry is tree-sitter only: there are no precision sidecars, so the
-    // build-symbol def-identity sets are always empty and the precision
-    // filter below is a pass-through.
-    let _ = (clang_precise, scip_precise);
     let by_def = format == Some("by-def");
     let paths_only = format == Some("paths");
     // by-def + paths both need to see ALL surviving refs to build their
@@ -7586,24 +7165,6 @@ fn serve_ref(
         if !file_path_matches(r, rr.file_id, in_, not_in) { continue; }
         if let Some(sc) = scope {
             if !rr.scope_path.iter().any(|seg| seg == sc) { continue; }
-        }
-        // --def-in filter: keep refs whose resolved_to lands in the
-        // target def set. Permissive mode keeps unresolved (None) too;
-        // --strict (v0.1.34) drops them.
-        // Empty target set ⇒ no narrowing (target def list was empty).
-        if let Some(tids) = def_target_ids.as_ref() {
-            if !tids.is_empty() {
-                match rr.resolved_to {
-                    Some(id) if !tids.contains(&id) => continue,
-                    None if strict => continue,
-                    _ => {}
-                }
-            }
-        }
-        // --strict without --def-in: drop unresolved refs entirely
-        // (only keep refs the resolver could attribute to some def).
-        if strict && def_target_ids.is_none() && rr.resolved_to.is_none() {
-            continue;
         }
         // Reachability filter: keep only refs whose owning module can
         // reach at least one module that defines `name`.
@@ -7695,7 +7256,6 @@ fn serve_uses(
     in_: Option<&str>,
     not_in: Option<&str>,
     kind: Option<&str>,
-    strict: bool,
     format: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
@@ -7729,8 +7289,6 @@ fn serve_uses(
             if let Some(k) = kind {
                 if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
             }
-            // v0.1.49 — --strict drops unresolved outgoing edges.
-            if strict && rr.resolved_to.is_none() { continue; }
             let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
             if seen.insert(key) {
                 if paths_only {
@@ -7759,7 +7317,6 @@ fn serve_uses(
 /// `callgraph` JSON-RPC handler — returns the recursive callers
 /// tree. Same algorithm as [`cmd_callgraph`]; result shape mirrors
 /// the CLI's `--json` payload.
-#[allow(clippy::too_many_arguments)]
 fn serve_callgraph(
     r: &StoreReader,
     name: &str,
@@ -7768,10 +7325,6 @@ fn serve_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
-    def_in: Option<&str>,
-    strict: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     let neg_prefix = not_in.unwrap_or("");
@@ -7781,23 +7334,6 @@ fn serve_callgraph(
                 .filter_map(|s| mg.module_of_file(s.file_id)).collect()
         })
     } else { None };
-
-    // Kythe-precise expansion at every level (same shape as
-    // cmd_callgraph). `--lexical` opt-out is signalled by neither
-    // clang_precise nor scip_precise being set — when both are
-    // false, callers got `--lexical` from the RPC, so we skip the
-    // resolved_to filter to match the CLI semantics.
-    let lexical_mode = !clang_precise && !scip_precise;
-    let in_scope_root_defs: Option<std::collections::HashSet<u64>> = if lexical_mode {
-        None
-    } else {
-        let mut all = r.lookup_exact(name);
-        if let Some(p) = def_in {
-            all.retain(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(p)));
-        }
-        Some(all.into_iter().map(|s| s.id).collect())
-    };
 
     #[derive(Debug, Default, serde::Serialize)]
     struct Node {
@@ -7810,12 +7346,10 @@ fn serve_callgraph(
     fn expand(
         r: &StoreReader,
         callee_name: &str,
-        in_scope_def_ids: Option<&std::collections::HashSet<u64>>,
         depth_left: usize,
         in_prefix: &str,
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
-        strict: bool,
         visited: &mut std::collections::HashSet<u64>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
@@ -7839,12 +7373,6 @@ fn serve_callgraph(
                         }
                     }
                 }
-            }
-            match (in_scope_def_ids, rr.resolved_to, strict) {
-                (Some(set), Some(id), _) if !set.contains(&id) => continue,
-                (Some(_), None, _) => continue,
-                (None, None, true) => continue,
-                _ => {}
             }
             let enc = r.enclosing_function(rr.file_id, rr.byte_start);
             let path = r.file_display_path(rr.file_id).unwrap_or_default();
@@ -7873,12 +7401,9 @@ fn serve_callgraph(
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for (caller_def_id, (caller_name, mut node)) in by_caller_def {
             if visited.insert(caller_def_id) {
-                let next_scope: std::collections::HashSet<u64> =
-                    std::iter::once(caller_def_id).collect();
-                let recurse_scope = in_scope_def_ids.map(|_| &next_scope);
-                node.callers = expand(r, &caller_name, recurse_scope,
+                node.callers = expand(r, &caller_name,
                     depth_left - 1, in_prefix, not_in_prefix,
-                    callee_modules, strict, visited, budget);
+                    callee_modules, visited, budget);
                 visited.remove(&caller_def_id);
             }
             let existing = out.entry(caller_name).or_default();
@@ -7896,9 +7421,9 @@ fn serve_callgraph(
 
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let tree = expand(r, name, in_scope_root_defs.as_ref(), depth,
+    let tree = expand(r, name, depth,
                       prefix, neg_prefix, callee_modules.as_ref(),
-                      strict, &mut visited, &mut budget);
+                      &mut visited, &mut budget);
     serde_json::json!({
         "callee": name,
         "depth": depth,
@@ -7911,7 +7436,6 @@ fn serve_callgraph(
 /// subclasses + files_touched summary. Same algorithm as
 /// [`cmd_impact`]; result shape mirrors the CLI's `--json` output
 /// so an LLM can consume either uniformly.
-#[allow(clippy::too_many_arguments)]
 fn serve_impact(
     r: &StoreReader,
     name: &str,
@@ -7919,39 +7443,14 @@ fn serve_impact(
     not_in: Option<&str>,
     subclass_depth: usize,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
-    def_in: Option<&str>,
-    strict: bool,
     limit: usize,
 ) -> serde_json::Value {
-    // Apply precision (clang USR + SCIP) on the callers leg only.
-    // Subclasses use type-hierarchy lookup; no symbol-identity index
-    // applies there. Soft-fail on sidecar errors so a broken sidecar
-    // doesn't take down the daemon RPC.
     let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
     let mut callers: Vec<RefRecord> = raw_callers.into_iter()
         .filter(|rr| file_path_matches(r, rr.file_id, in_, not_in))
         .collect();
-    // v0.1.46 — same root-level narrowing as cmd_impact.
-    if let Some(def_path) = def_in {
-        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(name)
-            .iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(def_path)))
-            .map(|s| s.id)
-            .collect();
-        if !target_ids.is_empty() {
-            callers.retain(|rr| match rr.resolved_to {
-                Some(id) => target_ids.contains(&id),
-                None => !strict,
-            });
-        }
-    } else if strict {
-        callers.retain(|rr| rr.resolved_to.is_some());
-    }
     if reachable {
         if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(name);
@@ -8324,13 +7823,6 @@ fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Val
 }
 
 fn serve_stats(r: &StoreReader) -> serde_json::Value {
-    // Mirror cmd_stats's v0.1.41 additions so MCP clients and CLI
-    // see the same resolution-coverage fields.
-    let refs_resolved = r.count_resolved_refs();
-    let refs_resolved_pct = refs_resolved.map(|n| {
-        if r.manifest.stats.refs == 0 { 0.0 }
-        else { (n as f64) * 100.0 / (r.manifest.stats.refs as f64) }
-    });
     serde_json::json!({
         "scry_version": r.manifest.scry_version,
         "indexed_at": r.manifest.indexed_at,
@@ -8340,8 +7832,6 @@ fn serve_stats(r: &StoreReader) -> serde_json::Value {
         "files_total": r.manifest.stats.files_total,
         "symbols": r.manifest.stats.symbols,
         "refs": r.manifest.stats.refs,
-        "refs_resolved": refs_resolved,
-        "refs_resolved_pct": refs_resolved_pct,
         "bytes_total": r.manifest.stats.bytes_total,
         "elapsed_ms": r.manifest.stats.elapsed_ms,
     })
@@ -8372,9 +7862,9 @@ fn ref_to_json(r: &StoreReader, rr: &RefRecord) -> serde_json::Value {
         "line": rr.line,
         "col": rr.col,
         "scope": rr.scope_path,
-        // resolved_to is the Layer 2 sidecar override (or Layer 1
-        // in-memory name match); 0 / null means we don't know the
-        // exact definition this ref points to.
+        // resolved_to comes from the Layer-1 in-memory name match
+        // (populated on non-streaming indexes); null means we don't
+        // know the exact definition this ref points to.
         "resolved_to": rr.resolved_to,
     })
 }
@@ -8867,7 +8357,7 @@ mod tests {
         // the bare message into text. Test the contract via the
         // public helper + a constructed Value matching what serve
         // emits.
-        let serve_result = serde_json::json!({"error": "missing sidecar — run `scry build-resolutions`"});
+        let serve_result = serde_json::json!({"error": "missing sidecar — run `scry build-file-refs`"});
         // Simulate the unwrap that mcp_tools_call performs.
         let err_val = serve_result.as_object().and_then(|m| m.get("error"))
             .expect("serve emits {error: <string>}");
@@ -8880,7 +8370,7 @@ mod tests {
                 "tool-error text must be the bare message, not a JSON literal; got: {text}");
         assert!(text.contains("missing sidecar"),
                 "tool-error text must preserve the hint; got: {text}");
-        assert!(text.contains("build-resolutions"),
+        assert!(text.contains("build-file-refs"),
                 "tool-error text must include the actionable hint; got: {text}");
     }
 

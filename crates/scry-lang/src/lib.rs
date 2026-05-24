@@ -742,11 +742,10 @@ fn java_spec() -> &'static LangSpec {
                 (method_declaration name: (identifier) @name) @def.method
                 (constructor_declaration name: (identifier) @name) @def.ctor
                 (field_declaration declarator: (variable_declarator name: (identifier) @name)) @def.field
-                ; Package declaration — emit one Package symbol per file.
-                ; cmd_build_resolutions builds per_file_pkg from these so
-                ; same-pkg and import-aware narrowing can fire. The inner
-                ; scoped_identifier text (e.g. "android.os") becomes the
-                ; symbol's name; the kind comes from the outer
+                ; Package declaration — emit one Package symbol per file
+                ; so `scry def --kind package` and package-scoped queries
+                ; work. The inner scoped_identifier text (e.g. "android.os")
+                ; becomes the symbol's name; the kind comes from the outer
                 ; @def.package capture.
                 (package_declaration (scoped_identifier) @name) @def.package
                 (package_declaration (identifier) @name) @def.package
@@ -809,9 +808,9 @@ fn kotlin_spec() -> &'static LangSpec {
                 (type_alias (identifier) @name) @def.type
                 (enum_entry (identifier) @name) @def.variant
                 ; Kotlin package header — emit one Package symbol per
-                ; file so cmd_build_resolutions's per_file_pkg map gets
-                ; populated for Kotlin too (Java already handled via its
-                ; own package_declaration rule). tree-sitter-kotlin-NG
+                ; file so package-scoped queries work for Kotlin too
+                ; (Java already handled via its own package_declaration
+                ; rule). tree-sitter-kotlin-NG
                 ; always wraps the package name in qualified_identifier
                 ; (even single-segment packages — qualified_identifier
                 ; uses `repeat`, not `repeat1`), so one pattern suffices.
@@ -1472,10 +1471,10 @@ fn yaml_spec() -> &'static LangSpec {
 /// Wildcard import hook for Java. Walks the parse tree for
 /// `import_declaration` nodes that contain an `asterisk` child,
 /// extracts the `scoped_identifier` (or `identifier`) sibling, and
-/// emits a synthetic Import ref with `name = "{path}.*"`. This is
-/// what lets the build-resolutions wildcard branch fire on real
-/// codebases — tree-sitter queries alone can't combine the
-/// scoped_identifier text with the trailing `*` into one capture.
+/// emits a synthetic Import ref with `name = "{path}.*"`. This makes
+/// wildcard imports searchable via `scry ref "{path}.*" --kind import`
+/// — tree-sitter queries alone can't combine the scoped_identifier
+/// text with the trailing `*` into one capture.
 fn java_wildcard_imports(tree: &tree_sitter::Tree, source: &[u8], out: &mut Vec<RawRef>) {
     java_kotlin_wildcard_imports_impl(
         tree, source, out,
@@ -1590,9 +1589,8 @@ fn java_refs_spec() -> &'static RefSpec {
                 ; assignment_expression — separate pattern needed.
                 (variable_declarator value: (identifier) @ref.field)
                 ; Capture the FULL path of an import (e.g. "android.os.PerfettoTrace"),
-                ; not just the trailing identifier. The resolver splits on the last
-                ; `.` to get (pkg, simple) — without the package side, import-aware
-                ; narrowing in build-resolutions can never fire.
+                ; not just the trailing identifier, so `scry ref` can match an
+                ; import by its fully-qualified name.
                 ; Wildcard imports (`import android.os.*;`) are not captured here
                 ; because tree-sitter queries can't combine the scoped_identifier
                 ; text with the trailing `*` into one capture; wildcard support

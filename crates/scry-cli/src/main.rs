@@ -1044,12 +1044,12 @@ fn main() -> Result<()> {
         }
         Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, lexical, reachable, scope, def_in, strict } => {
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, reachable);
+                (reachable, false, false);
             cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         Cmd::Callers { name, index, lang, in_, not_in, limit, json, lexical, reachable, scope, def_in, strict, format } => {
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, reachable);
+                (reachable, false, false);
             cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
         }
         Cmd::Stats { index, json } => cmd_stats(index, json),
@@ -2616,11 +2616,7 @@ fn cmd_impact(
         .into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
-    let (_reach, clang_precise, scip_precise) =
-        resolve_precision(lexical, false);
-    let callers_precise = apply_precision_filter(
-        &r, &name, raw_callers, clang_precise, scip_precise, None,
-    )?;
+    let callers_precise = raw_callers;
     let mut callers: Vec<RefRecord> = callers_precise.into_iter()
         .filter(|rr| match r.display_path_cached(rr.file_id) {
             Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
@@ -2907,71 +2903,7 @@ fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bo
         scored.len());
 }
 
-/// Resolve the precision flags. Default-on precision picks up
-/// clang USR + SCIP identity filters (both cheap: small sidecars,
-/// O(1) hash lookups, no-op if missing). Build-graph reachability
-/// (`--reachable`) stays explicit opt-in because the AOSP
-/// `module_graph.json` is 256MB and its eager parse + Warshall
-/// closure costs ~30s cold — paying that on every CLI invocation
-/// would crush the per-query latency the user expects from a
-/// grep-class tool. `--lexical` turns everything off, leaving
-/// pure tree-sitter name match.
-///
-/// Returns `(reachable, clang_precise, scip_precise)`. The latter
-/// two booleans gate which sidecar `apply_precision_filter` will
-/// consult; they're not surfaced as standalone CLI flags because
-/// the user choice is binary: precise-by-default or `--lexical`.
-fn resolve_precision(
-    lexical: bool,
-    explicit_reachable: bool,
-) -> (bool, bool, bool) {
-    // scry is tree-sitter only: there are no build-symbol precision
-    // sidecars (clang USR / SCIP) to engage, so precision is always off.
-    // `--lexical` is accepted as a documented no-op (this is the only mode).
-    let _ = lexical;
-    (explicit_reachable, false, false)
-}
 
-/// Apply build-symbol precision filtering (clang USR + SCIP symbol
-/// identity) to a candidate set of refs.
-///
-/// **Strict-by-default semantics (Kythe parity).** When precision is
-/// engaged we treat every ref as guilty until proven innocent: a ref
-/// survives only if its byte-position resolves to the same identity
-/// (USR / SCIP symbol) as one of NAME's defs. The previous
-/// "permissive over-include when uncovered" behaviour was a
-/// tree-sitter heuristic — it kept refs whose TU the build indexer
-/// hadn't seen, masking the gap and silently degrading precision.
-/// That fallback is gone; the only way back to tree-sitter
-/// behaviour is `--lexical`, which short-circuits this function
-/// entirely.
-///
-/// **Per-language sidecar policy.** C/C++/ObjC files use the clang
-/// USR sidecar; everything else uses SCIP. The two filters operate
-/// independently:
-///   - C-family ref + clang sidecar present  →  must match a def USR.
-///   - C-family ref + clang sidecar absent   →  unverifiable; drop.
-///   - Non-C ref     + SCIP sidecar present  →  must match a def sym.
-///   - Non-C ref     + SCIP sidecar absent   →  unverifiable; drop.
-///
-/// **Hard error only when BOTH sidecars are absent AND both filters
-/// were requested.** Otherwise we silently drop unverifiable refs
-/// (with a diagnostic). This lets a Python-only or Rust-only index
-/// run the default-on precision path without insisting on
-/// `clang_usrs.bin`, while still refusing to silently degrade to
-/// tree-sitter when nothing precision-grade exists.
-pub(crate) fn apply_precision_filter(
-    _r: &StoreReader,
-    _name: &str,
-    refs: Vec<RefRecord>,
-    _clang_precise: bool,
-    _scip_precise: bool,
-    _defs_override: Option<Vec<SymbolRecord>>,
-) -> Result<Vec<RefRecord>> {
-    // scry is tree-sitter only: no precision sidecars exist, so this is a
-    // pass-through. Callers always pass clang_precise = scip_precise = false.
-    Ok(refs)
-}
 
 
 #[allow(clippy::too_many_arguments)]
@@ -3191,9 +3123,7 @@ fn cmd_ref(
     } else {
         filtered
     };
-    let filtered = apply_precision_filter(
-        &r, &name, filtered, clang_precise, scip_precise, scoped_defs,
-    )?;
+    let _ = &scoped_defs;
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
     // --format count: just the totals, no per-hit rows. Pays off for
     // "how many callers does X have?" agent queries — one short line
@@ -7299,7 +7229,7 @@ fn serve_one_request<W: std::io::Write>(
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
+                (explicit_reachable, false, false);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -7312,7 +7242,7 @@ fn serve_one_request<W: std::io::Write>(
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
+                (explicit_reachable, false, false);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -7335,7 +7265,7 @@ fn serve_one_request<W: std::io::Write>(
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
+                (explicit_reachable, false, false);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable,
@@ -7353,7 +7283,7 @@ fn serve_one_request<W: std::io::Write>(
             let explicit_reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
             let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
+                (explicit_reachable, false, false);
             let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
             let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes,
@@ -8002,14 +7932,7 @@ fn serve_impact(
     let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
-    let callers_precise = if clang_precise || scip_precise {
-        apply_precision_filter(r, name, raw_callers, clang_precise, scip_precise, None)
-            .unwrap_or_else(|_| r.lookup_refs_exact(name).into_iter()
-                .filter(|rr| rr.kind == scry_store::RefKind::Call).collect())
-    } else {
-        raw_callers
-    };
-    let mut callers: Vec<RefRecord> = callers_precise.into_iter()
+    let mut callers: Vec<RefRecord> = raw_callers.into_iter()
         .filter(|rr| file_path_matches(r, rr.file_id, in_, not_in))
         .collect();
     // v0.1.46 — same root-level narrowing as cmd_impact.

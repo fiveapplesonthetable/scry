@@ -240,20 +240,10 @@ fn synthetic_tree_roundtrip() {
             "grep should hit Binder.java's transact() definition, got {:?}",
             hits.iter().map(|h| h["path"].clone()).collect::<Vec<_>>());
 
-    // 6. Run build-resolutions + assert Java refs get resolved_to set.
-    // This pins the Layer 2 sidecar end-to-end — apply_resolution_override
-    // in get_ref + the build-resolutions writer + the JSON serializer
-    // all have to work together for resolved_to to show up.
+    // 6. scry is tree-sitter only: there is no precision/resolution sidecar,
+    // so every Java ref's resolved_to must be null. Assert that contract.
     let out = Command::new(scry_bin())
-        .args(["build-resolutions", "--index"])
-        .arg(&idx)
-        .output()
-        .expect("spawn scry build-resolutions");
-    assert!(out.status.success(),
-            "scry build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
-    // --lexical: synthetic Java/AOSP fixture, no precision sidecars.
-    let out = Command::new(scry_bin())
-        .args(["callers", "transact", "--lexical", "--index"])
+        .args(["callers", "transact", "--index"])
         .arg(&idx)
         .args(["--json"])
         .output()
@@ -263,11 +253,9 @@ fn synthetic_tree_roundtrip() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     assert!(!lines.is_empty(), "expected at least one transact caller");
-    // build-resolutions is Kythe-only: every resolved_to comes from
-    // clang_usrs.bin / scip_index.bin. This synthetic fixture ships
-    // neither sidecar, so every resolved_to must be null. (The
-    // tree-sitter heuristic resolver was deleted in favour of the
-    // Kythe-only contract — see cmd_build_resolutions.)
+    // `scry index` always streams (flush_every defaults to 50k), which
+    // skips the in-memory Layer-1 resolve pass, so every ref's
+    // resolved_to must be null on this fixture.
     let resolved_count = lines.iter()
         .filter(|l| l["resolved_to"].as_u64().is_some()).count();
     assert_eq!(resolved_count, 0,
@@ -733,7 +721,7 @@ fn synthetic_tree_roundtrip() {
     };
     assert_smoke(&["prefix", "Bra", "--json"],     "Bravo",   "cmd_prefix");
     assert_smoke(&["fuzzy", "Bravo", "--json"],    "Bravo",   "cmd_fuzzy");
-    assert_smoke(&["ref",   "Bravo", "--lexical", "--json"],    "[",       "cmd_ref");
+    assert_smoke(&["ref",   "Bravo", "--json"],    "[",       "cmd_ref");
     assert_smoke(&["coverage", ".", "--json"],     "files",   "cmd_coverage");
 
     // 8h-fail. Locks the `[fail] PATH kind=… size=… reason=…` log line
@@ -883,9 +871,8 @@ fn synthetic_tree_roundtrip() {
     // 8j-bis. callers / ref --format=count — cheapest "how many?"
     // reply. Mutually exclusive with --json. Closes the consistency
     // gap surfaced by the Qwen small-model comparison.
-    // --lexical: synthetic AOSP fixture, no precision sidecars.
     let out = Command::new(scry_bin())
-        .args(["callers", "transact", "--lexical", "--format", "count",
+        .args(["callers", "transact", "--format", "count",
                "--index"]).arg(&inc_idx)
         .output().expect("callers --format count");
     assert!(out.status.success(),
@@ -894,7 +881,7 @@ fn synthetic_tree_roundtrip() {
     assert!(stdout.contains(" callers"),
             "callers --format count must say `N callers`; got: {stdout}");
     let out = Command::new(scry_bin())
-        .args(["ref", "transact", "--lexical", "--format", "count",
+        .args(["ref", "transact", "--format", "count",
                "--index"]).arg(&inc_idx)
         .output().expect("ref --format count");
     assert!(out.status.success());
@@ -903,7 +890,7 @@ fn synthetic_tree_roundtrip() {
             "ref --format count must say `N ref`; got: {stdout}");
     // Mutual-exclusion with --json.
     let out = Command::new(scry_bin())
-        .args(["callers", "transact", "--lexical", "--format", "count", "--json",
+        .args(["callers", "transact", "--format", "count", "--json",
                "--index"]).arg(&inc_idx)
         .output().expect("callers --format + --json");
     assert!(!out.status.success(),
@@ -983,17 +970,14 @@ fn synthetic_tree_roundtrip() {
                        "required check {} failed: {c}", c["artifact"]);
         }
     }
-    // v0.1.59 — file_refs sidecars and refs_resolved must appear in
-    // the checks list (regression guards: they were missing before
-    // v0.1.59 even though they're real on-disk artifacts / signals).
+    // file_refs sidecars must appear in the checks list (regression
+    // guard: they're real on-disk artifacts that power `scry uses`).
     let names: std::collections::HashSet<&str> = checks.iter()
         .filter_map(|c| c["artifact"].as_str()).collect();
     assert!(names.contains("file_refs.bin"),
         "health output missing file_refs.bin check: {names:?}");
     assert!(names.contains("file_refs_offsets.bin"),
         "health output missing file_refs_offsets.bin check: {names:?}");
-    assert!(names.contains("refs_resolved"),
-        "health output missing refs_resolved check: {names:?}");
 
     // 9. scry diff --since: turn the synthetic root into a git repo
     // with two commits, then assert `scry diff --since HEAD~1` finds
@@ -1156,48 +1140,6 @@ public class Binder {
         .ends_with("Binder.java"));
     assert!(!any_binder,
             "tombstoned Binder.java symbols must not appear in def results: {hits:?}");
-
-    // 11. `scry callers --precise` clangd integration. Two cases:
-    //  - clangd not on PATH (the common one in CI / fresh dev hosts):
-    //    the command must exit non-zero with an actionable message
-    //    instead of segfaulting or hanging.
-    //  - clangd present: smoke that the LSP client can complete
-    //    a session against a minimal compile_commands.json.
-    let clangd_ok = Command::new("clangd").arg("--version").output()
-        .map(|o| o.status.success()).unwrap_or(false);
-    if !clangd_ok {
-        // The interesting test case for environments without clangd:
-        // we assert the bail-out message is what the docs promise.
-        let out = Command::new(scry_bin())
-            .args(["callers", "Binder", "--precise", "--index"]).arg(&idx)
-            .output().expect("scry callers --precise");
-        assert!(!out.status.success(),
-                "scry callers --precise should error when clangd missing");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("clangd not on PATH"),
-                "error message should mention clangd; got: {stderr}");
-        assert!(stderr.contains("apt install clangd"),
-                "error message should include install hint; got: {stderr}");
-    } else {
-        // clangd present — smoke the absence-of-compile-commands path.
-        // (Generating a real compile_commands.json for the synthetic
-        // tree is out of scope; the test just confirms we error out
-        // with the right message instead of spawning into a broken
-        // clangd session.)
-        let out = Command::new(scry_bin())
-            .args(["callers", "Binder", "--precise", "--index"]).arg(&idx)
-            .output().expect("scry callers --precise (clangd present)");
-        // Either it errored on compile_commands missing OR it
-        // succeeded (unlikely on the synthetic tree without a real
-        // build). Both are acceptable; what matters is it didn't
-        // hang or panic.
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(stderr.contains("compile_commands.json")
-                    || stderr.contains("clangd"),
-                    "if --precise errored, message should explain why; got: {stderr}");
-        }
-    }
 
     // Best-effort cleanup; on a panic, the dir leaks under /tmp which
     // is fine for one test fixture.
@@ -1422,76 +1364,6 @@ fn unix_serve_concurrent_stress() {
 // asserts that scry fails CLEANLY (non-zero exit, recognizable error
 // message) without panicking or hanging — regardless of whether clangd
 // is present on the test runner.
-// ===========================================================================
-
-#[test]
-fn callers_precise_malformed_compile_commands() {
-    use std::process::Command;
-    use std::time::{Duration, Instant};
-
-    let base = scry_store::scry_tmp_dir().join(format!("scry-bad-cc-{}", std::process::id()));
-    let src = base.join("src");
-    let idx = base.join("idx");
-    std::fs::create_dir_all(&src).unwrap();
-    // Index needs a C++ symbol so callers_precise has something to
-    // anchor on. Without one it errors with "no definitions of ..."
-    // before ever touching compile_commands.json.
-    std::fs::write(src.join("a.cpp"),
-        "class Widget { public: void poke() {} };\n").unwrap();
-    // Deliberately malformed JSON — not even close to valid.
-    std::fs::write(src.join("compile_commands.json"),
-        "{ this is not json at all }").unwrap();
-    let out = Command::new(scry_bin())
-        .args(["index"]).arg(&src).arg("-o").arg(&idx)
-        .args(["--workers", "2"])
-        .output().expect("index for cc test");
-    assert!(out.status.success(),
-            "index failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    // Run with a wall-clock guard. If `scry callers --precise` were
-    // to hang on clangd parsing the malformed JSON, this loop would
-    // time out and we'd kill the child.
-    let start = Instant::now();
-    let mut child = Command::new(scry_bin())
-        .args(["callers", "Widget", "--precise", "--index"]).arg(&idx)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn().expect("spawn callers --precise");
-    let mut exit_code = None;
-    while start.elapsed() < Duration::from_secs(30) {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => { exit_code = Some(s); break; }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    if exit_code.is_none() {
-        child.kill().ok();
-        panic!("`scry callers --precise` hung > 30 s on malformed compile_commands.json");
-    }
-    let out = child.wait_with_output().expect("collect output");
-    // Either we don't have clangd (error mentions clangd) or we do
-    // but the malformed cc.json prevented success — in both cases
-    // exit must be non-zero and stderr must explain why.
-    assert!(!out.status.success(),
-            "scry should NOT succeed on malformed compile_commands.json");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr);
-    assert!(
-        combined.contains("clangd")
-            || combined.contains("compile_commands")
-            || combined.contains("precise")
-            || combined.contains("no definitions"),
-        "error message should explain failure cleanly; got:\n{combined}",
-    );
-
-    std::fs::remove_dir_all(&base).ok();
-}
-
-// ===========================================================================
-// Parse-budget integration: set SCRY_PARSE_TIMEOUT_MS=1 (one
-// millisecond) on a synthetic pathological C++ file. The per-file
-// parse must time out, scry index must skip the file cleanly, and
-// the run as a whole must succeed (not panic, not hang).
 // ===========================================================================
 
 #[test]
@@ -1864,13 +1736,8 @@ public class Caller { public void run() { new Animal().speak(); } }
     //   subclasses ≥ 1 (Dog; Puppy at depth ≥ 2)
     //   callers ≥ 1 (Caller.run() calls speak() on an Animal)
     // files_touched should include at least Dog.java and Caller.java.
-    //
-    // --lexical: the test fixture is a synthetic index with no
-    // build-symbol sidecars (no clang_usrs.bin, no scip_index.bin),
-    // so we explicitly opt into tree-sitter name match. Without it,
-    // default-precise refuses to silently degrade.
     let out = Command::new(scry_bin())
-        .args(["impact", "Animal", "--lexical", "--index"]).arg(&idx)
+        .args(["impact", "Animal", "--index"]).arg(&idx)
         .args(["--subclass-depth", "2", "--json", "--limit", "20"])
         .output().expect("spawn scry impact");
     assert!(out.status.success(), "impact Animal failed: {}",
@@ -1897,7 +1764,7 @@ public class Caller { public void run() { new Animal().speak(); } }
         .spawn().expect("spawn serve");
     {
         let stdin = child.stdin.as_mut().unwrap();
-        writeln!(stdin, r#"{{"id":1,"cmd":"impact","args":{{"name":"Animal","subclass_depth":2,"limit":20,"lexical":true}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"impact","args":{{"name":"Animal","subclass_depth":2,"limit":20}}}}"#).unwrap();
     }
     let out = child.wait_with_output().expect("serve wait");
     assert!(out.status.success(), "serve failed: {}",
@@ -1940,7 +1807,7 @@ public class Tree {
 
     // callgraph a --depth 1: just b.
     let out = Command::new(scry_bin())
-        .args(["callgraph", "a", "--lexical", "--index"]).arg(&idx)
+        .args(["callgraph", "a", "--index"]).arg(&idx)
         .args(["--depth", "1", "--json"])
         .output().expect("spawn scry callgraph");
     assert!(out.status.success(),
@@ -1955,7 +1822,7 @@ public class Tree {
 
     // callgraph a --depth 3: b, c, d nested.
     let out = Command::new(scry_bin())
-        .args(["callgraph", "a", "--lexical", "--index"]).arg(&idx)
+        .args(["callgraph", "a", "--index"]).arg(&idx)
         .args(["--depth", "3", "--json"])
         .output().expect("spawn scry callgraph --depth=3");
     assert!(out.status.success());
@@ -2088,10 +1955,9 @@ public class Hit {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// v0.1.28 — Java import refs must store the FULL qualified path,
-/// not just the trailing identifier. Without the package side,
-/// `cmd_build_resolutions`'s import-aware narrowing rule can never
-/// fire (it needs (pkg, simple) to match candidate FQNs).
+/// Java import refs must store the FULL qualified path, not just the
+/// trailing identifier, so an import is searchable by its fully-qualified
+/// name via `scry ref "android.os.PerfettoTrace" --kind import`.
 ///
 /// Indexes one file with `import android.os.PerfettoTrace;` and
 /// asserts the Import ref's name is the full "android.os.PerfettoTrace".
@@ -2119,10 +1985,8 @@ public class Caller {
             "index failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // Look for the import ref by its FULL qualified name.
-    // --lexical: synthetic index, no precision sidecars; this test
-    // exercises tree-sitter import ref capture, not symbol identity.
     let out = Command::new(scry_bin())
-        .args(["ref", "android.os.PerfettoTrace", "--lexical",
+        .args(["ref", "android.os.PerfettoTrace",
                "--kind", "import",
                "--index"]).arg(&idx).args(["--json"])
         .output().expect("spawn scry ref");
@@ -2139,7 +2003,7 @@ public class Caller {
     // The opposite: looking up by the bare class name should now miss
     // (because the import ref's name is the full path, not "PerfettoTrace").
     let out = Command::new(scry_bin())
-        .args(["ref", "PerfettoTrace", "--lexical",
+        .args(["ref", "PerfettoTrace",
                "--kind", "import", "--index"]).arg(&idx)
         .args(["--json"])
         .output().expect("spawn scry ref");
@@ -2155,11 +2019,11 @@ public class Caller {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// v0.1.28 — Java wildcard imports (`import android.os.*;`) must be
-/// captured with the synthetic `.*` suffix so the build-resolutions
-/// wildcard branch fires. Tree-sitter queries can't combine the
-/// scoped_identifier text with the asterisk in one capture; we use
-/// a post-processing walker hook.
+/// Java wildcard imports (`import android.os.*;`) must be captured
+/// with the synthetic `.*` suffix so they're searchable via
+/// `scry ref "android.os.*" --kind import`. Tree-sitter queries can't
+/// combine the scoped_identifier text with the asterisk in one
+/// capture; we use a post-processing walker hook.
 #[test]
 fn java_wildcard_import_captured_with_dot_star_suffix() {
     let nanos = std::time::SystemTime::now()
@@ -2184,9 +2048,8 @@ public class Caller {
             "index failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // The wildcard import should be searchable as "android.os.*".
-    // --lexical: synthetic index has no precision sidecars.
     let out = Command::new(scry_bin())
-        .args(["ref", "android.os.*", "--lexical",
+        .args(["ref", "android.os.*",
                "--kind", "import", "--index"]).arg(&idx)
         .args(["--json"])
         .output().expect("spawn scry ref");
@@ -2208,7 +2071,7 @@ public class Caller {
     // scoped_identifier child) with the wildcard version. Looking up
     // by the bare "android.os" path should miss.
     let out = Command::new(scry_bin())
-        .args(["ref", "android.os", "--lexical",
+        .args(["ref", "android.os",
                "--kind", "import", "--index"]).arg(&idx)
         .args(["--json"])
         .output().expect("spawn scry ref");
@@ -2229,10 +2092,10 @@ public class Caller {
 /// from the CLI's print_refs_by_def shape (CLI tested by
 /// close_polymorphism_full_stack above).
 ///
-/// Also asserts the v0.1.42 `serve_stats` adds `refs_resolved`
-/// + `refs_resolved_pct` once a resolutions sidecar exists.
+/// Also asserts `serve_stats` reports the core counts (no resolution
+/// coverage fields — scry is tree-sitter only).
 #[test]
-fn daemon_format_by_def_and_stats_refs_resolved() {
+fn daemon_format_by_def_and_stats() {
     use std::io::Write;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -2261,11 +2124,6 @@ public class B {
         .output().expect("spawn scry index");
     assert!(out.status.success(),
             "index failed: {}", String::from_utf8_lossy(&out.stderr));
-    let out = Command::new(scry_bin())
-        .args(["build-resolutions", "--index"]).arg(&idx)
-        .output().expect("spawn scry build-resolutions");
-    assert!(out.status.success(),
-            "build-resolutions failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // Daemon: send a callers-by-def request + a stats request.
     let mut child = Command::new(scry_bin())
@@ -2298,32 +2156,28 @@ public class B {
         assert!(g["def"].is_object() || g["def"].is_null(),
                 "each group's def must be object or null: {g}");
     }
-    // build-resolutions is Kythe-only. This fixture has no SCIP or
-    // clang USR sidecar, so every group's `def` must be null
-    // (unresolved bucket). The shape — "by-def returns a list of
-    // {count, def?} groups even when nothing resolves" — is what
-    // this test pins for the daemon transport. End-to-end Kythe
-    // attribution is validated against the real AOSP index by the
-    // headline manual checks, not by a synthetic fixture.
+    // `scry index` always streams (flush_every defaults to 50k), which
+    // skips the in-memory Layer-1 resolve pass, so every ref's
+    // resolved_to is null and every by-def group lands in the unresolved
+    // bucket. The shape — "by-def returns a list of {count, def?} groups
+    // even when nothing resolves" — is what this test pins for the
+    // daemon transport.
     let resolved_groups: Vec<_> = groups.iter().filter(|g| g["def"].is_object()).collect();
     assert!(resolved_groups.is_empty(),
-        "no SCIP / clang USR sidecar → all by-def groups must be in the unresolved bucket; got {} resolved: {:?}",
+        "streaming index skips resolve → all by-def groups must be in the unresolved bucket; got {} resolved: {:?}",
         resolved_groups.len(), resolved_groups);
 
-    // (2) stats includes the v0.1.42 refs_resolved + refs_resolved_pct.
+    // (2) stats: scry is tree-sitter only, so the resolution-coverage
+    // fields were dropped — `refs_resolved` must be ABSENT from the
+    // payload. `refs` itself is always a real count.
     let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(r2["id"], 2);
     let stats = &r2["result"];
-    assert!(stats["refs_resolved"].is_number(),
-        "stats.refs_resolved should be a number once build-resolutions ran; got {:?}",
-        stats["refs_resolved"]);
-    assert!(stats["refs_resolved_pct"].is_number(),
-        "stats.refs_resolved_pct should be a number; got {:?}",
-        stats["refs_resolved_pct"]);
-    let resolved = stats["refs_resolved"].as_u64().unwrap();
-    let total = stats["refs"].as_u64().unwrap();
-    assert!(resolved <= total,
-        "refs_resolved ({resolved}) must not exceed refs ({total})");
+    assert!(stats.get("refs_resolved").is_none(),
+        "tree-sitter-only stats must not emit refs_resolved; got {:?}",
+        stats.get("refs_resolved"));
+    assert!(stats["refs"].is_number(),
+        "stats.refs should always be a number; got {:?}", stats["refs"]);
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -2507,16 +2361,11 @@ public class A {
     // v0.1.54 — same hint extended to subclasses + callgraph + uses
     // + impact. Each runs on the typo `bindServce` and must surface
     // `bindService` in its stderr hint.
-    //
-    // --lexical: synthetic index has no precision sidecars; precision
-    // would hard-error before the hint code path runs. callgraph and
-    // impact respect --lexical; subclasses and uses bypass precision
-    // entirely (type-hierarchy / outgoing-edge ops).
     for (subcmd, extra_args) in [
         ("subclasses", vec!["--limit", "3"]),
-        ("callgraph",  vec!["--depth", "1", "--lexical"]),
+        ("callgraph",  vec!["--depth", "1"]),
         ("uses",       vec!["--limit", "3"]),
-        ("impact",     vec!["--limit", "3", "--lexical"]),
+        ("impact",     vec!["--limit", "3"]),
     ] {
         let mut cmd = Command::new(scry_bin());
         cmd.arg(subcmd).arg("bindServce").arg("--index").arg(&idx);
@@ -2579,7 +2428,7 @@ public class Idle {
 
     // (1) CLI human format: stdout is the path list, one per line.
     let out = Command::new(scry_bin())
-        .args(["callers", "open", "--lexical", "--index"]).arg(&idx)
+        .args(["callers", "open", "--index"]).arg(&idx)
         .args(["--format", "paths", "--limit", "20"])
         .output().expect("spawn callers paths");
     assert!(out.status.success(),
@@ -2602,7 +2451,7 @@ public class Idle {
 
     // (2) CLI JSON format: single sorted array of strings.
     let out = Command::new(scry_bin())
-        .args(["callers", "open", "--lexical", "--index"]).arg(&idx)
+        .args(["callers", "open", "--index"]).arg(&idx)
         .args(["--format", "paths", "--limit", "20", "--json"])
         .output().expect("spawn callers paths --json");
     assert!(out.status.success(),
@@ -2626,8 +2475,8 @@ public class Idle {
         .spawn().expect("spawn serve");
     {
         let stdin = child.stdin.as_mut().unwrap();
-        writeln!(stdin, r#"{{"id":1,"cmd":"callers","args":{{"name":"open","format":"paths","limit":20,"lexical":true}}}}"#).unwrap();
-        writeln!(stdin, r#"{{"id":2,"cmd":"ref","args":{{"name":"open","format":"paths","limit":20,"lexical":true}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":1,"cmd":"callers","args":{{"name":"open","format":"paths","limit":20}}}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":2,"cmd":"ref","args":{{"name":"open","format":"paths","limit":20}}}}"#).unwrap();
     }
     let out = child.wait_with_output().expect("serve wait");
     assert!(out.status.success(),
@@ -2867,199 +2716,3 @@ public class Cat extends Animal {}
 
     std::fs::remove_dir_all(&base).ok();
 }
-
-/// `scry finalize` auto-discovers compile_commands.json inside
-/// indexed roots and stages a clang-index run on it without the
-/// user passing --clang-compile-commands. This test uses a REAL
-/// C++ TU (not an empty `[]` placeholder) so the full Path B
-/// pipeline executes end-to-end: discovery → stage queue → libclang
-/// parse → USR sidecar on disk → `scry health` reports it.
-///
-/// libclang detection: if libclang isn't available in the test
-/// environment, the new soft-fail contract means finalize succeeds
-/// with a warning and no sidecar gets written. In that case the
-/// test asserts the warning path; it does NOT silently pass and
-/// does NOT incorrectly fail.
-#[test]
-fn finalize_auto_discovers_real_compile_commands() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = scry_store::scry_tmp_dir().join(format!("scry-autodisc-{nanos}"));
-    let src = base.join("src");
-    let idx = base.join("index");
-    std::fs::create_dir_all(&src).unwrap();
-
-    // Real C++ TU: a class with a definition + a free function that
-    // calls into it. Three USR-producing cursors guarantee a non-
-    // trivial sidecar when libclang processes the file.
-    std::fs::write(src.join("widget.h"), r#"#pragma once
-namespace demo {
-class Widget {
-public:
-    Widget();
-    int poke(int x) const;
-};
-int kick(const Widget& w);
-}
-"#).unwrap();
-    std::fs::write(src.join("widget.cpp"), r#"#include "widget.h"
-namespace demo {
-Widget::Widget() {}
-int Widget::poke(int x) const { return x + 1; }
-int kick(const Widget& w) { return w.poke(41); }
-}
-"#).unwrap();
-
-    // Valid compile_commands.json — single TU, absolute directory,
-    // relative file, plain c++17 args. clang-sys will parse this.
-    let cc_json = format!(
-        r#"[{{
-  "directory": "{dir}",
-  "file": "widget.cpp",
-  "arguments": ["clang++", "-std=c++17", "-c", "widget.cpp"]
-}}]
-"#,
-        dir = src.display(),
-    );
-    std::fs::write(src.join("compile_commands.json"), cc_json).unwrap();
-
-    let out = Command::new(scry_bin())
-        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
-        .output().expect("spawn index");
-    assert!(out.status.success(),
-        "index failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let out = Command::new(scry_bin())
-        .args(["finalize", "--index"]).arg(&idx)
-        .output().expect("spawn finalize");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(),
-        "finalize failed: stderr={stderr}");
-    assert!(stderr.contains("clang USR sidecar (auto:"),
-        "finalize stderr should log the auto clang-index stage; got:\n{stderr}");
-    assert!(stderr.contains("compile_commands.json"),
-        "finalize stderr should name the discovered compile_commands.json; \
-         got:\n{stderr}");
-    assert!(stderr.contains("ALL STAGES OK"),
-        "finalize should report ALL STAGES OK even when libclang is absent; \
-         got:\n{stderr}");
-
-    // Distinguish "libclang worked" from "libclang unavailable, soft-failed".
-    let libclang_failed = stderr.contains("auto clang USR sidecar failed");
-    let health_out = Command::new(scry_bin())
-        .args(["health", "--index"]).arg(&idx).arg("--json")
-        .output().expect("spawn health");
-    assert!(health_out.status.success(),
-        "health failed: {}", String::from_utf8_lossy(&health_out.stderr));
-    let v: serde_json::Value = serde_json::from_slice(&health_out.stdout)
-        .expect("health --json output should parse");
-    // `scry health --json` keys checks by `artifact`. There are two
-    // clang_usrs entries: one for the raw file presence ("clang_usrs.bin"),
-    // and one for the open+decode summary ("clang_usrs"). We want the
-    // latter — it carries the "v1, N USRs, M records" status line.
-    let cu = v["checks"].as_array().expect("checks array").iter()
-        .find(|c| c["artifact"] == "clang_usrs").expect("clang_usrs check present")
-        .clone();
-    let status = cu["status"].as_str().unwrap_or("").to_string();
-
-    if libclang_failed {
-        // Soft-fail contract: warning in stderr, sidecar absent,
-        // health reports "absent".
-        assert!(
-            status.contains("absent"),
-            "libclang-absent path: clang_usrs status should be 'absent'; got: {status}",
-        );
-    } else {
-        // Happy path: libclang parsed the TU, sidecar exists with
-        // > 0 USRs from the Widget class + methods + kick().
-        assert!(
-            status.starts_with("v1,"),
-            "libclang-present path: clang_usrs status should be 'v1, …'; got: {status}",
-        );
-        // Extract "v1, N USRs, M records" and assert N > 0.
-        let n_usrs: usize = status
-            .strip_prefix("v1, ").and_then(|s| s.split(' ').next())
-            .and_then(|s| s.parse().ok()).unwrap_or(0);
-        assert!(n_usrs > 0,
-            "libclang-present path: sidecar should have > 0 USRs from the \
-             C++ fixture; got: {status}");
-    }
-
-    std::fs::remove_dir_all(&base).ok();
-}
-
-/// Mimics the Soong/CMake-out-of-tree layout: source has no
-/// compile_commands.json, but the build dir (which is gitignored
-/// in real projects) does. The source-root walker (which honors
-/// .gitignore) misses it; `--build-out <path>` walks the build
-/// dir verbatim and picks it up.
-#[test]
-fn finalize_build_out_discovers_cc_json_in_gitignored_dir() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let base = scry_store::scry_tmp_dir().join(format!("scry-build-out-{nanos}"));
-    let src = base.join("src");
-    let out = base.join("out/build/compdb");
-    let idx = base.join("index");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::create_dir_all(&out).unwrap();
-
-    // Source tree has the .cpp but no cc.json. .gitignore would
-    // hide `out/` in a real project; this test makes that hiding
-    // even stricter by putting `out/` outside the indexed root
-    // entirely.
-    std::fs::write(src.join("widget.h"), r#"#pragma once
-namespace demo {
-class Widget { public: Widget(); int poke(int x) const; };
-}
-"#).unwrap();
-    std::fs::write(src.join("widget.cpp"), r#"#include "widget.h"
-namespace demo {
-Widget::Widget() {}
-int Widget::poke(int x) const { return x + 1; }
-}
-"#).unwrap();
-
-    // cc.json lives in the build dir, pointing back at the source
-    // tree (out-of-tree build pattern).
-    let cc_json = format!(
-        r#"[{{"directory": "{src}", "file": "widget.cpp", "arguments": ["clang++", "-std=c++17", "-c", "widget.cpp"]}}]"#,
-        src = src.display(),
-    );
-    std::fs::write(out.join("compile_commands.json"), cc_json).unwrap();
-
-    let r = Command::new(scry_bin())
-        .args(["index"]).arg(&src).args(["-o"]).arg(&idx)
-        .output().expect("spawn index");
-    assert!(r.status.success(),
-        "index failed: {}", String::from_utf8_lossy(&r.stderr));
-
-    // First: confirm that WITHOUT --build-out, source-root
-    // discovery finds nothing (since cc.json isn't in `src/`).
-    let r = Command::new(scry_bin())
-        .args(["finalize", "--index"]).arg(&idx)
-        .output().expect("spawn finalize (no build-out)");
-    let stderr_noflag = String::from_utf8_lossy(&r.stderr);
-    assert!(r.status.success(),
-        "finalize (no flag) failed: {stderr_noflag}");
-    assert!(!stderr_noflag.contains("clang USR sidecar (auto:"),
-        "without --build-out, auto clang-index should NOT fire \
-         (cc.json is outside indexed roots); got:\n{stderr_noflag}");
-
-    // Then: with --build-out pointing at the build dir, auto
-    // discovery picks it up.
-    let r = Command::new(scry_bin())
-        .args(["finalize", "--index"]).arg(&idx)
-        .args(["--build-out"]).arg(&out)
-        .output().expect("spawn finalize --build-out");
-    let stderr_with = String::from_utf8_lossy(&r.stderr);
-    assert!(r.status.success(),
-        "finalize --build-out failed: {stderr_with}");
-    assert!(stderr_with.contains("clang USR sidecar (auto:"),
-        "--build-out should make auto clang-index fire; got:\n{stderr_with}");
-    assert!(stderr_with.contains(&out.display().to_string()),
-        "--build-out auto stage should name the build-out path; got:\n{stderr_with}");
-
-    std::fs::remove_dir_all(&base).ok();
-}
-

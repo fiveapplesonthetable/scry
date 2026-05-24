@@ -58,14 +58,11 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         // linear scan; missing here would silently hide that.
         ("file_refs.bin",        paths.file_refs()),
         ("file_refs_offsets.bin", paths.file_refs_offsets()),
-        ("ref_resolutions.bin",  paths.ref_resolutions()),
         ("file_digests.bin",     paths.file_digests()),
         ("tombstones.bin",       paths.tombstones()),
-        // Precision sidecars (v0.1.12+). Each has its own structured
-        // status line below; this just reports raw file presence.
+        // Build-system module graph (used by --reachable). Has its own
+        // structured status line below; this just reports file presence.
         ("module_graph.json",    paths.module_graph_json()),
-        ("clang_usrs.bin",       paths.clang_usrs()),
-        ("scip_index.bin",       paths.scip_index()),
     ];
     for (name, path) in optional_files {
         let (ok, status) = match std::fs::metadata(path) {
@@ -110,11 +107,8 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         required: true, ok: reader_ok,
     });
 
-    // Precision-sidecar checks: open each precision sidecar that's
-    // present and report version + record counts. Drift here (e.g. a
-    // v0 sidecar against this scry) gets surfaced as a soft warn so
-    // the user knows --reachable / --clang-precise / --scip-precise
-    // won't behave as expected.
+    // Build-system module graph (used by `--reachable`): report version +
+    // counts, or absent. Drift surfaces as a soft warn.
     let mg_status = match std::fs::read(paths.module_graph_json()) {
         Err(_) => "absent (run `scry build-modgraph`)".to_string(),
         Ok(raw) => match serde_json::from_slice::<scry_store::modgraph::ModuleGraphJsonV1>(&raw) {
@@ -127,41 +121,6 @@ pub(crate) fn cmd_health(index: Option<PathBuf>, json: bool) -> Result<()> {
         },
     };
     checks.push(Check { name: "module_graph", status: mg_status, required: false, ok: true });
-    let cu_status = match scry_store::clang_usrs::ClangUsrIndex::open(&paths.clang_usrs()) {
-        Ok(None) => "absent (run `scry build-symbols --build-{gn,kbuild,cmake} DIR`)".to_string(),
-        Ok(Some(c)) => format!(
-            "v1, {} USRs, {} records", c.usr_count(), c.len(),
-        ),
-        Err(e) => format!("present but FAILED to open: {e:#}"),
-    };
-    checks.push(Check { name: "clang_usrs", status: cu_status, required: false, ok: true });
-    let si_status = match scry_store::scip_index::ScipIndex::open(&paths.scip_index()) {
-        Ok(None) => "absent (run `scry build-symbols --scip FILE.scip`)".to_string(),
-        Ok(Some(s)) => format!(
-            "v1, {} symbols, {} records", s.symbol_count(), s.len(),
-        ),
-        Err(e) => format!("present but FAILED to open: {e:#}"),
-    };
-    checks.push(Check { name: "scip_index", status: si_status, required: false, ok: true });
-
-    // Layer 2 resolution coverage (v0.1.59). Surface the resolved/total
-    // ratio so users know up-front whether `--def-in` / `--strict` will
-    // be useful on this index.
-    let resolution_status = match StoreReader::open(&index_dir).ok()
-        .and_then(|r| r.count_resolved_refs().map(|n| (n, r.n_refs())))
-    {
-        None => "absent (run `scry build-resolutions` to enable \
-                 --def-in/--strict narrowing)".to_string(),
-        Some((_, 0)) => "no refs in index (sidecar dimension unknown)".to_string(),
-        Some((resolved, total)) => {
-            let pct = (resolved as f64) * 100.0 / (total as f64);
-            format!("v1, {resolved}/{total} refs resolved ({pct:.1}%)")
-        }
-    };
-    checks.push(Check {
-        name: "refs_resolved", status: resolution_status,
-        required: false, ok: true,
-    });
 
     // Version-skew check.
     let manifest_version = std::fs::read_to_string(paths.manifest()).ok()

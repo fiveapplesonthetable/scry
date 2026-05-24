@@ -167,17 +167,14 @@ The accuracy gain comes from two structural things:
   `transact(` in a comment looks identical to a real call to
   `rg`'s pattern matcher.
 
-The remaining gap is type precision: scry's heuristic resolver
+The remaining gap is type precision: scry's name-based matcher
 might tag a call to `MyOtherInterface.transact()` as a callers-of
-`Binder.transact` hit. The Layer 2 resolution sidecar narrows
-this with package + import context (~89% of references on the
-live index are uniquely resolved). For full type precision, run
-`scry build-symbols --build-kzip PATH.kzip` to attach the Kythe
-sidecars — that gives Code-Search-class accuracy across all six
-indexer languages (C/C++/ObjC, Java, Kotlin/JVM, Go, proto,
-textproto) without leaving scry. For "give me a representative
-sample of who calls this", scry is correct enough that I act on
-its output without verification.
+`Binder.transact` hit, because it matches on the spelled name, not
+a compiler-resolved symbol identity. For compiler-grade semantic
+def/ref/callers on the AOSP C++/Java slice, that's the job of the
+companion tool `scry2`. For "give me a representative sample of who
+calls this", scry is correct enough that I act on its output without
+verification.
 
 ### Where scry is *less* accurate than `rg`
 
@@ -389,7 +386,6 @@ For an agent on top of an open-weights ≥3B-class model (Gemma 3
    - `outline(path, limit=20, with_snippets?)` — file's symbols
    - `tldr(path)` — one-call file summary; cheapest "what is this?"
    - `grep(pattern, lang?, in?, limit=10, format?, regex?, case_insensitive?)` — content (set `case_insensitive: true` when you're guessing at casing — `bindservice` will find `bindService`)
-   - `ask(query, in?, limit=5)` — semantic complement
 3. Encourage `format: 'count'` as the *first* invocation of
    `ref` / `callers` / `grep`. "Does this exist? How many?"
    before "Show me the locations." The model upgrades to
@@ -443,17 +439,17 @@ locations only when needed:
 
 ```
 $ scry callers noteAlarmStart --lang java --format lines --limit 10
-frameworks/.../app/ActivityManagerNative.java:95:25       noteAlarmStart  → def:...
-frameworks/.../alarm/AlarmManagerService.java:4316:46     noteAlarmStart  → def:...
-frameworks/.../app/ActivityManager.java:5968:26           noteAlarmStart  → def:...
-frameworks/.../am/ActivityManagerService.java:8636:30     noteAlarmStart  → def:...
-frameworks/.../am/ActivityManagerService.java:17292:41    noteAlarmStart  → def:...
+frameworks/.../app/ActivityManagerNative.java:95:25       noteAlarmStart
+frameworks/.../alarm/AlarmManagerService.java:4316:46     noteAlarmStart
+frameworks/.../app/ActivityManager.java:5968:26           noteAlarmStart
+frameworks/.../am/ActivityManagerService.java:8636:30     noteAlarmStart
+frameworks/.../am/ActivityManagerService.java:17292:41    noteAlarmStart
 ```
 
 Three tool calls, ~1.6 s wall, ~250 tokens of reply text
-total. The `→ def:...` field is Layer 2 resolution — every
-call site points back to the same concrete definition, so the
-agent knows it's the same `noteAlarmStart` across all 5 sites.
+total. Each row is a call site to a method spelled
+`noteAlarmStart`, with its enclosing scope inline — enough for
+the agent to read the call context without opening the files.
 
 The same task with `rg` would have run ~21 s, returned ~9 500
 tokens of mixed-up hits (class def lines and call sites
@@ -499,14 +495,12 @@ language-specific tooling beats scry.
 ### When precision matters more than speed
 
 For "find every place that *exactly* shadows the JDK
-`Object.hashCode` method", scry's bare heuristic resolution
-is wrong ~10-20% of the time. With Kythe sidecars attached
-(`scry build-symbols --build-kzip PATH.kzip`), scry resolves at
-Code-Search precision across all six indexer languages — the
-ref-side `--strict` filter drops everything that doesn't match
-the def's structured symbol identity. Without the sidecars,
-treat bare scry as "98% accurate, ask the IDE for the rest";
-with them, the IDE detour goes away.
+`Object.hashCode` method", scry's name-based matching is wrong
+~10-20% of the time — it keys on the spelled name, not a
+compiler-resolved symbol identity. Treat bare scry as
+"98% accurate, ask the IDE for the rest". For compiler-grade
+semantic def/ref/callers on the AOSP C++/Java slice, the
+companion tool `scry2` is the right tool.
 
 ### Long-form code understanding
 
@@ -516,40 +510,35 @@ no amount of `scry def` and `scry callers` will give me that —
 the answer lives in commit messages, design docs, blog posts.
 scry is the lookup table; reading prose is still on me.
 
-### Build-boundary precision (the Kythe gap)
+### Build-boundary precision
 
 This is the one that bites hardest on AOSP, and the one I should
-be most honest about. scry's resolution model is **name-based
-with light per-language narrowing** — closer to "ctags with a
-real symbol table" than to Kythe. Concretely:
+be most honest about. scry's resolution model is **name-based** —
+closer to "ctags with a real symbol table" than to a compiler.
+Concretely:
 
-- **Refs are keyed by `(spelled-name, file)`, not `(USR, file, variant)`.**
-  A C++ `foo()` defined in two distinct overloads collapses to
-  one entry in the index. tree-sitter parses without a
+- **Refs are keyed by `(spelled-name, file)`, not by a structured
+  symbol identity.** A C++ `foo()` defined in two distinct overloads
+  collapses to one entry in the index. tree-sitter parses without a
   preprocessor; `-D` defines, `#ifdef` branches, and template
   instantiations are invisible.
 - **The same `.cpp` compiled into multiple Soong module variants
   becomes one set of refs**, not one per variant. Different
   architectures, SDK versions, system/vendor/product partitions,
   APEX containers — scry sees them as one file.
-- **There is no Soong link-graph reachability filter.** A "caller
-  of `IActivityManager.startActivity`" returned by `scry callers`
-  is any file that spells `startActivity(` and is name-resolvable
-  to that target by scry's Layer-2 narrowing (Java imports +
-  same-package, Kotlin equivalent, JNI shadow). It is *not*
-  filtered by whether the caller's module transitively depends
-  on the definition's module per Soong.
+- **A "caller of `IActivityManager.startActivity`" returned by
+  `scry callers`** is any file that spells `startActivity(` and
+  matches that target by name. It is *not* filtered by whether the
+  caller's module transitively depends on the definition's module
+  per Soong (unless you pass `--reachable`, which prunes against the
+  build-graph `module_graph.json` from `scry build-modgraph`).
 - **Generated code under `out/` is not indexed** — AIDL, HIDL,
   protobuf, and Rust bindgen outputs live there. Callers
   into generated symbols won't resolve unless you re-index
   including `out/`.
 
-scry's Layer-2 sidecar does narrow some real ambiguity:
-same-name Java methods in different packages get disambiguated
-by the calling file's import list and package. Kotlin / C++ /
-JNI have their own narrow paths. That's enough to be useful at
-the editor scale; it is *not* enough to be "right" at the AOSP
-build-graph scale.
+That's enough to be useful at the editor scale; it is *not* enough
+to be "right" at the AOSP build-graph scale.
 
 **When this matters in practice**: agents that need to enumerate
 "every real call site of `bindService` that ships on the
@@ -558,29 +547,20 @@ scry — references in vendor code that doesn't link against
 `libframework`, references behind `#ifdef`'d branches that the
 build doesn't take, references in modules with no visibility
 into the definition's APEX. scry returns all the name matches;
-filtering to "real-given-build" needs build-graph data scry
-doesn't have today.
+filtering to "real-given-build" needs compiler-resolved data scry
+doesn't have.
 
-**The correct tool for that today is Kythe.** cs.android.com is
-Kythe-powered; its precise xrefs are built from per-TU
-extraction (full compiler flags captured) joined to the build
-graph at index time. Kythe is in maintenance mode but
-functional and open source.
+**The companion tool for that is `scry2`** — compiler-grade
+semantic def/ref/callers over the AOSP C++/Java slice. The right
+answer to "is this caller real on the build I ship?" is to query
+`scry2`, or use scry's name match as a starting set and verify
+with a real build.
 
-**The pragmatic do-it-yourself path** (Path B) is to run the
-Soong `compile_commands.json` through a per-TU clang indexer to
-get USR-keyed references with variant hashes, then join to the
-module graph from `m json-module-graph`. That's roughly the
-shape Kythe takes, minus the language-agnostic graph schema.
-This is queued as **`scry index --build soong`** for v0.1.12.
-Until that lands, the right answer to "is this caller real on
-the build I ship?" is: ask cs.android.com, or use scry's name
-match as a starting set and verify with a real build.
-
-What scry does have that Kythe doesn't: 13-min index for
-1 M files on a 72-core host, <100 ms cold queries, no
-indexer-as-builder cost. The point is that the trade is
-explicit — speed and footprint for precision.
+What scry has that a compiler-grade indexer doesn't: 13-min index
+for 1 M files on a 72-core host, <100 ms cold queries, no
+indexer-as-builder cost, and broad coverage across every language
+and build/platform format. The trade is explicit — speed and
+breadth here, semantic precision in `scry2`.
 
 ---
 
@@ -588,14 +568,6 @@ explicit — speed and footprint for precision.
 
 The features I've shipped because agents kept hitting the same
 walls without them:
-
-**Semantic retrieval.** `scry ask "how do I parse TOML in this
-codebase"` returns ranked chunk hits from an embedding sidecar.
-The current embedding is a deterministic hashing trick — no
-model download, no GPU — good enough for token-soup concept
-matches where the agent doesn't know the right identifier to
-grep for. Wrap a transformer model behind the existing chunk
-schema when an agent needs better recall.
 
 **MCP wrapper.** `scry mcp` speaks JSON-RPC 2.0 over stdio,
 negotiates the MCP protocol version per spec (2024-11-05 through

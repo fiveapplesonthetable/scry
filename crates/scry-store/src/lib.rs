@@ -1,9 +1,8 @@
 //! scry-store: on-disk index format for symbols, files, and roots.
 //!
 //! mmap'd columnar layout backed by packed sidecars (`files_packed.bin`,
-//! `precision_packed`-format `clang_usrs.bin` / `scip_index.bin`, packed
-//! trigram postings) plus bincode for `symbols.bin` / `refs.bin` and an
-//! FST over symbol names for prefix / fuzzy lookup.
+//! packed trigram postings) plus bincode for `symbols.bin` / `refs.bin`
+//! and an FST over symbol names for prefix / fuzzy lookup.
 //!
 //! # Unsafe policy
 //!
@@ -39,9 +38,6 @@ use std::path::{Path, PathBuf};
 
 pub mod trigram;
 pub mod modgraph;
-pub mod precision_packed;
-pub mod clang_usrs;
-pub mod scip_index;
 pub mod files_packed;
 
 /// Tell the kernel we plan to read every byte of `path` soon, so it
@@ -77,7 +73,7 @@ pub fn restore_default_sigpipe() {
 /// Scratch directory for any file scry needs to create that ISN'T
 /// part of the user-visible `--index` / `--out` tree. Honours
 /// `$SCRY_TMP_DIR` and defaults to `/mnt/agent/tmp`. Deliberately
-/// NOT `crate::scry_tmp_dir()` (which resolves to `/tmp`) — on the
+/// NOT `scry_tmp_dir()` (which resolves to `/tmp`) — on the
 /// production host `/tmp` is a near-full tmpfs that AOSP-scale runs
 /// would fill in seconds. Every caller across the workspace —
 /// production code AND tests — routes scratch paths through this
@@ -182,10 +178,9 @@ pub enum RefKind {
     Import = 4,
     InheritFrom = 5,
     /// C++ `using namespace X;` directive. Same wire shape as Import
-    /// (name = the namespace text, e.g. "android::base"); separated
-    /// from Import so the Layer 2 resolver can route C++ refs through
-    /// the namespace-narrowing path instead of the package-narrowing
-    /// path (Java / Kotlin).
+    /// (name = the namespace text, e.g. "android::base"); kept as a
+    /// distinct kind so queries can tell a namespace directive apart
+    /// from an import.
     UsingNamespace = 6,
 }
 
@@ -534,9 +529,9 @@ pub struct GrepExplain {
 /// format change in a primary file, breaking schema change in a record.
 ///
 /// Sidecar additions are NOT bumps: every sidecar (file_symbols, lazy
-/// offsets, trigram postings, ref_resolutions, file_digests, chunks,
-/// embeddings) is opened with `.exists()` first, and missing-sidecar
-/// degrades gracefully to the eager / unfiltered path.
+/// offsets, trigram postings, file_digests, chunks) is opened with
+/// `.exists()` first, and missing-sidecar degrades gracefully to the
+/// eager / unfiltered path.
 ///
 /// Mismatch handling today: readers do not refuse to open higher versions.
 /// The version field is informational; the per-command stale-index warning
@@ -627,22 +622,6 @@ impl StorePaths {
     /// JSON parse AND the 1.4M-file HashMap attribution loop.
     /// Bound to mtime+size of module_graph.json + files_packed.bin.
     pub fn module_graph_full(&self) -> PathBuf { self.root.join("module_graph_full.bin") }
-    /// Optional Path B sidecar: per-symbol clang USRs from
-    /// `scry-clang-index`. Present when the user has run the helper
-    /// against a compile_commands.json. v0.1.13+.
-    pub fn clang_usrs(&self) -> PathBuf { self.root.join("clang_usrs.bin") }
-    /// Optional Path C sidecar: per-occurrence SCIP symbol IDs
-    /// imported from external SCIP tools (scip-java, gopls,
-    /// rust-analyzer, …) via `scry scip-import`. v0.1.16+.
-    pub fn scip_index(&self) -> PathBuf { self.root.join("scip_index.bin") }
-    /// Optional companion sidecar: per-occurrence canonical JVM FQN
-    /// symbols produced by [`scry_kzip::fqn_importer`]. Holds the
-    /// language=jvm bridge canonicalized form of `scip_index.bin`'s
-    /// language=java VNames — lets cross-CU Java refs resolve when
-    /// the def-side and ref-side CUs disagree on the language=java
-    /// signature (the usual cause: classpath bytecode visibility).
-    /// Read alongside `scip_index.bin` by `build-resolutions`.
-    pub fn scip_index_fqn(&self) -> PathBuf { self.root.join("scip_index_fqn.bin") }
     /// file_id → list of symbol indices. Packed: per file_id (in order),
     /// a u32 count followed by `count` u32 indices into symbols.bin.
     pub fn file_symbols(&self) -> PathBuf { self.root.join("file_symbols.bin") }
@@ -658,10 +637,6 @@ impl StorePaths {
     /// of scanning all 63M.
     pub fn file_refs(&self) -> PathBuf { self.root.join("file_refs.bin") }
     pub fn file_refs_offsets(&self) -> PathBuf { self.root.join("file_refs_offsets.bin") }
-    /// Per-ref resolution overrides: packed u64-LE per ref_idx; 0 = unresolved,
-    /// other values are the resolved definition's id (matches SymbolRecord.id).
-    /// Produced by `scry build-resolutions`; reader honors it on get_ref().
-    pub fn ref_resolutions(&self) -> PathBuf { self.root.join("ref_resolutions.bin") }
     /// Per-file content digest: packed `[u8; 32]` per file_id (blake3).
     /// Indexed parallel to `files_packed.bin`. Used by `scry index --incremental`
     /// to detect which files actually changed between two index builds.
@@ -1144,10 +1119,6 @@ impl StoreWriter {
         }
 
         if final_dir.exists() {
-            // See `carry_over_sidecars` — preserve scip_index.bin /
-            // clang_usrs.bin across the atomic swap so `scry index`
-            // doesn't wipe what `scry build-symbols` just wrote.
-            carry_over_sidecars(&final_dir, &tmp)?;
             let old = final_dir.with_extension("old");
             if old.exists() {
                 std::fs::remove_dir_all(&old).ok();
@@ -1210,13 +1181,6 @@ impl StoreWriter {
         mf.flush()?;
 
         if final_dir.exists() {
-            // Preserve precision sidecars across the atomic swap.
-            // `scry build-symbols` writes scip_index.bin / clang_usrs.bin
-            // into the same dir but is independent of the main index
-            // pipeline. Without this carry-over, every re-run of
-            // `scry index` silently wipes the sidecar and turns
-            // precision queries into "no precision sidecars" errors.
-            carry_over_sidecars(&final_dir, &tmp)?;
             let old = final_dir.with_extension("old");
             if old.exists() {
                 std::fs::remove_dir_all(&old).ok();
@@ -1232,29 +1196,6 @@ impl StoreWriter {
         }
         Ok(())
     }
-}
-
-/// Copy precision-sidecar files from the live index dir into the
-/// staging dir before the atomic swap. The sidecars are written by
-/// `scry build-symbols` and must survive a re-run of `scry index`.
-fn carry_over_sidecars(live_dir: &Path, staging_dir: &Path) -> Result<()> {
-    // Keep this list narrow + explicit. Adding "everything not
-    // produced by the indexer" would carry over corrupt artifacts
-    // from older runs. New sidecars get added here as they ship.
-    const SIDECARS: &[&str] = &[
-        "scip_index.bin",
-        "clang_usrs.bin",
-    ];
-    for name in SIDECARS {
-        let src = live_dir.join(name);
-        if !src.exists() { continue; }
-        let dst = staging_dir.join(name);
-        std::fs::copy(&src, &dst)
-            .with_context(|| format!(
-                "carry over sidecar {} → {}", src.display(), dst.display(),
-            ))?;
-    }
-    Ok(())
 }
 
 /// Build a FST + posting list for a stream of (name, idx) tuples.
@@ -1795,10 +1736,6 @@ pub struct StoreReader {
     /// scanning all 63M refs.
     pub file_refs_mmap: Option<memmap2::Mmap>,
     pub file_refs_offsets_mmap: Option<memmap2::Mmap>,
-    /// Per-ref resolved-def-id overrides. Indexed by ref_idx; 0 ⇒
-    /// unresolved (use the RefRecord's own resolved_to, which may also
-    /// be None). Built post-finalize via `scry build-resolutions`.
-    pub ref_resolutions_mmap: Option<memmap2::Mmap>,
     /// Per-file blake3 content digest (packed `[u8; 32]` per file_id).
     /// Powers `scry index --incremental` change detection. Present when
     /// `scry build-digests` has run against this index; absent otherwise.
@@ -1826,8 +1763,8 @@ pub struct StoreReader {
     pub(crate) module_graph_cell: std::sync::OnceLock<Option<modgraph::ModuleGraph>>,
     /// Per-`FileEntry::id` `display_path` cache. Built lazily on
     /// the first query that needs path-shape rendering. Hot loops
-    /// in `cmd_def` / `cmd_outline` / `apply_precision_filter`
-    /// used to call `FileEntry::display_path(&roots)` per record,
+    /// in `cmd_def` / `cmd_outline` call
+    /// `FileEntry::display_path(&roots)` per record,
     /// each allocating a fresh `String` (PathBuf::push +
     /// Display::to_string). On the 1M-file production index that
     /// allocator pressure dominates every ranked query. Cached
@@ -1850,17 +1787,6 @@ pub struct StoreReader {
     /// `resolve_file_id`. The bincode `Vec<FileEntry>` that earlier
     /// versions held in RAM has been retired.
     pub files_packed: files_packed::FilesPacked,
-    /// Lazily-opened precision sidecars. Both back onto the
-    /// [`precision_packed`] mmap format, so `open` is microseconds
-    /// (header parse + a few mmap calls) — caching here means every
-    /// subsequent `apply_precision_filter` call inside the same
-    /// process reuses the same `PrecisionPacked` instance and its
-    /// lazy `abs_path → path_id` index. Daemon callers (`serve` /
-    /// `mcp`) build that index once at first query; CLI callers
-    /// pay it per process.
-    pub(crate) scip_index_cell: std::sync::OnceLock<Option<scip_index::ScipIndex>>,
-    pub(crate) scip_index_fqn_cell: std::sync::OnceLock<Option<scip_index::ScipIndex>>,
-    pub(crate) clang_usrs_cell: std::sync::OnceLock<Option<clang_usrs::ClangUsrIndex>>,
 }
 
 impl StoreReader {
@@ -1980,13 +1906,6 @@ impl StoreReader {
             (None, None)
         };
         tick!("file_refs");
-        // Per-ref resolution overrides (Layer 2 sidecar). Optional.
-        let ref_resolutions_mmap = if paths.ref_resolutions().exists() {
-            Some(safe_mmap(&paths.ref_resolutions())?)
-        } else {
-            None
-        };
-        tick!("ref_resolutions");
         // Per-file blake3 digests (for incremental change detection).
         // Optional sidecar; absence means we can't do `--incremental`.
         let file_digests_mmap = if paths.file_digests().exists() {
@@ -2013,47 +1932,12 @@ impl StoreReader {
             lazy_symbols, lazy_refs,
             file_symbols_mmap, file_symbols_offsets_mmap,
             file_refs_mmap, file_refs_offsets_mmap,
-            ref_resolutions_mmap,
             file_digests_mmap, tombstones_mmap,
             module_graph_cell: std::sync::OnceLock::new(),
             display_paths_cell: std::sync::OnceLock::new(),
             path_to_file_id_cell: std::sync::OnceLock::new(),
-            scip_index_cell: std::sync::OnceLock::new(),
-            scip_index_fqn_cell: std::sync::OnceLock::new(),
-            clang_usrs_cell: std::sync::OnceLock::new(),
             files_packed,
         })
-    }
-
-    /// Lazy accessor for the SCIP precision sidecar. First call
-    /// pays the full decode + HashMap build (~17 s for 14 M records
-    /// on the AOSP-scale `scip_index.bin`); subsequent calls borrow
-    /// the cached index. Returns `None` if the sidecar isn't on
-    /// disk for this index.
-    pub fn scip_index(&self) -> Option<&scip_index::ScipIndex> {
-        self.scip_index_cell
-            .get_or_init(|| scip_index::ScipIndex::open(&self.paths.scip_index()).ok().flatten())
-            .as_ref()
-    }
-
-    /// Lazy accessor for the JVM-FQN canonical companion sidecar
-    /// (see [`StorePaths::scip_index_fqn`]). Same open/decode shape
-    /// as [`scip_index`]; returns `None` when the sidecar isn't on
-    /// disk — that's the common case for non-Java indexes and for
-    /// older indexes built before `scry-kzip`'s fqn_importer phase.
-    pub fn scip_index_fqn(&self) -> Option<&scip_index::ScipIndex> {
-        self.scip_index_fqn_cell
-            .get_or_init(|| scip_index::ScipIndex::open(&self.paths.scip_index_fqn()).ok().flatten())
-            .as_ref()
-    }
-
-    /// Lazy accessor for the clang USR precision sidecar. Same
-    /// shape as [`scip_index`]: open + record-table build happens
-    /// once per process at first call.
-    pub fn clang_usrs(&self) -> Option<&clang_usrs::ClangUsrIndex> {
-        self.clang_usrs_cell
-            .get_or_init(|| clang_usrs::ClangUsrIndex::open(&self.paths.clang_usrs()).ok().flatten())
-            .as_ref()
     }
 
     /// Number of files in the index.
@@ -2167,10 +2051,10 @@ impl StoreReader {
         let arg_rel = arg.trim_start_matches('/');
         let mut best: Option<(usize, u32)> = None;
         for (i, p) in paths.iter().enumerate() {
-            if p.ends_with(suf_pat.as_str()) || p == arg_rel {
-                if best.map_or(true, |(len, _)| p.len() < len) {
-                    best = Some((p.len(), i as u32));
-                }
+            if (p.ends_with(suf_pat.as_str()) || p == arg_rel)
+                && best.map_or(true, |(len, _)| p.len() < len)
+            {
+                best = Some((p.len(), i as u32));
             }
         }
         best.map(|(_, id)| id)
@@ -2323,31 +2207,6 @@ impl StoreReader {
         (m[byte] >> bit) & 1 == 1
     }
 
-    /// Apply the resolution sidecar override to a RefRecord, if present.
-    /// 0 in the sidecar = "no override; keep the record's own resolved_to".
-    pub fn apply_resolution_override(&self, ref_idx: u32, r: &mut RefRecord) {
-        let m = match self.ref_resolutions_mmap.as_ref() { Some(m) => m, None => return };
-        let o = (ref_idx as usize) * 8;
-        if o + 8 > m.len() { return; }
-        let id = match m[o..o + 8].try_into() {
-            Ok(b) => u64::from_le_bytes(b),
-            Err(_) => return,
-        };
-        if id != 0 { r.resolved_to = Some(id); }
-    }
-
-    /// Count refs that the Layer 2 resolutions sidecar attributes to
-    /// a specific def. Streams the mmap 8 bytes at a time, counting
-    /// non-zero u64 entries. Returns None if the sidecar isn't
-    /// present (no `scry build-resolutions` was run).
-    ///
-    /// On a 506 MB sidecar (~63 M refs) this is ~0.5 s — cheap enough
-    /// to call from `scry stats`. v0.1.41.
-    pub fn count_resolved_refs(&self) -> Option<u64> {
-        let m = self.ref_resolutions_mmap.as_ref()?;
-        Some(m.chunks_exact(8).filter(|c| *c != [0u8; 8]).count() as u64)
-    }
-
     /// Function/method-like symbol whose source body encloses
     /// `byte_offset` in `file_id`. Used by `scry callgraph` to
     /// attribute a ref site to its containing routine.
@@ -2421,9 +2280,7 @@ impl StoreReader {
     }
 
     /// Iterate every ref record, transparently using the lazy mmap
-    /// path. Same de-duplication motive as iter_symbols. Note this
-    /// does NOT apply the resolution sidecar — callers that want
-    /// resolved_to overrides should go through get_ref(idx).
+    /// path. Same de-duplication motive as iter_symbols.
     pub fn iter_refs(&self) -> Box<dyn Iterator<Item = RefRecord> + '_> {
         if let Some(lz) = self.lazy_refs.as_ref() {
             Box::new(lz.iter())
@@ -2457,16 +2314,14 @@ impl StoreReader {
             self.symbols.get(idx as usize).cloned()
         }
     }
-    /// Get a RefRecord by index, filtering tombstones and applying the
-    /// Layer 2 resolution sidecar override. Same dual as get_symbol.
+    /// Get a RefRecord by index, filtering tombstones. Same dual as
+    /// get_symbol.
     pub fn get_ref(&self, idx: u32) -> Option<RefRecord> {
-        let mut rec = self.get_ref_raw(idx)?;
+        let rec = self.get_ref_raw(idx)?;
         if self.is_tombstoned(rec.file_id) { return None; }
-        self.apply_resolution_override(idx, &mut rec);
         Some(rec)
     }
-    /// Raw RefRecord access without tombstone filtering or resolution
-    /// override application.
+    /// Raw RefRecord access without tombstone filtering.
     pub fn get_ref_raw(&self, idx: u32) -> Option<RefRecord> {
         if let Some(l) = self.lazy_refs.as_ref() {
             l.get(idx as usize)
@@ -3370,7 +3225,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = crate::scry_tmp_dir().join(format!("scry-store-test-{tag}-{nanos}"));
+        let p = scry_tmp_dir().join(format!("scry-store-test-{tag}-{nanos}"));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -3995,7 +3850,7 @@ mod tests {
     #[test]
     fn scan_file_literal_basic_cases() {
         use std::io::Write;
-        let tmp = crate::scry_tmp_dir().join(
+        let tmp = scry_tmp_dir().join(
             format!("scry-scan-{}", std::process::id())
         );
         // Multi-match: "foo" appears 3x in "foo bar foo baz foo".
@@ -4022,7 +3877,7 @@ mod tests {
         assert!(m6.is_empty());
         // Write a partial-write helper test: file with no trailing
         // newline still scans correctly.
-        let tmp2 = crate::scry_tmp_dir().join(
+        let tmp2 = scry_tmp_dir().join(
             format!("scry-scan-2-{}", std::process::id())
         );
         let mut f = File::create(&tmp2).unwrap();

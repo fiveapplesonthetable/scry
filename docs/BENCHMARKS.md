@@ -92,8 +92,7 @@ The reader holds the index via mmap, plus a single packed
 [open]          name_trigram+uniq       2 ms
 [open]               file_symbols       2 ms
 [open]                  file_refs       2 ms
-[open]            ref_resolutions       2 ms
-[open]         digests+tomb+embed       2 ms
+[open]               digests+tomb       2 ms
 ```
 
 Two-millisecond cold open. Every per-query process pays this once;
@@ -113,8 +112,8 @@ index (seconds, `/usr/bin/time -f %e`).
 | `def main --limit 5`                                 | 0.52 / 0.50 / 0.53  |
 | `prefix Activ --limit 20`                            | 0.22 / 0.22 / 0.22  |
 | `fuzzy AcivManager --distance 2 --limit 10`          | 0.26 / 0.26 / 0.26  |
-| `ref ActivityManager --lexical --limit 20`           | 0.22 / 0.25 / 0.22  |
-| `callers ActivityManager --lexical --limit 20`       | 0.08 / 0.07 / 0.08  |
+| `ref ActivityManager --limit 20`                     | 0.22 / 0.25 / 0.22  |
+| `callers ActivityManager --limit 20`                 | 0.08 / 0.07 / 0.08  |
 | `grep IBinder --limit 20`                            | 0.44 / 0.45 / 0.44  |
 | `subclasses Activity --limit 20`                     | 0.35 / 0.35 / 0.34  |
 | `outline frameworks/.../ActivityManagerService.java` | 0.75 / 0.73 / 0.80  |
@@ -265,10 +264,10 @@ systemd-run --user --unit=scry-index --collect \
 
 The post-finalize chain (`scripts/await_finalize.sh` →
 `scripts/post_finalize.sh`) runs automatically: build-offsets,
-build-file-symbols, build-trigrams, build-resolutions, then
-`validate.sh` and `bench_grep.sh` to verify the published numbers
-against the just-finalized index. The email it sends contains the
-fresh measurements, so a successful run is also a self-audit of the
+build-file-symbols, build-trigrams, then `validate.sh` and
+`bench_grep.sh` to verify the published numbers against the
+just-finalized index. The email it sends contains the fresh
+measurements, so a successful run is also a self-audit of the
 claims in this doc.
 
 ### perf stat decomposition
@@ -317,7 +316,7 @@ floor just moves up with the hardware.
 
 - **Cold-vs-warm `def`.** Cold open from a dropped page cache is
   dominated by `sys` time — page-faulting `names.fst`,
-  `name_postings.bin`, `file_symbols`, and `ref_resolutions` into
+  `name_postings.bin`, `file_symbols`, and `symbols.bin` into
   RAM. After a single warm-up the same query reuses those pages
   and the bulk of the cost disappears.
 - **Cache-miss profile of cold grep.** `perf stat` on a cold
@@ -339,8 +338,3 @@ floor just moves up with the hardware.
   byte arrays) trip the per-file parse timeout deterministically;
   the OOM skiplist records them and the next run skips parsing
   without touching anything else.
-- **Layer 2 resolution determinism.** The resolver iterates refs
-  in on-disk order against `HashMap<u32, …>` keyed by `file_id`
-  and writes via tmp + atomic rename, so two `scry build-resolutions`
-  runs against the same index produce a byte-identical
-  `ref_resolutions.bin`.

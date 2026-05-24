@@ -143,221 +143,44 @@ public class Binder implements IBinder {
 
 ---
 
-## Build-symbol precision (default-on)
-
-Whenever `<index>/clang_usrs.bin` (libclang USRs) or
-`<index>/scip_index.bin` (SCIP symbols from any SCIP producer)
-is present, scry's `def` / `ref` / `callers` / `callgraph` /
-`impact` queries auto-engage **structured-identity narrowing**:
-a candidate ref is kept only if its compiler-bound symbol ID
-matches one of the def's symbol IDs. This is the Kythe-class
-precision pillar, default-on, zero flags.
-
-```sh
-# 1. Build the source index (tree-sitter walk).
-$ scry index ~/dev/myproject -o ./idx
-
-# 2. Generate the per-language indexer artifact for your build.
-#    Examples (one-time per build regeneration):
-$ cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .   # C / C++
-$ scip-typescript index                                  # TypeScript
-$ rust-analyzer scip .                                   # Rust
-$ scip-go                                                # Go
-$ scip-python index .                                    # Python
-$ scip-java index --build-tool gradle                    # Java
-
-# 3. Layer the precision sidecars onto the base index. One command
-#    per route:
-#      a) Kythe-integrated build (AOSP, Bazel, custom kzip pipeline):
-$ scry build-symbols --build-kzip ./all.kzip --source-root . --index ./idx
-#      b) Pre-built SCIP file from any other producer:
-$ scry build-symbols --scip ./index.scip --index ./idx
-#      c) Native non-kzip builds:
-$ scry build-symbols --build-cmake ./build --index ./idx     # CMake
-$ scry build-symbols --build-gn ./out --index ./idx          # GN
-$ scry build-symbols --build-kbuild ./build --index ./idx    # Kbuild
-
-# 4. Query. Precision narrows automatically.
-$ scry callers Foo --index ./idx
-[scry] precise (clang_usrs + scip_index): 18 → 7 refs (clang: 0 id-mismatch, 0 uncovered TU; SCIP: 11 id-mismatch, 0 uncovered TU; 0 def USRs, 2 def SCIP symbols)
-# 7 surviving call sites; 11 name-match false positives dropped.
-
-# To opt out and see the raw tree-sitter name match:
-$ scry callers Foo --index ./idx --lexical
-```
-
-`--lexical` is the single user-facing knob. Behind it, two
-auto-engaged filters run when their sidecar is present:
-
-| Sidecar              | Filter               | Built by                                  | Languages covered                         |
-|----------------------|----------------------|-------------------------------------------|-------------------------------------------|
-| `clang_usrs.bin`     | clang USR identity   | `scry build-symbols --build-{gn,cmake,kbuild,kzip}` | C / C++ / ObjC                            |
-| `scip_index.bin`     | Kythe SCIP / VName identity | `scry build-symbols --build-kzip` or `--scip` | Java, Kotlin, Rust, Go, TS, Python, etc.  |
-| `scip_index_fqn.bin` | JVM-FQN cross-CU bridge | `scry build-symbols --build-kzip` with `SCRY_KZIP_SERVING_DIR=<dir>` | Java / Kotlin cross-compilation-unit |
-
-A third filter, **`--reachable`**, narrows by build-graph module
-visibility (e.g. "drop callers in modules that can't link the
-callee"). It stays explicit opt-in because loading the 256MB
-AOSP module graph + computing Warshall closure costs ~30s
-cold — paying that on every query would crush latency.
-
-Cross-module call resolution is the natural consequence of
-clang USR uniqueness: a call to `strdup` in
-`bionic/libc/foo.c` has the same USR as `strdup`'s def in
-`bionic/libc/upstream-openbsd/.../strdup.c`. The filter links
-them across modules without scry needing per-module bookkeeping.
-
-### Cross-CU Java resolution
-
-By default, Kythe's `java_indexer` emits anchor records per
-compilation unit, and the source-level VName for
-`Binder.clearCallingIdentity()` differs between
-`Binder.java`'s own CU (where it's a def) and a caller's CU
-like `services.core` (where it's resolved against
-`framework.jar` bytecode). Without a cross-CU join, strict
-queries like
-`scry callers clearCallingIdentity --def-in /android/os/Binder.java --in services/core`
-return zero hits — the def-side and ref-side symbol IDs don't
-match.
-
-scry handles this by reading the `/kythe/edge/named` edges that
-`java_indexer` emits (the indexer-side handle to JVM canonical
-FQNs) and lifting them into `scip_index_fqn.bin`. To enable:
-
-```sh
-$ SCRY_KZIP_SERVING_DIR=/tmp/serving \
-  scry build-symbols --build-kzip ./all.kzip \
-    --source-root /home/zim/dev/aosp \
-    --index ./idx
-# Output includes:
-#   ./idx/scip_index.bin       (per-CU anchors)
-#   ./idx/scip_index_fqn.bin   (jvm-FQN canonical, cross-CU)
-```
-
-`SCRY_KZIP_SERVING_DIR` tees each indexer's stdout for Phase 5's
-2-pass FQN importer (Pass 1: collect named-edge bridges; Pass 2:
-emit anchors keyed on JVM FQN). The companion sidecar is
-consulted alongside the main one by both `build-resolutions`
-and the query-time precision filter — a ref matches if its
-call-site symbol lands in **either** projection of the def.
-After Phase 5 runs, queries like the Binder one above resolve
-**1320 hits across services/core** on the live AOSP corpus.
-
-The Kythe v0.0.75 indexers also need four small patches for
-AOSP-specific edge cases (Java 21 bytecode reading + classpath
-auto-derivation); see [`KYTHE_JVM_INDEXER_REBUILD.md`] for
-the patches, build procedure, and why each is needed.
-
-[`KYTHE_JVM_INDEXER_REBUILD.md`]: KYTHE_JVM_INDEXER_REBUILD.md
-
-For per-language one-line setup recipes (AOSP/Soong, CMake,
-Cargo, Gradle, etc.) see [`BUILD_AWARE.md`].
-
-[`BUILD_AWARE.md`]: BUILD_AWARE.md
-
----
-
-## Precision uplift via clangd (`--precise`, legacy path)
-
-For C++ overload-sensitive queries, `scry callers NAME --precise`
-routes the query through `clangd` (the LLVM language server) over
-LSP. clangd does the real semantic analysis — type inference,
-overload resolution, ADL — so call sites that scry's heuristic
-ref-extractor mis-attributes get the correct answer.
-
-Note: `--precise` predates the default-on build-symbol precision
-above and is now mainly useful when you don't have a precomputed
-clang USR sidecar but DO have clangd + a live compile_commands
-nearby. For batch / repeated queries, `scry build-symbols --build-{gn,cmake,kbuild}`
-+ the default-on clang USR filter is faster (no per-query clangd
-warmup) and produces identical narrowing.
-
-```sh
-$ scry callers transact --precise --index /mnt/agent/scry-index --limit 5
-[precise] clangd OK; compile_commands.json under /home/zim/dev/aosp/out
-[precise] clangd returned 142 locations in 1820 ms
-/.../frameworks/native/libs/binder/Binder.cpp:412:24  (ref-precise cpp)  transact
-/.../frameworks/av/services/.../AudioFlinger.cpp:1245:18  (ref-precise cpp)  transact
-...
-```
-
-Requirements:
-  - `clangd` on `$PATH` (Debian/Ubuntu: `apt install clangd`).
-  - `compile_commands.json` somewhere above the definition file
-    (generate via `bear -- m`, or your build system's equivalent).
-    AOSP: see `bUILD/soong/docs/compile_commands_json.md`.
-
-Without either, `--precise` exits non-zero with an actionable
-message pointing at the install / setup step. The heuristic path
-(without `--precise`) keeps working regardless.
-
-The shape of the output is identical to the regular `scry callers`
-output except for the `(ref-precise LANG)` tag and the `precise: true`
-field on JSON results — agents that consume both can dispatch on it.
-
-clangd warmup is ~1 minute on AOSP (it has to index its own metadata
-before answering queries). For a session that runs many precise
-queries, consider `scry serve --listen unix:...` and keep one
-clangd alive across the run (forthcoming; see `docs/ROADMAP.md` § 3).
-
----
-
 ## Reference lookup: `scry ref` / `scry callers`
 
 ```sh
 $ scry callers transact --lang Java --limit 3
-/home/zim/dev/aosp/cts/hostsidetests/appsecurity/test-apps/UseProcessSuccess/src/com/android/cts/useprocess/AccessNetworkTest.java:77:25  (call java)  [AccessNetworkTest::MyConnection]  transact  → def:fb80a66b3db3efd5
-/home/zim/dev/aosp/cts/hostsidetests/securitybulletin/test-apps/CVE-2022-20004/test-app/src/android/security/cts/CVE_2022_20004_test/PocActivity.java:98:26  (call java)  [PocActivity]  transact  → def:fb80a66b3db3efd5
-/home/zim/dev/aosp/frameworks/base/core/java/android/os/IBinder.java:419:38  (call java)  [IBinder]  transact  → def:fb80a66b3db3efd5
+/home/zim/dev/aosp/cts/hostsidetests/appsecurity/test-apps/UseProcessSuccess/src/com/android/cts/useprocess/AccessNetworkTest.java:77:25  (call java)  [AccessNetworkTest::MyConnection]  transact
+/home/zim/dev/aosp/cts/hostsidetests/securitybulletin/test-apps/CVE-2022-20004/test-app/src/android/security/cts/CVE_2022_20004_test/PocActivity.java:98:26  (call java)  [PocActivity]  transact
+/home/zim/dev/aosp/frameworks/base/core/java/android/os/IBinder.java:419:38  (call java)  [IBinder]  transact
 
 1524 refs (showing 3)
 [scry] cmd=callers q="transact" hits=1524 shown=3 files=1009166 elapsed=84ms
 ```
 
-`→ libs/binder/Binder.cpp:411 [android::BBinder]` is the
-Layer 2 resolution — the resolver picked that specific def. Without
-`--def-in`/`--strict` (see below) this is permissive: unresolved refs
-show no `→` annotation. Pass `--json` to get the raw `resolved_to`
-u64 instead of the human-readable file:line.
-
 `scry ref` is the generic version that includes all ref kinds (call,
 ctor, type-use, field-access, import, inherit). `callers` is the
 common-case shorthand for `ref --kind call`.
 
-### Cutting through polymorphism
+### `--format by-def`
 
-Polymorphic names like `close`, `onCreate`, `transact` have
-thousands of distinct defs in a big corpus. Three flags help
-narrow:
+`--format by-def` groups refs by their resolved def — a best-effort
+in-memory name match (`resolved_to`) populated only on non-streaming
+indexes. The default `scry index` streams, so on a typical index
+`resolved_to` is null and the histogram collapses to a single
+unresolved bucket:
 
 ```sh
-# --def-in PATH — keep only refs resolving to a def in PATH
-$ scry callers transact --def-in libs/binder/Binder.cpp
-# returns the 166 callers whose resolved_to lands at BBinder.transact
-# (plus the over-included permissive bucket if --strict isn't set)
-
-# --strict — drop refs that resolved to anything else, including
-# unresolved. Trades recall for precision.
-$ scry callers transact --def-in libs/binder/Binder.cpp --strict
-# returns only the 166 confidently-resolved hits, no over-include
-
-# --format by-def — histogram of which def gets called most
-$ scry callers transact --strict --format by-def --limit 8
-     166  → libs/binder/Binder.cpp:411 [android::BBinder]
-      14  → securityPatch/CVE-2016-2412/poc.cpp:77
-       7  → libs/binder/Binder.cpp:114 [android::hardware::BHwBinder]
-       7  → libs/binder/BpBinder.cpp:400 [android::BpBinder]
-       ...
-     219 refs in 19 groups (showing 8)
+$ scry callers transact --format by-def --limit 8
+     219  → (unresolved)
+     219 refs in 1 group (showing 1)
 ```
 
 `--format by-def` composes with `--json` for
 programmatic consumers — emits a JSON array of
-`{count, def: {path, line, col, scope, kind, id}}` entries.
+`{count, def: {path, line, col, scope, kind, id}}` entries (with
+`def: null` for the unresolved bucket).
 
-These three flags also work on `scry ref`, `scry callgraph`
+`--format by-def` also works on `scry ref`, `scry callgraph`
 (root-level only), and `scry impact` (callers leg only), and
-are exposed via the same args on the JSON-RPC + MCP `ref` /
+is exposed via the same args on the JSON-RPC + MCP `ref` /
 `callers` / `callgraph` / `impact` tools.
 
 ### `--format count`
@@ -747,7 +570,6 @@ files-failed: 0
 bytes-total:  70.4 GB
 symbols:      31496680
 refs:         63318468
-refs-resolved: 31426932 (49.6%)
 elapsed-ms:   690040
 
 by language:
@@ -764,13 +586,6 @@ by kind:
      6543210  method
      ...
 ```
-
-The `refs-resolved` line shows what fraction of refs
-the Layer 2 resolutions sidecar attributes to a specific def.
-`<no sidecar — run scry build-resolutions to enable>` appears
-when the sidecar hasn't been built yet. Higher is better — it's
-the lever the `--def-in` / `--strict` flags operate on (see the
-ref/callers section above).
 
 ### Machine-readable: `scry stats --json`
 
@@ -821,7 +636,7 @@ $ printf '%s\n' \
     '{"id":5,"cmd":"stats"}' \
   | scry serve --index /mnt/agent/scry-index
 {"id":1,"result":[{"name":"Binder","kind":"class","lang":"Java","path":"…","line":85,...}]}
-{"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","resolved_to":18122667880065789909,...}]}
+{"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","resolved_to":null,...}]}
 {"id":3,"result":[{"path":"…","line":92,"col":20,"snippet":"…ZygoteInit…","lang":"Cpp"}]}
 {"id":4,"result":{"path":"…/app_main.cpp","lang":"Cpp","symbols_total":13,...}}
 {"id":5,"result":{"scry_version":"0.0.1","files_total":1009166,...}}
@@ -1168,13 +983,6 @@ $ scry build-trigrams --index /mnt/agent/scry-index --workers 16
 [trigrams] streaming 1009166 files, ~30 min on full corpus
 [trigrams] DONE.
 
-$ scry build-resolutions --index /mnt/agent/scry-index
-[res] 22790955 symbols, 62772968 refs
-[res] pass 1 (by-name + per-file-pkg) in 20071 ms
-[res] pass 2 (per-file imports: 163951 files) in 19020 ms
-[res] pass 3 (resolve 62772968 refs, 55922904 resolved, 0 narrowed via Java context) in 420100 ms
-[res] DONE. 502183744 bytes written → /mnt/agent/scry-index/ref_resolutions.bin
-
 # Per-file content digest (blake3) sidecar — powers index-diff and
 # the full --incremental indexer. ~25 s for the full AOSP+Linux corpus.
 $ scry build-digests --index /mnt/agent/scry-index
@@ -1265,56 +1073,6 @@ approvers (3):
 where present) plus, under `--accumulate`, an `approvers` array
 on the envelope. Suitable for piping into the CI bot that does
 the actual `gerrit-push` invocation.
-
----
-
-## Semantic retrieval: `scry ask`
-
-Find code chunks whose embedded text is most similar to a natural-
-language query. Useful when the agent doesn't know which identifier
-to grep for. Default embedding model is a deterministic FNV-1a
-hashing-trick bag-of-tokens — no model download, no extra deps;
-catches vocabulary overlap (the dominant signal for code search).
-
-```sh
-# One-time setup: compute and store the embedding sidecar.
-$ scry build-embeddings --index /mnt/agent/scry-index
-[embed] 1009166 files; dim=64, chunk=100+20overlap
-[embed] computed 3128456 chunks in 412 s
-[embed] DONE. 3128456 chunks × 64 dim → 763.5 MB
-
-# Now ask in natural language:
-$ scry ask "how does the system create new processes" --limit 5
-/.../frameworks/base/services/.../ProcessRecord.java:54-153  (score=0.728)  (Java)
-    public ProcessRecord(ActivityManagerService _service, ...) {
-        this.mService = _service;
-/.../frameworks/native/services/.../ProcessLauncher.cpp:32-131  (score=0.694)  (Cpp)
-    pid_t launch(const Args& args) {
-        pid_t pid = fork();
-...
-
-# JSON for agent consumption:
-$ scry ask "parse toml configuration" --limit 3 --json
-{"path":"...","lang":"Rust","start_line":42,"end_line":131,"score":0.812,"snippet":"..."}
-```
-
-Flags:
-  `--dim N`            embedding dimension (default 64). Higher → bigger sidecar, finer discrimination.
-  `--chunk-lines N`    chunk window in lines (default 100).
-  `--chunk-overlap N`  overlap between consecutive chunks (default 20).
-  `--in PREFIX`        same path-substring filter as the rest of scry.
-  `--limit N`          top-K results (default 10).
-  `--json`             one JSON object per result.
-
-Exposed over `scry serve` and `scry mcp` as the `ask` tool. Cold-cache
-query latency on the full corpus is ~500 ms (dominated by walking the
-~760 MB embeddings.bin); warm queries are ~50 ms.
-
-The hashing-trick embedding is solid for vocabulary matching but not
-as semantically rich as a transformer-based one. The wire format is
-designed so a future commit can swap in a real model (candle +
-all-MiniLM or nomic-embed-code) behind a feature flag without
-changing the sidecar layout or query API.
 
 ---
 
@@ -1451,11 +1209,11 @@ frameworks/base/services/.../ActivityManagerService.java:5937:17  (method java) 
 [scry] cmd=def q="setProcessLimit" hits=1 shown=1 files=1009166 elapsed=324ms
 
 $ scry callers setProcessLimit --lang Java --limit 10
-frameworks/base/tests/permission/.../ActivityManagerPermissionTests.java:83:17  (call java)  [ActivityManagerPermissionTests]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:130:34  (call java)  [BackgroundProcessLimitPreferenceControllerTest]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:81:34  (call java)  [...]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/Settings/.../BackgroundProcessLimitPreferenceController.java:93:41  (call java)  [BackgroundProcessLimitPreferenceController]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [DevelopmentFragment]  setProcessLimit  → def:f3720ef78a480b7e
+frameworks/base/tests/permission/.../ActivityManagerPermissionTests.java:83:17  (call java)  [ActivityManagerPermissionTests]  setProcessLimit
+packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:130:34  (call java)  [BackgroundProcessLimitPreferenceControllerTest]  setProcessLimit
+packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:81:34  (call java)  [...]  setProcessLimit
+packages/apps/Settings/.../BackgroundProcessLimitPreferenceController.java:93:41  (call java)  [BackgroundProcessLimitPreferenceController]  setProcessLimit
+packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [DevelopmentFragment]  setProcessLimit
 ... 1 more ...
 6 refs (showing 6)
 [scry] cmd=callers q="setProcessLimit" hits=6 shown=6 files=1009166 elapsed=332ms
@@ -1468,9 +1226,8 @@ packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [Dev
   of source.
 - The second query gives every call site with its **enclosing scope**
   inline (`[BackgroundProcessLimitPreferenceController]`,
-  `[DevelopmentFragment]`, …) AND the Layer 2 `→ def:HEX` proves all
-  6 callers really do invoke the same definition (no false positives
-  from another class accidentally named `setProcessLimit`).
+  `[DevelopmentFragment]`, …) so the agent can read the call context
+  without opening each file.
 - Total output is ~ 1 k tokens of structured data the agent can
   reason about directly. No follow-up `Read` is needed unless the
   agent wants the surrounding code body — and even then it can read
@@ -1485,13 +1242,11 @@ packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [Dev
 | tokens consumed              | ~30–60 k                 | ~1 k                  | **30–60×** |
 | def vs ref disambiguation    | manual (Read each file)  | structural (kind)     | qualitative |
 | scope of each hit            | not in output            | `[Foo::Bar]` inline   | qualitative |
-| same-def confirmation        | not possible from rg     | `→ def:HEX` shared    | qualitative |
 
 The latency win comes from the index. The **token win comes from the
 structure** — scry returns what an agent actually needs (which symbol,
-which scope, which definition it resolves to) instead of a raw text
-match the agent has to ground itself. This is the leverage scry was
-built for.
+which scope, which kind) instead of a raw text match the agent has to
+ground itself. This is the leverage scry was built for.
 
 ### Caveats
 

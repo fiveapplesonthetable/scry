@@ -31,10 +31,6 @@ toml = { workspace = true }
 blake3 = "1"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
-scry-clang = { path = "../scry-clang" }
-scry-scip = { path = "../scry-scip" }
-scry-bridge = { path = "../scry-bridge" }
-scry-kzip = { path = "../scry-kzip" }
 ignore = { workspace = true }
 
 [lints]

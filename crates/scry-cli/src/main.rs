@@ -3,8 +3,6 @@
 #![forbid(unsafe_code)]
 
 mod build_adapter;
-mod clangd;
-mod finalize;
 mod health;
 
 // jemalloc returns freed memory to the OS aggressively. Default glibc malloc
@@ -193,24 +191,6 @@ enum Cmd {
         /// Mutually exclusive with --json.
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
-        /// Use lexical (tree-sitter) name match only — skip the
-        /// compiler-backed precision filters that auto-engage when
-        /// the clang USR / SCIP symbol sidecars are present.
-        /// Default behavior: precision filters are ON whenever
-        /// their sidecar exists, so you get Kythe-class structured
-        /// narrowing for free wherever the build produced an
-        /// indexer artifact (`compile_commands.json` / `*.scip`),
-        /// and graceful fallback to lexical-only on uncovered code.
-        ///
-        /// Composes orthogonally with `--strict`: `--lexical`
-        /// chooses HOW refs are matched (compiler symbol identity
-        /// vs tree-sitter name), `--strict` chooses WHICH matched
-        /// refs survive (require Layer 2 resolution vs allow
-        /// unresolved). `--lexical --strict` is a coherent
-        /// "name-match only, but drop the ones the resolver
-        /// couldn't pin to a def" query.
-        #[arg(long)]
-        lexical: bool,
         /// Compose with build-graph reachability: drop refs whose
         /// owning module can't transitively reach a definition of
         /// NAME per the Soong/GN/kernel module graph. No-op if the
@@ -226,42 +206,9 @@ enum Cmd {
         /// class matching use `--in` on the file path instead.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
-        /// Narrow which definition of NAME the refs must point at,
-        /// by path substring of the def's file. Useful for
-        /// overloaded names like `close()` where the index has
-        /// many distinct defs across the corpus:
-        ///   `scry ref close --def-in PerfettoTrace.java`
-        /// keeps only refs whose Layer 2 resolution (resolved_to)
-        /// points at a def in PerfettoTrace.java. Refs that
-        /// couldn't be resolved (resolved_to=None) pass through —
-        /// we'd rather over-include than silently drop the
-        /// unresolved ones. Build the resolutions sidecar via
-        /// `scry build-resolutions` (or `scry finalize`) for the
-        /// strongest narrowing.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop refs whose Layer 2 resolution didn't
-        /// land on a specific def (resolved_to=None). With --def-in
-        /// PATH, also drops refs resolving to a def outside PATH —
-        /// no permissive over-include. Useful when you want HIGH
-        /// PRECISION at the cost of recall: only refs the resolver
-        /// can confidently attribute survive. Without --def-in,
-        /// just shows refs that resolved to ANY specific def.
-        ///
-        /// Composes orthogonally with `--lexical`: see that flag's
-        /// help for the matrix.
-        #[arg(long)]
-        strict: bool,
     },
     /// Find callers of NAME (refs with kind=call). LSP analogue:
-    /// callHierarchy/incomingCalls.
-    ///
-    /// With --precise: route to clangd via LSP for type-aware C++
-    /// resolution. Closes the 10-20% accuracy gap on overloaded
-    /// method names by asking the real compiler instead of relying
-    /// on scry's heuristic name match. Requires `clangd` on PATH
-    /// and a `compile_commands.json` somewhere in the file's
-    /// ancestry; errors with an actionable message otherwise.
+    /// callHierarchy/incomingCalls. Tree-sitter name match.
     Callers {
         name: String,
         #[arg(long)]
@@ -278,16 +225,6 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
-        /// Use clangd for precise (type-aware) reference resolution.
-        /// C++ only today (clangd is C++-shaped). Falls back to the
-        /// heuristic path with a clear error if clangd or
-        /// compile_commands.json are missing.
-        #[arg(long)]
-        precise: bool,
-        /// Use lexical (tree-sitter) name match only. See
-        /// `scry ref --lexical` for the full explanation.
-        #[arg(long)]
-        lexical: bool,
         /// Compose with build-graph reachability: drop callers whose
         /// owning module can't transitively reach a definition of
         /// NAME per the Soong/GN/kernel module graph. Same semantics
@@ -303,15 +240,6 @@ enum Cmd {
         /// drops the 1400+ traceBegin sites outside that class.
         #[arg(long, value_name = "CLASS")]
         scope: Option<String>,
-        /// Narrow which definition of NAME the callers must target,
-        /// by path substring of the def's file. See `scry ref
-        /// --def-in` for the full description.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop callers whose Layer 2 resolution didn't
-        /// land on a specific def. See `scry ref --strict`.
-        #[arg(long)]
-        strict: bool,
         /// Compact output. `count` emits just `N callers` — cheapest
         /// possible "how many callers does X have?" reply. Mutually
         /// exclusive with --json.
@@ -349,62 +277,6 @@ enum Cmd {
         #[arg(long)]
         budget: Option<usize>,
     },
-    /// One-shot post-finalize pipeline: rebuilds every sidecar
-    /// scry's query path knows how to use, in one command.
-    /// Equivalent to running `build-offsets`, `build-file-symbols`,
-    /// `build-trigrams`, `build-resolutions` (always), plus
-    /// `build-modgraph` for each `--build-<kind> ROOT` flag passed,
-    /// plus `build-symbols --scip FILE` for each `--scip` flag passed.
-    /// Reports per-stage timings.
-    ///
-    /// Hidden — `scry index` runs every finalize stage end-to-end.
-    /// Call this directly only when partial rebuilds are needed.
-    #[clap(hide = true)]
-    Finalize {
-        #[arg(long, value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Soong project root → write `module_graph.json`.
-        #[arg(long, value_name = "PATH")]
-        build_soong: Option<PathBuf>,
-        /// Linux kernel project root → write `module_graph.json`
-        /// (overrides build_soong if both are set; only one
-        /// module_graph fits per index).
-        #[arg(long, value_name = "PATH")]
-        build_kernel: Option<PathBuf>,
-        /// GN project root.
-        #[arg(long, value_name = "PATH")]
-        build_gn: Option<PathBuf>,
-        /// Bazel project root.
-        #[arg(long, value_name = "PATH")]
-        build_bazel: Option<PathBuf>,
-        /// Cargo workspace root.
-        #[arg(long, value_name = "PATH")]
-        build_cargo: Option<PathBuf>,
-        /// SCIP index file to import.
-        #[arg(long, value_name = "PATH")]
-        scip: Option<PathBuf>,
-        /// compile_commands.json forwarded to `build-symbols`.
-        /// Set alongside this you can pass `--clang-root` to filter.
-        #[arg(long, value_name = "PATH")]
-        clang_compile_commands: Option<PathBuf>,
-        /// Optional `--root` forwarded to `build-symbols`.
-        #[arg(long, value_name = "PATH")]
-        clang_root: Option<PathBuf>,
-        /// Build-output directory to walk for compile_commands.json
-        /// and `*.scip` artifacts during auto-discovery. Repeatable.
-        /// Unlike walking the indexed source roots (which honors
-        /// .gitignore), `--build-out` paths are walked verbatim —
-        /// most build systems write outputs to gitignored dirs
-        /// (`out/soong/...`, `build/`, `target/`, `.gradle/`), so
-        /// the standard walker can't see them by default. Use this
-        /// flag to point at e.g. `out/soong/development/ide/compdb`
-        /// or your CMake build dir.
-        #[arg(long = "build-out", value_name = "PATH")]
-        build_out: Vec<PathBuf>,
-        /// Workers passed through to the sub-commands.
-        #[arg(long, default_value_t = 16)]
-        workers: usize,
-    },
     /// Outgoing edges from NAME's body: what does NAME call /
     /// reference? Symmetric counterpart to `scry callers NAME`.
     /// Resolves NAME to one or more SymbolRecords, computes each
@@ -430,12 +302,6 @@ enum Cmd {
         /// Default: all kinds.
         #[arg(long, short = 'k')]
         kind: Option<String>,
-        /// Strict mode: drop outgoing edges whose Layer 2 resolution
-        /// didn't pin a target def. Useful for "what does NAME call
-        /// that we know the target of?" — strips out unresolved
-        /// calls that the heuristic resolver couldn't attribute.
-        #[arg(long)]
-        strict: bool,
         /// Compact output. `count` emits just `N edges`. `paths`
         /// emits deduped sorted file paths of the outgoing refs —
         /// "which files does NAME touch?". Same shape as on ref /
@@ -480,25 +346,6 @@ enum Cmd {
         /// whose owning module can reach NAME's module.
         #[arg(long)]
         reachable: bool,
-        /// Narrow ROOT-LEVEL callers by callee location — same shape
-        /// as `scry ref --def-in PATH`. Only NAME's callers whose
-        /// Layer 2 resolution points at a def in PATH (or whose
-        /// resolution is None, permissively) are walked. Deeper
-        /// levels are not narrowed because the callgraph walker
-        /// doesn't track per-frame def context.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop root-level callers whose Layer 2
-        /// resolution didn't land on a specific def. See
-        /// `scry ref --strict`.
-        #[arg(long)]
-        strict: bool,
-        /// Use lexical (tree-sitter) name match only. Default
-        /// auto-engages clang USR + SCIP symbol identity filters
-        /// when their sidecars are present (root level only —
-        /// deeper recursion stays lexical). See `scry ref --lexical`.
-        #[arg(long)]
-        lexical: bool,
         #[arg(long)]
         json: bool,
     },
@@ -526,23 +373,6 @@ enum Cmd {
         /// Build-graph reachability filter on callers; off by default.
         #[arg(long)]
         reachable: bool,
-        /// Narrow the CALLERS portion of impact by callee location —
-        /// same shape as `scry ref --def-in PATH`. Doesn't affect the
-        /// subclass walk (subclasses are about the type, not the
-        /// method). Use when impact is being asked about ONE specific
-        /// `close()` overload, not every method named close.
-        #[arg(long, value_name = "PATH")]
-        def_in: Option<String>,
-        /// Strict mode: drop callers whose Layer 2 resolution didn't
-        /// land on a specific def. See `scry ref --strict`.
-        #[arg(long)]
-        strict: bool,
-        /// Use lexical (tree-sitter) name match only. Default
-        /// auto-engages clang USR + SCIP symbol identity filters
-        /// on the callers leg when their sidecars are present.
-        /// See `scry ref --lexical`.
-        #[arg(long)]
-        lexical: bool,
         #[arg(long, default_value = "200")]
         limit: usize,
         #[arg(long)]
@@ -567,13 +397,6 @@ enum Cmd {
         /// Walk the hierarchy this many levels deep. 0 = direct only.
         #[arg(long, default_value_t = 0)]
         depth: usize,
-        /// Accepted as a no-op for consistency with ref/callers/impact —
-        /// `subclasses` walks tree-sitter `InheritFrom` refs from the
-        /// modgraph and does not consult the precision sidecars, so
-        /// `--lexical` has no effect here. Lets scripts pass the flag
-        /// uniformly across query subcommands.
-        #[arg(long, hide = true)]
-        lexical: bool,
         /// Compact output. `count` emits `N subclasses` only. `paths`
         /// emits deduped sorted file paths of the children — useful
         /// for "which files define a subtype of X?" agent queries.
@@ -863,103 +686,6 @@ enum Cmd {
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
     },
-    /// `scry build-symbols` — Kythe-class symbol-identity sidecars.
-    ///
-    /// One command, one explicit `--build-{gn,kbuild,cmake,cargo,kzip}`
-    /// flag, produces the matching sidecars:
-    ///   - GN     → clang USRs from `compile_commands.json`.
-    ///   - Kbuild → same (kernel C), via the kernel's
-    ///              `scripts/clang-tools/gen_compile_commands.py`.
-    ///   - CMake  → same; `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
-    ///   - Cargo  → polyglot pass only (Rust via rust-analyzer scip).
-    ///   - Kzip   → ingest an `all.kzip` produced by a Kythe extractor
-    ///              (e.g. AOSP via `build/soong/build_kzip.bash`).
-    ///
-    /// `--scip FILE` imports a pre-built SCIP index into the sidecar.
-    /// `--with-polyglot` also runs the polyglot pass (Rust / Go /
-    /// TypeScript / Python) over the source root regardless of the
-    /// build type.
-    BuildSymbols {
-        /// Source root. Required for every flavour except `--build-kzip`
-        /// (the kzip already carries its own paths).
-        #[arg(long, value_name = "PATH")]
-        source_root: Option<PathBuf>,
-        /// GN build out dir (the one containing `args.gn`).
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_gn: Option<PathBuf>,
-        /// Path to the `gn` binary. Defaults to `gn` on PATH.
-        #[arg(long, value_name = "PATH")]
-        gn_binary: Option<PathBuf>,
-        /// Linux kernel build out dir (the one containing `.config`).
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_kbuild: Option<PathBuf>,
-        /// CMake build out dir (the one containing `CMakeCache.txt`).
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_cmake: Option<PathBuf>,
-        /// Path to the `cmake` binary. Defaults to `cmake` on PATH.
-        #[arg(long, value_name = "PATH")]
-        cmake_binary: Option<PathBuf>,
-        /// Cargo workspace — runs polyglot pass only.
-        #[arg(long, group = "build")]
-        build_cargo: bool,
-        /// Path to an `all.kzip` produced by a Kythe extractor (AOSP
-        /// via `build/soong/build_kzip.bash`, Bazel via the equivalent,
-        /// any custom Kythe pipeline). Routes through `scry-kzip`,
-        /// which spawns the six Kythe v0.0.75 indexers per CU and
-        /// emits scry's packed sidecars directly.
-        #[arg(long, value_name = "PATH", group = "build")]
-        build_kzip: Option<PathBuf>,
-        /// Root of the Kythe release tree (the one containing
-        /// `indexers/cxx_indexer` etc.). Only used with `--build-kzip`.
-        #[arg(
-            long, value_name = "PATH",
-            default_value = "/mnt/agent/kythe-release/kythe-v0.0.75",
-        )]
-        kythe_root: PathBuf,
-        /// Escape hatch: import a pre-built `.scip` file directly into
-        /// the sidecar instead of running an indexer.
-        #[arg(long, value_name = "PATH")]
-        scip: Option<PathBuf>,
-        /// Existing scry index dir.
-        #[arg(long, short = 'o', visible_alias = "out", value_name = "DIR")]
-        index: Option<PathBuf>,
-        /// Also run polyglot pass (Rust / Go / TS / Python). Implied
-        /// when --build-cargo is set.
-        #[arg(long)]
-        with_polyglot: bool,
-        /// Skip Rust during the polyglot pass.
-        #[arg(long)]
-        no_rust: bool,
-        /// Skip Go during the polyglot pass.
-        #[arg(long)]
-        no_go: bool,
-        /// Skip TypeScript during the polyglot pass.
-        #[arg(long)]
-        no_typescript: bool,
-        /// Skip Python during the polyglot pass.
-        #[arg(long)]
-        no_python: bool,
-        /// Workers for the libclang USR pass. 0 = auto (one per CPU).
-        #[arg(long, default_value_t = 0)]
-        workers: usize,
-        /// Per-target `.scip` files (polyglot only).
-        #[arg(long, value_name = "PATH")]
-        scip_out_dir: Option<PathBuf>,
-        /// Resume from existing checkpoint at <out_dir>/kythe-logs/checkpoint/.
-        /// Errors if no checkpoint exists or its fingerprint doesn't
-        /// match the current kzip + env. Only meaningful with
-        /// `--build-kzip`.
-        #[arg(long)]
-        resume: bool,
-        /// Phase-3 rayon worker count for `--build-kzip`. Default 0
-        /// = auto: `SCRY_KZIP_WORKERS` if set, else `num_cpus/2`
-        /// (the floor keeps JVM-based indexers — java, jvm-bytecode —
-        /// from OOM'ing the host at ~200-300 MB resident set each).
-        /// Set explicitly when you've measured the headroom and want
-        /// to push above the safe cap.
-        #[arg(long, default_value_t = 0)]
-        kzip_workers: usize,
-    },
     /// Prewarm the OS page cache with every sidecar in the index, so
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
     /// hundreds of ms). Sequential parallel read of every file in
@@ -1019,17 +745,6 @@ enum Cmd {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Layer 2 ref-to-def resolution: per-ref override sidecar produced
-    /// by walking the index ONCE post-finalize. For each unresolved or
-    /// ambiguous ref, narrow candidates using language-specific context
-    /// (Java today: same package + explicit imports; same fallback to
-    /// name-match for everything else). Writes ref_resolutions.bin;
-    /// the reader honors it automatically on get_ref.
-    #[clap(hide = true)]
-    BuildResolutions {
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
     /// Compute and store per-file blake3 content digests
     /// (file_digests.bin) for an existing index. The digest is what
     /// `scry index --incremental` reads to decide which files actually
@@ -1085,9 +800,9 @@ enum Cmd {
     /// Validate the on-disk index: confirm every required artifact
     /// exists and is non-empty, the manifest is parseable, the lazy
     /// sidecars round-trip a small sample of records, and the
-    /// optional sidecars (file_symbols, ref_resolutions, file_digests,
-    /// trigrams, chunks/embeddings) are either present-and-valid or
-    /// absent (each has its own build subcommand). Reports the state
+    /// optional sidecars (file_symbols, file_digests, trigrams) are
+    /// either present-and-valid or absent (each has its own build
+    /// subcommand). Reports the state
     /// of each. Exits non-zero on any required-artifact failure.
     Health {
         #[arg(long)]
@@ -1235,19 +950,10 @@ fn main() -> Result<()> {
         Cmd::Fuzzy { substr, index, in_, not_in, distance, limit, json } => {
             cmd_fuzzy(substr, index, in_, not_in, distance, limit, json)
         }
-        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, lexical, reachable, scope, def_in, strict } => {
-            let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, reachable);
-            cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
-        }
-        Cmd::Callers { name, index, lang, in_, not_in, limit, json, precise, lexical, reachable, scope, def_in, strict, format } => {
-            if precise {
-                return cmd_callers_precise(name, index, lang, in_, not_in, limit, json);
-            }
-            let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, reachable);
-            cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, clang_precise, scip_precise, scope, def_in, strict)
-        }
+        Cmd::Ref { name, index, lang, kind, in_, not_in, limit, json, format, reachable, scope } =>
+            cmd_ref(name, index, lang, kind, in_, not_in, limit, json, format, reachable, scope),
+        Cmd::Callers { name, index, lang, in_, not_in, limit, json, reachable, scope, format } =>
+            cmd_ref(name, index, lang, Some("call".to_string()), in_, not_in, limit, json, format, reachable, scope),
         Cmd::Stats { index, json } => cmd_stats(index, json),
         Cmd::Coverage { path, index, by_kind, json } => cmd_coverage(path, index, by_kind, json),
         Cmd::Outline { path, index, json, limit, with_snippets } =>
@@ -1264,31 +970,13 @@ fn main() -> Result<()> {
         Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
-        Cmd::BuildSymbols {
-            source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
-            build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
-            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
-            kzip_workers,
-        } => cmd_build_symbols(
-            source_root, build_gn, gn_binary, build_kbuild, build_cmake, cmake_binary,
-            build_cargo, build_kzip, kythe_root, scip, index, with_polyglot,
-            no_rust, no_go, no_typescript, no_python, workers, scip_out_dir, resume,
-            kzip_workers,
-        ),
-        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json } =>
-            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, def_in, strict, lexical, limit, json),
-        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json } =>
-            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, def_in, strict, lexical, json),
-        Cmd::Uses { name, index, in_, not_in, kind, strict, format, limit, json } =>
-            cmd_uses(name, index, in_, not_in, kind, strict, format, limit, json),
-        Cmd::Finalize {
-            index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
-            scip, clang_compile_commands, clang_root, build_out, workers,
-        } => finalize::cmd_finalize(
-            index, build_soong, build_kernel, build_gn, build_bazel, build_cargo,
-            scip, clang_compile_commands, clang_root, build_out, workers,
-        ),
-        Cmd::Subclasses { name, index, in_, not_in, depth, lexical: _, format, limit, json } =>
+        Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, limit, json } =>
+            cmd_impact(name, index, in_, not_in, subclass_depth, reachable, limit, json),
+        Cmd::Callgraph { name, index, in_, not_in, depth, max_nodes, reachable, json } =>
+            cmd_callgraph(name, index, in_, not_in, depth, max_nodes, reachable, json),
+        Cmd::Uses { name, index, in_, not_in, kind, format, limit, json } =>
+            cmd_uses(name, index, in_, not_in, kind, format, limit, json),
+        Cmd::Subclasses { name, index, in_, not_in, depth, format, limit, json } =>
             cmd_subclasses(name, index, in_, not_in, depth, format, limit, json),
         Cmd::Diff { since, in_, verbose, limit, index, json } =>
             cmd_diff(since, in_, verbose, limit, index, json),
@@ -1301,7 +989,6 @@ fn main() -> Result<()> {
         Cmd::BuildOffsets { index } => cmd_build_offsets(index),
         Cmd::BuildFileSymbols { index } => cmd_build_file_symbols(index),
         Cmd::BuildFileRefs { index } => cmd_build_file_refs(index),
-        Cmd::BuildResolutions { index } => cmd_build_resolutions(index),
         Cmd::BuildDigests { index, workers } => cmd_build_digests(index, workers),
         Cmd::Compact { index } => cmd_compact(index),
         Cmd::IndexDiff { roots, index, profile, verbose, workers, json } =>
@@ -1312,229 +999,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// `scry build-symbols` — Kythe-class symbol-identity sidecars.
-///
-/// Takes one explicit `--build-{gn,kbuild,cmake,cargo,kzip}` flag,
-/// or `--scip FILE` to import a pre-built SCIP index. Optional
-/// `--with-polyglot` runs the Rust/Go/TS/Python polyglot pass over
-/// the source root.
-#[allow(clippy::too_many_arguments)]
-fn cmd_build_symbols(
-    source_root: Option<PathBuf>,
-    build_gn: Option<PathBuf>,
-    gn_binary: Option<PathBuf>,
-    build_kbuild: Option<PathBuf>,
-    build_cmake: Option<PathBuf>,
-    cmake_binary: Option<PathBuf>,
-    build_cargo: bool,
-    build_kzip: Option<PathBuf>,
-    kythe_root: PathBuf,
-    scip: Option<PathBuf>,
-    index: Option<PathBuf>,
-    with_polyglot: bool,
-    no_rust: bool,
-    no_go: bool,
-    no_typescript: bool,
-    no_python: bool,
-    workers: usize,
-    scip_out_dir: Option<PathBuf>,
-    resume: bool,
-    kzip_workers: usize,
-) -> Result<()> {
-    use scry_bridge::{cmake, gn, kbuild, polyglot};
-    let t_total = Instant::now();
-    let index_dir = index.clone().unwrap_or_else(default_index_dir);
-    let n_build_flags = build_gn.is_some() as u32
-        + build_kbuild.is_some() as u32
-        + build_cmake.is_some() as u32
-        + build_kzip.is_some() as u32
-        + build_cargo as u32;
-    if n_build_flags > 1 {
-        anyhow::bail!(
-            "build-symbols accepts at most one --build-{{gn,kbuild,cmake,cargo,kzip}} flag"
-        );
-    }
-    // --source-root is REQUIRED for every flavour, including
-    // --build-kzip. Earlier versions treated --build-kzip as
-    // self-contained, on the (wrong) assumption that the kzip's
-    // VName paths were absolute. They're corpus-relative — without
-    // a source root to prepend, the resulting clang_usrs / scip
-    // sidecars carry paths like `frameworks/base/...` while
-    // queries pass `/home/zim/dev/aosp/frameworks/base/...`, so
-    // every precision lookup misses with "uncovered TU".
-    if source_root.is_none() {
-        anyhow::bail!(
-            "--source-root PATH is required. For --build-kzip this is the on-disk \
-             root that Kythe's corpus-relative paths resolve against (e.g. \
-             /home/zim/dev/aosp). Without it the precision sidecars are unusable \
-             from query time."
-        );
-    }
-    let source_root: PathBuf = source_root.unwrap();
-
-    if let Some(build_dir) = build_gn.as_ref() {
-        eprintln!("[build-symbols] gn build_dir: {}", build_dir.display());
-        let cc = match gn::locate_compile_commands(build_dir)? {
-            Some(cc) => {
-                eprintln!("[build-symbols] gn: reusing existing {}", cc.display());
-                cc
-            }
-            None => {
-                let bin = gn_binary.unwrap_or_else(|| PathBuf::from("gn"));
-                eprintln!(
-                    "[build-symbols] gn: regenerating compile_commands.json via `{} gen --export-compile-commands {}`",
-                    bin.display(), build_dir.display(),
-                );
-                gn::regenerate_compile_commands(&bin, &source_root, build_dir)?
-            }
-        };
-        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
-    } else if let Some(build_dir) = build_kbuild.as_ref() {
-        eprintln!("[build-symbols] kbuild build_dir: {}", build_dir.display());
-        if !kbuild::looks_like_kernel_source(&source_root) {
-            anyhow::bail!(
-                "{} doesn't look like a Linux kernel source tree \
-                 (expected Makefile + Kconfig + scripts/ at top level)",
-                source_root.display(),
-            );
-        }
-        let cc = match kbuild::locate_compile_commands(build_dir)? {
-            Some(cc) => {
-                eprintln!("[build-symbols] kbuild: reusing existing {}", cc.display());
-                cc
-            }
-            None => {
-                eprintln!(
-                    "[build-symbols] kbuild: regenerating compile_commands.json via gen_compile_commands.py"
-                );
-                kbuild::regenerate_compile_commands(&source_root, build_dir)?
-            }
-        };
-        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
-    } else if let Some(build_dir) = build_cmake.as_ref() {
-        eprintln!("[build-symbols] cmake build_dir: {}", build_dir.display());
-        let cc = match cmake::locate_compile_commands(build_dir)? {
-            Some(cc) => {
-                eprintln!("[build-symbols] cmake: reusing existing {}", cc.display());
-                cc
-            }
-            None => {
-                let bin = cmake_binary.unwrap_or_else(|| PathBuf::from("cmake"));
-                eprintln!(
-                    "[build-symbols] cmake: regenerating compile_commands.json via {}",
-                    bin.display(),
-                );
-                cmake::regenerate_compile_commands(&bin, build_dir)?
-            }
-        };
-        run_clang_on_cc(&cc, &source_root, &index_dir, workers)?;
-    } else if build_cargo {
-        // No C-family step; polyglot pass handles Rust via rust-analyzer scip.
-        eprintln!(
-            "[build-symbols] cargo: skipping C-family step, polyglot pass will handle Rust"
-        );
-    } else if let Some(kzip_path) = build_kzip.as_ref() {
-        let workers_override = if kzip_workers == 0 { None } else { Some(kzip_workers) };
-        eprintln!(
-            "[build-symbols] kzip: {} (kythe-root: {}, source-root: {}, resume={}, workers={})",
-            kzip_path.display(), kythe_root.display(), source_root.display(), resume,
-            workers_override.map(|n| n.to_string())
-                .unwrap_or_else(|| "auto".to_string()),
-        );
-        let report = scry_kzip::build_packed_from_kzip(
-            kzip_path, &index_dir, &kythe_root, resume, workers_override, &source_root,
-        )
-            .with_context(|| format!("build packed sidecars from {}", kzip_path.display()))?;
-        eprintln!(
-            "[build-symbols] kzip done: {} clang USRs, {} SCIP records in {:.1}s",
-            report.emit.cxx_records, report.emit.scip_records, report.wall_secs,
-        );
-    } else if resume {
-        anyhow::bail!("--resume is only meaningful with --build-kzip");
-    }
-
-    if let Some(scip_path) = scip.as_ref() {
-        let t = Instant::now();
-        scry_scip::import_scip(scip_path, &index_dir, Some(source_root.as_path()))
-            .with_context(|| format!("import scip {}", scip_path.display()))?;
-        eprintln!(
-            "[build-symbols] imported scip {} in {:.2}s",
-            scip_path.display(), t.elapsed().as_secs_f64(),
-        );
-    }
-
-    // Cargo always needs the polyglot pass since it's pure-Rust.
-    if with_polyglot || build_cargo {
-        let mut kinds: Vec<polyglot::PolyglotKind> = Vec::new();
-        if !no_rust       { kinds.push(polyglot::PolyglotKind::Rust); }
-        if !no_go         { kinds.push(polyglot::PolyglotKind::Go); }
-        if !no_typescript { kinds.push(polyglot::PolyglotKind::TypeScript); }
-        if !no_python     { kinds.push(polyglot::PolyglotKind::Python); }
-        if kinds.is_empty() {
-            anyhow::bail!("polyglot pass requested but every language was disabled");
-        }
-        eprintln!(
-            "[build-symbols] polyglot pass over {} ({})",
-            source_root.display(),
-            kinds.iter().map(|k| k.label()).collect::<Vec<_>>().join(", "),
-        );
-        let targets = polyglot::discover(&source_root, &kinds)
-            .context("discover polyglot project roots")?;
-        if targets.is_empty() {
-            eprintln!("[build-symbols] polyglot: no targets discovered");
-        } else {
-            let mut cfg = polyglot::PolyglotConfig::default();
-            if let Some(p) = scip_out_dir { cfg.scip_out_dir = p; }
-            let report = polyglot::run(&targets, &cfg).context("polyglot dispatch")?;
-            eprintln!(
-                "[build-symbols] polyglot: {} OK, {} failed ({} .scip files)",
-                report.ok, report.failed, report.scip_files.len(),
-            );
-            if report.failed > 0 {
-                anyhow::bail!(
-                    "{} of {} polyglot targets failed to index",
-                    report.failed, report.ok + report.failed,
-                );
-            }
-            for shard in &report.scip_files {
-                scry_scip::import_scip_with_mode(
-                    shard, &index_dir, Some(source_root.as_path()), true,
-                ).with_context(|| format!("import polyglot scip {}", shard.display()))?;
-            }
-        }
-    }
-
-    eprintln!(
-        "[build-symbols] ALL STAGES OK in {:.2}s",
-        t_total.elapsed().as_secs_f64(),
-    );
-    Ok(())
-}
-
-/// Run libclang USR extraction over `compile_commands.json`. Shared
-/// by the gn / kbuild / cmake arms of `cmd_build_symbols`.
-fn run_clang_on_cc(
-    compile_commands: &Path,
-    source_root: &Path,
-    index_dir: &Path,
-    workers: usize,
-) -> Result<()> {
-    let t = Instant::now();
-    scry_clang::build_clang_usrs(
-        compile_commands, index_dir, Some(source_root), workers,
-        4 * 1024 * 1024,
-    )?;
-    eprintln!(
-        "[build-symbols] clang USRs landed in {} in {:.2}s",
-        index_dir.join("clang_usrs.bin").display(),
-        t.elapsed().as_secs_f64(),
-    );
-    Ok(())
-}
-
-/// Emit a shell-completion script for `shell` to stdout. Wraps
-/// `clap_complete::generate` against the live `Args` derivation —
-/// no manual sync needed when subcommands or flags change.
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
     use clap::CommandFactory;
     let mut cmd = Cli::command();
@@ -1749,10 +1213,11 @@ fn cmd_index(
     // (file enumeration), parse (tree-sitter + symbol extraction with
     // streaming chunk flushes), and finalize-write (the in-memory
     // writer commits its packed sidecars and manifest).
-    // build-resolutions / build-trigrams / build-digests live in
-    // `scry finalize`, not here. Each phase brackets one terse start
-    // line and a one-line done summary so operators can grep
-    // `^\[index\] phase ` for a milestone trace.
+    // The optional sidecar builders (build-file-symbols / build-file-refs
+    // / build-trigrams / build-digests) are separate subcommands, not part
+    // of this path. Each phase brackets one terse start line and a
+    // one-line done summary so operators can grep `^\[index\] phase ` for
+    // a milestone trace.
     const N_PHASES: u32 = 3;
     let t_phase_walk = Instant::now();
     eprintln!("[index] phase 1/{N_PHASES}: walk source roots ({} root{})",
@@ -2775,9 +2240,6 @@ fn cmd_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
-    def_in: Option<String>,
-    strict: bool,
-    lexical: bool,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
@@ -2794,35 +2256,6 @@ fn cmd_callgraph(
         })
     } else { None };
 
-    // Kythe-precise expansion uses `resolved_to` (written by
-    // build-resolutions exclusively from SCIP / clang USR symbol
-    // identity, no lexical heuristic) at every level of the tree.
-    // The root in-scope def set is whatever `--def-in` narrows the
-    // callee's defs to, or — when --def-in is absent — every def of
-    // the callee's bare name. Deeper levels recompute their in-scope
-    // set from the enclosing-function id of the parent call site.
-    //
-    // `--lexical` opts out of precision entirely (in_scope_def_ids
-    // = None at every level → expansion is pure name-match, same as
-    // the pre-Kythe behavior).
-    let in_scope_root_defs: Option<std::collections::HashSet<u64>> = if lexical {
-        None
-    } else {
-        let mut all = r.lookup_exact(&name);
-        if let Some(p) = def_in.as_deref() {
-            all.retain(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(p)));
-            if all.is_empty() {
-                eprintln!(
-                    "[scry] --def-in: no def of {name:?} found in any file \
-                     containing {p:?}; precision filter would reject every \
-                     candidate. Pass `--lexical` to bypass.",
-                );
-            }
-        }
-        Some(all.into_iter().map(|s| s.id).collect())
-    };
-
     /// One node in the callers tree. Children are callers of this
     /// function (i.e. parents on the call stack).
     #[derive(Debug, Default, serde::Serialize)]
@@ -2835,24 +2268,18 @@ fn cmd_callgraph(
         callers: std::collections::BTreeMap<String, Node>,
     }
 
-    /// Per-level expansion. `in_scope_def_ids = Some(set)` requires
-    /// `resolved_to ∈ set` (Kythe-precise mode); `None` means the
-    /// user opted into `--lexical` and every name-matched ref is
-    /// kept. The grouping key for children is the enclosing
-    /// function's SymbolRecord id, NOT the bare function name — so
-    /// at the next level we recurse with `Some({that-id})` and only
-    /// follow refs that Kythe attributed to THAT specific function
-    /// def, not every same-named function across the corpus.
+    /// Per-level expansion. Every name-matched call ref (after path +
+    /// reachability filters) is kept; children are grouped by the
+    /// enclosing function's SymbolRecord id so recursion follows the
+    /// exact call site, and `visited` breaks mutual-recursion cycles.
     #[allow(clippy::too_many_arguments)]
     fn expand(
         r: &StoreReader,
         callee_name: &str,
-        in_scope_def_ids: Option<&std::collections::HashSet<u64>>,
         depth_left: usize,
         in_prefix: &str,
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
-        strict: bool,
         visited: &mut std::collections::HashSet<u64>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
@@ -2884,18 +2311,6 @@ fn cmd_callgraph(
                         }
                     }
                 }
-            }
-            // Kythe-precise filter: in precise mode (Some), the ref
-            // must resolve to one of the in-scope defs. In --lexical
-            // mode (None), every name-matched ref passes. Mixed:
-            // `--strict` without precision still drops Layer-2
-            // unresolveds even in lexical mode (preserves the
-            // pre-Kythe `--strict` semantics).
-            match (in_scope_def_ids, rr.resolved_to, strict) {
-                (Some(set), Some(id), _) if !set.contains(&id) => continue,
-                (Some(_), None, _) => continue, // unresolved in precise mode
-                (None, None, true) => continue, // strict + lexical = drop unresolveds
-                _ => {}
             }
             // Caller-side identity: the enclosing function symbol id.
             // Fall back to scope_path (the enclosing class on Java)
@@ -2932,16 +2347,10 @@ fn cmd_callgraph(
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for (caller_def_id, (caller_name, mut node)) in by_caller_def {
             if visited.insert(caller_def_id) {
-                let next_scope: std::collections::HashSet<u64> =
-                    std::iter::once(caller_def_id).collect();
-                // In --lexical mode (None at this level) keep
-                // recursion lexical too — user opted out of precision
-                // for the whole tree.
-                let recurse_scope = in_scope_def_ids.map(|_| &next_scope);
                 node.callers = expand(
-                    r, &caller_name, recurse_scope,
+                    r, &caller_name,
                     depth_left - 1, in_prefix, not_in_prefix,
-                    callee_modules, strict, visited, budget,
+                    callee_modules, visited, budget,
                 );
                 visited.remove(&caller_def_id);
             }
@@ -2965,9 +2374,9 @@ fn cmd_callgraph(
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let prefix = in_.as_deref().unwrap_or("");
     let neg_prefix = not_in.as_deref().unwrap_or("");
-    let tree = expand(&r, &name, in_scope_root_defs.as_ref(), depth,
+    let tree = expand(&r, &name, depth,
                       prefix, neg_prefix, callee_modules.as_ref(),
-                      strict, &mut visited, &mut budget);
+                      &mut visited, &mut budget);
 
     if json {
         println!("{}", serde_json::json!({
@@ -3000,7 +2409,7 @@ fn cmd_callgraph(
             println!("  (no callers found)");
             // v0.1.54 — typo hint when nothing matched. Gated on
             // no narrowing flags (same logic as cmd_def / cmd_ref).
-            if in_.is_none() && not_in.is_none() && def_in.is_none() {
+            if in_.is_none() && not_in.is_none() {
                 if let Some(hint) = suggest_similar(&r, &name) {
                     eprintln!("[scry] {hint}");
                 }
@@ -3038,67 +2447,23 @@ fn cmd_impact(
     not_in: Option<String>,
     subclass_depth: usize,
     reachable: bool,
-    def_in: Option<String>,
-    strict: bool,
-    lexical: bool,
     limit: usize,
     json: bool,
 ) -> Result<()> {
     let t = Instant::now();
     let r = open_index(index)?;
 
-    // Callers — lookup_refs_exact, filter by kind=call, then apply
-    // build-symbol precision (auto-on when sidecars are present —
-    // `lexical` opt-out skips it) and path filters.
+    // Callers — lookup_refs_exact, filter by kind=call, then path filters.
     let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(&name)
         .into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
-    let (_reach, clang_precise, scip_precise) =
-        resolve_precision(lexical, false);
-    let callers_precise = apply_precision_filter(
-        &r, &name, raw_callers, clang_precise, scip_precise, None,
-    )?;
-    let mut callers: Vec<RefRecord> = callers_precise.into_iter()
+    let mut callers: Vec<RefRecord> = raw_callers.into_iter()
         .filter(|rr| match r.display_path_cached(rr.file_id) {
             Some(p) => path_matches(p, in_.as_deref(), not_in.as_deref()),
             None => in_.is_none() && not_in.is_none(),
         })
         .collect();
-    // v0.1.45 — narrow callers by callee location (same as ref --def-in).
-    // Doesn't affect subclasses (which are about the type, not the method).
-    if let Some(def_path) = def_in.as_deref() {
-        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(&name)
-            .iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(def_path)))
-            .map(|s| s.id)
-            .collect();
-        if target_ids.is_empty() {
-            eprintln!(
-                "[scry] impact --def-in: no def of {name:?} found in any file \
-                 containing {def_path:?}; callers will not be narrowed.",
-            );
-        } else {
-            let before = callers.len();
-            callers.retain(|rr| match rr.resolved_to {
-                Some(id) => target_ids.contains(&id),
-                None => !strict,
-            });
-            eprintln!(
-                "[scry] impact --def-in {def_path:?}{}: {} → {} callers",
-                if strict { " --strict" } else { "" },
-                before, callers.len(),
-            );
-        }
-    } else if strict {
-        let before = callers.len();
-        callers.retain(|rr| rr.resolved_to.is_some());
-        eprintln!(
-            "[scry] impact --strict: {} → {} callers (unresolved dropped)",
-            before, callers.len(),
-        );
-    }
     if reachable {
         if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(&name);
@@ -3160,7 +2525,7 @@ fn cmd_impact(
         // narrowed the search. Helps users who typo the name (the no-op
         // shape would otherwise be silently confusing).
         if callers.is_empty() && subclasses.is_empty()
-            && in_.is_none() && not_in.is_none() && def_in.is_none()
+            && in_.is_none() && not_in.is_none()
         {
             if let Some(hint) = suggest_similar(&r, &name) {
                 eprintln!("[scry] {hint}");
@@ -3345,316 +2710,8 @@ fn print_fuzzy_results(r: &StoreReader, scored: &[(SymbolRecord, u32)], json: bo
         scored.len());
 }
 
-/// Resolve the precision flags. Default-on precision picks up
-/// clang USR + SCIP identity filters (both cheap: small sidecars,
-/// O(1) hash lookups, no-op if missing). Build-graph reachability
-/// (`--reachable`) stays explicit opt-in because the AOSP
-/// `module_graph.json` is 256MB and its eager parse + Warshall
-/// closure costs ~30s cold — paying that on every CLI invocation
-/// would crush the per-query latency the user expects from a
-/// grep-class tool. `--lexical` turns everything off, leaving
-/// pure tree-sitter name match.
-///
-/// Returns `(reachable, clang_precise, scip_precise)`. The latter
-/// two booleans gate which sidecar `apply_precision_filter` will
-/// consult; they're not surfaced as standalone CLI flags because
-/// the user choice is binary: precise-by-default or `--lexical`.
-fn resolve_precision(
-    lexical: bool,
-    explicit_reachable: bool,
-) -> (bool, bool, bool) {
-    if lexical {
-        return (false, false, false);
-    }
-    (explicit_reachable, true, true)
-}
 
-/// Apply build-symbol precision filtering (clang USR + SCIP symbol
-/// identity) to a candidate set of refs.
-///
-/// **Strict-by-default semantics (Kythe parity).** When precision is
-/// engaged we treat every ref as guilty until proven innocent: a ref
-/// survives only if its byte-position resolves to the same identity
-/// (USR / SCIP symbol) as one of NAME's defs. The previous
-/// "permissive over-include when uncovered" behaviour was a
-/// tree-sitter heuristic — it kept refs whose TU the build indexer
-/// hadn't seen, masking the gap and silently degrading precision.
-/// That fallback is gone; the only way back to tree-sitter
-/// behaviour is `--lexical`, which short-circuits this function
-/// entirely.
-///
-/// **Per-language sidecar policy.** C/C++/ObjC files use the clang
-/// USR sidecar; everything else uses SCIP. The two filters operate
-/// independently:
-///   - C-family ref + clang sidecar present  →  must match a def USR.
-///   - C-family ref + clang sidecar absent   →  unverifiable; drop.
-///   - Non-C ref     + SCIP sidecar present  →  must match a def sym.
-///   - Non-C ref     + SCIP sidecar absent   →  unverifiable; drop.
-///
-/// **Hard error only when BOTH sidecars are absent AND both filters
-/// were requested.** Otherwise we silently drop unverifiable refs
-/// (with a diagnostic). This lets a Python-only or Rust-only index
-/// run the default-on precision path without insisting on
-/// `clang_usrs.bin`, while still refusing to silently degrade to
-/// tree-sitter when nothing precision-grade exists.
-pub(crate) fn apply_precision_filter(
-    r: &StoreReader,
-    name: &str,
-    refs: Vec<RefRecord>,
-    clang_precise: bool,
-    scip_precise: bool,
-    defs_override: Option<Vec<SymbolRecord>>,
-) -> Result<Vec<RefRecord>> {
-    if !clang_precise && !scip_precise {
-        return Ok(refs);
-    }
-    // Window covers the offset drift between tree-sitter (identifier
-    // position) and the indexer's cursor position (clang sometimes
-    // sits at the keyword for class/struct/typedef). 64 bytes covers
-    // every real-world identifier without bridging adjacent decls.
-    const WINDOW: u32 = 64;
-    // `defs_override` lets the caller narrow precision to a scoped
-    // def set (e.g. callers passing through `--def-in PATH` filter
-    // the defs to one class before we build def_usrs / def_syms).
-    // Without it, the filter pulls the full corpus-wide def list,
-    // which for common method names (`set`, `get`, `add`, ...) is
-    // hundreds of defs across unrelated classes — letting through
-    // refs to e.g. `ThreadLocal.set` when the user asked about
-    // `SystemProperties.set`, wherever the SCIP CU is missing.
-    let defs = defs_override.unwrap_or_else(|| r.lookup_exact(name));
 
-    // Cached lazy accessors. Open is microseconds (header parse +
-    // mmap calls); the lazy `abs_path → path_id` index is built on
-    // first lookup. Daemon (`serve` / `mcp`) pays both once at
-    // startup, CLI pays per process.
-    let cusr_opt: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
-        r.clang_usrs()
-    } else {
-        None
-    };
-    let sidx_opt: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
-        r.scip_index()
-    } else {
-        None
-    };
-    // JVM-FQN canonical companion sidecar — see [`StorePaths::scip_index_fqn`].
-    // Gated on the same --scip-precise switch as the main SCIP
-    // sidecar; both feed `def_syms` independently and the ref-side
-    // verdict accepts EITHER side's match. This is the cross-CU
-    // bridge: when a def-side anchor and a ref-side call site
-    // project the same JVM entity onto two different symbol-string
-    // namespaces (the language=java VName signature vs the
-    // bridged `jvm:...` FQN), the FQN sidecar carries both anchors
-    // keyed on the same canonical FQN, so the def_syms ∩ ref-side
-    // lookup succeeds.
-    let sidx_fqn_opt: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
-        r.scip_index_fqn()
-    } else {
-        None
-    };
-
-    if cusr_opt.is_none() && sidx_opt.is_none() && sidx_fqn_opt.is_none() {
-        anyhow::bail!(
-            "precision query but no precision sidecars at {} (looked for \
-             clang_usrs.bin and scip_index.bin). Run \
-             `scry build-symbols --build-gn DIR` (or `--build-kbuild` / \
-             `--build-cmake` for the equivalent compile_commands.json \
-             producer) and / or `scry build-symbols --scip FILE.scip` \
-             against `--index DIR` first, or pass `--lexical` to opt \
-             into tree-sitter name match.",
-            r.paths.clang_usrs().parent().map(|p| p.display().to_string())
-                .unwrap_or_default(),
-        );
-    }
-
-    // Build a per-file_id cache of (display_path, is_c_family) so the
-    // per-ref filter loop below avoids reallocating both on every
-    // record. On AOSP+kernel scale this loop fires for 100k+ refs;
-    // hoisting display_path turns the inner cost from "string alloc
-    // + HashMap<String> hash + strcmp" into "Vec::get + bool check".
-    let n_files = r.file_count();
-    let mut path_by_id: Vec<Option<(String, bool)>> = vec![None; n_files];
-    for fe in r.iter_files() {
-        let p = fe.display_path();
-        let cf = is_c_family(&p);
-        path_by_id[fe.id as usize] = Some((p, cf));
-    }
-    // Drive the sidecar precompute step from the same cache so each
-    // sidecar's per-file lookup table is also file_id-indexed.
-    let cusr_lookup = cusr_opt.map(|cusr| {
-        cusr.precompute_by_file_ids(
-            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
-                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
-            }),
-            n_files,
-        )
-    });
-    let sidx_lookup = sidx_opt.map(|sidx| {
-        sidx.precompute_by_file_ids(
-            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
-                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
-            }),
-            n_files,
-        )
-    });
-    let sidx_fqn_lookup = sidx_fqn_opt.map(|sidx| {
-        sidx.precompute_by_file_ids(
-            path_by_id.iter().enumerate().filter_map(|(i, slot)| {
-                slot.as_ref().map(|(p, _)| (i as u32, p.as_str()))
-            }),
-            n_files,
-        )
-    });
-
-    // Gather def identities once per sidecar. Empty sets are fine:
-    // they signal "this name has no defs the sidecar attributes to a
-    // symbol", which then forces every ref in that family to drop
-    // (Kythe parity — no def attribution means no ref attribution).
-    let def_usrs: std::collections::HashSet<String> = match &cusr_lookup {
-        Some(cl) => defs.iter()
-            .filter_map(|s| {
-                let (_, cf) = path_by_id.get(s.file_id as usize)?.as_ref()?;
-                if !cf { return None; }
-                cl.usr_for_window(s.file_id, s.byte_start, WINDOW)
-                    .map(str::to_string)
-            })
-            .collect(),
-        None => Default::default(),
-    };
-    // Def-side symbol identities. Pull from BOTH the main SCIP sidecar
-    // (source-level language=java VName signatures) AND the FQN
-    // companion (canonical `jvm:` FQNs). Both go into one set — the
-    // two namespaces are disjoint by construction (`jvm:` prefix vs
-    // the Kythe SCIP signature shape), so there's no collision.
-    // Carrying both lets the ref-side filter below accept a match
-    // against either projection of the same def.
-    let def_syms: std::collections::HashSet<String> = {
-        let mut set: std::collections::HashSet<String> = Default::default();
-        if let Some(sl) = sidx_lookup.as_ref() {
-            for s in defs.iter() {
-                let Some((_, cf)) = path_by_id.get(s.file_id as usize).and_then(|o| o.as_ref())
-                else { continue; };
-                if *cf { continue; }
-                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, WINDOW) {
-                    set.insert(sym.to_string());
-                }
-            }
-        }
-        if let Some(sl) = sidx_fqn_lookup.as_ref() {
-            for s in defs.iter() {
-                let Some((_, cf)) = path_by_id.get(s.file_id as usize).and_then(|o| o.as_ref())
-                else { continue; };
-                if *cf { continue; }
-                if let Some(sym) = sl.symbol_for_window(s.file_id, s.byte_start, WINDOW) {
-                    set.insert(sym.to_string());
-                }
-            }
-        }
-        set
-    };
-
-    let before = refs.len();
-    let mut c_dropped_uncov = 0usize;
-    let mut c_dropped_id = 0usize;
-    let mut s_dropped_uncov = 0usize;
-    let mut s_dropped_id = 0usize;
-    let kept: Vec<RefRecord> = refs.into_iter().filter(|rr| {
-        let Some((_, c_family)) = path_by_id
-            .get(rr.file_id as usize).and_then(|o| o.as_ref())
-        else { return false; };
-        if *c_family {
-            // C-family ref: clang sidecar owns the verdict.
-            let Some(cl) = cusr_lookup.as_ref() else {
-                c_dropped_uncov += 1;
-                return false;
-            };
-            match cl.usr_for_window(rr.file_id, rr.byte_start, WINDOW) {
-                Some(u) => {
-                    let ok = def_usrs.contains(u);
-                    if !ok { c_dropped_id += 1; }
-                    ok
-                }
-                None => {
-                    c_dropped_uncov += 1;
-                    false
-                }
-            }
-        } else {
-            // Non-C ref: SCIP sidecar owns the verdict. Try the main
-            // sidecar first, then the JVM-FQN companion — a match
-            // against either def_syms projection keeps the ref.
-            // "Uncovered TU" only fires when NEITHER sidecar covers
-            // the file_id; "id mismatch" fires when at least one
-            // looked up a symbol but none was in def_syms. Counters
-            // are charged once per ref, no double-counting.
-            let main_covers = sidx_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-            let fqn_covers = sidx_fqn_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-            if !main_covers && !fqn_covers {
-                s_dropped_uncov += 1;
-                return false;
-            }
-            let from_main = if main_covers {
-                sidx_lookup.as_ref()
-                    .and_then(|sl| sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW))
-                    .filter(|s| def_syms.contains(*s))
-            } else { None };
-            if from_main.is_some() {
-                return true;
-            }
-            let from_fqn = if fqn_covers {
-                sidx_fqn_lookup.as_ref()
-                    .and_then(|sl| sl.symbol_for_window(rr.file_id, rr.byte_start, WINDOW))
-                    .filter(|s| def_syms.contains(*s))
-            } else { None };
-            if from_fqn.is_some() {
-                true
-            } else {
-                s_dropped_id += 1;
-                false
-            }
-        }
-    }).collect();
-
-    // Always log when precision was engaged — quiet success is
-    // indistinguishable from quiet pass-through, and we want users
-    // (and tests) to be able to see that strict-precise actually ran.
-    let sidecars = match (cusr_opt.is_some(), sidx_opt.is_some(), sidx_fqn_opt.is_some()) {
-        (true,  true,  true)  => "clang_usrs + scip_index + scip_index_fqn",
-        (true,  true,  false) => "clang_usrs + scip_index",
-        (true,  false, false) => "clang_usrs",
-        (false, true,  true)  => "scip_index + scip_index_fqn",
-        (false, true,  false) => "scip_index",
-        (false, false, true)  => "scip_index_fqn",
-        // FQN-only without main is supported (the bridge can carry
-        // both decl and ref anchors on its own); listed for completeness.
-        (true,  false, true)  => "clang_usrs + scip_index_fqn",
-        // unreachable: bailed above when ALL of (cusr, sidx) are None.
-        // sidx_fqn_opt alone doesn't trip the bail, but the bail
-        // intentionally requires at least one of cusr/sidx to be present.
-        (false, false, false) => "(none)",
-    };
-    eprintln!(
-        "[scry] precise ({sidecars}): {before} → {} refs (clang: {} id-mismatch, \
-         {} uncovered TU; SCIP: {} id-mismatch, {} uncovered TU; \
-         {} def USRs, {} def SCIP symbols)",
-        kept.len(),
-        c_dropped_id, c_dropped_uncov,
-        s_dropped_id, s_dropped_uncov,
-        def_usrs.len(), def_syms.len(),
-    );
-    Ok(kept)
-}
-
-/// File-path classifier used by [`apply_precision_filter`] to decide
-/// which precision sidecar owns a given ref. C/C++/ObjC live in the
-/// clang USR sidecar; everything else lives in SCIP.
-fn is_c_family(path: &str) -> bool {
-    matches!(
-        path.rsplit('.').next().unwrap_or(""),
-        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx"
-        | "ipp" | "inl" | "m" | "mm"
-    )
-}
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_ref(
@@ -3668,11 +2725,7 @@ fn cmd_ref(
     json: bool,
     format: Option<String>,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
     scope: Option<String>,
-    def_in: Option<String>,
-    strict: bool,
 ) -> Result<()> {
     if let Some(f) = format.as_deref() {
         if !matches!(f, "count" | "by-def" | "paths") {
@@ -3724,103 +2777,6 @@ fn cmd_ref(
             true
         })
         .collect();
-    // --def-in PATH: only keep refs whose resolved_to points at a
-    // def whose file path contains PATH. Refs with resolved_to=None
-    // (build-resolutions couldn't narrow them) pass through — we'd
-    // rather over-include than silently drop the ones Layer 2
-    // resolution didn't reach.
-    //
-    // `scoped_defs` carries the narrowed def set into
-    // `apply_precision_filter` below so the SCIP / clang USR identity
-    // check compares against only the in-scope defs, not the full
-    // corpus-wide def union. Without this, common method names
-    // (`set`, `get`, `add`, …) degenerate the filter into "is this
-    // any same-named def anywhere" — any uncovered CU then lets
-    // unrelated `Foo.set` / `Bar.set` calls through even when the
-    // user scoped to `SystemProperties.set`.
-    let mut scoped_defs: Option<Vec<SymbolRecord>> = None;
-    let filtered = if let Some(def_path) = def_in.as_deref() {
-        let defs_in_scope: Vec<SymbolRecord> = r.lookup_exact(&name)
-            .into_iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(def_path)))
-            .collect();
-        let target_ids: std::collections::HashSet<u64> =
-            defs_in_scope.iter().map(|s| s.id).collect();
-        if target_ids.is_empty() {
-            eprintln!(
-                "[scry] --def-in: no def of {name:?} found in any file containing \
-                 {def_path:?}; returning all refs unfiltered.",
-            );
-            filtered
-        } else {
-            scoped_defs = Some(defs_in_scope);
-            let before = filtered.len();
-            let kept: Vec<RefRecord> = filtered.into_iter().filter(|rr| {
-                match rr.resolved_to {
-                    Some(id) => target_ids.contains(&id),
-                    // Strict mode (v0.1.34): drop unresolved instead of
-                    // permissively keeping them. Trades recall for
-                    // precision — only refs the resolver could confidently
-                    // attribute to PATH survive.
-                    None => !strict,
-                }
-            }).collect();
-            let resolved_kept = kept.iter().filter(|rr| rr.resolved_to.is_some()).count();
-            let unresolved = kept.len() - resolved_kept;
-            if strict {
-                eprintln!(
-                    "[scry] --def-in {def_path:?} --strict: {} → {} refs \
-                     ({} resolved to a def in scope; unresolved dropped)",
-                    before, kept.len(), resolved_kept,
-                );
-            } else if resolved_kept == 0 {
-                // v0.1.48 — special-case the "0 resolved" diagnostic.
-                // The generic message ("pass --strict to drop unresolved")
-                // is misleading here — strict would just return 0 hits,
-                // which doesn't help the user. The real issue is one of:
-                //   (a) the def has no callers in the corpus,
-                //   (b) the resolver couldn't attribute any caller to it
-                //       (typical for Java method dispatch without
-                //        receiver-type inference — `obj.foo()` calls
-                //        often resolve to an interface or parent class
-                //        method, not the override),
-                //   (c) the build-resolutions sidecar is stale.
-                eprintln!(
-                    "[scry] --def-in {def_path:?}: {} → {} refs (0 resolved to a \
-                     def in scope, all {} permissively kept). The over-include \
-                     is the best the heuristic resolver can do — receiver-type \
-                     inference would be needed to confidently attribute callers \
-                     to a specific override of {name:?}. Try \
-                     `scry callers {name} --format by-def` to see which defs \
-                     the callers actually resolve to.",
-                    before, kept.len(), unresolved,
-                );
-            } else {
-                eprintln!(
-                    "[scry] --def-in {def_path:?}: {} → {} refs ({} resolved to a \
-                     def in scope, {} unresolved-but-kept; pass --strict to drop \
-                     unresolved, or run `scry build-resolutions` for tighter narrowing)",
-                    before, kept.len(), resolved_kept, unresolved,
-                );
-            }
-            kept
-        }
-    } else if strict {
-        // --strict without --def-in: drop refs the resolver couldn't
-        // attribute to any specific def. Useful for "show me only the
-        // confidently-resolved call sites of X".
-        let before = filtered.len();
-        let kept: Vec<RefRecord> = filtered.into_iter()
-            .filter(|rr| rr.resolved_to.is_some()).collect();
-        eprintln!(
-            "[scry] --strict: {} → {} refs (unresolved dropped)",
-            before, kept.len(),
-        );
-        kept
-    } else {
-        filtered
-    };
     // --reachable: drop refs whose owning module can't transitively
     // reach any module that defines the name, per the Soong / GN /
     // kernel module-graph sidecar. No-op without the sidecar
@@ -3873,9 +2829,6 @@ fn cmd_ref(
     } else {
         filtered
     };
-    let filtered = apply_precision_filter(
-        &r, &name, filtered, clang_precise, scip_precise, scoped_defs,
-    )?;
     let label = if kind.as_deref() == Some("call") { "callers" } else { "ref" };
     // --format count: just the totals, no per-hit rows. Pays off for
     // "how many callers does X have?" agent queries — one short line
@@ -3910,7 +2863,7 @@ fn cmd_ref(
     if filtered.is_empty()
         && in_.is_none() && not_in.is_none()
         && lang.is_none()
-        && scope.is_none() && def_in.is_none()
+        && scope.is_none()
     {
         if let Some(hint) = suggest_similar(&r, &name) {
             eprintln!("[scry] {hint}");
@@ -3920,7 +2873,8 @@ fn cmd_ref(
     Ok(())
 }
 
-/// Histogram of refs grouped by their Layer 2 resolved_to target.
+/// Histogram of refs grouped by their resolved_to target (Layer-1
+/// name match; null on streaming indexes that skip the resolve pass).
 /// Human format: `<count>  → file:line [scope]` per group,
 /// descending by count, capped at `limit` groups. Unresolved refs
 /// are bucketed into a single `<unresolved>` row at the bottom.
@@ -4070,14 +3024,6 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
         *by_kind.entry(s.kind).or_default() += 1;
     }
 
-    // Resolution sidecar coverage (v0.1.41). None ⇒ sidecar absent
-    // (no `scry build-resolutions` was run).
-    let resolved_count = r.count_resolved_refs();
-    let total_refs = r.manifest.stats.refs;
-    let resolved_pct = resolved_count.map(|n|
-        if total_refs == 0 { 0.0 }
-        else { (n as f64) * 100.0 / (total_refs as f64) });
-
     if json {
         let by_lang_map: serde_json::Map<String, serde_json::Value> = by_lang.iter()
             .map(|(k, c)| (k.as_str().to_string(), serde_json::json!(c)))
@@ -4099,8 +3045,6 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
             "bytes_total":     r.manifest.stats.bytes_total,
             "symbols":         r.manifest.stats.symbols,
             "refs":            r.manifest.stats.refs,
-            "refs_resolved":   resolved_count,
-            "refs_resolved_pct": resolved_pct,
             "elapsed_ms":      r.manifest.stats.elapsed_ms,
             "by_lang":         serde_json::Value::Object(by_lang_map),
             "by_kind":         serde_json::Value::Object(by_kind_map),
@@ -4121,12 +3065,6 @@ fn cmd_stats(index: Option<PathBuf>, json: bool) -> Result<()> {
     println!("bytes-total:  {}", human_bytes(r.manifest.stats.bytes_total));
     println!("symbols:      {}", r.manifest.stats.symbols);
     println!("refs:         {}", r.manifest.stats.refs);
-    match (resolved_count, resolved_pct) {
-        (Some(n), Some(p)) => println!("refs-resolved: {n} ({p:.1}%)"),
-        _ => println!(
-            "refs-resolved: <no sidecar — run `scry build-resolutions` to enable>",
-        ),
-    }
     println!("elapsed-ms:   {}", r.manifest.stats.elapsed_ms);
 
     println!("\nby language:");
@@ -5069,7 +4007,7 @@ fn print_refs(reader: &StoreReader, refs: &[RefRecord], limit: usize, json: bool
     eprintln!("\n{} refs (showing {})", refs.len(), refs.len().min(limit));
 }
 
-/// Render the `→ def:...` suffix for a ref whose Layer 2 resolution
+/// Render the `→ def:...` suffix for a ref whose Layer-1 resolution
 /// picked a specific def. Shows the def's filename + line + scope so
 /// users can SEE which class's method the ref targets — the previous
 /// `→ def:707c64fb...` hex id was unintelligible and made it
@@ -5653,7 +4591,6 @@ fn cmd_uses(
     in_: Option<String>,
     not_in: Option<String>,
     kind: Option<String>,
-    strict: bool,
     format: Option<String>,
     limit: usize,
     json: bool,
@@ -5725,20 +4662,7 @@ fn cmd_uses(
         }
     }
 
-    // v0.1.49 — --strict drops outgoing edges the resolver couldn't
-    // attribute to a specific def. Useful for "show me only the
-    // outgoing calls whose target we KNOW", filtering out the noise
-    // of unresolved heuristic-only matches.
-    if strict {
-        let before = out_refs.len();
-        out_refs.retain(|rr| rr.resolved_to.is_some());
-        eprintln!(
-            "[scry] uses --strict: {} → {} edges (unresolved dropped)",
-            before, out_refs.len(),
-        );
-    }
-
-    // v0.1.57 — --format paths / count on uses (symmetric with ref/callers).
+    // --format paths / count on uses (symmetric with ref/callers).
     match format.as_deref() {
         Some("count") => {
             println!("{} edges", out_refs.len());
@@ -5794,17 +4718,6 @@ fn next_function_byte_start(
 }
 
 // ---------------------------------------------------------------------------
-// build-resolutions (Layer 2 ref→def resolution sidecar)
-// ---------------------------------------------------------------------------
-
-/// One-shot pass over the finalized index producing a u64-LE per-ref
-/// override (`ref_resolutions.bin`). Algorithm:
-///   1. Walk symbols once → name → Vec<(sym_idx, sym_id, file_id, lang)>
-///      and per_file_pkg (Java only) from kind=Package symbols.
-///   2. Walk refs once → for each ref, narrow candidates with the
-///      file's package + imports, fall back to plain name match, write
-///      the chosen def's u64 id to the sidecar (or 0 if unresolved).
-// ---------------------------------------------------------------------------
 // build-digests (per-file blake3 content digest sidecar)
 // ---------------------------------------------------------------------------
 //
@@ -5850,7 +4763,7 @@ fn cmd_build_digests(index: Option<PathBuf>, workers: usize) -> Result<()> {
     eprintln!("[digests] hashed in {} ms", t.elapsed().as_millis());
 
     // Write to .tmp then atomic-rename — same pattern as
-    // build-file-symbols / build-resolutions.
+    // build-file-symbols.
     let tmp = paths.file_digests().with_extension("bin.tmp");
     {
         use std::io::{BufWriter, Write};
@@ -6027,7 +4940,7 @@ fn cmd_index_diff(
 //   - True append-only writes preserving old file_ids. The new index
 //     reassigns file_ids 0..N sequentially; readers re-open and see
 //     the new mapping. (No external state depends on file_id stability.)
-//   - Re-run build-resolutions or build-file-symbols. The user can
+//   - Re-run build-file-symbols / build-file-refs. The user can
 //     invoke them post-incremental if they need the sidecars.
 fn cmd_index_incremental(
     roots: Vec<PathBuf>,
@@ -6412,141 +5325,6 @@ fn cmd_tombstone(path: PathBuf, index: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// callers --precise (clangd-driven, type-aware C++ references)
-// ---------------------------------------------------------------------------
-//
-// Flow:
-//   1. Look up NAME via scry's heuristic path to find a definition
-//      site (file + line + column).
-//   2. Spawn clangd, send initialize + didOpen for that file.
-//   3. Send textDocument/references at the definition position.
-//   4. Map LSP Locations back to scry file_ids via path.
-//   5. Emit using the same format as `cmd_callers` so the caller
-//      doesn't see a different shape just because they passed
-//      --precise.
-//
-// Falls back to the heuristic path with a clear error when clangd
-// or compile_commands.json is missing.
-fn cmd_callers_precise(
-    name: String,
-    index: Option<PathBuf>,
-    _lang: Option<String>,
-    in_: Option<String>,
-    not_in: Option<String>,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let t = Instant::now();
-    if !clangd::clangd_available() {
-        anyhow::bail!(
-            "clangd not on PATH. --precise requires clangd for type-aware C++ \
-             reference resolution.\n\
-             Install: apt install clangd  (Debian/Ubuntu)\n\
-             Or rerun without --precise for the heuristic path."
-        );
-    }
-    let r = open_index(index)?;
-
-    // 1. Pick the definition site to anchor the references query at.
-    // We prefer a C++ Function/Method/Class definition matching the
-    // name, since clangd is C++-shaped. If we can't find one, fall
-    // back to the first match of any kind.
-    let candidates = r.lookup_exact(&name);
-    let def_site = candidates.iter()
-        .find(|s| matches!(s.lang, FileKind::Cpp | FileKind::Header | FileKind::HeaderCpp))
-        .or_else(|| candidates.first())
-        .ok_or_else(|| anyhow::anyhow!("no definitions of '{name}' in the index"))?;
-    let def_path = r.file_display_path(def_site.file_id)
-        .ok_or_else(|| anyhow::anyhow!("def file_id {} out of range", def_site.file_id))?;
-    let def_path = PathBuf::from(def_path);
-
-    // 2. Discover compile_commands.json; clangd needs it for C++
-    // resolution. If missing, error early — clangd would otherwise
-    // run but every reference would come back wrong.
-    let cc_dir = clangd::find_compile_commands(&def_path)
-        .ok_or_else(|| anyhow::anyhow!(
-            "no compile_commands.json found above {}\n\
-             Generate one via `bear -- m` or your build system's equivalent.",
-            def_path.display(),
-        ))?;
-    eprintln!("[precise] clangd OK; compile_commands.json under {}",
-        cc_dir.display());
-
-    // 3. Spawn clangd, didOpen the definition file, query references.
-    let mut session = clangd::ClangdSession::start(Some(&cc_dir))
-        .with_context(|| "starting clangd session")?;
-    let lang_id = match def_site.lang {
-        FileKind::C => "c",
-        _ => "cpp",
-    };
-    session.did_open(&def_path, lang_id)?;
-    // Clangd accepts 0-based char positions; def_site.col is 1-based.
-    let char_0 = def_site.col.saturating_sub(1);
-    let locs = session.references(&def_path, def_site.line, char_0, /* include_decl */ false)?;
-    eprintln!("[precise] clangd returned {} locations in {} ms",
-        locs.len(), t.elapsed().as_millis());
-
-    // 4. Build a (path -> file_id) lookup so we can map LSP results
-    // back to scry's path display + lang.
-    let in_prefix = in_.as_deref();
-    let not_in_prefix = not_in.as_deref();
-    let by_path: std::collections::HashMap<String, FileKind> =
-        r.iter_files().map(|fe| (fe.display_path(), fe.kind)).collect();
-    let mut emitted = 0usize;
-    if !json {
-        for loc in &locs {
-            let p = match loc.fs_path() { Some(p) => p, None => continue };
-            let p_str = p.display().to_string();
-            if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
-            let lang = by_path.get(&p_str).map(|k| k.as_str()).unwrap_or("?");
-            println!("{}:{}:{}  (ref-precise {})  {}",
-                p_str, loc.line, loc.character, lang, name);
-            emitted += 1;
-            if emitted >= limit { break; }
-        }
-    } else {
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        for loc in &locs {
-            let p = match loc.fs_path() { Some(p) => p, None => continue };
-            let p_str = p.display().to_string();
-            if !path_matches(&p_str, in_prefix, not_in_prefix) { continue; }
-            let lang = by_path.get(&p_str).map(|k| k.as_str()).unwrap_or("?");
-            let obj = serde_json::json!({
-                "name": name,
-                "ref_kind": "call",
-                "lang": lang,
-                "path": p_str,
-                "line": loc.line,
-                "col": loc.character,
-                "precise": true,
-            });
-            writeln!(out, "{}", obj)?;
-            emitted += 1;
-            if emitted >= limit { break; }
-        }
-    }
-    log_query(&r, "callers-precise", &name, locs.len(), emitted, t);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// compact (rewrite the index dropping tombstoned records)
-// ---------------------------------------------------------------------------
-//
-// Reads the current index, builds a remap from old file_id → new file_id
-// (compacted; tombstoned ids removed), streams every symbol/ref through,
-// re-emits with the remapped file_id. The trigram FST + name FSTs need
-// rebuilding from the surviving postings, which dominates the cost.
-//
-// For v1 this is a placeholder that errors clearly when there are
-// tombstones; the full rebuild is a non-trivial standalone change.
-// The expected use pattern is "incremental + occasional full rebuild
-// via `scry index` overwriting the dir" — `compact` is the in-place
-// alternative for very-large indexes where the full rebuild is
-// expensive.
 fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     let index_dir = index.unwrap_or_else(default_index_dir);
     let paths = scry_store::StorePaths::new(index_dir.clone());
@@ -6574,310 +5352,6 @@ fn cmd_compact(index: Option<PathBuf>) -> Result<()> {
     let _ = paths.tombstones();
     Ok(())
 }
-
-pub(crate) fn cmd_build_resolutions(index: Option<PathBuf>) -> Result<()> {
-    use std::collections::HashMap;
-    use std::io::{BufWriter, Write};
-    let index_dir = index.unwrap_or_else(default_index_dir);
-    eprintln!("[res] target index: {}", index_dir.display());
-    let paths = scry_store::StorePaths::new(index_dir.clone());
-    let r = StoreReader::open(&index_dir)?;
-    let n_refs = r.n_refs();
-    let n_syms = r.n_symbols();
-    if n_refs == 0 {
-        eprintln!("[res] no refs to resolve — skipping");
-        return Ok(());
-    }
-    eprintln!("[res] {} symbols, {} refs", n_syms, n_refs);
-
-
-    // --- Pass 2b: Kythe def-symbol reverse index. ---
-    //
-    // For each (file_id, byte_start) of a def, ask the SCIP / clang
-    // sidecar what Kythe-class symbol identity that def carries, and
-    // store `symbol-string → def_id`. The pass-3 ref loop then asks
-    // the SAME sidecar what symbol the call site carries and looks
-    // up the def directly — bypassing the heuristic for any ref that
-    // both SCIP/clang covers AND maps to a known def.
-    //
-    // This is the architectural fix to the "test mock shadows prod"
-    // class of bugs (e.g. `ActiveServices.java` calling
-    // `Binder.clearCallingIdentity()` got attributed to a test
-    // `TestInjector.clearCallingIdentity` by the same-package
-    // heuristic). Kythe knows the receiver type → emits the right
-    // symbol identity at the call site → no guesswork.
-    //
-    // Coverage falls back to the heuristic for files Kythe doesn't
-    // see (uncovered TU in the SCIP / clang sidecar) and for refs
-    // whose symbol doesn't map to any indexed def.
-    let t2b = Instant::now();
-    let path_by_file_id: Vec<Option<String>> = {
-        let n = r.file_count();
-        let mut v: Vec<Option<String>> = vec![None; n];
-        for fe in r.iter_files() {
-            v[fe.id as usize] = Some(fe.display_path());
-        }
-        v
-    };
-    let scip_idx = r.scip_index();
-    let scip_fqn_idx = r.scip_index_fqn();
-    let cusr_idx = r.clang_usrs();
-    let scip_lookup = scip_idx.map(|sx| {
-        sx.precompute_by_file_ids(
-            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
-                p.as_deref().map(|s| (i as u32, s))
-            }),
-            path_by_file_id.len(),
-        )
-    });
-    // JVM-FQN canonical companion. Same precompute shape as the
-    // regular SCIP sidecar — both contribute defs and ref lookups
-    // independently in pass 2b / pass 3. The FQN sidecar carries
-    // anchors keyed by language=jvm canonical FQNs (the bridge
-    // target of language=java VNames), which is what lets
-    // cross-CU Java refs resolve when the ref-side CU compiled
-    // against bytecode rather than source.
-    let scip_fqn_lookup = scip_fqn_idx.map(|sx| {
-        sx.precompute_by_file_ids(
-            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
-                p.as_deref().map(|s| (i as u32, s))
-            }),
-            path_by_file_id.len(),
-        )
-    });
-    let cusr_lookup = cusr_idx.map(|cx| {
-        cx.precompute_by_file_ids(
-            path_by_file_id.iter().enumerate().filter_map(|(i, p)| {
-                p.as_deref().map(|s| (i as u32, s))
-            }),
-            path_by_file_id.len(),
-        )
-    });
-    const KYTHE_WINDOW: u32 = 64;
-    // Both sidecars feed a single string→def_id map. JVM-FQN
-    // canonical symbols (`jvm:android.os.Binder#clearCallingIdentity:()J`)
-    // and language=java VName signatures from the Kythe entries live
-    // in disjoint symbol-string namespaces by construction (the FQN
-    // sidecar's strings always start with `jvm:`, the main sidecar's
-    // strings carry the Kythe SCIP signature shape), so merging into
-    // one map can't collide. Pass 3 then asks BOTH sidecars for the
-    // call-site's symbol and accepts the first one that maps to an
-    // indexed def.
-    let mut scip_def_by_symbol: HashMap<String, u64> = HashMap::new();
-    let mut cusr_def_by_symbol: HashMap<String, u64> = HashMap::new();
-    let mut scip_defs_indexed = 0u64;
-    let mut scip_fqn_defs_indexed = 0u64;
-    let mut cusr_defs_indexed = 0u64;
-    if scip_lookup.is_some() || scip_fqn_lookup.is_some() || cusr_lookup.is_some() {
-        // Pass 2b uses KIND_MASK_DECL_ONLY so we only pick up
-        // def-anchors at def sites — pass 3 below uses the
-        // complementary KIND_MASK_REF_OR_CALL at ref sites. The
-        // unfiltered "closest in window" would otherwise let a call
-        // adjacent to its enclosing method's decl resolve to the
-        // surrounding def (e.g. `return Binder.clearCallingIdentity()`
-        // on the line right after a `clearCallingIdentity()` decl).
-        for s in r.iter_symbols() {
-            let cf = path_by_file_id.get(s.file_id as usize)
-                .and_then(|o| o.as_deref())
-                .map(is_c_family)
-                .unwrap_or(false);
-            if cf {
-                if let Some(cl) = cusr_lookup.as_ref() {
-                    if let Some(sym) = cl.symbol_for_window_kind(
-                        s.file_id, s.byte_start, KYTHE_WINDOW,
-                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                    ) {
-                        // First def wins. Multiple defs with the same
-                        // USR happen in decl+def-split C++ headers /
-                        // partial-class shapes; the first one is
-                        // arbitrary but stable across runs.
-                        cusr_def_by_symbol.entry(sym.to_string())
-                            .or_insert_with(|| { cusr_defs_indexed += 1; s.id });
-                    }
-                }
-            } else {
-                if let Some(sl) = scip_lookup.as_ref() {
-                    if let Some(sym) = sl.symbol_for_window_kind(
-                        s.file_id, s.byte_start, KYTHE_WINDOW,
-                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                    ) {
-                        scip_def_by_symbol.entry(sym.to_string())
-                            .or_insert_with(|| { scip_defs_indexed += 1; s.id });
-                    }
-                }
-                if let Some(sl) = scip_fqn_lookup.as_ref() {
-                    if let Some(sym) = sl.symbol_for_window_kind(
-                        s.file_id, s.byte_start, KYTHE_WINDOW,
-                        scry_store::precision_packed::KIND_MASK_DECL_ONLY,
-                    ) {
-                        scip_def_by_symbol.entry(sym.to_string())
-                            .or_insert_with(|| { scip_fqn_defs_indexed += 1; s.id });
-                    }
-                }
-            }
-        }
-    }
-    eprintln!(
-        "[res] pass 2b (Kythe def-symbol index): {} SCIP defs, {} SCIP-FQN defs, {} clang USR defs in {} ms",
-        scip_defs_indexed, scip_fqn_defs_indexed, cusr_defs_indexed, t2b.elapsed().as_millis(),
-    );
-
-    // --- Pass 3: resolve every ref, write sidecar. ---
-    //
-    // Parallel resolution with rayon: collect refs into chunks of
-    // ~64K, resolve each chunk on a worker, then write chunks back
-    // out in iteration order. The sidecar format is byte_offset =
-    // ref_idx * 8, so ordering MUST be preserved — we collect chunks
-    // sequentially from `iter_refs`, dispatch resolution in parallel,
-    // and stream the results back in submission order.
-    //
-    // Each ref tries Kythe first (if a sidecar covers its file AND
-    // its call-site symbol points at an indexed def) → falls back to
-    // the lexical heuristic otherwise. Trust ordering: Kythe knows
-    // the receiver type, the heuristic only sees the method name.
-    //
-    // Memory: at peak we hold ~16 chunks × 64K refs × ~64B/ref ≈
-    // ~64 MiB of input + ~16 chunks × 64K × 8B = ~8 MiB output.
-    // Well within budget.
-    let t3 = Instant::now();
-    let tmp = paths.ref_resolutions().with_extension("bin.tmp");
-    let mut ow = BufWriter::with_capacity(8 << 20, std::fs::File::create(&tmp)?);
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let resolved_count = AtomicU64::new(0);
-    let unresolved_no_sidecar = AtomicU64::new(0);
-    let unresolved_kythe_blank = AtomicU64::new(0);
-    let mut chunk: Vec<RefRecord> = Vec::with_capacity(CHUNK_SIZE);
-    let process_chunk = |chunk: &mut Vec<RefRecord>, ow: &mut BufWriter<std::fs::File>| -> Result<()> {
-        if chunk.is_empty() { return Ok(()); }
-        let ids: Vec<u64> = chunk.par_iter().map(|rr| {
-            let cf = path_by_file_id.get(rr.file_id as usize)
-                .and_then(|o| o.as_deref())
-                .map(is_c_family)
-                .unwrap_or(false);
-            // Resolution is sidecar-only. C-family → clang USR sidecar;
-            // everything else → SCIP. If the sidecar covers the file,
-            // its verdict is law: a symbol that maps to an indexed
-            // def resolves, anything else is honestly unresolved
-            // (returning 0). No lexical heuristic, no guessing — the
-            // `--lexical` query flag already exists for users who
-            // want raw tree-sitter name matches with no narrowing.
-            // Look up the ref-anchor INSIDE the tree-sitter identifier
-            // span [byte_start, byte_end] — Kythe emits a separate
-            // ref-anchor for each identifier in a dotted access (the
-            // receiver AND the method name), so a fat byte-window picks
-            // the closer receiver anchor instead. Restricting to the
-            // identifier span the tree-sitter ref actually points at
-            // eliminates that bleed. KIND_MASK_REF_OR_CALL further
-            // rules out the enclosing method's own decl anchor when
-            // the call sits on the line right after the decl.
-            let id = if cf {
-                match cusr_lookup.as_ref() {
-                    Some(cl) if cl.covers_file_id(rr.file_id) => {
-                        match cl.symbol_in_span_kind(
-                            rr.file_id, rr.byte_start, rr.byte_end,
-                            scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                        ).and_then(|sym| cusr_def_by_symbol.get(sym).copied()) {
-                            Some(kid) => kid,
-                            None => {
-                                unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
-                                0
-                            }
-                        }
-                    }
-                    _ => {
-                        unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
-                        0
-                    }
-                }
-            } else {
-                // Try the regular SCIP sidecar first (language=java
-                // VName symbol-strings). If that's blank for this
-                // ref — the common cause is a cross-CU call where
-                // the def-side CU and ref-side CU disagree on the
-                // canonical Java signature — fall through to the
-                // JVM-FQN companion sidecar. Both writers use
-                // disjoint symbol-string namespaces, so the
-                // string→def_id lookup picks the right side
-                // automatically.
-                //
-                // "Covered" semantics: a file is covered if EITHER
-                // sidecar has anchor data for it. That way refs in
-                // services.core (only the FQN sidecar carries the
-                // cross-CU bridge entries) don't get accounted as
-                // unresolved_no_sidecar just because the regular
-                // sidecar doesn't reach them.
-                let scip_covers = scip_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-                let fqn_covers = scip_fqn_lookup.as_ref().is_some_and(|sl| sl.covers_file_id(rr.file_id));
-                if !scip_covers && !fqn_covers {
-                    unresolved_no_sidecar.fetch_add(1, Ordering::Relaxed);
-                    0
-                } else {
-                    let from_scip = if scip_covers {
-                        scip_lookup.as_ref().and_then(|sl| {
-                            sl.symbol_in_span_kind(
-                                rr.file_id, rr.byte_start, rr.byte_end,
-                                scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                            ).and_then(|sym| scip_def_by_symbol.get(sym).copied())
-                        })
-                    } else { None };
-                    let resolved = from_scip.or_else(|| {
-                        if !fqn_covers { return None; }
-                        scip_fqn_lookup.as_ref().and_then(|sl| {
-                            sl.symbol_in_span_kind(
-                                rr.file_id, rr.byte_start, rr.byte_end,
-                                scry_store::precision_packed::KIND_MASK_REF_OR_CALL,
-                            ).and_then(|sym| scip_def_by_symbol.get(sym).copied())
-                        })
-                    });
-                    match resolved {
-                        Some(kid) => kid,
-                        None => {
-                            unresolved_kythe_blank.fetch_add(1, Ordering::Relaxed);
-                            0
-                        }
-                    }
-                }
-            };
-            if id != 0 { resolved_count.fetch_add(1, Ordering::Relaxed); }
-            id
-        }).collect();
-        for id in ids { ow.write_all(&id.to_le_bytes())?; }
-        chunk.clear();
-        Ok(())
-    };
-    for rr in r.iter_refs() {
-        chunk.push(rr);
-        if chunk.len() >= CHUNK_SIZE {
-            process_chunk(&mut chunk, &mut ow)?;
-        }
-    }
-    process_chunk(&mut chunk, &mut ow)?;
-    ow.flush()?;
-    drop(ow);
-    std::fs::rename(&tmp, paths.ref_resolutions())?;
-    let resolved_count = resolved_count.into_inner();
-    let unresolved_no_sidecar = unresolved_no_sidecar.into_inner();
-    let unresolved_kythe_blank = unresolved_kythe_blank.into_inner();
-    eprintln!(
-        "[res] pass 3 (resolve {} refs, {} resolved via Kythe sidecar; \
-         {} unresolved: {} in files Kythe didn't cover, {} where Kythe \
-         had no def-attribution for the call site) in {} ms",
-        n_refs, resolved_count,
-        unresolved_no_sidecar + unresolved_kythe_blank,
-        unresolved_no_sidecar, unresolved_kythe_blank,
-        t3.elapsed().as_millis(),
-    );
-    eprintln!("[res] DONE. {} bytes written → {}",
-        std::fs::metadata(paths.ref_resolutions()).map(|m| m.len()).unwrap_or(0),
-        paths.ref_resolutions().display());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// build-trigrams (standalone — add trigram index to an existing index)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn cmd_build_trigrams(
     index: Option<PathBuf>,
@@ -7654,14 +6128,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar. Opt-in (not default) because the module graph is ~256MB and adds ~50-500ms to first query in a process."},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever their sidecars are present, dropping name-collision false positives across C/C++/ObjC + Java/Kotlin/Rust/Go/TS/Python. Set true to see raw name-match results (debugging / want-everything mode)."},
                 "scope": {"type": "string",
                     "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
-                "def_in": {"type": "string",
-                    "description": "Substring of the def-site file path. Keeps only refs whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` disambiguates `close` when many unrelated classes also define `close`. Refs whose resolved_to is None pass through (over-include rather than silently drop). No-op without a build-resolutions sidecar."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop refs whose Layer 2 resolution didn't land on a specific def (resolved_to=None). With `def_in`, also drops the permissive over-include — only refs the resolver confidently attributed to the target survive. Without `def_in`, shows only refs that resolved to some specific def."},
                 "format": {"type": "string", "enum": ["by-def", "paths"],
                     "description": "Output mode. `by-def` returns a histogram array `[{count, def: {path, line, col, scope, kind, id}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files contain refs to X?`. Without `format`, returns the per-ref JSONL stream."},
             })),
@@ -7671,10 +6139,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
             "Find call sites of NAME (shorthand for `ref` with \
              kind=call). For 'does X get called anywhere?' or 'how \
              many?', pass `format: 'count'` — it returns just `N \
-             callers` and costs almost nothing. Build-symbol \
-             precision filters (clang USRs / SCIP symbols) \
-             auto-engage when their sidecars are present; pass \
-             `lexical: true` for raw name-match. Set `reachable: \
+             callers` and costs almost nothing. Set `reachable: \
              true` for build-graph pruning (extra ~50-500ms cost).",
             obj(&["name"], serde_json::json!({
                 "name": {"type": "string"},
@@ -7685,14 +6150,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "format": format_count_prop,
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present. Opt-in."},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Same as on `ref` — opt out of all auto-engaged precision filters and return raw name-match callers."},
                 "scope": {"type": "string",
                     "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
-                "def_in": {"type": "string",
-                    "description": "Substring of the def-site file path. Keeps only callers whose Layer 2 resolution (resolved_to) points at a def in a file containing this path — e.g. `def_in: \"PerfettoTrace.java\"` cuts through cases where many classes share a method name like `close`. Callers whose resolved_to is None pass through. No-op without a build-resolutions sidecar."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include — only callers the resolver confidently attributed survive. Trades recall for precision."},
                 "format": {"type": "string", "enum": ["by-def", "paths"],
                     "description": "Output mode. `by-def` returns a histogram array `[{count, def: {...}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last — invaluable for polymorphic names like `close`, `onCreate`, `transact`. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files call X?`."},
             })),
@@ -7728,8 +6187,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "kind":  {"type": "string",
                     "description": "Filter by ref kind: call, type, field, import, inherit, using-ns. Default: all."},
                 "limit": limit_prop,
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop outgoing edges whose Layer 2 resolution didn't pin a target. Use for `what does NAME call that we KNOW the target of?` — strips heuristic-only matches the resolver couldn't attribute."},
                 "format": {"type": "string", "enum": ["count", "paths"],
                     "description": "Optional. `count` returns `{count: N}` — cheapest probe for `how many edges`. `paths` returns a deduped sorted array of file paths — `which files does NAME touch?`. Without `format`, returns per-ref JSONL stream."},
             })),
@@ -7741,11 +6198,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
              levels via `enclosing_function` resolution (more \
              accurate than scope_path for Java/Kotlin where the \
              scope is the class). `--max-nodes` caps total expansion \
-             on hub functions (logger, assert, etc.). Root-level \
-             callers are auto-filtered by clang USR + SCIP symbol \
-             identity when those sidecars are present; pass \
-             `lexical: true` to opt out and see the raw name-match \
-             tree.",
+             on hub functions (logger, assert, etc.).",
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
@@ -7753,12 +6206,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                 "depth": {"type": "integer", "minimum": 1, "default": 3},
                 "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
                 "reachable": {"type": "boolean", "default": false},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Use lexical (tree-sitter) name match only. Default behavior auto-engages clang USR + SCIP symbol identity filters on the ROOT level whenever the sidecars are present. Deeper recursion stays lexical (walker doesn't track per-name precision context)."},
-                "def_in": {"type": "string",
-                    "description": "Substring of the def-site file path for the ROOT callee. Same shape as `ref --def-in`. Narrows ONLY the topmost level — deeper recursive levels are not filtered because the walker doesn't track per-frame def context."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop root-level callers whose Layer 2 resolution didn't land on a specific def. With `def_in`, also drops the permissive over-include."},
             })),
         ),
         tool(
@@ -7768,11 +6215,7 @@ fn mcp_tools_list_result() -> serde_json::Value {
              Returns counts (callers, subclasses, files_touched) plus \
              the up-to-`limit` instances of each. Use this as a \
              pre-flight check before refactors: small counts → safe \
-             rename; large counts → split the change. The callers \
-             leg auto-engages clang USR + SCIP symbol identity \
-             filters (sidecar-gated); pass `lexical: true` to opt \
-             out. Subclasses leg is identity-based already \
-             (type-hierarchy lookup).",
+             rename; large counts → split the change.",
             obj(&["name"], serde_json::json!({
                 "name":  {"type": "string"},
                 "in":    in_prop,
@@ -7782,12 +6225,6 @@ fn mcp_tools_list_result() -> serde_json::Value {
                     "description": "BFS depth for the subclass leg of the impact set."},
                 "reachable": {"type": "boolean", "default": false,
                     "description": "Build-graph reachability filter on callers leg only."},
-                "lexical": {"type": "boolean", "default": false,
-                    "description": "Use lexical (tree-sitter) name match only for the callers leg. Default behavior auto-engages clang USR + SCIP symbol identity filters whenever the sidecars are present."},
-                "def_in": {"type": "string",
-                    "description": "Narrow the callers portion by def-site path (same as `ref --def-in`). Doesn't affect the subclass walk."},
-                "strict": {"type": "boolean", "default": false,
-                    "description": "Drop callers whose Layer 2 resolution didn't land on a specific def."},
             })),
         ),
         tool(
@@ -7882,12 +6319,8 @@ fn mcp_tools_list_result() -> serde_json::Value {
         tool(
             "stats",
             "Index metadata: size, file/symbol/ref counts, freshness, \
-             scry_version, and Layer 2 resolution coverage \
-             (`refs_resolved` + `refs_resolved_pct`, both null when \
-             the build-resolutions sidecar isn't present). No \
-             arguments. Useful as a first probe before harder \
-             queries — the resolution percentage tells you how much \
-             of the call-graph the resolver has nailed down.",
+             and scry_version. No arguments. Useful as a first probe \
+             before harder queries.",
             serde_json::json!({
                 "type": "object", "properties": serde_json::json!({}),
             }),
@@ -8415,30 +6848,18 @@ fn serve_one_request<W: std::io::Write>(
             serve_fuzzy_with_distance(reader, arg_str("substr"), in_, not_in, dist, limit)
         }
         "ref"     => {
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, kind, in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
+            serve_ref(reader, arg_str("name"), lang, kind, in_, not_in, limit, reachable, scope, format)
         }
         "callers" => {
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
             let scope = args.get("scope").and_then(serde_json::Value::as_str);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, not_in, limit, reachable, clang_precise, scip_precise, scope, def_in, strict, format)
+            serve_ref(reader, arg_str("name"), lang, Some("call"), in_, not_in, limit, reachable, scope, format)
         }
         "subclasses" => {
             let depth = args.get("depth")
@@ -8451,16 +6872,9 @@ fn serve_one_request<W: std::io::Write>(
             let depth = args.get("subclass_depth")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(2);
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable,
-                         clang_precise, scip_precise, def_in, strict, limit)
+            serve_impact(reader, arg_str("name"), in_, not_in, depth, reachable, limit)
         }
         "callgraph" => {
             let depth = args.get("depth")
@@ -8469,21 +6883,13 @@ fn serve_one_request<W: std::io::Write>(
             let max_nodes = args.get("max_nodes")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize).unwrap_or(200);
-            let lexical = args.get("lexical")
+            let reachable = args.get("reachable")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let explicit_reachable = args.get("reachable")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let (reachable, clang_precise, scip_precise) =
-                resolve_precision(lexical, explicit_reachable);
-            let def_in = args.get("def_in").and_then(serde_json::Value::as_str);
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes,
-                            reachable, clang_precise, scip_precise, def_in, strict)
+            serve_callgraph(reader, arg_str("name"), in_, not_in, depth, max_nodes, reachable)
         }
         "uses" => {
-            let strict = args.get("strict").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let format = args.get("format").and_then(serde_json::Value::as_str);
-            serve_uses(reader, arg_str("name"), in_, not_in, kind, strict, format, limit)
+            serve_uses(reader, arg_str("name"), in_, not_in, kind, format, limit)
         }
         "grep"    => {
             let ci = args.get("case_insensitive")
@@ -8723,23 +7129,9 @@ fn serve_ref(
     not_in: Option<&str>,
     limit: usize,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
     scope: Option<&str>,
-    def_in: Option<&str>,
-    strict: bool,
     format: Option<&str>,
 ) -> serde_json::Value {
-    // --def-in PATH: precompute the target def id set. Empty target
-    // set ⇒ no filtering (matches cmd_ref's "over-include rather than
-    // silently drop" policy; daemon stays quiet on diagnostics).
-    let def_target_ids: Option<std::collections::HashSet<u64>> = def_in.map(|p| {
-        r.lookup_exact(name).iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(p)))
-            .map(|s| s.id)
-            .collect()
-    });
     // Precompute the callee module set ONCE if --reachable + sidecar.
     // Same shape as cmd_ref's filter. No graph or no defs → no filter
     // (callers pass through unchanged; the daemon doesn't emit a
@@ -8754,32 +7146,6 @@ fn serve_ref(
     } else {
         None
     };
-    // Cached lazy accessors. The StoreReader OnceLock caches keep
-    // both sidecars in RAM after the first daemon query, so per-
-    // request decode cost is paid once at startup.
-    const PRECISE_WINDOW: u32 = 64;
-    let cusr: Option<&scry_store::clang_usrs::ClangUsrIndex> = if clang_precise {
-        r.clang_usrs()
-    } else {
-        None
-    };
-    let def_usrs: Option<std::collections::HashSet<String>> = cusr.map(|c| {
-        r.lookup_exact(name).iter().filter_map(|s| {
-            let p = r.display_path_cached(s.file_id)?;
-            c.usr_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
-        }).collect()
-    });
-    let sidx: Option<&scry_store::scip_index::ScipIndex> = if scip_precise {
-        r.scip_index()
-    } else {
-        None
-    };
-    let def_scip: Option<std::collections::HashSet<String>> = sidx.map(|c| {
-        r.lookup_exact(name).iter().filter_map(|s| {
-            let p = r.display_path_cached(s.file_id)?;
-            c.symbol_for_window(p, s.byte_start, PRECISE_WINDOW).map(str::to_string)
-        }).collect()
-    });
     let by_def = format == Some("by-def");
     let paths_only = format == Some("paths");
     // by-def + paths both need to see ALL surviving refs to build their
@@ -8800,24 +7166,6 @@ fn serve_ref(
         if let Some(sc) = scope {
             if !rr.scope_path.iter().any(|seg| seg == sc) { continue; }
         }
-        // --def-in filter: keep refs whose resolved_to lands in the
-        // target def set. Permissive mode keeps unresolved (None) too;
-        // --strict (v0.1.34) drops them.
-        // Empty target set ⇒ no narrowing (target def list was empty).
-        if let Some(tids) = def_target_ids.as_ref() {
-            if !tids.is_empty() {
-                match rr.resolved_to {
-                    Some(id) if !tids.contains(&id) => continue,
-                    None if strict => continue,
-                    _ => {}
-                }
-            }
-        }
-        // --strict without --def-in: drop unresolved refs entirely
-        // (only keep refs the resolver could attribute to some def).
-        if strict && def_target_ids.is_none() && rr.resolved_to.is_none() {
-            continue;
-        }
         // Reachability filter: keep only refs whose owning module can
         // reach at least one module that defines `name`.
         if let (Some(mg), Some(cms)) = (r.module_graph(), callee_modules.as_ref()) {
@@ -8828,27 +7176,6 @@ fn serve_ref(
                     }
                 }
                 // Unattributed caller: pass through (same as CLI).
-            }
-        }
-        // Clang USR identity filter (Path B). Sites without a clang
-        // record pass through (non-C/C++ or uncovered TU).
-        if let (Some(c), Some(usrs)) = (cusr, def_usrs.as_ref()) {
-            if !usrs.is_empty() {
-                if let Some(p) = r.display_path_cached(rr.file_id) {
-                    if let Some(u) = c.usr_for_window(p, rr.byte_start, PRECISE_WINDOW) {
-                        if !usrs.contains(u) { continue; }
-                    }
-                }
-            }
-        }
-        // SCIP symbol identity filter (Path C).
-        if let (Some(c), Some(syms)) = (sidx, def_scip.as_ref()) {
-            if !syms.is_empty() {
-                if let Some(p) = r.display_path_cached(rr.file_id) {
-                    if let Some(s) = c.symbol_for_window(p, rr.byte_start, PRECISE_WINDOW) {
-                        if !syms.contains(s) { continue; }
-                    }
-                }
             }
         }
         if by_def {
@@ -8929,7 +7256,6 @@ fn serve_uses(
     in_: Option<&str>,
     not_in: Option<&str>,
     kind: Option<&str>,
-    strict: bool,
     format: Option<&str>,
     limit: usize,
 ) -> serde_json::Value {
@@ -8963,8 +7289,6 @@ fn serve_uses(
             if let Some(k) = kind {
                 if !rr.kind.short().eq_ignore_ascii_case(k) { continue; }
             }
-            // v0.1.49 — --strict drops unresolved outgoing edges.
-            if strict && rr.resolved_to.is_none() { continue; }
             let key = ((rr.file_id as u64) << 32) | (rr.byte_start as u64);
             if seen.insert(key) {
                 if paths_only {
@@ -8993,7 +7317,6 @@ fn serve_uses(
 /// `callgraph` JSON-RPC handler — returns the recursive callers
 /// tree. Same algorithm as [`cmd_callgraph`]; result shape mirrors
 /// the CLI's `--json` payload.
-#[allow(clippy::too_many_arguments)]
 fn serve_callgraph(
     r: &StoreReader,
     name: &str,
@@ -9002,10 +7325,6 @@ fn serve_callgraph(
     depth: usize,
     max_nodes: usize,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
-    def_in: Option<&str>,
-    strict: bool,
 ) -> serde_json::Value {
     let prefix = in_.unwrap_or("");
     let neg_prefix = not_in.unwrap_or("");
@@ -9015,23 +7334,6 @@ fn serve_callgraph(
                 .filter_map(|s| mg.module_of_file(s.file_id)).collect()
         })
     } else { None };
-
-    // Kythe-precise expansion at every level (same shape as
-    // cmd_callgraph). `--lexical` opt-out is signalled by neither
-    // clang_precise nor scip_precise being set — when both are
-    // false, callers got `--lexical` from the RPC, so we skip the
-    // resolved_to filter to match the CLI semantics.
-    let lexical_mode = !clang_precise && !scip_precise;
-    let in_scope_root_defs: Option<std::collections::HashSet<u64>> = if lexical_mode {
-        None
-    } else {
-        let mut all = r.lookup_exact(name);
-        if let Some(p) = def_in {
-            all.retain(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(p)));
-        }
-        Some(all.into_iter().map(|s| s.id).collect())
-    };
 
     #[derive(Debug, Default, serde::Serialize)]
     struct Node {
@@ -9044,12 +7346,10 @@ fn serve_callgraph(
     fn expand(
         r: &StoreReader,
         callee_name: &str,
-        in_scope_def_ids: Option<&std::collections::HashSet<u64>>,
         depth_left: usize,
         in_prefix: &str,
         not_in_prefix: &str,
         callee_modules: Option<&std::collections::HashSet<u32>>,
-        strict: bool,
         visited: &mut std::collections::HashSet<u64>,
         budget: &mut usize,
     ) -> std::collections::BTreeMap<String, Node> {
@@ -9073,12 +7373,6 @@ fn serve_callgraph(
                         }
                     }
                 }
-            }
-            match (in_scope_def_ids, rr.resolved_to, strict) {
-                (Some(set), Some(id), _) if !set.contains(&id) => continue,
-                (Some(_), None, _) => continue,
-                (None, None, true) => continue,
-                _ => {}
             }
             let enc = r.enclosing_function(rr.file_id, rr.byte_start);
             let path = r.file_display_path(rr.file_id).unwrap_or_default();
@@ -9107,12 +7401,9 @@ fn serve_callgraph(
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for (caller_def_id, (caller_name, mut node)) in by_caller_def {
             if visited.insert(caller_def_id) {
-                let next_scope: std::collections::HashSet<u64> =
-                    std::iter::once(caller_def_id).collect();
-                let recurse_scope = in_scope_def_ids.map(|_| &next_scope);
-                node.callers = expand(r, &caller_name, recurse_scope,
+                node.callers = expand(r, &caller_name,
                     depth_left - 1, in_prefix, not_in_prefix,
-                    callee_modules, strict, visited, budget);
+                    callee_modules, visited, budget);
                 visited.remove(&caller_def_id);
             }
             let existing = out.entry(caller_name).or_default();
@@ -9130,9 +7421,9 @@ fn serve_callgraph(
 
     let mut budget = max_nodes;
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let tree = expand(r, name, in_scope_root_defs.as_ref(), depth,
+    let tree = expand(r, name, depth,
                       prefix, neg_prefix, callee_modules.as_ref(),
-                      strict, &mut visited, &mut budget);
+                      &mut visited, &mut budget);
     serde_json::json!({
         "callee": name,
         "depth": depth,
@@ -9145,7 +7436,6 @@ fn serve_callgraph(
 /// subclasses + files_touched summary. Same algorithm as
 /// [`cmd_impact`]; result shape mirrors the CLI's `--json` output
 /// so an LLM can consume either uniformly.
-#[allow(clippy::too_many_arguments)]
 fn serve_impact(
     r: &StoreReader,
     name: &str,
@@ -9153,46 +7443,14 @@ fn serve_impact(
     not_in: Option<&str>,
     subclass_depth: usize,
     reachable: bool,
-    clang_precise: bool,
-    scip_precise: bool,
-    def_in: Option<&str>,
-    strict: bool,
     limit: usize,
 ) -> serde_json::Value {
-    // Apply precision (clang USR + SCIP) on the callers leg only.
-    // Subclasses use type-hierarchy lookup; no symbol-identity index
-    // applies there. Soft-fail on sidecar errors so a broken sidecar
-    // doesn't take down the daemon RPC.
     let raw_callers: Vec<RefRecord> = r.lookup_refs_exact(name).into_iter()
         .filter(|rr| rr.kind == scry_store::RefKind::Call)
         .collect();
-    let callers_precise = if clang_precise || scip_precise {
-        apply_precision_filter(r, name, raw_callers, clang_precise, scip_precise, None)
-            .unwrap_or_else(|_| r.lookup_refs_exact(name).into_iter()
-                .filter(|rr| rr.kind == scry_store::RefKind::Call).collect())
-    } else {
-        raw_callers
-    };
-    let mut callers: Vec<RefRecord> = callers_precise.into_iter()
+    let mut callers: Vec<RefRecord> = raw_callers.into_iter()
         .filter(|rr| file_path_matches(r, rr.file_id, in_, not_in))
         .collect();
-    // v0.1.46 — same root-level narrowing as cmd_impact.
-    if let Some(def_path) = def_in {
-        let target_ids: std::collections::HashSet<u64> = r.lookup_exact(name)
-            .iter()
-            .filter(|s| r.display_path_cached(s.file_id)
-                .is_some_and(|dp| dp.contains(def_path)))
-            .map(|s| s.id)
-            .collect();
-        if !target_ids.is_empty() {
-            callers.retain(|rr| match rr.resolved_to {
-                Some(id) => target_ids.contains(&id),
-                None => !strict,
-            });
-        }
-    } else if strict {
-        callers.retain(|rr| rr.resolved_to.is_some());
-    }
     if reachable {
         if let Some(mg) = r.module_graph() {
             let defs = r.lookup_exact(name);
@@ -9565,13 +7823,6 @@ fn serve_coverage(r: &StoreReader, path: &str, by_kind: bool) -> serde_json::Val
 }
 
 fn serve_stats(r: &StoreReader) -> serde_json::Value {
-    // Mirror cmd_stats's v0.1.41 additions so MCP clients and CLI
-    // see the same resolution-coverage fields.
-    let refs_resolved = r.count_resolved_refs();
-    let refs_resolved_pct = refs_resolved.map(|n| {
-        if r.manifest.stats.refs == 0 { 0.0 }
-        else { (n as f64) * 100.0 / (r.manifest.stats.refs as f64) }
-    });
     serde_json::json!({
         "scry_version": r.manifest.scry_version,
         "indexed_at": r.manifest.indexed_at,
@@ -9581,8 +7832,6 @@ fn serve_stats(r: &StoreReader) -> serde_json::Value {
         "files_total": r.manifest.stats.files_total,
         "symbols": r.manifest.stats.symbols,
         "refs": r.manifest.stats.refs,
-        "refs_resolved": refs_resolved,
-        "refs_resolved_pct": refs_resolved_pct,
         "bytes_total": r.manifest.stats.bytes_total,
         "elapsed_ms": r.manifest.stats.elapsed_ms,
     })
@@ -9613,9 +7862,9 @@ fn ref_to_json(r: &StoreReader, rr: &RefRecord) -> serde_json::Value {
         "line": rr.line,
         "col": rr.col,
         "scope": rr.scope_path,
-        // resolved_to is the Layer 2 sidecar override (or Layer 1
-        // in-memory name match); 0 / null means we don't know the
-        // exact definition this ref points to.
+        // resolved_to comes from the Layer-1 in-memory name match
+        // (populated on non-streaming indexes); null means we don't
+        // know the exact definition this ref points to.
         "resolved_to": rr.resolved_to,
     })
 }
@@ -10108,7 +8357,7 @@ mod tests {
         // the bare message into text. Test the contract via the
         // public helper + a constructed Value matching what serve
         // emits.
-        let serve_result = serde_json::json!({"error": "missing sidecar — run `scry build-resolutions`"});
+        let serve_result = serde_json::json!({"error": "missing sidecar — run `scry build-file-refs`"});
         // Simulate the unwrap that mcp_tools_call performs.
         let err_val = serve_result.as_object().and_then(|m| m.get("error"))
             .expect("serve emits {error: <string>}");
@@ -10121,7 +8370,7 @@ mod tests {
                 "tool-error text must be the bare message, not a JSON literal; got: {text}");
         assert!(text.contains("missing sidecar"),
                 "tool-error text must preserve the hint; got: {text}");
-        assert!(text.contains("build-resolutions"),
+        assert!(text.contains("build-file-refs"),
                 "tool-error text must include the actionable hint; got: {text}");
     }
 

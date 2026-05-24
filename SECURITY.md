@@ -51,11 +51,6 @@ Specifically:
   agent loops, not internet exposure. There's no auth, no rate
   limiting, no TLS. Bind to `127.0.0.1` or restrict via firewall
   / socket permissions if you must expose it.
-- **MCP transport.** `scry mcp` reads JSON-RPC on stdin from a
-  parent process (the agent runtime). The trust boundary is the
-  agent runtime's: a malicious MCP client can issue any query, but
-  scry only reads from disk — it cannot mutate the indexed source
-  tree.
 - **Query log.** `~/.scry/queries.log` records every query (cmd,
   args, latency, hit count). Treat as you would shell history —
   it may contain sensitive identifiers if you've grepped for

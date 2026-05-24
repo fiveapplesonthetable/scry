@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Runs after `scry index` finalizes:
-#   1. build-offsets (~30 sec — enables lazy/mmap reader)
+# Runs after `scry index` finishes:
+#   1. build-file-symbols + build-file-refs (outline / uses sidecars)
 #   2. build-trigrams (~15-20 min — enables 100× faster grep)
-#   3. validate.sh — sanity-check def/ref/grep on real AOSP symbols
-#   4. bench_grep.sh — quantify the 100× rg claim
-#   5. Email the user with results
+#   3. build-digests (incremental-reindex change detection)
+#   4. build-modgraph soong (the --reachable build graph)
+#   5. validate.sh — sanity-check def/ref/grep on real AOSP symbols
+#   6. bench_grep.sh — quantify the 100× rg claim
+#   7. Email the user with results
 #
 # Invoke once the scry-index.service has finished. Designed to be run
 # by hand OR by a poller that watches for the unit to deactivate.
@@ -29,18 +31,15 @@ if [ ! -d "$INDEX" ]; then
   exit 1
 fi
 
-echo "=== steps 1–4 + build-modgraph soong: scry finalize (v0.1.21+) ==="
+echo "=== sidecar builds + Soong module graph ==="
 t1=$(date +%s)
-# Discovers all four core sidecar builds (offsets, file-symbols,
-# trigrams, resolutions) + the Soong module_graph in one pass.
-# Per-stage timings echo to stderr; we still wrap the whole thing
-# in a single timer so the high-level "step X took Y sec" lines
-# stay consistent with the previous step-by-step layout.
-$SCRY finalize \
-  --index "$INDEX" \
-  --workers 16 \
-  --build-soong /home/zim/dev/aosp
-echo "finalize took $(($(date +%s) - t1)) sec"
+$SCRY build-file-symbols --index "$INDEX"
+$SCRY build-file-refs    --index "$INDEX"
+$SCRY build-trigrams     --index "$INDEX" --workers 16
+$SCRY build-digests      --index "$INDEX" --workers 16
+$SCRY build-modgraph --kind soong --root /home/zim/dev/aosp \
+  --output "$INDEX/module_graph.json"
+echo "sidecar builds took $(($(date +%s) - t1)) sec"
 
 echo "=== final index layout ==="
 ls -la "$INDEX"
@@ -86,12 +85,13 @@ To: $TO
 From: $FROM
 Subject: [scry] FULL INDEX COMPLETE — post-finalize done in ${DURATION}s
 
-The scry full AOSP + Linux kernel index has finalized. Post-finalize
+The scry full AOSP + Linux kernel index has finished. Post-index
 pipeline ran:
-  1. build-offsets (lazy/mmap reader sidecars)
+  1. build-file-symbols + build-file-refs (outline / uses sidecars)
   2. build-trigrams (100× rg grep path)
-  3. validate.sh (def/ref/grep against real AOSP symbols)
-  4. bench_grep.sh (scry vs rg head-to-head)
+  3. build-digests + build-modgraph soong
+  4. validate.sh (def/ref/grep against real AOSP symbols)
+  5. bench_grep.sh (scry vs rg head-to-head)
 
 Index at: $INDEX
 Index size on disk: $INDEX_DISK

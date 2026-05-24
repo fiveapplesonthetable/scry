@@ -119,7 +119,6 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 | [`docs/OPERATIONS.md`]       | production knobs, the systemd recipe, troubleshooting                      |
 | [`docs/DEVELOPMENT.md`]      | workspace layout, how to test/bench/profile, known coverage gaps, contributing |
 | [`docs/AGENT_NOTES.md`]      | LLM-agent perspective — token economy, accuracy, setup for small models       |
-| [`docs/MCP.md`]              | Model Context Protocol integration — wire shape, error semantics, client recipes (Claude Desktop / Cursor / Continue / custom) |
 | [`docs/ROADMAP.md`]          | concrete design sketches for the multi-day items ahead (in-place incremental writer) plus a measured-and-rejected io_uring write-up |
 
 [`docs/USAGE.md`]: docs/USAGE.md
@@ -130,7 +129,6 @@ auto-resume after OOM): [`docs/OPERATIONS.md`].
 [`docs/OPERATIONS.md`]: docs/OPERATIONS.md
 [`docs/DEVELOPMENT.md`]: docs/DEVELOPMENT.md
 [`docs/AGENT_NOTES.md`]: docs/AGENT_NOTES.md
-[`docs/MCP.md`]: docs/MCP.md
 [`docs/ROADMAP.md`]: docs/ROADMAP.md
 
 ## One-paragraph architecture

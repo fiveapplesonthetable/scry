@@ -26,8 +26,8 @@ The interface is a single static binary `scry` that:
    takes. Default roots configured for this host: `~/dev/aosp/` (AOSP) and
    `/mnt/agent/dev/linux/` (Linux 7.0-rc7, 37 GB). Additional roots passed
    on the command line.
-2. **Answers queries** — definitions, references, callers, callees,
-   subtype/override hierarchies, fuzzy symbol lookup, build-module-scoped
+2. **Answers queries** — definitions, references, callers, and outgoing
+   `uses`, subclass hierarchies, fuzzy symbol lookup, build-module-scoped
    filters, owner-scoped filters, ripgrep-grade substring search — at
    interactive latency on a warm index.
 3. **Streams results in formats LLM agents can consume**: line-delimited
@@ -460,7 +460,7 @@ formats (aconfig, init.rc, sepolicy) are first-class, not afterthoughts.
 ### Android platform configuration (high-value AOSP-distinctive)
 | Type             | Parser            | What we extract                                                                                  |
 |------------------|-------------------|--------------------------------------------------------------------------------------------------|
-| `.aconfig`       | custom (proto-shaped textproto) | **Feature-flag definitions**: name, namespace, description, default, is_fixed_read_only. Match them up with `Flags.FOO_BAR` symbol references in Java/Kotlin/C++ code so `scry flag foo.bar` returns the definition *and* all readers. |
+| `.aconfig`       | custom (proto-shaped textproto) | **Feature-flag definitions**: name, namespace, description, default, is_fixed_read_only. Match them up with `Flags.FOO_BAR` symbol references in Java/Kotlin/C++ code so `def foo.bar --kind aconfig` returns the definition and `ref foo.bar --kind aconfig` returns all readers. |
 | `.rc` (init)     | custom            | `service NAME`, `on EVENT`, `class`, `user`, `group`, property triggers. Resolves `start NAME`/`stop NAME` to service defs. |
 | `.te` (sepolicy) | custom            | `type T`, `typeattribute`, `allow`/`neverallow`/`auditallow` rules — refs from rule sources to the types they touch. |
 | `.policy`        | custom            | mac_permissions / seapp_contexts style records. |
@@ -485,28 +485,27 @@ formats (aconfig, init.rc, sepolicy) are first-class, not afterthoughts.
 
 A query is `(predicate, filters, output)`. Predicates:
 
-| Predicate          | Meaning                                                     |
-|--------------------|-------------------------------------------------------------|
-| `def NAME`         | Definitions of NAME (any kind), ranked by exactness.        |
-| `ref NAME`         | References to NAME, with surrounding scope.                 |
-| `callers NAME`     | Refs where NAME appears in call position.                   |
-| `callees IN`       | Names in call position inside IN (a function/method def).   |
-| `impls IFACE`      | Types/classes that implement IFACE.                         |
-| `overrides METHOD` | Subclasses that override METHOD.                            |
-| `subtypes TYPE`    | Direct + transitive subtypes.                               |
-| `members TYPE`     | Fields/methods/inner types of TYPE.                         |
-| `mod NAME`         | Soong module info: srcs, deps, type, owners.                |
-| `owner PATH`       | Owners of PATH (walks up OWNERS chain).                     |
-| `fuzzy STR`        | Fuzzy symbol search (FST-based).                            |
-| `grep PATTERN`     | ripgrep-style substring/regex over indexed files only.      |
-| `aidl-link NAME`   | All Java/Cpp/Rust shadows of an AIDL symbol.                |
-| `flag NAME`        | aconfig flag definition + every read site (Java/Kotlin/C++). |
-| `service NAME`     | init.rc service definition + start/stop sites + binary path. |
-| `sepolicy TYPE`    | SELinux type definition + every rule that touches it.        |
-| `component NAME`   | Android manifest component (activity/service/receiver/provider) → declaration + Java/Kotlin class. |
-| `xml-id ID`        | `@+id/ID` definition + every `@id/ID` and `R.id.ID` read.    |
-| `module-of PATH`   | Soong module a path belongs to (and which `.bp` declared it). |
-| `cflag FLAG`       | Which modules use this compiler flag.                        |
+| Predicate            | Meaning                                                     |
+|----------------------|-------------------------------------------------------------|
+| `def NAME`           | Definitions of NAME (any kind), ranked by exactness.        |
+| `ref NAME`           | References to NAME, with surrounding scope.                 |
+| `callers NAME`       | Refs where NAME appears in call position.                   |
+| `uses NAME`          | Names referenced inside NAME's body (outgoing edges).       |
+| `callgraph NAME`     | Recursive caller tree, N levels deep.                      |
+| `impact NAME`        | Callers + transitive subclasses + touched files.           |
+| `subclasses NAME`    | Direct + transitive subtypes / implementers.               |
+| `prefix STR` / `fuzzy STR` | Prefix and typo-tolerant symbol search (FST-based).  |
+| `grep PATTERN`       | ripgrep-style substring/regex over indexed files only.     |
+| `outline PATH` / `tldr PATH` | Per-file symbol listing / one-call file summary.   |
+| `coverage PATH`      | Files/bytes/symbols by language under a subtree.            |
+| `owner PATH`         | Owners of PATH (walks up the OWNERS chain).                 |
+| `diff --since REV`   | Symbols/refs in files changed since a git revision.         |
+
+AOSP / platform entities — Soong modules, aconfig flags, init.rc
+services, SELinux types, manifest components, AIDL/HIDL interfaces —
+are indexed as symbols (and their relationships as refs), reachable
+through `def` / `ref` with `--kind` and `--lang` filters rather than
+through dedicated verbs.
 
 Filters (composable, attach to any predicate):
 - `--lang java,kotlin`
@@ -630,26 +629,31 @@ scry index [ROOT...] [--profile aosp|linux|generic] [--incremental] [--workers N
 scry def    NAME [filters...]   [--json|--jsonl|--md]
 scry ref    NAME [filters...]
 scry callers NAME [filters...]
-scry callees DEF  [filters...]
-scry impls   IFACE
-scry overrides METHOD
-scry subtypes TYPE
-scry members  TYPE
-scry owner   PATH
+scry uses    NAME [filters...]      # outgoing references from a definition
+scry callgraph NAME [filters...]
+scry impact  NAME [filters...]
+scry subclasses TYPE
+scry prefix  STR                    # symbols by name prefix
 scry fuzzy   STR
+scry outline PATH                   # definitions in a file, in order
+scry tldr    NAME                   # one-shot summary of a symbol
+scry owner   PATH
 scry grep    PATTERN [filters...]   # rg-class speed
-scry aidl-link NAME
-scry flag     NAME                  # aconfig def + readers
-scry service  NAME                  # init.rc service
-scry sepolicy TYPE                  # SELinux type + rules
-scry component NAME                 # AndroidManifest activity/service/...
-scry xml-id   ID                    # @+id def + R.id readers
-scry module-of PATH                 # which .bp declared this file
-scry cflag    FLAG                  # who passes this compiler flag
+scry coverage [filters...]          # indexing coverage report
+scry diff    [filters...]           # semantic diff of working tree
 scry serve  [--bind unix:/tmp/scry.sock|tcp:127.0.0.1:PORT]
+scry warm                           # prefault the mmap'd index into page cache
+scry compact                        # rewrite the index to reclaim slack
 scry stats                          # index size, freshness, lang breakdown
 scry health                         # validates index integrity
 ```
+
+AOSP / platform entities — Soong modules, aconfig flags, init.rc
+services, SELinux types, AndroidManifest components, AIDL/HIDL
+interfaces, XML ids — are indexed as symbols (their relationships as
+refs) and reached through `def` / `ref` with `--kind` and `--lang`
+filters rather than dedicated verbs (e.g. `def NAME --kind aconfig`,
+`ref NAME --kind init.svc`).
 
 `scry serve` exposes the same predicates over a JSON-RPC line protocol
 (one JSON object per line, request/response keyed by `id`). This is the
@@ -850,20 +854,18 @@ phase reflects what shipped vs what was scoped down.
 - **Exit gate met**: full AOSP+Linux index 13.3 min;
   `scry def Binder` returns 5–15 ms warm.
 
-### Phase 2 — references and resolution shipped (core); ⏳ sugar commands
+### Phase 2 — references and resolution shipped
 
 - Reference extraction for the seven languages.
 - Layer 1 resolver (imports + same-file scope + inheritance).
 - `scry ref`, `scry callers` shipped.
-- ⏳ Sugar commands `scry callees`, `scry overrides`, `scry impls`,
-  `scry subtypes`, `scry members` not shipped as separate
-  subcommands — achievable today via `def --kind X` / `ref --kind X`
-  combinations. Documented as a follow-up in
-  `docs/DEVELOPMENT.md` "Concrete pending items".
+- Outgoing references are `scry uses`; subtype hierarchies are
+  `scry subclasses`. Override, implementation, and member queries are
+  expressed via `def --kind X` / `ref --kind X` combinations.
 - **Exit gate met for the core**: `scry callers transact --lang Java`
   returns the right call sites in 80 ms warm.
 
-### Phase 3 — AOSP build awareness shipped (core); ⏳ sugar commands
+### Phase 3 — AOSP build awareness shipped
 
 - Android.bp parser → module graph (deps, srcs, cflags, ldflags
   refs). Hand-written; 4 unit tests.
@@ -871,17 +873,17 @@ phase reflects what shipped vs what was scoped down.
 - AIDL parser → cross-language linker via shadow symbols (commit
   f9a506f).
 - OWNERS parser → `scry owner PATH` (this commit).
-- Filters: `--in`, `--lang`, `--kind` shipped. `--module`,
-  `--owner` not shipped as standalone filters; module info is
-  reachable via `def NAME --kind soong` and `scry module-of`,
-  ownership via `scry owner PATH`.
-- `scry module-of`, `scry owner` shipped. `def --kind soong` is
-  the uniform spelling for build-system queries. ⏳ `scry aidl-link`,
-  `scry cflag` not shipped — same `def --kind` / `ref --kind`
-  story as Phase 2 sugar.
+- Filters: `--in`, `--lang`, `--kind` shipped. Module info is
+  reached via `def NAME --kind soong` and the `--reachable` build
+  graph; ownership via `scry owner PATH`.
+- `scry owner PATH` is the OWNERS verb. `def --kind soong` is the
+  uniform spelling for build-system queries: a module's metadata via
+  `def NAME --kind soong`, which `.bp` declares a file via that
+  module's srcs refs, and compiler flags / AIDL links as `ref --kind`
+  over the module-graph refs.
 - **Exit gate met for the core**.
 
-### Phase 3.5 — AOSP platform configs shipped (parsers); ⏳ sugar commands
+### Phase 3.5 — AOSP platform configs shipped (parsers)
 
 - aconfig parser (`crates/scry-aosp/src/aconfig.rs`); flags appear
   as `SymbolKind::AconfigFlag` queryable via
@@ -893,10 +895,10 @@ phase reflects what shipped vs what was scoped down.
 - AndroidManifest.xml component extraction →
   `SymbolKind::ManifestComponent`.
 - Resource XML id extraction → `SymbolKind::XmlId`.
-- ⏳ Sugar commands `scry flag`, `scry service`, `scry sepolicy`,
-  `scry component`, `scry xml-id` not shipped — all reachable as
-  `def --kind X`. Sugar layer is a thin alias; queued for
-  follow-up.
+- Every platform entity is reached as `def --kind X` for the
+  definition and `ref --kind X` for its readers/relationships:
+  aconfig flags, init.rc services, SELinux types, manifest
+  components, and XML ids share this one uniform spelling.
 - Bash tree-sitter integration deferred (low corpus
   signal-to-noise).
 
@@ -943,12 +945,8 @@ phase reflects what shipped vs what was scoped down.
 
 ### Additional shipped beyond original Phase plan
 
-- **MCP server** (`scry mcp`) — drop-in Model Context Protocol
-  integration with required-arg validation and `isError`
-  discipline. See `docs/MCP.md`.
-- **Memory primitives** (`scry recall`, `scry diff --since`) —
-  thin readers over the ops log and git history for agent
-  memory + PR-scoped exploration.
+- **`scry diff --since`** — a thin reader over git history for
+  PR-scoped exploration ("what symbols/refs changed since rev X").
 
 ## 14. Decisions (resolved with user)
 
@@ -967,8 +965,9 @@ phase reflects what shipped vs what was scoped down.
    semantic resolution over the AOSP C++/Java slice lives in the separate
    companion tool `scry2`, which resolves the Kythe graph. **Confirmed.**
 7. **AIDL cross-linkage** — Phase 3 (AOSP-distinctive killer feature).
-8. **LLM transport** — line-delimited JSON over a Unix socket from
-   `scry serve`. Open to revisit if you want an MCP variant later.
+8. **LLM transport** — line-delimited JSON-RPC over stdin/stdout
+   (or a Unix/TCP socket) from `scry serve`, plus a `--json` flag
+   on every query command for one-shot use.
 
 ---
 

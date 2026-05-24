@@ -157,7 +157,7 @@ block; see "Code quality posture" below for the rationale.
 ## Test
 
 ```sh
-cargo test --release --workspace    # 129 tests, ~3 s total
+cargo test --release --workspace    # 118 tests, ~3 s total
 ```
 
 Breakdown (counts as of 2026-05-16):
@@ -165,15 +165,15 @@ Breakdown (counts as of 2026-05-16):
 | crate        | tests | what they cover                                                                                              |
 |--------------|------:|--------------------------------------------------------------------------------------------------------------|
 | scry-aosp    |    19 | one happy-path per format parser (Soong, AIDL, HIDL, OWNERS, aconfig, init.rc, sepolicy, manifest, Bazel, CMake, GN, api-txt) plus the `cmake_comments_with_unbalanced_paren` regression that took down indexing |
-| scry-cli     |    47 | regex literal extractor, file_symbols + lazy + epoch_iso, name-match resolve_one branches, Java pkg/import narrowing edge cases, MCP arg validation (7), MCP version negotiation (4), OWNERS parser, ranking & path penalties |
-| scry-cli e2e |     1 | end-to-end: synthetic source tree → real `scry index` subprocess → every CLI + JSON-RPC + MCP path; round-trips `scry index --incremental` (modify + add a file, replay unchanged) |
+| scry-cli     |    36 | regex literal extractor, file_symbols + lazy + epoch_iso, name-match resolve_one branches, Java pkg/import narrowing edge cases, OWNERS parser, ranking & path penalties |
+| scry-cli e2e |     1 | end-to-end: synthetic source tree → real `scry index` subprocess → every CLI + JSON-RPC path; round-trips `scry index --incremental` (modify + add a file, replay unchanged) |
 | scry-lang    |     9 | per-language minimal extraction (Java / Cpp / Rust / Go / Python), Cpp out-of-line method bare-name + scope, Kotlin extension receiver scoping, progress-callback abort, unbounded-parse sanity. 2 ignored AST-dump helpers (`-- --ignored --nocapture` to see) |
 | scry-store   |    51 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder, trigram posting wire format (round-trip + truncation + malformed-varint), name posting wire format, rank_score tier ordering, epoch_to_iso8601 known values + leap year + pre-epoch, trigram extraction + query + intersection, file_digest absent-sidecar accessor |
 | scry-walker  |     2 | FileKind classification |
 
 The e2e test is the strongest single signal — it runs the just-built
 binary against a synthetic source tree, exercises writer + reader +
-CLI + JSON-RPC + MCP + incremental indexing + trigram grep, finishes
+CLI + JSON-RPC + incremental indexing + trigram grep, finishes
 in ~2 s. Any cross-crate API drift surfaces there.
 
 ### Adding a test

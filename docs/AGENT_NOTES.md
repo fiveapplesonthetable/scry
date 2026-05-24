@@ -375,10 +375,9 @@ Gemma 3 8B:
 For an agent on top of an open-weights ≥3B-class model (Gemma 3
 8B, Qwen 2.5 Coder 7B, Llama 3.2 3B, Mistral 7B):
 
-1. Pre-launch `scry serve --index /path` once, or `scry mcp`
-   if you're driving via the MCP protocol. Same warm-reader
-   benefit either way; sub-second per query because the FSTs
-   and lazy-vec sidecars stay mmap'd.
+1. Pre-launch `scry serve --index /path` once and drive it as a
+   warm daemon over newline-delimited JSON-RPC. Sub-second per
+   query because the FSTs and lazy-vec sidecars stay mmap'd.
 2. Expose these tools to the model:
    - `def(name, kind?, lang?, in?, limit=10)` — symbol lookup
    - `ref(name, lang?, in?, limit=10, format?)` — references
@@ -394,7 +393,7 @@ For an agent on top of an open-weights ≥3B-class model (Gemma 3
 4. Stash `~/.scry/queries.log` and inject the last 5 queries
    into the system prompt as memory. Stops the model
    re-asking the same question.
-5. The MCP tool descriptions scry emits already lead with the
+5. The per-command descriptions scry emits already lead with the
    most common failure mode ("if a name is common, ALWAYS pass
    kind/lang"); for ≥3B-class models that nudge is enough.
 
@@ -569,14 +568,13 @@ breadth here, semantic precision in `scry2`.
 The features I've shipped because agents kept hitting the same
 walls without them:
 
-**MCP wrapper.** `scry mcp` speaks JSON-RPC 2.0 over stdio,
-negotiates the MCP protocol version per spec (2024-11-05 through
-2025-11-25), and exposes one tool per scry command. The wrapper
-validates required arguments (a missing or empty `name` doesn't
-silently coerce to a wildcard) and reports tool-level failures
-with `isError: true` so the agent can branch on success vs
-failure without parsing prose. See [`docs/MCP.md`](MCP.md) for
-the wire shape and client recipes.
+**Warm-daemon JSON-RPC.** `scry serve` speaks newline-delimited
+JSON-RPC 2.0 over stdin/stdout (or a `--listen unix:…/tcp:…`
+socket), exposing one method per scry command from a single
+long-lived warm reader. It validates required arguments (a
+missing or empty `name` doesn't silently coerce to a wildcard)
+and reports failures in the JSON-RPC `error` object so the agent
+can branch on success vs failure without parsing prose.
 
 **Outline with snippets.** `scry outline PATH --with-snippets N`
 returns each symbol's name + line *and* its first N source lines
@@ -587,7 +585,7 @@ so a single 4 KB log line doesn't blow the reply budget.
 PATH` returns lang + total symbol count + per-kind histogram +
 top 3 ranked symbols + the file's first non-blank line, in a
 single call. Cuts ~70% of the tokens vs `outline + 3×def` for
-the same answer. Exposed as the `tldr` MCP tool.
+the same answer. Exposed as the `tldr` JSON-RPC method.
 
 **Token-cheap grep.** `--format=lines` emits
 `path:line:col\tsnippet` one hit per line — 5–10× cheaper than
@@ -637,13 +635,12 @@ nearest-first by default; `--include-deep` shows every layer;
 
 ## Things I'd still want
 
-1. **Streaming MCP `tools/call`.** `scry serve` already has
-   `stream: true` for per-record delivery; MCP doesn't define
-   streaming on `tools/call`. For "list every call site of X"
-   on a corpus with 50k matches, the right answer is to stream
-   top-K and cut early. Today MCP forces full materialization.
-   This is a spec-level conversation upstream, not a scry
-   change.
+1. **Wider agent uptake of streaming.** `scry serve` already has
+   `stream: true` for per-record delivery. For "list every call
+   site of X" on a corpus with 50k matches, the right answer is
+   to stream top-K and cut early rather than fully materialize
+   the result. The plumbing exists; the gap is agent harnesses
+   that consume it instead of waiting for one big reply.
 
 2. **Compound calls.** "Outline this file, then for each method
    call `callers`, return only the methods with > 10
@@ -658,11 +655,11 @@ The bugs I've shipped a release to fix kept landing in the same
 category: a correct piece of A talking to a correct piece of B
 through an interaction layer that nobody had a unit test for.
 
-- The `serve` layer returned `{"error": "..."}` correctly. The
-  MCP wrapper wrapped a result correctly. Together they emitted
-  `content[0].text = "{\"error\":\"…\"}"` — JSON-stringified
-  inside JSON. An agent had to parse twice to read the hint.
-  Each side's unit test passed.
+- The query layer returned `{"error": "..."}` correctly. The
+  `serve` JSON-RPC envelope wrapped a result correctly. Together
+  they emitted the hint JSON-stringified inside the `result`
+  field instead of as a structured `error` object — an agent had
+  to parse twice to read it. Each side's unit test passed.
 
 - The parser computed scope_path correctly. The reader decoded
   scope_path correctly. An index built before the parser fix
@@ -675,10 +672,10 @@ through an interaction layer that nobody had a unit test for.
   trusting query results. A feature that exists isn't the same
   as a feature that fires.
 
-Driving the tool the way an agent does — full MCP session,
-every tool, every negative path — costs one session per release.
-It catches the bugs no unit test will. The cost-benefit is
-obvious once you ship a release that needed it.
+Driving the tool the way an agent does — a full `scry serve`
+session, every method, every negative path — costs one session
+per release. It catches the bugs no unit test will. The
+cost-benefit is obvious once you ship a release that needed it.
 
 ---
 

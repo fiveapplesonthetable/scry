@@ -2137,8 +2137,8 @@ to `symbols.offs`. The reader uses `LazyVec<T>`
 (`crates/scry-store/src/lib.rs:92`) which mmaps both files and
 implements `get(i)` via the two-step lookup above.
 
-Same construction for `refs.bin / refs.offs`, `file_symbols.bin /
-file_symbols.offs`, and `ref_resolutions.bin / ref_resolutions.offs`.
+Same construction for `refs.bin / refs.offs` and `file_symbols.bin /
+file_symbols.offs`.
 
 ### 8.6 Tradeoffs
 
@@ -2541,7 +2541,6 @@ walker (ignore crate)               parsers (rayon par_iter)
                               │   k-way merge → FSTs     │
                               │   build file_symbols     │
                               │   build trigram postings │
-                              │   build ref_resolutions  │
                               │   atomic rename .tmp → / │
                               └──────────────────────────┘
 ```
@@ -2676,7 +2675,7 @@ doesn't ask for.
 
 ---
 
-## Chapter 14 — the LLM-agent surface (JSON-RPC, MCP, token economy)
+## Chapter 14 — the LLM-agent surface (JSON-RPC + CLI, token economy)
 
 ### 14.1 Why a separate agent interface at all
 
@@ -2686,80 +2685,27 @@ scry has three classes of caller:
    error messages, sensible defaults. Latency tolerance: ~1 s.
 2. **A shell pipeline** (`scry grep | xargs ...`). Wants newline-
    delimited rows, no envelope, exit codes that pipe right.
-3. **An LLM agent** (Claude, Cursor, custom LangGraph, ...).
-   Wants strict, schema-validated tool calls; structured replies
-   it can branch on without parsing prose; "is this an error or
-   a zero-result?" disambiguated at the protocol level. Token
-   cost matters more than wall-time for the agent's quality.
+3. **An LLM agent.** Wants structured replies it can branch on
+   without parsing prose; "is this an error or a zero-result?"
+   disambiguated at the protocol level. Token cost matters more
+   than wall-time for the agent's quality.
 
 A single output mode can't serve all three without compromise.
-scry exposes three on the same `serve_one_request` core:
+scry exposes its tool surface two ways on the same
+`serve_one_request` core:
 
-- **CLI** (`scry def`, `scry grep`, ...) for humans + shells.
+- **CLI** (`scry def`, `scry grep`, ...) for humans + shells, and
+  with `--json` on every query command for one-shot agent use:
+  the agent shells out (`scry def Foo --json`) and parses stdout.
+  No daemon, no handshake — the lowest-integration path.
 - **JSON-RPC** (`scry serve`) — newline-delimited requests on
   stdin / Unix socket / TCP. Each request is
   `{"id": N, "cmd": "def", "args": {...}}`, each reply
   `{"id": N, "result": ...}` or `{"id": N, "error": "..."}`. The
-  long-lived form for shell agents that want to skip the per-
-  query mmap setup.
-- **MCP** (`scry mcp`) — the [Model Context Protocol] dialect of
-  JSON-RPC. Same tools, but wrapped in `tools/list` + `tools/call`
-  with JSON-Schema tool descriptors and `isError`-disciplined
-  responses. Drops directly into Claude Desktop, Cursor, Continue.
+  long-lived warm-daemon form for agents and editor plugins that
+  want to skip the per-query mmap setup.
 
-[Model Context Protocol]: https://modelcontextprotocol.io
-
-### 14.2 The MCP protocol: what's load-bearing
-
-MCP is an opinionated dialect of JSON-RPC 2.0 that an LLM-host
-runtime understands without configuration. Three handshake
-messages establish the session:
-
-1. Client → Server `initialize` (requests a protocol version,
-   declares capabilities, names itself).
-2. Server → Client `initialize` reply (echoes the version it
-   supports, declares server capabilities, identifies itself).
-3. Client → Server `notifications/initialized` (one-way; no reply).
-
-After that, `tools/list` enumerates the surface, `tools/call`
-invokes one, `ping` is a liveness check. scry's MCP wrapper is
-~250 LOC; the bulk of the work was getting four things right:
-
-**a) Version negotiation per spec.** Per
-`§lifecycle/Version Negotiation`, the server MUST echo the
-client's requested version if it supports it, OTHERWISE reply
-with its own latest. scry supports `2024-11-05` → `2025-11-25`
-(the wire shape we care about is stable across that range; we
-just don't emit the optional newer fields). Hard-coding a
-version was a v0.1.0 bug — caught by LLM-self-test.
-
-**b) Tool-level vs protocol-level errors.** JSON-RPC `-32601`
-("method not found") says *the call didn't make it to a tool*.
-MCP's `isError: true` inside a successful result says *the tool
-ran, the call shape was fine, but the tool couldn't satisfy it*.
-The two are semantically distinct and most clients render them
-differently in their UI. scry sends `-32601` for unknown
-methods (`tools/foo`) and `isError: true` for tool-level
-failures (unknown tool name, missing arg, missing sidecar).
-
-**c) Required-arg validation.** The `inputSchema` on each tool
-declares required arguments. Without server-side enforcement, a
-client that omits or sends an empty string for `name` silently
-matches the empty needle and returns garbage. scry's
-`mcp_validate_required_args` rejects missing, null, and empty
-required args before they reach the tool body — and a unit test
-pins that the validator and the advertised schema can't drift
-apart.
-
-**d) Error-text unwrapping.** Tools emit their failures as
-`{"error": "<bare message>"}` in the result envelope. When
-wrapping that into MCP's `content[]`, the wrapper unwraps the
-inner string so the LLM reads the human-readable hint directly
-in `content[0].text` rather than having to `json.parse` it
-again. (Caught by the same LLM-self-test that surfaced version
-negotiation.)
-
-### 14.3 Token economy is a design constraint
+### 14.2 Token economy is a design constraint
 
 Every byte in a tool reply is a byte the agent's context window
 must hold. For an LLM with a 200k-token budget, a single 50KB
@@ -2783,14 +2729,11 @@ this constraint:
 - **`def --budget BYTES`** stops emitting markdown blocks once
   the cumulative byte count would exceed BYTES. The agent
   controls its own token budget by passing the byte cap.
-- **`scry recall`** lets the agent ask "what have I already
-  searched this session?" rather than re-issuing the same query
-  and burning the same tokens twice.
 
 None of these are speculative — every one was added in response
 to a real token-overrun the AGENT_NOTES.md case studies named.
 
-### 14.4 Persistence for agent loops
+### 14.3 Persistence for agent loops
 
 A naive agent shells out a fresh `scry` process per query. Each
 process pays ~50–100 ms of cold-open cost (mmap setup, FST page-
@@ -2798,7 +2741,7 @@ in, manifest parse). For a tight loop ("did the change I made
 break callers of X? what about Y? and Z?") that overhead
 dominates.
 
-Three escape hatches, ordered by integration cost:
+Two escape hatches, ordered by integration cost:
 
 1. **`scry serve --listen unix:/tmp/scry.sock`** — long-lived
    daemon holding one `StoreReader` open. Each new client
@@ -2808,32 +2751,27 @@ Three escape hatches, ordered by integration cost:
    For language-runtime agents that find TCP cheaper than
    Unix sockets. Bind to `127.0.0.1` or restrict via firewall —
    no auth in either transport.
-3. **`scry mcp`** — stdio-only by spec, but the MCP host runtime
-   (Claude Desktop, Cursor) keeps the subprocess alive across
-   the session. Same one-warm-StoreReader benefit as serve.
 
 The shared core is `serve_one_request`: a pure function over
 `(StoreReader, request)` returning a JSON `Value`. Adding a new
 transport is one wiring file; the tool surface stays in lock-
 step automatically.
 
-### 14.5 Open questions on the agent surface
+### 14.4 Open questions on the agent surface
 
 - **Streaming results.** `serve` supports `stream: true` for
-  per-record incremental delivery; MCP currently doesn't (the
-  spec doesn't define streaming on `tools/call`). If an agent
-  hits 50k matching call sites, the right answer is to stream
-  the top-K then cut early. Today MCP forces materialization
-  of the full reply.
+  per-record incremental delivery. If an agent hits 50k matching
+  call sites, the right answer is to stream the top-K then cut
+  early, rather than materialize the full reply.
 - **Tool composition.** "Outline this file, then for each
   method, call `callers` and tell me which ones have > 10
   references" is three round-trips today. A compound-tool
   primitive (`scry pipeline {...}`) would cut both latency and
   tokens, but defining the pipeline grammar is hard to get
   right without becoming a language.
-- **Authenticated MCP over network.** Today MCP is stdio-only
-  and the network transports (`serve --listen tcp:`) have no
-  auth. Multi-user agent hosting would want both.
+- **Authenticated network transport.** The network transports
+  (`serve --listen tcp:`) have no auth. Multi-user agent hosting
+  would want it.
 
 ---
 

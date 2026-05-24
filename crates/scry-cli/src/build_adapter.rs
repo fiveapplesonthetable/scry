@@ -514,8 +514,7 @@ mod soong {
 
         // Build module table. Dedup by name (some modules appear in
         // multiple variants; we keep the first and ignore the rest
-        // for the v1 schema since variant differentiation needs the
-        // clang USR pass).
+        // for the v1 schema, which does not differentiate variants).
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let mut modules: Vec<OutModule> = Vec::new();
         let mut compact_mods: Vec<(String, ModInfo)> = Vec::new();

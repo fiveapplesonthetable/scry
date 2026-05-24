@@ -1,8 +1,8 @@
 # ROADMAP — concrete design sketches for the deep items
 
 The contained next-steps that landed in May 2026 — persistent
-socket, streaming/budget, MCP, `scry recall`, `scry diff`, AIDL/HIDL
-shadows — are all in `git log`. This document is the *other* list:
+socket, streaming/budget, `scry diff`, AIDL/HIDL shadows — are all
+in `git log`. This document is the *other* list:
 the multi-day items that still sit ahead. Each one is sketched
 in enough detail that a fresh contributor could read this doc, the
 referenced source files, and start writing the change.

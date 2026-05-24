@@ -126,8 +126,8 @@ $ scry ref bindService --in frameworks --not-in /tests/ --format count
 ```
 
 Wired through `def`, `ref`, `callers`, `uses`, `callgraph`,
-`impact` (everywhere `--in` works). On the daemon /
-MCP, pass `args.not_in: "/tests/"` with the same semantics.
+`impact` (everywhere `--in` works). On the daemon,
+pass `args.not_in: "/tests/"` with the same semantics.
 
 Markdown for LLM tool output:
 
@@ -180,7 +180,7 @@ programmatic consumers — emits a JSON array of
 
 `--format by-def` also works on `scry ref`, `scry callgraph`
 (root-level only), and `scry impact` (callers leg only), and
-is exposed via the same args on the JSON-RPC + MCP `ref` /
+is exposed via the same args on the JSON-RPC `ref` /
 `callers` / `callgraph` / `impact` tools.
 
 ### `--format count`
@@ -224,7 +224,7 @@ $ scry callers bindService --format paths --json --limit 3
 Dedup happens before `--limit`, so the cap counts unique files
 (not raw refs). Output is sorted ascending so diffs across runs
 stay stable. Works on `scry ref` and `scry callers`; same
-`args.format: "paths"` shape on the daemon and MCP `ref` /
+`args.format: "paths"` shape on the daemon `ref` /
 `callers` tools.
 
 ---
@@ -277,7 +277,7 @@ $ scry fuzzy PrcelFile --distance 1 --limit 3
 … ParcelFile (d=1)  …
 ```
 
-JSON-RPC + MCP both honor `args.distance: N` to override the
+JSON-RPC honors `args.distance: N` to override the
 default; output gains a `distance` field per hit.
 
 ---
@@ -448,7 +448,7 @@ line, col, scope}]`, and `first_line`. Cuts ~70% of the tokens
 vs `outline + 3×def` for the same answer.
 
 Same PATH-matching rules as `outline`. Exposed as the `tldr`
-tool in MCP.
+tool over JSON-RPC.
 
 ### `--with-snippets N`
 
@@ -696,8 +696,8 @@ so a panic still frees capacity.
 
 When the cap is hit, scry writes a single JSON-RPC error line
 to the rejected connection before closing it (rather than
-silently dropping). MCP-aware clients can branch on
-`error.code == -32004`; non-MCP clients see the human-readable
+silently dropping). Clients can branch on
+`error.code == -32004`; humans read the
 `message`:
 
 ```json
@@ -789,57 +789,6 @@ section.
 
 ---
 
-## MCP (Model Context Protocol): `scry mcp`
-
-Drop-in MCP server for Claude Desktop, Cursor, and other MCP-aware
-agent runtimes. No custom shell-out wrapper required.
-
-Full wire-shape reference, error semantics, and per-client
-configuration recipes (Claude Desktop, Cursor, Continue, custom
-LangGraph) live in [`docs/MCP.md`]. The summary below is the
-quickstart.
-
-[`docs/MCP.md`]: MCP.md
-
-```sh
-$ printf '%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"def","arguments":{"name":"Binder","limit":1}}}' \
-  | scry mcp --index /mnt/agent/scry-index
-{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"scry","version":"0.0.1"}}}
-{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"def",...},{"name":"ref",...},...]}}
-{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"[{\"name\":\"Binder\",...}]"}],"isError":false}}
-```
-
-Each scry command (def, ref, callers, prefix, fuzzy, grep, outline,
-coverage, stats) is exposed as one MCP tool with a JSON Schema for
-its arguments. The tool result is the JSON output of the underlying
-serve command, wrapped in MCP's `content[]` text-part format.
-
-**Notifications** (JSON-RPC messages without an `id`, e.g.
-`notifications/initialized`) are silently consumed per the MCP spec.
-
-**Configuration for Claude Desktop** (`~/Library/Application
-Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "scry": {
-      "command": "/mnt/agent/scry/target/release/scry",
-      "args": ["mcp", "--index", "/mnt/agent/scry-index"]
-    }
-  }
-}
-```
-
-The MCP server reuses the same `serve_one_request` code path as the
-non-MCP transports, so anything that works over stdio JSON-RPC works
-through MCP without extra implementation effort.
-
----
-
 ## Changed-since-commit view: `scry diff`
 
 Surfaces files in the index that have changed since a git commit-ish.
@@ -878,43 +827,6 @@ Flags:
   `--verbose`        list every changed symbol, not just per-file counts
   `--limit N`        cap files reported (default 50)
   `--json`           one JSON object per changed file, ready for `jq`
-
----
-
-## Query memory: `scry recall`
-
-A thin memory primitive over `~/.scry/queries.log`. Useful for
-agents that want to know "what did I already search for this
-session" without re-running every query, and for humans wanting
-to inspect a session's search activity.
-
-```sh
-$ scry recall --last 5
-recent queries (last 5 of 134 total):
-  3m ago     callers   transact                                  820 hits in 120ms
-  5m ago     def       ActivityManagerService                    4 hits in 8ms
-  6m ago     grep      ZygoteInit                                12 hits in 580ms (1416 cand)
-  7m ago     outline   frameworks/base/.../ActivityThread.java   1 hits in 45ms
-  9m ago     ref       Binder                                    87 hits in 30ms
-```
-
-Filters:
-
-```sh
-$ scry recall --cmd def --last 10              # only def queries
-$ scry recall --grep transact                  # only queries matching transact
-$ scry recall --dedup                          # collapse consecutive same-query repeats
-$ scry recall --json | jq -s 'group_by(.cmd) | map({cmd:.[0].cmd, count:length})'
-```
-
-`--log PATH` overrides the default location (`$SCRY_LOG` then
-`$HOME/.scry/queries.log`). Missing logs are not an error — the
-command exits 0 with an empty result so agent loops don't break
-in fresh sessions.
-
-The parser is tolerant: a partial-write at the tail (the writer
-was SIGKILL'd mid-line) is silently skipped, so recall always
-returns the longest valid prefix of the log.
 
 ---
 
@@ -1150,13 +1062,13 @@ query's exit status or stdout.
 Bounded total disk = 2 × the cap. Set `SCRY_LOG_MAX_BYTES=0` to
 disable rotation entirely.
 
-Why this matters: under a tight MCP loop (one query / 100 ms,
+Why this matters: under a tight agent loop (one query / 100 ms,
 24 h × 7 = ~6M queries × ~300 bytes/row ≈ 1.8 GB) the log would
 otherwise eat disk in days. With the default cap, you keep at
 most ~200 MB and roughly the last day or two of history per host.
 
 **Disabling the log entirely.** Set `SCRY_LOG=` (empty string).
-Useful for ephemeral MCP sessions where the activity log isn't
+Useful for ephemeral agent sessions where the activity log isn't
 load-bearing. With logging off, the stderr footer still prints
 (zero-disk-cost).
 

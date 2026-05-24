@@ -610,25 +610,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// MCP (Model Context Protocol) server. Stdio JSON-RPC 2.0 over
-    /// the standard MCP request/response shape; one MCP tool per scry
-    /// command (def/ref/callers/prefix/fuzzy/grep/outline/coverage/
-    /// stats). Drop straight into Claude Desktop, Cursor, or any MCP-
-    /// aware agent without writing a custom shell-out wrapper.
-    ///
-    /// Implements:
-    ///   initialize             → server info + capabilities
-    ///   tools/list             → one entry per scry command with JSON schema
-    ///   tools/call             → run the named tool, return its JSON result
-    ///                           wrapped in MCP text-content shape
-    ///   notifications/*        → silently consumed (no response per spec)
-    Mcp {
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
     /// JSON-RPC server. Reads newline-delimited requests, writes
     /// newline-delimited responses. Each request is
-    /// {"id": N, "cmd": "def|ref|callers|prefix|fuzzy|grep|outline|coverage|stats", "args": {...}}.
+    /// {"id": N, "cmd": "<verb>", "args": {...}}, where <verb> is any
+    /// query command (def / ref / callers / uses / callgraph / impact /
+    /// subclasses / prefix / fuzzy / grep / outline / tldr / coverage /
+    /// stats) and args mirror that command's CLI flags.
     ///
     /// Transport defaults to stdin/stdout (one-shot agent loops). Pass
     /// --listen unix:/tmp/scry.sock or --listen tcp:127.0.0.1:9999 to
@@ -690,9 +677,9 @@ enum Cmd {
     /// subsequent queries land warm (sub-10 ms) instead of cold (50–
     /// hundreds of ms). Sequential parallel read of every file in
     /// the index dir; uses available RAM as page cache. `scry serve`
-    /// and `scry mcp` auto-run this on startup; use the standalone
-    /// command after a fresh boot before issuing queries, or before
-    /// a perf bench so you're measuring warm latency.
+    /// auto-runs this on startup; use the standalone command after a
+    /// fresh boot before issuing queries, or before a perf bench so
+    /// you're measuring warm latency.
     Warm {
         #[arg(long)]
         index: Option<PathBuf>,
@@ -967,7 +954,6 @@ fn main() -> Result<()> {
             max_file_bytes, mem_cap, format, explain,
         ),
         Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
-        Cmd::Mcp { index } => cmd_mcp(index),
         Cmd::Warm { index } => cmd_warm(index),
         Cmd::BuildModgraph { kind, root, output } => cmd_build_modgraph(&kind, &root, &output),
         Cmd::Impact { name, index, in_, not_in, subclass_depth, reachable, limit, json } =>
@@ -2285,7 +2271,7 @@ fn cmd_callgraph(
     ) -> std::collections::BTreeMap<String, Node> {
         if depth_left == 0 || *budget == 0 { return Default::default(); }
         // Group by caller_def_id so we can recurse into the exact
-        // enclosing function (Kythe identity), not the bare name.
+        // enclosing function (its SymbolRecord id), not the bare name.
         let mut by_caller_def: std::collections::BTreeMap<u64, (String, Node)>
             = std::collections::BTreeMap::new();
         // Bare-name fallback for refs where we couldn't resolve an
@@ -2341,9 +2327,9 @@ fn cmd_callgraph(
             if *budget == 0 { break; }
         }
         // Materialize the tree. Recurse only into entries that have
-        // a caller_def_id (so the next level can Kythe-filter by it);
-        // bare-name leaves stay as leaves. `visited` tracks
-        // caller_def_ids to break cycles (mutual recursion).
+        // a caller_def_id (so the next level groups by it); bare-name
+        // leaves stay as leaves. `visited` tracks caller_def_ids to
+        // break cycles (mutual recursion).
         let mut out: std::collections::BTreeMap<String, Node> = std::collections::BTreeMap::new();
         for (caller_def_id, (caller_name, mut node)) in by_caller_def {
             if visited.insert(caller_def_id) {
@@ -3708,8 +3694,8 @@ fn print_results_md(
 /// or missing HOME (no log = best-effort skip, not an error).
 ///
 /// Set `SCRY_LOG=` (empty string) to disable logging entirely —
-/// useful in long-running MCP sessions where the log would otherwise
-/// grow without bound during tight agent loops.
+/// useful in long-running agent sessions where the log would otherwise
+/// grow without bound during tight query loops.
 fn query_log_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SCRY_LOG") {
         if p.is_empty() { return None; }
@@ -3724,7 +3710,7 @@ fn query_log_path() -> Option<PathBuf> {
 /// (single backup, overwriting any prior `.1`) and a fresh log
 /// starts. Bounded total disk = 2 × max_bytes.
 ///
-/// Cap chosen so a tight MCP loop (e.g. one query / 100 ms over 24 h
+/// Cap chosen so a tight agent loop (e.g. one query / 100 ms over 24 h
 /// ≈ 860K rows × ~300 bytes/row ≈ 260 MB) survives a single day even
 /// without rotation; with the default 100 MB cap it rotates roughly
 /// twice/day under that load. Adjust upward on instrumented
@@ -5933,537 +5919,6 @@ fn git_changed_files(root: &Path, since: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Entry point for the `mcp` subcommand. MCP — Model Context Protocol
-/// — is a stdio JSON-RPC 2.0 protocol used by Claude Desktop, Cursor,
-/// and other agent runtimes to call out to external tools. scry's MCP
-/// surface exposes one tool per existing `serve` command.
-///
-/// Wire shape (one line per message):
-///   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}
-///   {"jsonrpc":"2.0","id":2,"method":"tools/list"}
-///   {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"def","arguments":{...}}}
-///
-/// Notifications (no `id`) are consumed silently as the spec requires.
-fn cmd_mcp(index: Option<PathBuf>) -> Result<()> {
-    use std::io::{BufRead, Write};
-    let resolved = index.clone().unwrap_or_else(default_index_dir);
-    let reader = open_index(index)?;
-    // Auto-warm: same rationale as cmd_serve — the first agent /
-    // Claude tool call shouldn't pay cold-mmap latency.
-    let _ = warm_index_dir(&resolved);
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let in_lock = stdin.lock();
-    for line in in_lock.lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        let req: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": serde_json::Value::Null,
-                    "error": {"code": -32700, "message": format!("parse error: {e}")},
-                });
-                writeln!(out, "{}", resp)?;
-                out.flush()?;
-                continue;
-            }
-        };
-        // Notifications carry no `id` per JSON-RPC 2.0; MCP uses them
-        // for `notifications/initialized` etc. Acknowledge by doing
-        // nothing — emitting a response would be a protocol violation.
-        if req.get("id").is_none() {
-            continue;
-        }
-        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
-        let params = req.get("params").cloned().unwrap_or(serde_json::json!({}));
-        let resp = mcp_dispatch(&reader, &id, method, &params);
-        writeln!(out, "{}", resp)?;
-        out.flush()?;
-    }
-    Ok(())
-}
-
-/// MCP method dispatcher. Pure function of reader + method + params;
-/// returns the full JSON-RPC envelope (including `jsonrpc: "2.0"` and
-/// the echoed `id`) ready to be written to the wire.
-fn mcp_dispatch(
-    reader: &StoreReader,
-    id: &serde_json::Value,
-    method: &str,
-    params: &serde_json::Value,
-) -> serde_json::Value {
-    let result = match method {
-        "initialize" => Ok(mcp_initialize_result(params)),
-        "tools/list" => Ok(mcp_tools_list_result()),
-        "tools/call" => mcp_tools_call(reader, params),
-        // ping is part of the spec for liveness checks.
-        "ping" => Ok(serde_json::json!({})),
-        // Anything else is unknown.
-        other => Err(format!("method not found: {other}")),
-    };
-    match result {
-        Ok(v) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": v}),
-        Err(msg) => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": {"code": -32601, "message": msg},
-        }),
-    }
-}
-
-/// MCP protocol versions this server supports. Listed newest first so
-/// `MCP_SUPPORTED_VERSIONS[0]` is our preferred latest. Our wire shape
-/// (initialize / tools/list / tools/call with text content parts) has
-/// been stable since 2024-11-05; the newer revisions add optional
-/// features (tasks, elicitation, output schemas) we don't yet emit, so
-/// declaring support is safe — we just don't use the new fields.
-const MCP_SUPPORTED_VERSIONS: &[&str] =
-    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-
-/// Reply to MCP `initialize`. Per spec §lifecycle/Version Negotiation:
-/// if the server supports the version the client requested, it MUST
-/// respond with the same version; otherwise it MUST respond with its
-/// latest supported version (the client then decides whether to
-/// continue or disconnect).
-///
-/// `tools` is the only capability we advertise — we don't (yet)
-/// implement prompts, resources, sampling, logging, or tasks, so we
-/// don't claim them.
-fn mcp_initialize_result(params: &serde_json::Value) -> serde_json::Value {
-    let requested = params.get("protocolVersion").and_then(|v| v.as_str());
-    let agreed = match requested {
-        Some(v) if MCP_SUPPORTED_VERSIONS.contains(&v) => v,
-        _ => MCP_SUPPORTED_VERSIONS[0],
-    };
-    serde_json::json!({
-        "protocolVersion": agreed,
-        "capabilities": {
-            "tools": { "listChanged": false },
-        },
-        "serverInfo": {
-            "name": "scry",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-    })
-}
-
-/// Reply to MCP `tools/list`. One entry per scry command. The
-/// `inputSchema` is a small JSON Schema describing the args each
-/// tool accepts; MCP clients use it to validate arguments before
-/// calling and to render UI hints. We keep the schemas tight but
-/// not exhaustive — the agent's prompt teaches the semantic flags,
-/// the schema teaches the shape.
-fn mcp_tools_list_result() -> serde_json::Value {
-    fn tool(name: &str, desc: &str, schema: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "description": desc,
-            "inputSchema": schema,
-        })
-    }
-    fn obj(req: &[&str], props: serde_json::Value) -> serde_json::Value {
-        let req_arr: Vec<_> = req.iter().map(|s| serde_json::json!(*s)).collect();
-        serde_json::json!({
-            "type": "object",
-            "properties": props,
-            "required": req_arr,
-        })
-    }
-    // Shared property fragments. Each description is one short
-    // sentence written for a 1B-class model: it has to land the hint
-    // without depending on the model "knowing what to do" from
-    // surrounding context.
-    let lang_prop = serde_json::json!({"type": "string",
-        "description": "Language filter — narrow results to one of: java, kotlin, cpp, rust, go, python, soong, aidl. Always pass this when you know the language; cuts noise on cross-language names."});
-    let in_prop = serde_json::json!({"type": "string",
-        "description": "Path substring filter (e.g. 'frameworks/base/' to scope to a subtree). Useful when one name lives in many directories."});
-    let not_in_prop = serde_json::json!({"type": "string",
-        "description": "Negative path substring filter — drop results whose file path contains this substring. Symmetric to `in`. Common use: `not_in: '/tests/'` to exclude test files. Combined with `in` to scope + exclude in one call."});
-    let limit_prop = serde_json::json!({"type": "integer", "default": 20,
-        "description": "Max records returned. Pass a small integer (5-20). Do NOT pass placeholders like 'N' — they fail to parse."});
-    let format_count_prop = serde_json::json!({"type": "string",
-        "description": "Optional. Set to 'count' to get just `N callers` / `N hits` instead of per-record output — ~50× cheaper in tokens when you only need to know IF or HOW MANY. Mutually exclusive with json output mode."});
-
-    let tools = vec![
-        tool(
-            "def",
-            "Find exact-name symbol definitions. If a name is common \
-             (e.g. 'Activity', 'Binder', 'Buffer'), you will get hits \
-             from multiple kinds and languages — ALWAYS pass `kind` \
-             (e.g. 'class') and/or `lang` to narrow the search; \
-             otherwise the top hits may be Python test files or \
-             unrelated structs.",
-            obj(&["name"], serde_json::json!({
-                "name": {"type": "string", "description": "Exact symbol name (case-sensitive)."},
-                "lang": lang_prop,
-                "kind": {"type": "string",
-                    "description": "Kind filter. Common values: class, method, fn (Rust/Go function), interface, struct, enum, aidl.iface, soong (Soong module), init.svc, sepolicy. Strongly recommended when name is ambiguous."},
-                "in":   in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-            })),
-        ),
-        tool(
-            "ref",
-            "Find all references to a name (any ref kind — call, ctor, \
-             type-use, import, inherit). Use `callers` for the common \
-             call-only case. Pass `format: 'count'` if you only need \
-             the total. Set `reachable: true` to drop refs in modules \
-             that can't actually link to a definition of `name` per \
-             the build graph — eliminates cross-module false positives \
-             on AOSP / kernel / GN-based projects when the index was \
-             built with `scry index --build <system>`.",
-            obj(&["name"], serde_json::json!({
-                "name": {"type": "string"},
-                "lang": lang_prop,
-                "kind": {"type": "string",
-                    "description": "Ref-kind filter. Common: call, ctor, inherit, import, type-use, field-access."},
-                "in":   in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-                "format": format_count_prop,
-                "reachable": {"type": "boolean", "default": false,
-                    "description": "Filter refs by Soong/GN/kernel module-graph reachability. No-op if the index has no module_graph.json sidecar. Opt-in (not default) because the module graph is ~256MB and adds ~50-500ms to first query in a process."},
-                "scope": {"type": "string",
-                    "description": "Keep only refs whose enclosing scope_path contains this class/namespace as an exact segment (e.g. \"BroadcastQueueImpl\")."},
-                "format": {"type": "string", "enum": ["by-def", "paths"],
-                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {path, line, col, scope, kind, id}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files contain refs to X?`. Without `format`, returns the per-ref JSONL stream."},
-            })),
-        ),
-        tool(
-            "callers",
-            "Find call sites of NAME (shorthand for `ref` with \
-             kind=call). For 'does X get called anywhere?' or 'how \
-             many?', pass `format: 'count'` — it returns just `N \
-             callers` and costs almost nothing. Set `reachable: \
-             true` for build-graph pruning (extra ~50-500ms cost).",
-            obj(&["name"], serde_json::json!({
-                "name": {"type": "string"},
-                "lang": lang_prop,
-                "in":   in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-                "format": format_count_prop,
-                "reachable": {"type": "boolean", "default": false,
-                    "description": "Same as on `ref` — filters by build-graph reachability when the module_graph.json sidecar is present. Opt-in."},
-                "scope": {"type": "string",
-                    "description": "Keep only callers whose enclosing scope_path contains this class as an exact segment. Big win on hub functions."},
-                "format": {"type": "string", "enum": ["by-def", "paths"],
-                    "description": "Output mode. `by-def` returns a histogram array `[{count, def: {...}}, ..., {count, def: null}]` sorted descending by count; the unresolved bucket is last — invaluable for polymorphic names like `close`, `onCreate`, `transact`. `paths` returns a deduped sorted array of file path strings — cheapest way to ask `which files call X?`."},
-            })),
-        ),
-        tool(
-            "subclasses",
-            "Direct (or transitive) subclasses of a type. LSP \
-             typeHierarchy/subtypes. Set `depth: N` to walk the \
-             hierarchy N levels (default 0 = direct children only).",
-            obj(&["name"], serde_json::json!({
-                "name":  {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-                "depth": {"type": "integer", "minimum": 0, "default": 0,
-                    "description": "BFS depth. 0 = direct subclasses; 1 = grandchildren too; etc."},
-                "format": {"type": "string", "enum": ["count", "paths"],
-                    "description": "Optional. `count` returns `{count: N}`. `paths` returns a deduped sorted array of file paths — `which files define a subtype of X?`. Without `format`, returns per-symbol records."},
-            })),
-        ),
-        tool(
-            "uses",
-            "Outgoing edges from NAME's body — what does NAME call \
-             or reference? Symmetric to `callers`. Returns up to \
-             `limit` refs inside NAME's function body. Use \
-             `kind: \"call\"` to restrict to call sites. Requires \
-             the file_refs sidecar (`scry build-file-refs`) for \
-             O(1) per-file lookup.",
-            obj(&["name"], serde_json::json!({
-                "name":  {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "kind":  {"type": "string",
-                    "description": "Filter by ref kind: call, type, field, import, inherit, using-ns. Default: all."},
-                "limit": limit_prop,
-                "format": {"type": "string", "enum": ["count", "paths"],
-                    "description": "Optional. `count` returns `{count: N}` — cheapest probe for `how many edges`. `paths` returns a deduped sorted array of file paths — `which files does NAME touch?`. Without `format`, returns per-ref JSONL stream."},
-            })),
-        ),
-        tool(
-            "callgraph",
-            "Recursive callers tree for NAME — \"how does control \
-             flow reach this function?\". Walks call refs upward N \
-             levels via `enclosing_function` resolution (more \
-             accurate than scope_path for Java/Kotlin where the \
-             scope is the class). `--max-nodes` caps total expansion \
-             on hub functions (logger, assert, etc.).",
-            obj(&["name"], serde_json::json!({
-                "name":  {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "depth": {"type": "integer", "minimum": 1, "default": 3},
-                "max_nodes": {"type": "integer", "minimum": 1, "default": 200},
-                "reachable": {"type": "boolean", "default": false},
-            })),
-        ),
-        tool(
-            "impact",
-            "\"What breaks if I change NAME?\" — composes callers + \
-             transitive subclasses into one deduped impact set. \
-             Returns counts (callers, subclasses, files_touched) plus \
-             the up-to-`limit` instances of each. Use this as a \
-             pre-flight check before refactors: small counts → safe \
-             rename; large counts → split the change.",
-            obj(&["name"], serde_json::json!({
-                "name":  {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-                "subclass_depth": {"type": "integer", "minimum": 0, "default": 2,
-                    "description": "BFS depth for the subclass leg of the impact set."},
-                "reachable": {"type": "boolean", "default": false,
-                    "description": "Build-graph reachability filter on callers leg only."},
-            })),
-        ),
-        tool(
-            "prefix",
-            "Symbols whose name starts with PREFIX (FST-backed \
-             completion). Useful for 'what's everything starting \
-             with Activity?'.",
-            obj(&["prefix"], serde_json::json!({
-                "prefix": {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "limit": limit_prop,
-            })),
-        ),
-        tool(
-            "fuzzy",
-            "Typo-tolerant symbol search, ranked by edit distance. \
-             Use when you're not sure of the exact spelling. If you \
-             ARE sure, use `def` (exact match, cheaper).",
-            obj(&["substr"], serde_json::json!({
-                "substr": {"type": "string"},
-                "in":    in_prop,
-                "not_in": not_in_prop,
-                "distance": {"type": "integer", "default": 2,
-                    "description": "Levenshtein bound for typo tolerance (1-3 is sensible; higher = noisier results)."},
-                "limit": limit_prop,
-            })),
-        ),
-        tool(
-            "grep",
-            "Content search across indexed source. Literal pattern \
-             unless `regex: true`. Set `case_insensitive: true` for \
-             case-folded match (e.g. 'bindservice' finds 'bindService') \
-             — trigram pre-filter expands across case variants so this \
-             stays fast on big indexes. For 'is X mentioned at all?' \
-             prefer `format: 'count'`; for 'list all hits' use \
-             `format: 'lines'` (rg-shape, much cheaper in tokens \
-             than the default JSON envelope).",
-            obj(&["pattern"], serde_json::json!({
-                "pattern": {"type": "string"},
-                "regex":   {"type": "boolean", "default": false,
-                    "description": "Treat pattern as a regex. Default is literal substring."},
-                "case_insensitive": {"type": "boolean", "default": false,
-                    "description": "Match case-insensitively. Works for literal and regex patterns. Trigram pre-filter expands each query trigram across ASCII case variants so this stays fast."},
-                "lang":    lang_prop,
-                "in":      in_prop,
-                "not_in":  not_in_prop,
-                "limit":   limit_prop,
-                "format":  {"type": "string",
-                    "description": "Optional. 'lines' = rg-shape `path:line:col\\tsnippet` per hit (cheapest list form). 'count' = just `N hits across M files`. Mutually exclusive with json output."},
-            })),
-        ),
-        tool(
-            "outline",
-            "Every symbol defined in one file, ordered by line. PATH \
-             matches by suffix (e.g. 'Activity.java' works if \
-             unambiguous). Set `with_snippets: N` to also include \
-             the first N source lines of each symbol — saves a \
-             round-trip when you'd otherwise call `def` per name.",
-            obj(&["path"], serde_json::json!({
-                "path":  {"type": "string",
-                    "description": "Full or suffix-style path (e.g. 'app_main.cpp' if no ambiguity, or the full /home/... path)."},
-                "limit": limit_prop,
-                "with_snippets": {"type": "integer", "default": 0,
-                    "description": "If > 0, attach the first N source lines of each symbol as a `snippet` field. Lines clip at 200 chars."},
-            })),
-        ),
-        tool(
-            "tldr",
-            "One-call file summary: language, total symbol count, \
-             per-kind breakdown, top 3 ranked symbols, and the file's \
-             first non-blank line. Use this FIRST when the question \
-             is 'what does this file do?' — saves ~70% of the tokens \
-             vs `outline + N×def`.",
-            obj(&["path"], serde_json::json!({
-                "path": {"type": "string",
-                    "description": "Full or suffix-style path (same matching rules as `outline`)."},
-            })),
-        ),
-        tool(
-            "coverage",
-            "Subtree stats: files / bytes / symbols per language for \
-             any directory inside the index. Useful for 'what \
-             fraction of $repo did scry actually parse?'.",
-            obj(&["path"], serde_json::json!({
-                "path":    {"type": "string",
-                    "description": "Path prefix to scope (empty string = whole index)."},
-                "by_kind": {"type": "boolean", "default": false,
-                    "description": "Also break down per SymbolKind within each language."},
-            })),
-        ),
-        tool(
-            "stats",
-            "Index metadata: size, file/symbol/ref counts, freshness, \
-             and scry_version. No arguments. Useful as a first probe \
-             before harder queries.",
-            serde_json::json!({
-                "type": "object", "properties": serde_json::json!({}),
-            }),
-        ),
-    ];
-    serde_json::json!({ "tools": tools })
-}
-
-/// Dispatch an MCP `tools/call`. Translates the MCP-shaped request
-/// into a `serve_one_request`-shaped one and wraps the JSON result
-/// in MCP's `{content: [{type: "text", text: ...}]}` envelope.
-///
-/// We deliberately reuse the serve_one_request code path rather than
-/// re-implementing the tool bodies: any future change to the serve
-/// commands (new arg names, ranking tweaks, schema changes) is picked
-/// up automatically by the MCP surface.
-fn mcp_tools_call(reader: &StoreReader, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let name = params.get("name").and_then(|v| v.as_str())
-        .ok_or_else(|| "missing required parameter: 'name'".to_string())?;
-    let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-
-    // Unknown tool: surface as a tool-level error (isError: true) per
-    // MCP convention rather than a JSON-RPC -32601 error. A
-    // JSON-RPC error would tell the client "the protocol failed";
-    // we want "the tool call failed; the call shape was valid".
-    if mcp_required_args_for(name).is_none() {
-        return Ok(mcp_tool_error(format!("unknown tool: '{}'. \
-            Call tools/list to see available tools.", name)));
-    }
-
-    // Required-arg validation. The tool schemas advertise required
-    // fields; the wrapper must enforce them so a malformed call from
-    // a client (or LLM) doesn't silently coerce to an empty-string
-    // query and return garbage hits.
-    if let Some(missing) = mcp_validate_required_args(name, &arguments) {
-        return Ok(mcp_tool_error(format!(
-            "missing or empty required argument '{}' for tool '{}'",
-            missing, name,
-        )));
-    }
-
-    // Route through serve_one_request so any future change to the
-    // serve surface (new args, ranking tweaks) is picked up here too.
-    let req = serde_json::json!({
-        "id": 1, "cmd": name, "args": arguments,
-    });
-    let line = req.to_string();
-    let mut buf: Vec<u8> = Vec::new();
-    serve_one_request(reader, &line, &mut buf)
-        .map_err(|e| format!("internal error invoking serve: {e:#}"))?;
-    let resp_line = String::from_utf8(buf).map_err(|e| format!("non-utf8 serve output: {e}"))?;
-    let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-        .map_err(|e| format!("serve response parse error: {e}"))?;
-
-    // Envelope-level error (e.g. unknown cmd that slipped past
-    // mcp_required_args_for — shouldn't happen but defensive).
-    // serve returns {"id": N, "error": "msg"} for these.
-    if let Some(err) = resp.get("error") {
-        let msg = err.as_str().map(String::from).unwrap_or_else(|| err.to_string());
-        return Ok(mcp_tool_error(msg));
-    }
-
-    let result = resp.get("result").cloned().unwrap_or(serde_json::Value::Null);
-
-    // Tool-level error: the call protocol succeeded but the tool
-    // couldn't satisfy the request (the canonical case: `ask` against
-    // an index without an embedding sidecar). serve emits these as
-    // `{"error": "..."}` in the result. MCP spec: set isError: true
-    // so the client can branch correctly. Unwrap the bare message
-    // string from the {error: "..."} envelope before placing it in
-    // the text content — otherwise the LLM sees a JSON literal it
-    // has to re-parse to find the human-readable hint.
-    if let Some(err_val) = result.as_object().and_then(|m| m.get("error")) {
-        let msg = err_val.as_str().map(String::from)
-            .unwrap_or_else(|| err_val.to_string());
-        return Ok(mcp_tool_error(msg));
-    }
-
-    let text = serde_json::to_string(&result).map_err(|e| format!("encode: {e}"))?;
-    Ok(serde_json::json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": false,
-    }))
-}
-
-/// Build an MCP "tool-level error" response: well-formed result with
-/// `isError: true` and a human-readable text content part. Used for
-/// all tool-call failures that aren't protocol-level (unknown tool,
-/// missing required arg). Distinguishes from JSON-RPC errors which
-/// indicate the *call* failed at the protocol level.
-fn mcp_tool_error(msg: String) -> serde_json::Value {
-    serde_json::json!({
-        "content": [{"type": "text", "text": msg}],
-        "isError": true,
-    })
-}
-
-/// Required-args lookup. Keep in sync with `mcp_tools_list_result`'s
-/// inputSchema declarations — these two functions must agree or the
-/// MCP server lies about what it accepts. Returns `None` if the tool
-/// name is unknown (callers treat that as "no such tool").
-fn mcp_required_args_for(tool: &str) -> Option<&'static [&'static str]> {
-    Some(match tool {
-        "def"      => &["name"],
-        "ref"      => &["name"],
-        "callers"  => &["name"],
-        "subclasses"      => &["name"],
-        "impact"          => &["name"],
-        "callgraph"       => &["name"],
-        "uses"            => &["name"],
-        "prefix"   => &["prefix"],
-        "fuzzy"    => &["substr"],
-        "grep"     => &["pattern"],
-        "outline"  => &["path"],
-        "tldr"     => &["path"],
-        "coverage" => &["path"],
-        "stats"    => &[],
-        _ => return None,
-    })
-}
-
-/// Validate that every required arg for `tool` is present in `args`
-/// AND non-empty (an empty string would coerce to a meaningless
-/// "match anything" query that returns garbage). Returns the name of
-/// the first missing/empty arg, or `None` if all present.
-fn mcp_validate_required_args(tool: &str, args: &serde_json::Value) -> Option<String> {
-    let required = mcp_required_args_for(tool)?;
-    for name in required {
-        let v = args.get(name);
-        let ok = match v {
-            Some(serde_json::Value::String(s)) => !s.is_empty(),
-            Some(serde_json::Value::Number(_) | serde_json::Value::Bool(_)) => true,
-            Some(serde_json::Value::Array(a)) => !a.is_empty(),
-            Some(serde_json::Value::Object(o)) => !o.is_empty(),
-            Some(serde_json::Value::Null) | None => false,
-        };
-        if !ok {
-            return Some((*name).to_string());
-        }
-    }
-    None
-}
-
 /// Entry point for the `serve` subcommand. Dispatches to the requested
 /// transport — stdin/stdout (default) or a bound listener (unix / tcp).
 /// The shared `StoreReader` lives for the whole process and is borrowed
@@ -6633,12 +6088,12 @@ fn serve_listener(reader: &StoreReader, spec: &str, max_conns: u32) -> Result<()
     }
 
     // Reply written when a connection is rejected for hitting the
-    // cap. JSON-RPC-style shape so MCP-aware clients can branch on
-    // `error.code` without ambiguity (-32004 is the canonical
-    // "server busy" range in JSON-RPC custom-code space; we use it
-    // here to mean "scry serve at capacity"). Non-MCP clients see
-    // the human-readable `message`. Single line, newline-terminated
-    // so any line-based client picks it up cleanly.
+    // cap. JSON-RPC error shape so clients can branch on `error.code`
+    // without ambiguity (-32004 is the canonical "server busy" range
+    // in JSON-RPC custom-code space; we use it here to mean "scry
+    // serve at capacity"). Clients that don't inspect the code see the
+    // human-readable `message`. Single line, newline-terminated so any
+    // line-based client picks it up cleanly.
     let make_cap_reply = |cap: u32| -> Vec<u8> {
         let v = serde_json::json!({
             "jsonrpc": "2.0",
@@ -6784,7 +6239,7 @@ fn reader_clone_for_share(r: &StoreReader) -> Result<StoreReader> {
 
 /// Handle a single newline-delimited JSON-RPC request by writing its
 /// response(s) to `wr`. Shared by all transports — stdio, unix socket,
-/// tcp socket, MCP. The shape of what gets written depends on the
+/// tcp socket. The shape of what gets written depends on the
 /// request:
 ///
 /// - **Default (non-streaming)**: one JSON line of the form
@@ -8246,183 +7701,6 @@ mod tests {
         assert!(r.is_some());
         // The bare "name" field always survives.
         assert_eq!(hit["name"], "Foo");
-    }
-
-    // ------------------------------------------------------------------
-    // MCP arg validation — pin the per-tool required-arg map and the
-    // empty-string-rejection rule. These tests run without a real
-    // StoreReader because mcp_required_args_for + mcp_validate_required_args
-    // are pure functions of the tool name + JSON arguments.
-    // ------------------------------------------------------------------
-
-    /// Every tool advertised by tools/list must have an entry in
-    /// mcp_required_args_for. Catches schema/validator drift at test
-    /// time so a future "add a new tool" change has to update both
-    /// in the same diff.
-    #[test]
-    fn mcp_required_args_covers_every_advertised_tool() {
-        let v = mcp_tools_list_result();
-        let tools = v.pointer("/tools").and_then(|x| x.as_array())
-            .expect("tools array");
-        assert!(!tools.is_empty(), "tools list must not be empty");
-        for t in tools {
-            let name = t.get("name").and_then(|x| x.as_str())
-                .expect("tool entry has name");
-            assert!(mcp_required_args_for(name).is_some(),
-                "advertised tool '{name}' missing from mcp_required_args_for; \
-                 add it to keep schema + validator in sync");
-        }
-    }
-
-    /// The required set per tool. If this changes, USAGE / MCP docs
-    /// must change too — that's the point of pinning it.
-    #[test]
-    fn mcp_required_args_match_documented_shape() {
-        assert_eq!(mcp_required_args_for("def"),      Some(&["name"][..]));
-        assert_eq!(mcp_required_args_for("ref"),      Some(&["name"][..]));
-        assert_eq!(mcp_required_args_for("callers"),  Some(&["name"][..]));
-        assert_eq!(mcp_required_args_for("prefix"),   Some(&["prefix"][..]));
-        assert_eq!(mcp_required_args_for("fuzzy"),    Some(&["substr"][..]));
-        assert_eq!(mcp_required_args_for("grep"),     Some(&["pattern"][..]));
-        assert_eq!(mcp_required_args_for("outline"),  Some(&["path"][..]));
-        assert_eq!(mcp_required_args_for("coverage"), Some(&["path"][..]));
-        assert_eq!(mcp_required_args_for("stats"),    Some(&[][..]));
-        assert_eq!(mcp_required_args_for("nonexistent"), None);
-    }
-
-    /// Missing arg → returns the arg's name.
-    #[test]
-    fn mcp_validate_flags_missing_arg() {
-        let args = serde_json::json!({});
-        assert_eq!(mcp_validate_required_args("def", &args),
-                   Some("name".to_string()));
-    }
-
-    /// Empty-string arg → also flagged. The original bug:
-    /// `{"name": ""}` silently coerced to "match all" and returned
-    /// garbage anonymous-enum hits from C++ code where the FST has
-    /// thousands of empty-name entries.
-    #[test]
-    fn mcp_validate_flags_empty_string_arg() {
-        let args = serde_json::json!({"name": ""});
-        assert_eq!(mcp_validate_required_args("def", &args),
-                   Some("name".to_string()));
-    }
-
-    /// Null arg → flagged. JSON null is the explicit "I deliberately
-    /// don't have a value" — treat the same as missing.
-    #[test]
-    fn mcp_validate_flags_null_arg() {
-        let args = serde_json::json!({"prefix": null});
-        assert_eq!(mcp_validate_required_args("prefix", &args),
-                   Some("prefix".to_string()));
-    }
-
-    /// Valid non-empty string → no error.
-    #[test]
-    fn mcp_validate_accepts_non_empty_arg() {
-        let args = serde_json::json!({"name": "ActivityManagerService", "limit": 5});
-        assert!(mcp_validate_required_args("def", &args).is_none());
-    }
-
-    /// A tool with no required args (stats) always passes validation
-    /// regardless of what arguments object the caller sends.
-    #[test]
-    fn mcp_validate_zero_required_args_always_passes() {
-        assert!(mcp_validate_required_args("stats", &serde_json::json!({})).is_none());
-        assert!(mcp_validate_required_args("stats", &serde_json::json!({"junk": 1})).is_none());
-    }
-
-    /// mcp_tool_error wraps a message in the correct MCP envelope
-    /// shape (content[] of text part, isError: true). Pinned because
-    /// MCP clients rely on this exact field layout.
-    #[test]
-    fn mcp_tool_error_shape() {
-        let err = mcp_tool_error("kaboom".to_string());
-        assert_eq!(err.pointer("/content/0/type").and_then(|v| v.as_str()), Some("text"));
-        assert_eq!(err.pointer("/content/0/text").and_then(|v| v.as_str()), Some("kaboom"));
-        assert_eq!(err.get("isError").and_then(serde_json::Value::as_bool), Some(true));
-    }
-
-    /// Regression test for the MCP tool-error unwrap. When `serve`
-    /// returns `{"error": "..."}` inside the result, the MCP wrapper
-    /// must place the BARE message string into content[0].text — NOT
-    /// the JSON-stringified `{"error": "..."}`. An LLM consuming the
-    /// content shouldn't have to json.parse again to read the hint.
-    #[test]
-    fn mcp_tool_error_unwraps_serve_error_envelope() {
-        // mcp_tool_error itself produces the envelope shape that
-        // mcp_tools_call uses; the call path additionally unwraps
-        // `{"error": "..."}` from the serve response before placing
-        // the bare message into text. Test the contract via the
-        // public helper + a constructed Value matching what serve
-        // emits.
-        let serve_result = serde_json::json!({"error": "missing sidecar — run `scry build-file-refs`"});
-        // Simulate the unwrap that mcp_tools_call performs.
-        let err_val = serve_result.as_object().and_then(|m| m.get("error"))
-            .expect("serve emits {error: <string>}");
-        let bare = err_val.as_str().map(String::from).expect("bare string");
-        let envelope = mcp_tool_error(bare);
-        let text = envelope.pointer("/content/0/text").and_then(|v| v.as_str())
-            .expect("text part");
-        // The bare message: no leading {"error":, no escaped quotes.
-        assert!(!text.starts_with('{'),
-                "tool-error text must be the bare message, not a JSON literal; got: {text}");
-        assert!(text.contains("missing sidecar"),
-                "tool-error text must preserve the hint; got: {text}");
-        assert!(text.contains("build-file-refs"),
-                "tool-error text must include the actionable hint; got: {text}");
-    }
-
-    // ------------------------------------------------------------------
-    // MCP version negotiation — per spec §lifecycle/Version Negotiation.
-    // ------------------------------------------------------------------
-
-    /// Client requests a version we support → server MUST echo it.
-    /// (Forward-compatibility: a 2024 client connecting to a 2025 server
-    /// still gets 2024 back so it can continue talking to us.)
-    #[test]
-    fn mcp_initialize_echoes_supported_version() {
-        for v in MCP_SUPPORTED_VERSIONS {
-            let req = serde_json::json!({"protocolVersion": v});
-            let r = mcp_initialize_result(&req);
-            assert_eq!(r.pointer("/protocolVersion").and_then(|x| x.as_str()), Some(*v),
-                       "must echo client-requested version '{v}' verbatim");
-        }
-    }
-
-    /// Client requests an unsupported version → server returns its
-    /// latest. (The client is then free to disconnect per spec; that's
-    /// not our problem.)
-    #[test]
-    fn mcp_initialize_returns_latest_on_unsupported_version() {
-        let req = serde_json::json!({"protocolVersion": "1999-01-01"});
-        let r = mcp_initialize_result(&req);
-        assert_eq!(r.pointer("/protocolVersion").and_then(|x| x.as_str()),
-                   Some(MCP_SUPPORTED_VERSIONS[0]),
-                   "unsupported version must fall back to our latest");
-    }
-
-    /// Missing protocolVersion field → also falls back to latest.
-    /// Some lightweight clients omit it entirely.
-    #[test]
-    fn mcp_initialize_handles_missing_version() {
-        let r = mcp_initialize_result(&serde_json::json!({}));
-        assert_eq!(r.pointer("/protocolVersion").and_then(|x| x.as_str()),
-                   Some(MCP_SUPPORTED_VERSIONS[0]));
-    }
-
-    /// Newest-first ordering on MCP_SUPPORTED_VERSIONS is load-bearing
-    /// — `[0]` is treated as "our latest" in the fallback path. Pin it.
-    #[test]
-    fn mcp_supported_versions_newest_first() {
-        let v = MCP_SUPPORTED_VERSIONS;
-        assert!(!v.is_empty(), "must support at least one MCP version");
-        let mut sorted: Vec<&&str> = v.iter().collect();
-        sorted.sort_by(|a, b| b.cmp(a));
-        let sorted_owned: Vec<&str> = sorted.iter().map(|s| **s).collect();
-        let actual: Vec<&str> = v.to_vec();
-        assert_eq!(actual, sorted_owned, "MCP_SUPPORTED_VERSIONS must be newest-first");
     }
 
     // ------------------------------------------------------------------

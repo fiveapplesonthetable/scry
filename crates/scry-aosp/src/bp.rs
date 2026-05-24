@@ -11,7 +11,8 @@
 //!                | value '+' value
 //!
 //! We only need to extract module name, deps, srcs, cflags, visibility,
-//! defaults — enough to answer `scry mod`, `scry module-of`, `scry cflag`.
+//! defaults — enough to surface Soong modules as symbols (queryable via
+//! `scry def NAME --kind soong`) and their deps as refs.
 //!
 //! On parse error we emit whatever symbols we collected before the error and
 //! stop. Soong's own parser is the source of truth; this is best-effort.

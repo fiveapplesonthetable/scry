@@ -29,7 +29,7 @@ scry/
 │   ├── run_index.sh          production indexer wrapper (cgroup + resume)
 │   ├── await_finalize.sh     post-finalize watcher; fires post_finalize.sh
 │   ├── post_finalize.sh      build-offsets + build-file-symbols + build-trigrams
-│   │                         + build-resolutions + validate + bench + email
+│   │                         + validate + bench + email
 │   ├── validate.sh           sanity-check every command against a real index
 │   ├── bench_grep.sh         scry-vs-rg-vs-grep latency matrix
 │   ├── bench_index.sh        index-time vs --workers matrix
@@ -52,9 +52,6 @@ Hard requirements:
   `[workspace.lints]` table relies on the 1.74 manifest-lints
   feature.
 - **Git ≥ 2.30.** For `scry diff --since` (parses `git diff --name-only`).
-- **clang 14+ in `$PATH`.** Required only if you exercise the
-  `--precise` path on `scry callers` (clangd-driven C++ type
-  resolution). Absent clang, every other command works.
 - **Disk space.** ~3 GB of cargo deps + target; the live AOSP+Linux
   index itself needs ~12 GB. The benchmarked corpus on this host
   (1,009,166 files, 70 GB source) does not need to be present to
@@ -89,28 +86,22 @@ toolchain for the tree-sitter grammars' build.rs scripts plus
 ```sh
 sudo apt update
 sudo apt install -y build-essential pkg-config git curl
-# (optional) for the precise C++ path: clangd >= 14
-sudo apt install -y clangd
 # (optional) for the comparison benches:
 sudo apt install -y ripgrep
 ```
 
 Fedora / RHEL / Rocky use `dnf install gcc gcc-c++ make
-pkgconfig clang-tools-extra ripgrep`; Arch uses `pacman -S
-base-devel pkgconf clang ripgrep`.
+pkgconfig ripgrep`; Arch uses `pacman -S
+base-devel pkgconf ripgrep`.
 
 **macOS.** Xcode Command Line Tools (or the full Xcode) supply
 the C toolchain rustup needs:
 
 ```sh
 xcode-select --install
-# rustup as above. Homebrew clangd + ripgrep (optional):
-brew install llvm ripgrep
+# rustup as above. Homebrew ripgrep (optional, for benches):
+brew install ripgrep
 ```
-
-The Apple system clangd is older than what scry's `--precise`
-path expects; either install `brew install llvm` and prefix
-`PATH="$(brew --prefix llvm)/bin:$PATH"`, or skip `--precise`.
 
 **Windows** is not officially supported (no production users on
 Windows today). It should compile under the MSVC toolchain but
@@ -174,7 +165,7 @@ Breakdown (counts as of 2026-05-16):
 | crate        | tests | what they cover                                                                                              |
 |--------------|------:|--------------------------------------------------------------------------------------------------------------|
 | scry-aosp    |    19 | one happy-path per format parser (Soong, AIDL, HIDL, OWNERS, aconfig, init.rc, sepolicy, manifest, Bazel, CMake, GN, api-txt) plus the `cmake_comments_with_unbalanced_paren` regression that took down indexing |
-| scry-cli     |    47 | regex literal extractor, file_symbols + lazy + epoch_iso, Layer 2 resolve_one branches, Java pkg/import narrowing edge cases, MCP arg validation (7), MCP version negotiation (4), OWNERS parser, ranking & path penalties |
+| scry-cli     |    47 | regex literal extractor, file_symbols + lazy + epoch_iso, name-match resolve_one branches, Java pkg/import narrowing edge cases, MCP arg validation (7), MCP version negotiation (4), OWNERS parser, ranking & path penalties |
 | scry-cli e2e |     1 | end-to-end: synthetic source tree → real `scry index` subprocess → every CLI + JSON-RPC + MCP path; round-trips `scry index --incremental` (modify + add a file, replay unchanged) |
 | scry-lang    |     9 | per-language minimal extraction (Java / Cpp / Rust / Go / Python), Cpp out-of-line method bare-name + scope, Kotlin extension receiver scoping, progress-callback abort, unbounded-parse sanity. 2 ignored AST-dump helpers (`-- --ignored --nocapture` to see) |
 | scry-store   |    51 | LazyVec round-trip (sequential / reverse / random / OOB / empty / refs-too), file_symbols entry decoder, trigram posting wire format (round-trip + truncation + malformed-varint), name posting wire format, rank_score tier ordering, epoch_to_iso8601 known values + leap year + pre-epoch, trigram extraction + query + intersection, file_digest absent-sidecar accessor |
@@ -182,9 +173,8 @@ Breakdown (counts as of 2026-05-16):
 
 The e2e test is the strongest single signal — it runs the just-built
 binary against a synthetic source tree, exercises writer + reader +
-CLI + JSON-RPC + MCP + incremental indexing + Layer 2 resolution +
-trigram grep, finishes in ~2 s. Any cross-crate API drift surfaces
-there.
+CLI + JSON-RPC + MCP + incremental indexing + trigram grep, finishes
+in ~2 s. Any cross-crate API drift surfaces there.
 
 ### Adding a test
 
@@ -272,7 +262,7 @@ This is what produced the "13.3 min for 1 M files" number in
 `docs/BENCHMARKS.md`. `scripts/await_finalize.sh` runs as a
 sibling job and fires `scripts/post_finalize.sh` automatically when
 the writer exits, chaining build-offsets → build-file-symbols →
-build-trigrams → build-resolutions → validate → bench → email.
+build-trigrams → validate → bench → email.
 
 ### `perf stat` decomposition
 
@@ -315,7 +305,7 @@ SCRY_INDEX_DIR=/mnt/agent/scry-index /mnt/agent/scry/scripts/validate.sh
 |------------------------------|------------------------------------------------------------------------|
 | `scripts/run_index.sh`       | production indexer wrapper (cgroup + resume + post-finalize trigger)   |
 | `scripts/await_finalize.sh`  | watches for indexer exit; fires `post_finalize.sh`                     |
-| `scripts/post_finalize.sh`   | build-offsets + build-file-symbols + build-trigrams + build-resolutions + validate + bench + email |
+| `scripts/post_finalize.sh`   | build-offsets + build-file-symbols + build-trigrams + validate + bench + email |
 | `scripts/validate.sh`        | sanity-checks every CLI / JSON-RPC command shape                       |
 | `scripts/bench_grep.sh`      | scry vs rg vs POSIX grep query-latency matrix                          |
 | `scripts/bench_index.sh`     | indexing throughput vs `--workers`                                     |
@@ -435,20 +425,21 @@ find and currently won't.
 Live work items, sized roughly. Each one has a clear acceptance
 signal; items move to the changelog once landed.
 
-- **SCIP ingestion** (phase-5 opt-in per DESIGN §5). Closing the
-  10-20 % overload-resolution gap for C++/Java would require
-  consuming SCIP indexes the build system already emits for IDE
-  use. Half-day per language to wire up. Pending an AOSP build
-  step that actually produces SCIP for arbitrary modules.
-- **Per-commit incremental on the build-resolutions sidecar.**
-  Today `scry build-resolutions` re-resolves every ref on each
-  run; a smaller-than-corpus per-file resolver delta would let
-  the nightly timer maintain the sidecar in seconds instead of
-  minutes.
-- **Layer 2 determinism check in CI.** Build the resolutions
-  sidecar twice; diff. Should be byte-identical (every map is
-  `HashMap<u32, ...>` keyed by file_id; iter order is on-disk).
-  Cheap enough to gate releases on.
+- **Assembly symbol extraction.** The walker classifies kernel
+  `.S` / `.s` files but no extractor runs; wiring a minimal
+  label/function extractor would let agents find asm entry points.
+- **Per-commit incremental on the trigram sidecar.** Today
+  `scry build-trigrams` rebuilds the full FST on each run; a
+  smaller-than-corpus per-file delta would let the nightly timer
+  maintain the sidecar in seconds instead of minutes.
+- **Build-graph reachability beyond Soong.** `--reachable` reads
+  the `module_graph.json` built by `scry build-modgraph`; extending
+  the graph builder to Bazel and CMake targets would broaden the
+  `--reachable` filter past the AOSP/Soong corpus.
+
+Compiler-grade semantic precision (def / ref / callers resolved by
+a real compiler over the AOSP C++/Java slice) is the job of the
+separate companion tool `scry2`, not scry.
 
 ## Verification checklist
 
@@ -494,9 +485,9 @@ from `perf stat` and timed runs. Numbers reported in
 code.
 
 - **Cold-vs-warm `def` gap is page-fault dominated.** Cold cost
-  is `sys` time bringing `names.fst`, `name_postings.bin`,
-  `file_symbols`, `ref_resolutions` into RAM. A single warm-up
-  reuses the pages and the bulk disappears.
+  is `sys` time bringing `names.fst`, `name_postings.bin`, and
+  `file_symbols` into RAM. A single warm-up reuses the pages and
+  the bulk disappears.
 - **Cold grep is IO-bound.** Cache-miss rate sits around 17 %;
   `sys` >> `user` confirms the time is in page-faulting candidate
   files, not in the scan loop. The trigram pre-filter is doing
@@ -515,11 +506,6 @@ code.
   data-as-headers files in `external/libwebsockets/`; the OOM
   skiplist records them and the next run skips parsing without
   touching the rest of indexing.
-- **Layer 2 resolution is deterministic by construction.** The
-  resolver iterates refs in on-disk order against
-  `HashMap<u32, …>` keyed by `file_id` and writes via tmp +
-  atomic rename, so two `scry build-resolutions` runs against
-  the same index produce a byte-identical `ref_resolutions.bin`.
 
 ## Decisions: ideas considered and not pursued
 
@@ -543,7 +529,7 @@ don't earn their cost. Captured here so the rationale survives
   grep is bytes-from-disk-wait bound, not syscall bound; the
   rayon mmap+memchr loop already saturates the IO queue depth
   the page cache can absorb. Upside < 10 % on the worst query,
-  nothing on warm. Full breakdown in `docs/ROADMAP.md` § 4.
+  nothing on warm. Full breakdown in `docs/ROADMAP.md` § 2.
 - **`MAP_HUGETLB` for the trigram FST.** Single-digit-% win on
   warm queries; needs huge pages configured at boot, doesn't
   pay for the deployment friction.
@@ -556,10 +542,6 @@ don't earn their cost. Captured here so the rationale survives
 - **DAX / persistent-memory layout.** Hardware-blocked. The
   on-disk format is already forward-compatible with mmap-then-read
   semantics; nothing to do until pmem hardware shows up.
-- **Stack Graphs for Kotlin / Python.** Active research project
-  at GitHub; Rust bindings unclear. Revisit if the project
-  publishes a stable Rust API and our heuristic Layer 1 starts
-  costing us meaningful precision.
 - **Streaming JSON-RPC responses.** Agents can already cap with
   `--limit`; the tokio + framed-codec dep is significant for the
   marginal value of early cut-off.
@@ -595,7 +577,7 @@ A change is mergeable when:
   outside scry-store, no `.unwrap()` on user/FS input without a
   defensive guard, on-disk format additions are backwards-compatible
   via the optional-sidecar pattern (see `file_symbols_mmap`,
-  `ref_resolutions_mmap`).
+  `file_digests_mmap`).
 - If the change touches CLI shape, `docs/USAGE.md` is updated to
   reflect the new flag / command with at least one real-output
   example.
@@ -605,172 +587,35 @@ A change is mergeable when:
 State as of the last commit. Each entry should land its own PR + a
 test pinning the new behaviour.
 
-### Coverage vs full Kythe parity
+### Assembly symbol extraction
 
-What's currently shipping vs what's missing for 100% Kythe-class
-symbol-identity coverage on the four reference corpora:
+The walker classifies kernel `.S` / `.s` files but no symbol
+extractor runs against them, so `scry def`/`ref` on an asm label or
+function returns nothing. A minimal extractor — `.globl` / label /
+`ENTRY()` / `SYM_FUNC_START()` patterns — would close the gap for
+the kernel arch corpus. The grammar is small enough to hand-roll a
+line-oriented pass rather than wire a full tree-sitter grammar.
 
-| Language   | Corpus            | Path                          | Current                                                                          | Blocker to 100%                                                                                  |
-|------------|-------------------|-------------------------------|----------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| C/C++/ObjC | AOSP              | kzip (`xref_cxx`)             | every CU reachable in `build_kzip.bash` output                                   | unbuilt module variants — operator runs `m <module>` to expand the kzip                          |
-| C/C++/ObjC | Perfetto (GN)     | `compile_commands.json` → libclang | 100% real-failures-free (1349 missing-source TUs correctly classified as skipped) | — |
-| C          | Linux (Kbuild)    | `compile_commands.json` → libclang | ~97% (634 / 24,980 TUs `CXError_ASTReadError`)                              | classify the 634 by directory + dump representative `CXDiagnostic` per group; most are likely arch-specific include paths in the compdb. Alternative: run `cxx_extractor` over the same compdb to emit a kernel-wide kzip and ingest via `--build-kzip`. |
-| Java       | AOSP              | kzip (`xref_java`)            | every CU reachable in `build_kzip.bash` output                                   | unbuilt module variants — operator runs `m <module>` to expand the kzip                          |
-| Kotlin     | AOSP              | kzip (`xref_kotlin`)          | every CU reachable in `build_kzip.bash` output                                   | same as Java                                                                                     |
-| Rust       | scry              | `rust-analyzer scip`          | 100%                                                                             | — |
-| Rust       | AOSP              | kzip (`xref_rust`)            | not exercised                                                                    | needs end-to-end verification through the same kzip pipeline                                    |
-| Go         | AOSP              | n/a                           | not exercised                                                                    | no Go in AOSP root; would apply to a separate Go corpus                                          |
-| TypeScript | scry-ui           | `scip-typescript`             | partial — `editors/vscode` works                                                 | full scry-ui workspace not yet indexed                                                           |
-| Python     | scry              | `scip-python`                 | partial — one .py file missing on disk gets cleanly skipped                      | full Python corpus not yet exercised                                                             |
+### Embedded-DSL parse timeouts
 
-The AOSP precision path is a single command:
-`scry build-symbols --build-kzip PATH.kzip`. The kzip is produced
-by `build_kzip.bash` (in `~/dev/aosp/build/soong/`), which wraps
-Soong's own compilation graph with Kythe extractors for **C, C++,
-ObjC, Java, Kotlin, and Rust**. scry drives the Kythe
-`kythe_indexer_{java,kotlin,cxx}` binaries against each CU in the
-kzip and writes packed sidecars (`clang_usrs.bin`,
-`scip_index.bin`) — no compiler re-invocation, no per-build-system
-ninja parsing, no compiler plugin.
+A small set of generated C++ files (Soong-generated `aidl_const.cpp`,
+big generated NeuralNetworks `.cpp` test fixtures, data-as-headers in
+`external/libwebsockets/`) trip the 60 s per-file tree-sitter parse
+cap and end up on the `ts-TIMEOUT` skiplist. They are skipped on
+subsequent runs so they don't stall the rest of indexing. Open: a
+cheaper pre-scan that recognises these shapes and either chunks or
+short-circuits them so their symbols are still captured.
 
-The kzip path generalises beyond Soong. Any C/C++ project with a
-`compile_commands.json` can be turned into a kzip by running
-Kythe's standalone `cxx_extractor`; the same ingest path applies.
-That's the planned upgrade for the Linux corpus — the current
-libclang path stays as a no-extra-toolchain default.
+### Semantic precision is scry2's job
 
-The only "missing CU" failure mode is a source file the build
-system never compiled. For AOSP, run `m <module>` or `m droid` to
-expand the kzip.
-
-### Cross-CU Java resolution — how it works
-
-`scry callers clearCallingIdentity --def-in /android/os/Binder.java --in services/core --strict`
-resolves **1320 hits** against the live AOSP index. The mechanism has
-three load-bearing components; this section is the canonical writeup
-of why each is necessary.
-
-**1. Patched Kythe indexers** (`docs/KYTHE_JVM_INDEXER_REBUILD.md`).
-The stock Kythe v0.0.75 `java_indexer` cannot read Java 21 bytecode
-(ASM 9.1 bundled, `KytheClassVisitor` capped at ASM7) and silently
-drops `JavaDetails`-missing CUs onto a path with no classpath. AOSP
-fails on both: framework.jar ships at class major version 65, and
-services.core's CU has no `JavaDetails` extension. Four patches:
-
-- **#1** bumps ASM 9.1 → 9.7.1.
-- **#2** raises `ASM_API_LEVEL` from ASM7 to ASM9.
-- **#3** adds `--default_corpus` so jvm_indexer's VNames align with
-  java_indexer's.
-- **#4** (load-bearing) derives `CLASS_PATH` from `!CLASS_PATH_JAR!`
-  entries in `required_input` when `JavaDetails` is missing. Without
-  it, services.core's javac can't resolve Binder against bytecode,
-  field.sym becomes a placeholder `ClassSymbol`, and the bridge
-  edge is never emitted. With it, services.core emits **1209**
-  `named` edges to JVM FQNs of `android.os.Binder.*` (was 0).
-
-**2. Phase 5 — FQN-canonical sidecar** (`crates/scry-kzip/src/fqn_importer.rs`).
-When `SCRY_KZIP_SERVING_DIR=<dir>` is set on a `--build-kzip` run,
-phase 3 tees every per-CU indexer's stdout to `<dir>/cu-<sha>.entries`.
-Phase 5 then runs a 2-pass streaming importer over those files:
-
-- **Pass 1** — walk every Entry, collect `/kythe/edge/named` edges
-  whose target VName has `language=jvm`. Build a deduplicated
-  `HashMap<source_vname_string → jvm_fqn_string>` of "bridges".
-- **Pass 2** — re-walk every Entry via `decode_stream`'s anchor-fold;
-  for each anchor record whose target appears in the bridge map,
-  emit a `precision_packed::Record` keyed on the JVM FQN instead of
-  the per-CU opaque hash. Records without a bridge are skipped
-  (already captured by `scip_index.bin`).
-
-Output: `<index>/scip_index_fqn.bin`. Disk-streamed, peak memory is
-bounded to the bridge map (~1M entries → ~200 MB) plus the decode
-accumulator. Tests: `fqn_importer::tests::two_cu_bridge_resolves_through_jvm_fqn`
-and `anchor_without_bridge_is_skipped`.
-
-**3. Reader wiring**
-(`crates/scry-store/src/lib.rs::StoreReader::scip_index_fqn`,
-`crates/scry-cli/src/main.rs::cmd_build_resolutions`,
-`apply_precision_filter`). Both the resolution and the query-time
-precision filter consult **both** sidecars: the main `scip_index.bin`
-(source-level Kythe VName signatures) and `scip_index_fqn.bin`
-(canonical JVM FQNs). The two namespaces are disjoint by construction
-(`kythe:java:` vs `kythe:jvm:`), so a single `HashMap<String, def_id>`
-holds both safely. Pass 3 short-circuits — main first, FQN as fall-
-through — so refs that the main sidecar already resolves don't pay
-the second lookup. Counters: build-resolutions reports
-`SCIP defs / SCIP-FQN defs / clang USR defs` separately.
-
-**Empirical verification.** Live AOSP test-agent index, May 2026:
-
-| Query | Lexical | Strict | Resolution |
-|---|---|---|---|
-| `clearCallingIdentity --def-in /android/os/Binder.java --in services/core` | 1523 | **1320** | 87% cross-CU |
-| `setDeliveryState --in BroadcastQueueImpl` (regression) | 15 | **15** | 100% same-CU |
-| `getCallingUid --def-in /android/os/Binder.java --in services/core` | 1480 | **1480** | 97% cross-CU |
-
-Two false leads worth recording so we don't re-walk them:
-
-1. Kythe v0.0.75 `java_indexer.jar` does **not** emit
-   `/kythe/edge/callableas` edges. Verified empirically on Binder.java
-   (22,943 entries, zero callableas) and services.core (5.6M entries,
-   zero callableas). Commit `ef36d7b` tried to exploit them; reverted
-   in `04fe2a2`. The `named`-edge bridge is the only cross-CU surface
-   the indexers ship.
-2. The pre-`36513db` "lexical receiver-class match" heuristic is
-   wrong: it false-positives on `Class.method` shadowing (`MockBinder`
-   tests, `AMS::Injector.clearCallingIdentity()`). The Kythe-only
-   resolution path is structurally correct.
-
-### Kernel 634 parse failures
-
-`scry build-symbols --build-kbuild …` on the current Linux corpus
-produces 634 `CXError_ASTReadError` (code 4) failures, mostly in
-`drivers/gpu/drm/amd/`, `virt/kvm/`, and arch-specific subsystems.
-Probable causes (in order of likelihood):
-
-1. The compile-commands.json was generated for one defconfig but
-   the source files reference headers selected by a different
-   defconfig (e.g. AMD GPU code expects `CONFIG_DRM_AMDGPU=y`).
-2. Cross-arch include paths (the entry says
-   `-D__KERNEL__ -Iarch/x86/include` but the file lives in
-   `arch/arm64/`).
-3. libclang's resolution of kernel-specific macros
-   (`__builtin_va_list`, gcc-only intrinsics) — but the
-   `is_gcc_only_flag` filter already handles the common ones.
-
-Open: classify the 634 failures by directory + dump one
-representative CXDiagnostic per group to identify the root cause.
-
-### `usr_for_window` warm latency
-
-Three layers compose to bring strict-precision lookups inside a query
-loop down to single-digit-µs per ref:
-
-- `ClangUsrIndex::precompute_by_file_ids` + `ByFileLookup` materialise
-  a per-`file_id` slice of sorted `(byte_offset, usr_id)` tuples at
-  query start. The per-ref loop in `apply_precision_filter` then
-  binary-searches that slice (`partition_point` + ±window scan)
-  instead of re-allocating a display_path and probing the
-  `HashMap<String, …>` per ref.
-- The `display_path` cache (`StoreReader::display_path_cached`)
-  removes the per-ref `String` alloc + `PathBuf::push` in the same
-  hot loop.
-- `clang_usrs.bin` and `scip_index.bin` are now mmap-backed packed
-  files (see `crates/scry-store/src/precision_packed.rs`). Cold open
-  is two `safe_mmap` calls + a header parse — no bincode decode, no
-  per-record `String` clone into a HashMap. On the AOSP-scale SCIP
-  sidecar (14 M records / 1.3 M unique symbols) that retired a
-  ~17 s open + ~14 M `String::clone` cost that previously paid out
-  on every cold CLI query.
-
-The same precompute lives in `scip_index::ByFileSymbolLookup` for
-SCIP sidecar lookups.
-
-The packed sidecar layout is shared between `clang_usrs.bin` and
-`scip_index.bin`; only the magic bytes differ (`SCRYUP01` /
-`SCRYSP01`). Old bincode-format sidecars are rejected at open time
-with a `bad magic` error — they need to be re-generated through
-`scry build-symbols` once after upgrading.
+scry resolves `def` / `ref` / `callers` by name and scope through
+tree-sitter, narrowed by the cross-cutting filters (`--in`,
+`--not-in`, `--scope`, `--reachable`). Compiler-grade semantic
+precision over the AOSP C++/Java slice — exact overload resolution,
+cross-translation-unit reference identity — lives in the separate
+companion tool `scry2`, which consumes a compiler-built index. Point
+agents that need that level of precision at scry2; scry stays the
+fast, mostly-right lexical path.
 
 ### File split: scry-cli main.rs
 
@@ -782,7 +627,7 @@ self-contained):
 - `cmd_callgraph` + traversal helpers
 - `cmd_impact` + `cmd_subclasses`
 - the `build-*` sidecar commands (trigrams, offsets, file_refs,
-  file_symbols, resolutions, digests, embeddings)
+  file_symbols, modgraph, digests)
 - the `Index` command's mega-function (currently inline)
 
 Each split should land as its own commit with no behavioural

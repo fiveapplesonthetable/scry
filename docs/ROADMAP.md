@@ -3,17 +3,15 @@
 The contained next-steps that landed in May 2026 — persistent
 socket, streaming/budget, MCP, `scry recall`, `scry diff`, AIDL/HIDL
 shadows — are all in `git log`. This document is the *other* list:
-the five multi-day items that still sit ahead. Each one is sketched
+the multi-day items that still sit ahead. Each one is sketched
 in enough detail that a fresh contributor could read this doc, the
 referenced source files, and start writing the change.
 
 The items, in roughly the order I'd ship them:
 
-1. [Semantic retrieval as a sibling tool](#1-semantic-retrieval--foundation-shipped-with-hashing-trick-embedding) — foundation shipped
-2. [Incremental indexing](#2-incremental-indexing--shipped) — shipped
-3. [clangd-as-a-service for C++ precision](#3-clangd-as-a-service-for-c-precision) — shipped
-4. [`io_uring` for the candidate scan](#4-candidate-scan-io-path--mmapmemchr-shipped--io_uring-measured-not-shipping) — measured, not shipping
-5. [Fuzzy ranking by edit distance](#5-fuzzy-ranking-by-edit-distance--shipped) — shipped
+1. [Incremental indexing](#1-incremental-indexing--shipped) — shipped
+2. [`io_uring` for the candidate scan](#2-candidate-scan-io-path--mmapmemchr-shipped--io_uring-measured-not-shipping) — measured, not shipping
+3. [Fuzzy ranking by edit distance](#3-fuzzy-ranking-by-edit-distance--shipped) — shipped
 
 Each section follows the same shape: **goal**, **why now**,
 **design**, **new dependencies**, **acceptance criteria**,
@@ -21,150 +19,7 @@ Each section follows the same shape: **goal**, **why now**,
 
 ---
 
-## 1. Semantic retrieval — foundation shipped with hashing-trick embedding
-
-**Shipped** in `scry build-embeddings` + `scry ask`. Defaults:
-chunks of 100 lines with 20-line overlap; 64-dim FNV-1a hashing-
-trick embeddings; brute-force cosine search over the mmap'd
-sidecar. Exposed via `serve` and `mcp` as the `ask` tool.
-
-The hashing-trick embedding (Weinberger et al. 2009) catches
-vocabulary overlap — the dominant signal for "how do I X in this
-codebase" queries — without requiring a model download or any
-new heavyweight dependencies. The wire format (chunks.bin +
-embeddings.bin with dim/count header) is designed so a future
-commit can swap in a transformer-based embedding (candle +
-all-MiniLM or nomic-embed-code) behind a feature flag without
-changing the sidecar layout or query API.
-
-What's still future work for true transformer quality:
-  - Add `--features transformer` that pulls in `candle-core` +
-    `candle-transformers` + `tokenizers`.
-  - Download model weights once at first run (or via separate
-    `scry fetch-embedding-model` subcommand).
-  - Per-chunk inference: ~3 ms × 3M chunks = 2.5 hours for the
-    full corpus full build — within the "one cup of coffee" envelope.
-
-### Goal (original)
-
-Answer "how do I X in this codebase" questions where X isn't a
-known identifier. Today scry can find `parse_toml` if it exists by
-name; it can't surface the right *area* of code when the agent
-doesn't know what to grep for. The fix is an embedding-based
-retrieval path that complements (not replaces) the lexical one.
-
-### Why now
-
-Every modern RAG system over code uses both lexical and semantic
-retrieval. Lexical catches identifiers and exact strings; semantic
-catches conceptual matches. scry has the lexical side production-
-ready; the semantic complement is the single biggest functional
-gap from an LLM-agent perspective. Smaller models (Gemma 3 8B
-class) benefit disproportionately because their reasoning about
-"oh, maybe this token-soup belongs to a TOML parser" is weaker.
-
-### Design
-
-A new subcommand parallel to `scry grep`:
-
-```sh
-scry ask "how do I parse TOML in this codebase" [--limit N] [--in PREFIX] [--json]
-```
-
-The pipeline:
-
-1. **At index time** (add a new finalize pass or a sidecar
-   `build-embeddings` post-finalize utility): chunk every indexed
-   source file into ~50–100 line windows, embed each chunk with a
-   local code-capable model, write the embeddings to a sidecar.
-   Expected size: ~2 GB for the full AOSP+Linux corpus at 768-dim
-   half-precision.
-2. **At query time**: embed the user's query, do an approximate
-   nearest-neighbor search over the chunk index, return top-K
-   chunks with file/line/snippet shaped like a grep result.
-
-Concrete components and what they need:
-
-| component | candidate | why |
-|---|---|---|
-| embedding model | `nomic-embed-code` or `all-minilm-l6-v2` via `candle` | Pure-Rust inference; no Python; works on CPU. |
-| ANN index | `usearch` (Rust bindings) or hand-rolled HNSW | usearch is a single C++ dependency; hnsw_rs is pure-Rust. |
-| chunker | 50–100 line windows with 20-line overlap | Standard RAG sizing for code; pin in tests. |
-| sidecar files | `embeddings.bin` (packed f16 vectors), `embeddings.idx` (HNSW graph), `chunks.bin` (chunk metadata) | Mirrors the trigram + offset sidecar pattern. |
-
-Output shape (parallels grep):
-
-```json
-{
-  "path": "frameworks/base/.../TomlReader.java",
-  "start_line": 102, "end_line": 158,
-  "score": 0.84,
-  "snippet": "…",
-  "lang": "java"
-}
-```
-
-Wiring to existing surfaces: `scry serve` gets an `ask` command,
-`scry mcp` gets an `ask` tool, `--budget` and `--limit` honored
-the same way as elsewhere.
-
-### New dependencies
-
-- `candle-core` + `candle-transformers` (embedding inference)
-- Either `usearch` (C++ FFI, smaller code) or `hnsw_rs` (pure Rust)
-- Model artifacts (~50–500 MB depending on choice)
-
-### Acceptance criteria
-
-- `scry ask "how to read TOML"` on the full index returns ≥1
-  relevant chunk in the top 10 with no manual prompt tuning.
-- Cold open of the embeddings index ≤ 200 ms (mmap'd HNSW).
-- Per-query latency ≤ 500 ms warm on a 1 M-chunk index.
-- Build pass (`scry build-embeddings`) completes in ≤ 4× the
-  parse pass time (so a full reindex stays under an hour).
-- The embeddings sidecar is *optional*: indexes without it answer
-  every other query type unchanged; `scry ask` errors with a clear
-  "run scry build-embeddings first" message.
-
-### Tradeoffs
-
-- **Model choice is binding.** Switching embedding models requires
-  full reindex of the embeddings. Pin the model name + commit hash
-  in `manifest.json`; refuse cross-model queries.
-- **Storage cost.** ~2 GB extra index. Tolerable on the current
-  envelope (~9.5 GB → ~12 GB).
-- **Quality is workload-dependent.** AOSP-specific identifier soup
-  will retrieve worse than well-commented OSS Rust. Worth
-  benchmarking on a handful of real agent questions before claiming
-  parity with grep.
-- **Determinism.** ANN is approximate; two runs of the same query
-  can return different orderings. Pin the random seed in the HNSW
-  build for reproducibility.
-
-### What could go wrong
-
-- **The embedding model isn't quite good enough.** Code embeddings
-  in 2026 are mediocre at long-form questions; we may need a
-  hybrid scoring pass that re-ranks ANN candidates with a small
-  cross-encoder.
-- **CPU inference is too slow.** Per-chunk inference at 768d on a
-  10 KB file is ~3 ms on this host's CPU. Full corpus build is
-  ~3 M chunks × 3 ms = 2.5 hours — within budget but slow. GPU
-  offload would help if available.
-- **Index size grows past the page-cache budget.** 2 GB extra
-  bytes; if the working set inflates beyond ~120 GB resident the
-  page-cache LRU model degrades. Profile before committing.
-
-### Estimate
-
-- Skeleton (chunker + embedding pipeline + sidecar writer): 3 days
-- Query path (load + ANN + serve integration): 2 days
-- Bench + quality tuning on real questions: 2 days
-- Total: **~1 week** of focused work.
-
----
-
-## 2. Incremental indexing — shipped
+## 1. Incremental indexing — shipped
 
 **`scry index --incremental` is live.** Opens the existing index,
 diffs the source tree against `file_digests.bin`, re-parses only
@@ -295,125 +150,7 @@ None. blake3 is already in.
 
 ---
 
-## 3. clangd-as-a-service — per-query session shipped; persistent daemon pending
-
-**Shipped**: `scry callers NAME --precise` spawns clangd, completes
-the LSP `initialize` handshake, `didOpen`s the definition file, and
-issues `textDocument/references`. Results are mapped back to scry's
-file_id space and emitted with the same shape as the heuristic
-path (plus a `precise: true` flag for JSON output).
-
-Implementation lives in `crates/scry-cli/src/clangd.rs` — a small,
-hand-rolled LSP client (~280 LOC) covering exactly the methods
-we need (initialize, initialized, didOpen, references, shutdown,
-exit). No async runtime; sync stdin/stdout framing per the LSP spec.
-
-When clangd is missing from PATH or compile_commands.json is
-not findable above the definition file, the command exits non-zero
-with an actionable error: "install clangd" / "generate
-compile_commands.json". The heuristic path (without --precise)
-keeps working regardless.
-
-**Still pending**: Persistent clangd daemon alongside `scry serve`,
-so multi-precise-query sessions don't pay the ~1-min clangd warmup
-each time. Mechanical wiring: hold a `ClangdSession` inside the
-serve loop, lazy-init on first --precise request, keep alive for
-the rest of the process lifetime. ~1 day of focused work; deferred
-because the per-query cost is already acceptable for one-shot use.
-
-### Goal (original)
-
-Close the 10–20% precision gap on C++ overload resolution without
-requiring the user to maintain a SCIP build. When the user asks
-"who calls `Foo::bar()`", we want the *exact* overload set, not
-the trigram-narrowed approximation tree-sitter gives us.
-
-### Why now
-
-C++ is half of AOSP. The current `scry callers` on a C++ method
-name is correct ~85% of the time; the 15% are overload mistakes
-(two `transact` methods with different signatures). For
-exploratory code reading this is fine; for code review or
-refactoring it's not.
-
-### Design
-
-Run a persistent `clangd` subprocess and route the precision-
-critical C++ queries through it via LSP. scry stays the
-"answer-fast, mostly-right" path; clangd is the "answer-slow,
-precise" fallback for `--precise` queries.
-
-Pieces:
-
-1. **LSP client crate**. There isn't a great one in pure Rust yet;
-   either pull in `lsp-server` + write the client side, or shell
-   out to `clangd` and speak the protocol over stdin/stdout.
-   ~500 LOC either way.
-2. **Subprocess lifecycle**. clangd is heavyweight — needs a
-   `compile_commands.json` and ~1 min to warm. We start it on
-   demand at the first `--precise` query and keep it alive for the
-   process lifetime; if `scry serve` is running, clangd lives as
-   long as the server.
-3. **Query routing**. `scry callers Foo --precise` invokes a new
-   `precise_callers(name, file_hint)` that asks clangd for the
-   symbol's USR (universal symbol resolution), then asks for
-   `references`. Map back to the file table; emit.
-4. **compile_commands.json discovery**. Walk up from one of the
-   indexed roots; if not found, surface a clear "run
-   `bear -- m` or equivalent" error.
-
-### New dependencies
-
-- `lsp-types` (well-maintained Rust types for LSP)
-- Either `lsp-server` or hand-rolled LSP client (~500 LOC)
-- An installed `clangd` binary (runtime dep, not link-time)
-
-### Acceptance criteria
-
-- `scry callers Foo --precise` on a known-ambiguous overload
-  returns the correct subset (only callers of the matching
-  signature).
-- When clangd or `compile_commands.json` is missing, the precise
-  path errors with an actionable message; the non-precise path
-  still works.
-- clangd subprocess warm time amortized across a session: ≤ 1
-  min to first --precise query, then ≤ 200 ms per follow-up.
-- `scry serve` keeps the clangd subprocess alive across many
-  client connections.
-
-### Tradeoffs
-
-- **clangd's memory footprint is ~ 1–4 GB** for AOSP-sized
-  projects. The cgroup envelope must account.
-- **clangd needs the build to succeed**. AOSP partial builds
-  produce partial compile_commands.json. The user-experience
-  question is whether "no compile commands → no precise queries"
-  is acceptable. (Yes for v1.)
-- **Two indexes of truth**. clangd's symbol index can drift from
-  scry's. Document that scry's `callers` and `--precise callers`
-  may disagree; the user picks which they want.
-
-### What could go wrong
-
-- **clangd crashes or hangs.** Subprocess supervision (restart on
-  exit, timeout per query). Don't let a clangd hang block other
-  scry queries.
-- **The LSP request shape changes.** lsp-types is versioned; pin.
-- **AOSP doesn't produce a usable compile_commands.json out of
-  the box.** Document the `b create_compile_db` Soong invocation
-  somewhere visible.
-
-### Estimate
-
-- LSP client: 3 days
-- Subprocess lifecycle + serve integration: 2 days
-- Query routing + USR mapping: 2 days
-- Tests with a real clangd + a small fixture: 2 days
-- Total: **~9 days**.
-
----
-
-## 4. Candidate-scan IO path — mmap+memchr shipped; io_uring measured, not shipping
+## 2. Candidate-scan IO path — mmap+memchr shipped; io_uring measured, not shipping
 
 **Shipped**: `scan_file_literal` in scry-store — mmap + memchr
 helper that replaces `std::fs::read` for literal-pattern `scry grep`
@@ -507,7 +244,7 @@ right call.
 
 ---
 
-## 5. Fuzzy ranking by edit distance — shipped
+## 3. Fuzzy ranking by edit distance — shipped
 
 **Shipped in `scry fuzzy` — see USAGE.md "Fuzzy symbol search".**
 Two candidate sources (substring + Levenshtein automaton) merged,
@@ -581,15 +318,10 @@ K=100 / |q|=12 / max_name=64 is ~75 µs total. Negligible.
 
 If I were picking the order strictly by leverage:
 
-1. **#5 fuzzy ranking** first — 1–2 days, no risk, pure UX win.
-2. **#2 incremental indexing** — unblocks the editor-integration
+1. **#3 fuzzy ranking** first — 1–2 days, no risk, pure UX win.
+2. **#1 incremental indexing** — unblocks the editor-integration
    use case scry has been missing.
-3. **#1 semantic retrieval** — the single biggest functional
-   gap for LLM agents; biggest investment too.
-4. **#3 clangd-as-a-service** — niche but valuable for C++
-   reviewers; can be deferred indefinitely without blocking
-   anyone.
-5. **#4 io_uring** — measurable but small win on the current
+3. **#2 io_uring** — measurable but small win on the current
    workload; only worth it if scry deploys to rotational /
    networked storage where the gain compounds.
 

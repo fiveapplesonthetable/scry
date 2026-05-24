@@ -147,58 +147,40 @@ public class Binder implements IBinder {
 
 ```sh
 $ scry callers transact --lang Java --limit 3
-/home/zim/dev/aosp/cts/hostsidetests/appsecurity/test-apps/UseProcessSuccess/src/com/android/cts/useprocess/AccessNetworkTest.java:77:25  (call java)  [AccessNetworkTest::MyConnection]  transact  → def:fb80a66b3db3efd5
-/home/zim/dev/aosp/cts/hostsidetests/securitybulletin/test-apps/CVE-2022-20004/test-app/src/android/security/cts/CVE_2022_20004_test/PocActivity.java:98:26  (call java)  [PocActivity]  transact  → def:fb80a66b3db3efd5
-/home/zim/dev/aosp/frameworks/base/core/java/android/os/IBinder.java:419:38  (call java)  [IBinder]  transact  → def:fb80a66b3db3efd5
+/home/zim/dev/aosp/cts/hostsidetests/appsecurity/test-apps/UseProcessSuccess/src/com/android/cts/useprocess/AccessNetworkTest.java:77:25  (call java)  [AccessNetworkTest::MyConnection]  transact
+/home/zim/dev/aosp/cts/hostsidetests/securitybulletin/test-apps/CVE-2022-20004/test-app/src/android/security/cts/CVE_2022_20004_test/PocActivity.java:98:26  (call java)  [PocActivity]  transact
+/home/zim/dev/aosp/frameworks/base/core/java/android/os/IBinder.java:419:38  (call java)  [IBinder]  transact
 
 1524 refs (showing 3)
 [scry] cmd=callers q="transact" hits=1524 shown=3 files=1009166 elapsed=84ms
 ```
 
-`→ libs/binder/Binder.cpp:411 [android::BBinder]` is the
-Layer 2 resolution — the resolver picked that specific def. Without
-`--def-in`/`--strict` (see below) this is permissive: unresolved refs
-show no `→` annotation. Pass `--json` to get the raw `resolved_to`
-u64 instead of the human-readable file:line.
-
 `scry ref` is the generic version that includes all ref kinds (call,
 ctor, type-use, field-access, import, inherit). `callers` is the
 common-case shorthand for `ref --kind call`.
 
-### Cutting through polymorphism
+### `--format by-def`
 
-Polymorphic names like `close`, `onCreate`, `transact` have
-thousands of distinct defs in a big corpus. Three flags help
-narrow:
+`--format by-def` groups refs by their resolved def — a best-effort
+in-memory name match (`resolved_to`) populated only on non-streaming
+indexes. The default `scry index` streams, so on a typical index
+`resolved_to` is null and the histogram collapses to a single
+unresolved bucket:
 
 ```sh
-# --def-in PATH — keep only refs resolving to a def in PATH
-$ scry callers transact --def-in libs/binder/Binder.cpp
-# returns the 166 callers whose resolved_to lands at BBinder.transact
-# (plus the over-included permissive bucket if --strict isn't set)
-
-# --strict — drop refs that resolved to anything else, including
-# unresolved. Trades recall for precision.
-$ scry callers transact --def-in libs/binder/Binder.cpp --strict
-# returns only the 166 confidently-resolved hits, no over-include
-
-# --format by-def — histogram of which def gets called most
-$ scry callers transact --strict --format by-def --limit 8
-     166  → libs/binder/Binder.cpp:411 [android::BBinder]
-      14  → securityPatch/CVE-2016-2412/poc.cpp:77
-       7  → libs/binder/Binder.cpp:114 [android::hardware::BHwBinder]
-       7  → libs/binder/BpBinder.cpp:400 [android::BpBinder]
-       ...
-     219 refs in 19 groups (showing 8)
+$ scry callers transact --format by-def --limit 8
+     219  → (unresolved)
+     219 refs in 1 group (showing 1)
 ```
 
 `--format by-def` composes with `--json` for
 programmatic consumers — emits a JSON array of
-`{count, def: {path, line, col, scope, kind, id}}` entries.
+`{count, def: {path, line, col, scope, kind, id}}` entries (with
+`def: null` for the unresolved bucket).
 
-These three flags also work on `scry ref`, `scry callgraph`
+`--format by-def` also works on `scry ref`, `scry callgraph`
 (root-level only), and `scry impact` (callers leg only), and
-are exposed via the same args on the JSON-RPC + MCP `ref` /
+is exposed via the same args on the JSON-RPC + MCP `ref` /
 `callers` / `callgraph` / `impact` tools.
 
 ### `--format count`
@@ -588,7 +570,6 @@ files-failed: 0
 bytes-total:  70.4 GB
 symbols:      31496680
 refs:         63318468
-refs-resolved: 31426932 (49.6%)
 elapsed-ms:   690040
 
 by language:
@@ -605,13 +586,6 @@ by kind:
      6543210  method
      ...
 ```
-
-The `refs-resolved` line shows what fraction of refs
-the Layer 2 resolutions sidecar attributes to a specific def.
-`<no sidecar — run scry build-resolutions to enable>` appears
-when the sidecar hasn't been built yet. Higher is better — it's
-the lever the `--def-in` / `--strict` flags operate on (see the
-ref/callers section above).
 
 ### Machine-readable: `scry stats --json`
 
@@ -662,7 +636,7 @@ $ printf '%s\n' \
     '{"id":5,"cmd":"stats"}' \
   | scry serve --index /mnt/agent/scry-index
 {"id":1,"result":[{"name":"Binder","kind":"class","lang":"Java","path":"…","line":85,...}]}
-{"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","resolved_to":18122667880065789909,...}]}
+{"id":2,"result":[{"name":"transact","ref_kind":"call","lang":"Java","resolved_to":null,...}]}
 {"id":3,"result":[{"path":"…","line":92,"col":20,"snippet":"…ZygoteInit…","lang":"Cpp"}]}
 {"id":4,"result":{"path":"…/app_main.cpp","lang":"Cpp","symbols_total":13,...}}
 {"id":5,"result":{"scry_version":"0.0.1","files_total":1009166,...}}
@@ -1102,56 +1076,6 @@ the actual `gerrit-push` invocation.
 
 ---
 
-## Semantic retrieval: `scry ask`
-
-Find code chunks whose embedded text is most similar to a natural-
-language query. Useful when the agent doesn't know which identifier
-to grep for. Default embedding model is a deterministic FNV-1a
-hashing-trick bag-of-tokens — no model download, no extra deps;
-catches vocabulary overlap (the dominant signal for code search).
-
-```sh
-# One-time setup: compute and store the embedding sidecar.
-$ scry build-embeddings --index /mnt/agent/scry-index
-[embed] 1009166 files; dim=64, chunk=100+20overlap
-[embed] computed 3128456 chunks in 412 s
-[embed] DONE. 3128456 chunks × 64 dim → 763.5 MB
-
-# Now ask in natural language:
-$ scry ask "how does the system create new processes" --limit 5
-/.../frameworks/base/services/.../ProcessRecord.java:54-153  (score=0.728)  (Java)
-    public ProcessRecord(ActivityManagerService _service, ...) {
-        this.mService = _service;
-/.../frameworks/native/services/.../ProcessLauncher.cpp:32-131  (score=0.694)  (Cpp)
-    pid_t launch(const Args& args) {
-        pid_t pid = fork();
-...
-
-# JSON for agent consumption:
-$ scry ask "parse toml configuration" --limit 3 --json
-{"path":"...","lang":"Rust","start_line":42,"end_line":131,"score":0.812,"snippet":"..."}
-```
-
-Flags:
-  `--dim N`            embedding dimension (default 64). Higher → bigger sidecar, finer discrimination.
-  `--chunk-lines N`    chunk window in lines (default 100).
-  `--chunk-overlap N`  overlap between consecutive chunks (default 20).
-  `--in PREFIX`        same path-substring filter as the rest of scry.
-  `--limit N`          top-K results (default 10).
-  `--json`             one JSON object per result.
-
-Exposed over `scry serve` and `scry mcp` as the `ask` tool. Cold-cache
-query latency on the full corpus is ~500 ms (dominated by walking the
-~760 MB embeddings.bin); warm queries are ~50 ms.
-
-The hashing-trick embedding is solid for vocabulary matching but not
-as semantically rich as a transformer-based one. The wire format is
-designed so a future commit can swap in a real model (candle +
-all-MiniLM or nomic-embed-code) behind a feature flag without
-changing the sidecar layout or query API.
-
----
-
 ## Ops log
 
 Every CLI invocation appends one JSON line to `~/.scry/queries.log`
@@ -1285,11 +1209,11 @@ frameworks/base/services/.../ActivityManagerService.java:5937:17  (method java) 
 [scry] cmd=def q="setProcessLimit" hits=1 shown=1 files=1009166 elapsed=324ms
 
 $ scry callers setProcessLimit --lang Java --limit 10
-frameworks/base/tests/permission/.../ActivityManagerPermissionTests.java:83:17  (call java)  [ActivityManagerPermissionTests]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:130:34  (call java)  [BackgroundProcessLimitPreferenceControllerTest]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:81:34  (call java)  [...]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/Settings/.../BackgroundProcessLimitPreferenceController.java:93:41  (call java)  [BackgroundProcessLimitPreferenceController]  setProcessLimit  → def:f3720ef78a480b7e
-packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [DevelopmentFragment]  setProcessLimit  → def:f3720ef78a480b7e
+frameworks/base/tests/permission/.../ActivityManagerPermissionTests.java:83:17  (call java)  [ActivityManagerPermissionTests]  setProcessLimit
+packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:130:34  (call java)  [BackgroundProcessLimitPreferenceControllerTest]  setProcessLimit
+packages/apps/Settings/tests/.../BackgroundProcessLimitPreferenceControllerTest.java:81:34  (call java)  [...]  setProcessLimit
+packages/apps/Settings/.../BackgroundProcessLimitPreferenceController.java:93:41  (call java)  [BackgroundProcessLimitPreferenceController]  setProcessLimit
+packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [DevelopmentFragment]  setProcessLimit
 ... 1 more ...
 6 refs (showing 6)
 [scry] cmd=callers q="setProcessLimit" hits=6 shown=6 files=1009166 elapsed=332ms
@@ -1302,9 +1226,8 @@ packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [Dev
   of source.
 - The second query gives every call site with its **enclosing scope**
   inline (`[BackgroundProcessLimitPreferenceController]`,
-  `[DevelopmentFragment]`, …) AND the Layer 2 `→ def:HEX` proves all
-  6 callers really do invoke the same definition (no false positives
-  from another class accidentally named `setProcessLimit`).
+  `[DevelopmentFragment]`, …) so the agent can read the call context
+  without opening each file.
 - Total output is ~ 1 k tokens of structured data the agent can
   reason about directly. No follow-up `Read` is needed unless the
   agent wants the surrounding code body — and even then it can read
@@ -1319,13 +1242,11 @@ packages/apps/TvSettings/.../DevelopmentFragment.java:1666:42  (call java)  [Dev
 | tokens consumed              | ~30–60 k                 | ~1 k                  | **30–60×** |
 | def vs ref disambiguation    | manual (Read each file)  | structural (kind)     | qualitative |
 | scope of each hit            | not in output            | `[Foo::Bar]` inline   | qualitative |
-| same-def confirmation        | not possible from rg     | `→ def:HEX` shared    | qualitative |
 
 The latency win comes from the index. The **token win comes from the
 structure** — scry returns what an agent actually needs (which symbol,
-which scope, which definition it resolves to) instead of a raw text
-match the agent has to ground itself. This is the leverage scry was
-built for.
+which scope, which kind) instead of a raw text match the agent has to
+ground itself. This is the leverage scry was built for.
 
 ### Caveats
 

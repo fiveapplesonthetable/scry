@@ -68,9 +68,10 @@ Both should get the same answers; only the formatter changes.
 ### Non-goals (initially)
 
 - **Refactoring / writing**: scry is read-only. No edits, no quick-fixes.
-- **Full type inference**: we will not reach `clangd`-level precision for
-  C++ overload resolution; that requires `compile_commands.json` and a real
-  compilation database, which we treat as **optional precision uplift**.
+- **Full type inference**: scry is syntactic; it does not perform
+  C++ overload resolution or compiler-grade reference disambiguation.
+  Compiler-grade semantic precision is the job of the separate companion
+  tool `scry2`, which resolves the Kythe graph over the AOSP C++/Java slice.
 - **GUI**: terminal + JSON only. A web UI can come later but it's not the
   product.
 - **Anything outside AOSP**: scry is tuned for this tree. Generalization to
@@ -147,17 +148,16 @@ collide with `init` in AOSP.
 | ctags / gtags | Symbol tags, callers (gtags)    | No real scope/type resolution; Java/Kotlin/Rust support weak  |
 | cscope      | C/C++ xrefs                       | C/C++ only; slow on 100k+ files                               |
 | clangd      | Precise C++ semantics             | Needs `compile_commands.json`, single language, slow warmup   |
-| Sourcegraph | Web UI, multi-lang, SCIP-based    | Heavyweight service, not designed for CLI/LLM loops           |
+| Sourcegraph | Web UI, multi-lang code intel     | Heavyweight service, not designed for CLI/LLM loops           |
 | Zoekt       | Trigram index, very fast grep     | Substring only — no semantic xrefs                            |
-| SCIP        | Precise multi-lang index *format* | Format, not a tool; needs per-language indexer (we'll use these as optional inputs) |
-| Stack Graphs (GitHub) | Scope resolution from rules | Promising; we may adopt for Java/Kotlin/Python              |
-| Kythe       | Semantic graph (used in Google3)  | Industrial scope, deep per-lang indexer integration           |
+| Kythe       | Semantic graph (used in Google3)  | Industrial scope, deep per-lang indexer integration; this is the niche the companion tool `scry2` fills |
 
-**Pragmatic synthesis**: we build a tree-sitter-based syntactic index as the
-spine (covers all languages cheaply), then **optionally** ingest SCIP files
-from `scip-clang` / `scip-java` to upgrade precision where the user has
-generated them. The on-disk format is unified; clients don't care how a
-fact arrived.
+**Pragmatic synthesis**: scry is a tree-sitter-based syntactic index
+(covers all languages cheaply) fused with a Russ-Cox trigram content
+search and a set of AOSP build-file parsers. The on-disk format is
+unified; clients don't care which parser produced a fact. Where a task
+genuinely needs compiler-grade semantic resolution over the AOSP
+C++/Java slice, that is the job of the separate companion tool `scry2`.
 
 ## 5. Technology choices
 
@@ -237,13 +237,14 @@ because writing a custom B-tree is not a fight worth picking.
   - package/namespace siblings,
   - inheritance graph (for `super`/`this` and method lookups).
   This is heuristic — we accept ambiguity (multiple candidates).
-- **Layer 2 — precise (optional)**: if `compile_commands.json` exists, run
-  `scip-clang` and merge SCIP facts. Same for `scip-java` if the user
-  produced jars. SCIP records win over heuristics where they overlap.
-- **Layer 3 — build-graph augmented**: use the Soong module graph to filter
-  candidates by visibility ("module A can't see module B's internals").
+- **Build-graph augmented**: use the Soong module graph to filter
+  candidates by visibility ("module A can't see module B's internals")
+  via the `--reachable` filter.
 
-Layer 0 + 1 + build-graph is the MVP. Layer 2 is a precision uplift, opt-in.
+Layer 0 + 1 + build-graph is the model. It is name-level by design:
+heuristic resolution that ranks and scopes candidates, not compiler
+overload resolution. For compiler-grade semantic resolution over the
+AOSP C++/Java slice, use the separate companion tool `scry2`.
 
 ## 6. Indexing pipeline
 
@@ -369,11 +370,11 @@ Applied to grep hits to push noise paths down:
   Surfaces the root-level service over its 10-deep test
   variant.
 
-### Layer 2 resolver — narrow callers / refs to one def
+### Scope-aware narrowing — narrow callers / refs toward one def
 
-Implementation: `resolve_one` in `crates/scry-cli/src/main.rs`
-(see `build-resolutions`). Per-language narrowing rules,
-applied in order until one candidate remains:
+Implementation: `resolve_one` in `crates/scry-cli/src/main.rs`.
+Per-language scope/import narrowing rules, applied in order until
+one candidate remains:
 
 **Java**:
   1. Same package as the caller.
@@ -437,7 +438,7 @@ formats (aconfig, init.rc, sepolicy) are first-class, not afterthoughts.
 ### Source code
 | Language    | Parser       | Notes                                                       |
 |-------------|--------------|-------------------------------------------------------------|
-| C / C++     | tree-sitter-cpp | No preprocessor. We do *not* expand macros — we record macro names as symbols and treat macro call sites as refs. SCIP-clang (optional) handles precision. |
+| C / C++     | tree-sitter-cpp | No preprocessor. We do *not* expand macros — we record macro names as symbols and treat macro call sites as refs. |
 | Java        | tree-sitter-java | Imports resolved against package map; inner classes flattened in scope path. |
 | Kotlin      | tree-sitter-kotlin | Extension functions tracked as defs on receiver type. Java interop resolved through shared FQN map. |
 | Rust        | tree-sitter-rust | `use` tree expanded; `mod` files merged. Macro names recorded; macro expansion not attempted. |
@@ -555,21 +556,20 @@ filter no-ops gracefully when the sidecar is missing).
 
 Why "sidecar" instead of "extend the main index":
 
-- **Optional.** A C++-only project doesn't need `scip_index.bin`.
-  An AOSP index without `m json-module-graph` run doesn't have
-  `module_graph.json`. Making these required would force every
-  user to install every toolchain.
+- **Optional.** A project that never runs `scry grep` doesn't
+  need `trigrams.fst`. An AOSP index without `m json-module-graph`
+  run doesn't have `module_graph.json`. Making these required
+  would force every user to build every artifact.
 
 - **Independently regeneratable.** Editing source flips file
   digests → next `scry index --incremental` reparses changed
   files and rewrites `symbols.bin` / `refs.bin`. The sidecars
-  stay valid because they're keyed by `(abs_path, byte_offset)`
-  — only the parts of them whose source moved need a rebuild,
-  and that rebuild happens via `scry build-symbols` (e.g.
-  `--build-{gn,cmake,kbuild}` when `compile_commands.json`
-  changes, `--build-kzip` when the Kythe kzip is regenerated,
-  `--scip FILE` when an external `*.scip` changes). The core
-  never forces an across-the-board rebuild.
+  stay valid because they're keyed by file and offset — only the
+  parts of them whose source moved need a rebuild, and that
+  rebuild happens via the matching `scry build-*` command (e.g.
+  `scry build-trigrams`, `scry build-file-symbols`,
+  `scry build-modgraph`). The core never forces an
+  across-the-board rebuild.
 
 - **Independent versioning.** Each sidecar checks its own
   version header on open: mismatched version → "absent" status
@@ -590,90 +590,36 @@ Current sidecars (all optional; `scry health` reports each):
 | `refs_offsets.bin`         | `scry build-offsets`              | O(1) ref record lookup           |
 | `file_symbols.bin` + `_offsets.bin` | `scry build-file-symbols` | `scry outline FILE` (file → syms)|
 | `file_refs.bin` + `_offsets.bin` | `scry build-file-refs`        | `scry uses NAME` (refs-in-file)  |
-| `ref_resolutions.bin`      | `scry build-resolutions`          | Layer-2 resolved_to per ref      |
 | `module_graph.json`        | `scry build-modgraph`             | `--reachable` filter             |
-| `clang_usrs.bin`           | `scry build-symbols --build-{gn,cmake,kbuild,kzip}` | clang USR identity (default-on)  |
-| `scip_index.bin`           | `scry build-symbols --build-kzip` or `--scip`       | SCIP symbol identity (default-on) |
-| `scip_index_fqn.bin`       | `scry build-symbols --build-kzip` (with `SCRY_KZIP_SERVING_DIR=<dir>`) | JVM-FQN cross-CU bridge (Java/Kotlin) |
+| `file_digests.bin`         | `scry index`                      | incremental change detection     |
 
-`scip_index_fqn.bin` is a companion to `scip_index.bin`: same packed
-format, but its records are keyed on canonical JVM FQN strings
-(`kythe:jvm:<corpus>###<fqn>`) lifted from `/kythe/edge/named` edges,
-not on the per-CU Kythe SCIP signature. Resolution and the precision
-filter consult both — a ref matches if its call-site symbol is in
-**either** sidecar's def-symbol set. This is what makes cross-CU
-Java calls (`services.core → Binder.clearCallingIdentity`) resolve
-without joining Kythe's `write_tables` graph at query time. The
-two namespaces are disjoint by construction (`kythe:java:` vs
-`kythe:jvm:` prefixes from `VName::to_symbol_string`), so merging
-into one in-memory map can't collide. See
-`docs/DEVELOPMENT.md` § "Cross-CU Java resolution" for the
-mechanism and `crates/scry-kzip/src/fqn_importer.rs` for the
-2-pass streaming importer.
-
-## 8.5 Build-symbol precision (Path B / Path C)
+## 8.5 Name-level matching and where it stops
 
 Tree-sitter gives scry name-level symbols cheaply across every
 language. Name-level matching is fast but lossy: `transact()` in
 AOSP has 1981 name-matched call sites; only ~166 actually
-target `BBinder.transact`. The other ~1815 are false positives
-from unrelated `transact` methods in unrelated classes.
+target `BBinder.transact`. The other ~1815 are unrelated
+`transact` methods in unrelated classes that share the name.
 
-Two compiler-backed precision layers sit on top of the tree-sitter
-base, both optional and both consumed as separate on-disk
-sidecars in the index dir:
+scry ranks and scopes those candidates — by symbol kind, by path
+quality, by `--in` / `--scope` / `--reachable` filters — but it
+does not disambiguate them by compiler-grade semantics. That is a
+deliberate boundary: scry stays syntactic and fast, and the
+ranking surfaces the likely target without claiming to have
+resolved it.
 
-- **Path B (`clang_usrs.bin`)** — per-translation-unit libclang
-  parse driven by `scry build-symbols --build-{gn,cmake,kbuild}
-  <build-out-dir>` (also populated when a kzip's cxx CUs are
-  ingested via `--build-kzip`). Emits one
-  `UsrRecord{ abs_path, byte_offset, usr_id, kind }` per
-  declaration / reference cursor in the TU. The clang USR is
-  a globally unique mangled identifier for the symbol — same
-  USR for the def of `strdup` and every call site to it across
-  every translation unit, regardless of which Soong module the
-  call sits in. Coverage: C, C++, Objective-C.
+Compiler-grade disambiguation (one call site → exactly one
+definition, resolved by a real compiler over the AOSP C++/Java
+slice) is the job of the separate companion tool `scry2`, which
+resolves the Kythe graph and serves def/ref/callers/callgraph at
+structured-identity precision. Use scry for breadth and speed
+across all languages and build files; reach for `scry2` when a
+C++/Java symbol question needs exact identity.
 
-- **Path C (`scip_index.bin`)** — generic SCIP protobuf ingest
-  driven by `scry build-symbols --scip <index.scip>` (or
-  populated directly from kzip's jvm / go / proto / textproto
-  indexers under `--build-kzip`). SCIP
-  (https://github.com/sourcegraph/scip) is the Sourcegraph
-  successor to Kythe-the-format; one indexer per language
-  emits a single .scip file. Same record shape as Path B
-  (`ScipRecord{ abs_path, byte_offset, symbol_id, role }`)
-  but the symbol IDs are SCIP-formatted strings. Coverage:
-  every language with a SCIP producer — Java (Kythe
-  `java_indexer` or `scip-java`), Kotlin (Kythe via kzip),
-  Rust (`rust-analyzer scip` or Soong's `xref_rust` in a kzip),
-  Go (`gopls scip` or Kythe `go_indexer`), TypeScript
-  (`scip-typescript`), Python (`scip-python`), and others.
-
-Both sidecars are mmap'd into a `(path, byte_offset) → symbol_id`
-index at query time. Lookup is O(1). When a `ref` / `callers`
-query runs, scry asks the sidecar for the symbol at each
-candidate ref's location and keeps only those whose symbol
-matches one of the def's symbols. This is the Kythe-class
-structured-identity narrowing — false positives drop because
-the structured ID disagrees, even when the names match.
-
-**Default-on:** both filters auto-engage whenever their sidecar
-exists in the index dir. Users get the precise answer for free
-on covered code, and graceful fallback to lexical name match on
-uncovered code. `--lexical` is the explicit opt-out — useful
-for "show me everything" mode or for measuring filter impact.
-A third filter, `--reachable`, narrows by Soong/Bazel/Kernel
-module-graph visibility; it stays explicit opt-in because the
-256MB AOSP module graph + Warshall closure costs ~30s cold.
-
-**Sidecar producers:** `scry build-symbols --build-{gn,kbuild,cmake,cargo,kzip}`
-runs the language-appropriate indexer flow and writes the
-matching sidecars into `--index DIR`. The `--build-kzip` path
-drives the six Kythe v0.0.75 indexers from a single
-`build_kzip.bash` artifact (and is the canonical path for
-AOSP / Bazel); the others wrap `compile_commands.json` /
-rust-analyzer / scip-* per language. `--scip FILE` is the
-escape hatch when you already have a SCIP file from elsewhere.
+The `--reachable` filter narrows candidates by
+Soong/Bazel/Kernel module-graph visibility; it is explicit
+opt-in because the 256MB AOSP module graph + Warshall closure
+costs ~30s cold.
 
 ## 9. CLI surface (concrete)
 
@@ -745,10 +691,10 @@ Ranking inputs (in priority order):
 |----------------------------------------|--------------|----------------------------------|
 | cold full index                        | < 10 min     | 13.3 min (1.0M files, workers=16) |
 | `scry def NAME` (warm)                 | < 10 ms      | 5–15 ms                          |
-| `scry ref NAME` (warm, 1k refs)        | < 100 ms     | 80–150 ms (Layer 2 sidecar adds ~20ms) |
+| `scry ref NAME` (warm, 1k refs)        | < 100 ms     | 80–150 ms                        |
 | `scry grep PATTERN`                    | within 2× rg | 30–45× FASTER than rg            |
 | `scry fuzzy STR`                       | < 30 ms      | 150–250 ms (substring FST walk; over budget — see USAGE.md) |
-| index size                             | < 6 GB       | 9.5 GB (refs + offsets + trigrams + file_symbols + resolutions; the columns are 4 GB total) |
+| index size                             | < 6 GB       | 9.5 GB (refs + offsets + trigrams + file_symbols; the columns are 4 GB total) |
 | RSS for `scry serve`                   | < 1 GB       | 200–300 MB (lazy reader)         |
 
 See `docs/BENCHMARKS.md` for the full measurement methodology and
@@ -822,7 +768,7 @@ The production wrapper that wires all of this is
 `scripts/run_index.sh` + the `systemd-run --user --unit=scry-index`
 invocation documented in `docs/OPERATIONS.md`. The post-finalize
 chain (build-offsets → build-file-symbols → build-trigrams →
-build-resolutions → validate → bench → email) runs automatically
+validate → bench → email) runs automatically
 via `scripts/await_finalize.sh`.
 
 These are achieved, not aspirations; the milestone gates (§13) made
@@ -830,12 +776,13 @@ them concrete.
 
 ## 12. Risks and known unknowns
 
-1. **C++ resolution without compile commands is mediocre.**
-   `scry callers NAME --precise` routes through clangd via LSP
-   (`crates/scry-cli/src/clangd.rs`). Uses the real compiler's
-   overload resolution. Requires `clangd` on PATH plus a
-   `compile_commands.json`; clean error message when missing.
-   The heuristic path stays the default.
+1. **C++ resolution is name-level, not overload-resolved.**
+   Without a real compilation database scry cannot disambiguate
+   C++ overloads or template instantiations; `scry callers NAME`
+   returns every call site whose name matches, ranked but not
+   resolved. This is an accepted limitation of a syntactic tool.
+   Compiler-grade overload resolution over the AOSP C++ slice is
+   the job of the companion tool `scry2`.
 
 2. **Tree-sitter-kotlin is the weakest of the major grammars.**
    `tree-sitter-kotlin-ng` (the actively maintained fork) is
@@ -907,10 +854,7 @@ phase reflects what shipped vs what was scoped down.
 
 - Reference extraction for the seven languages.
 - Layer 1 resolver (imports + same-file scope + inheritance).
-- Layer 2 resolver via `scry build-resolutions` sidecar (89%
-  of refs resolved on the live index).
-- `scry ref`, `scry callers` shipped. `--precise` clangd routing for
-  C++ shipped (commit 6bf1b3d).
+- `scry ref`, `scry callers` shipped.
 - ⏳ Sugar commands `scry callees`, `scry overrides`, `scry impls`,
   `scry subtypes`, `scry members` not shipped as separate
   subcommands — achievable today via `def --kind X` / `ref --kind X`
@@ -972,18 +916,17 @@ phase reflects what shipped vs what was scoped down.
 - **Exit gate met**: warm `def` ~ 8 ms; grep is **30–45× faster
   than `rg`** (not within-2x — exceeded expectation).
 
-### Phase 5 — precision uplift (clangd shipped; SCIP + Stack Graphs partial)
+### Phase 5 — the syntactic boundary and the scry2 companion
 
-- `scry callers NAME --precise` via clangd. Covers the C++
-  overload-resolution use case SCIP-clang was originally planned
-  for.
-- Direct SCIP file ingestion deferred — the clangd path gives
-  the same precision without requiring users to manage SCIP
-  files. If user demand for SCIP appears, the ingestion path is
-  a contained add.
-- Stack Graphs experiment for Kotlin/Python and cross-language
-  JNI binding inference not shipped. Both documented as future
-  work in `docs/DEVELOPMENT.md`.
+- scry's resolution is syntactic (Layer 0 + Layer 1 + build-graph
+  scoping). It ranks and scopes candidates across every language
+  cheaply, but it does not perform compiler-grade overload
+  resolution or one-call-site-to-one-definition disambiguation.
+- Compiler-grade semantic precision over the AOSP C++/Java slice
+  is delivered by the separate companion tool `scry2`, which
+  resolves the Kythe graph. scry stays the breadth-and-speed tool;
+  scry2 is the exact-identity tool. The split keeps scry a single
+  static binary with no compiler toolchain on its critical path.
 
 ### Phase 6 — polish (partial)
 
@@ -1003,9 +946,6 @@ phase reflects what shipped vs what was scoped down.
 - **MCP server** (`scry mcp`) — drop-in Model Context Protocol
   integration with required-arg validation and `isError`
   discipline. See `docs/MCP.md`.
-- **Semantic retrieval** (`scry ask`) — embedding-based chunk
-  search via the deterministic hashing trick; transformer model
-  upgrade behind a future feature flag (ROADMAP § 1).
 - **Memory primitives** (`scry recall`, `scry diff --since`) —
   thin readers over the ops log and git history for agent
   memory + PR-scoped exploration.
@@ -1022,11 +962,10 @@ phase reflects what shipped vs what was scoped down.
    **Confirmed.**
 5. ~~**Incremental**~~ — manual only (`scry index --incremental`). No
    inotify watcher. **Confirmed.**
-6. ~~**SCIP**~~ — Phase 5, opt-in precision uplift. SCIP = Sourcegraph
-   Code Intelligence Protocol; per-language indexers like `scip-clang`
-   that hook into the real compiler and emit precise references. We
-   ingest `.scip` files when present and let them outvote tree-sitter
-   answers. **Confirmed.**
+6. ~~**Semantic precision**~~ — out of scope for scry. scry stays
+   syntactic (tree-sitter + trigram + build-file parsing). Compiler-grade
+   semantic resolution over the AOSP C++/Java slice lives in the separate
+   companion tool `scry2`, which resolves the Kythe graph. **Confirmed.**
 7. **AIDL cross-linkage** — Phase 3 (AOSP-distinctive killer feature).
 8. **LLM transport** — line-delimited JSON over a Unix socket from
    `scry serve`. Open to revisit if you want an MCP variant later.

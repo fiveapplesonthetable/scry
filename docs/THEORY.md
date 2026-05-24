@@ -1189,37 +1189,29 @@ What this generation left for the next:
   understanding the Soong module graph, which content search
   doesn't see.
 
-### Late 2010s — SCIP, LSIF, and the precision uplift
+### Late 2010s — language servers and serialized semantics
 
 The Language Server Protocol (Microsoft, 2016) gave IDEs a
 language-agnostic interface to per-language semantic engines:
 `clangd`, `rust-analyzer`, `gopls`, `pylsp`, etc. The "semantic"
 side of code intelligence consolidated around LSP.
 
-LSIF (Language Server Index Format, 2019) was the first attempt
-to *serialize* LSP responses to disk so a code-search system
-could replay them. SCIP (Source Code Intelligence Protocol,
-Sourcegraph, 2022) is the second-generation cleaner protobuf
-form. The idea: run the real per-language indexer (`scip-clang`,
-`scip-java`) once, emit a SCIP file, and load it as an *override*
-for the heuristic resolution scry / Zoekt / etc. would otherwise
-do.
+This is where the field splits into two complementary families.
+One family runs the real per-language compiler over a buildable
+tree and emits compiler-grade symbol identities that survive
+overload resolution and cross-module linking; the price is a
+working toolchain and an index emit that often takes longer than
+the build itself. The other family — content + syntax search,
+where scry lives — runs no compiler, needs no build, and answers
+the name-level and content-level questions in seconds.
 
-The tradeoff is sharp:
-
-- **Heuristic + tree-sitter** (scry's default): 80-90% accurate
-  on the queries that matter, ~13 min for a 1 M-file index,
-  zero per-language toolchain dependencies.
-- **SCIP**: 99% accurate, requires the real per-language
-  compiler to run (clangd needs `compile_commands.json`;
-  scip-java needs a working JVM build), and the index emit
-  takes longer than the actual build for most projects.
-
-scry leaves SCIP as a phase-5 opt-in path (DESIGN.md §13). The
-implementation is straightforward: a SCIP record wins over a
-tree-sitter heuristic where they overlap; everything else stays
-unchanged. We haven't shipped it because AOSP's build is large
-and the SCIP indexers aren't currently configured for it.
+scry is squarely in the second family: tree-sitter parses give
+it name-level symbols, the trigram index gives it content, and
+neither needs a compiler in the loop. Compiler-grade semantic
+resolution is a different tool's job. If you need "which overload,
+across translation units, exactly" answers on AOSP, that is the
+companion tool **scry2**, which builds a semantic graph from a
+real compiler's output; scry itself stays toolchain-free.
 
 ### 2020s — Sourcegraph Code Intelligence, GitHub Code Search v2, embeddings
 
@@ -1286,7 +1278,7 @@ what happened?** The answers for scry's main decisions:
 | trigram-narrowed grep        | Glimpse 1994, Cox 2012, Zoekt 2015 | standard pattern; works           |
 | FST for symbol names         | `fst` crate (Gallant), rooted in Daciuk 2000 | works; production-grade       |
 | mmap'd on-disk format        | Zoekt 2015, Lucene segments      | works; standard                    |
-| heuristic resolution + opt-in SCIP | Sourcegraph default, kythe at Google | works; SCIP is the precision-when-you-need-it lever |
+| name + content search, no compiler | Glimpse 1994, Zoekt 2015, livegrep | works; fast and toolchain-free |
 | single host, no daemon       | ctags 1979, cscope 1979, livegrep 2014 (mostly) | works for one user, fails at scale |
 | LLM-shaped JSON-RPC          | new — no precedent              | unknown but designed conservatively |
 
@@ -2393,7 +2385,8 @@ skipped.
   checker. Symbol resolution within a file uses scope rules;
   cross-file resolution uses imports + heuristics; type-level
   questions (which overload, which type parameter) are out of
-  reach. The opt-in SCIP path (ch. 13) covers this when needed.
+  reach. Those questions belong to a compiler-driven tool — the
+  companion `scry2` — not to scry's content+syntax core.
 - **Per-language quality varies.** tree-sitter-c, tree-sitter-cpp,
   tree-sitter-java, tree-sitter-rust are excellent.
   tree-sitter-kotlin is weaker — Kotlin's grammar is genuinely
@@ -2407,9 +2400,10 @@ skipped.
 - **Semantic vs syntactic indexing.** scry's symbol model is
   syntactic — it knows there's a definition called `foo`, but it
   doesn't know if `foo()` resolves to it without scope+import
-  reasoning. SCIP files from real compilers give precise answers
-  but require building the code. Whether it's worth the cost is
-  workload-dependent; we made it opt-in.
+  reasoning. Compiler-driven indexers answer that precisely at
+  the cost of building the code; that is the design space the
+  companion `scry2` occupies. scry itself stays syntactic, which
+  is what keeps it toolchain-free and fast.
 
 ---
 
@@ -2655,7 +2649,7 @@ be right.
 | parallelism                       | rayon work-stealing on whole files     | intra-file parallelism               | giant single files           |
 | per-file parse timeout            | 60 s hard                              | parsing genuinely huge files         | extreme generated code       |
 | memory enforcement                | cgroup MemoryMax=60G + restart         | running in unconstrained env         | embedded / non-systemd       |
-| resolution layer                  | tree-sitter + scope heuristics         | type-level precision                 | refactoring tools (use SCIP) |
+| resolution layer                  | tree-sitter + scope heuristics         | type-level precision                 | refactoring tools (use scry2) |
 | regex grep                        | literal extract → trigram → scan       | non-literal-anchored regex           | full regex over scan-only    |
 | language coverage                 | C/C++/Java/Kotlin/Rust/Go/Python/sh+asm | Swift, Dart, Haskell, etc.          | other tree's primary langs   |
 | host count                        | one                                    | multi-host scale                     | Sourcegraph-scale corpus     |
@@ -2665,8 +2659,10 @@ well-known corpus, indexed once per ~hour, queried many times
 per minute, by a mix of human and LLM clients on one host**.
 Change the workload and the table changes. Add real-time
 freshness, scry needs incremental updates. Add multi-tenant
-hosting, scry needs sharded indexes. Add intra-file precision,
-scry needs SCIP integration.
+hosting, scry needs sharded indexes. Add compiler-grade
+intra-file resolution, and that is a separate tool entirely —
+the companion `scry2`, which builds a semantic graph from a real
+compiler's output rather than from tree-sitter.
 
 Within the assumed workload, the decisions are tight: each one
 saves a measurable amount of work or memory and gives up
@@ -2677,86 +2673,6 @@ That's the L7 instinct in one paragraph: name the workload
 honestly, derive the constraints, pick the smallest design that
 satisfies them, and don't pay for capabilities the workload
 doesn't ask for.
-
----
-
-## Chapter 13.5 — composing with real compilers (Path B / Path C)
-
-Tree-sitter gives scry name-level symbols. Across a million-file
-corpus, name-level matching is roughly grep-with-syntax: fast
-but lossy. The classic Kythe answer is to run a real
-compiler-driven extractor per translation unit and emit
-structured symbol IDs (clang USRs, scip-java symbols, etc.)
-that survive overload resolution and cross-module linking.
-
-scry doesn't reimplement Kythe. It consumes Kythe's two ideas:
-per-TU structured symbol IDs, and a separate join that uses
-them. Both come in as separate on-disk sidecars next to the
-mmap'd index:
-
-- **Path B**: `scry build-symbols --build-{gn,cmake,kbuild,kzip}`
-  drives libclang per TU from the build's `compile_commands.json`
-  (or, for `--build-kzip`, runs Kythe's `cxx_indexer` per CU and
-  packs the entries equivalently). Emits `clang_usrs.bin` — a
-  packed table of `(abs_path, byte_offset, usr_id, kind)`. The
-  USR string is libclang's globally unique mangled identifier;
-  the same USR appears at the def of `strdup` AND at every call
-  site to it across the whole corpus.
-
-- **Path C**: `scry build-symbols --scip FILE` ingests a SCIP
-  protobuf index emitted by any external SCIP producer
-  (`scip-typescript`, `gopls scip`, `rust-analyzer scip`,
-  `scip-python`, ...) — or `--build-kzip` populates the same
-  sidecar directly from Kythe's `java_indexer`, `jvm_indexer`,
-  `go_indexer`, `proto_indexer`, `textproto_indexer`. Same record
-  shape as Path B (`scip_index.bin`), but symbol IDs are
-  SCIP-formatted strings.
-
-Both sidecars are built once per source-tree change (or once per
-build for Path B's compile_commands.json). At query time scry
-mmap's the sidecar, asks it for the symbol at each candidate
-ref's `(path, byte_offset)`, and keeps only refs whose symbol
-matches a symbol at one of the def's locations.
-
-The information-theoretic shape: tree-sitter contributes the
-candidate set (every site whose tokenized name matches), and
-the structured-ID sidecar contributes a confirming bit per site
-(does the structured ID equal the def's ID?). Two independent
-sources of evidence; the AND of "name matches" + "structured
-ID matches" rejects the false positives a pure name match
-would keep.
-
-Crucially scry does NOT compute the structured IDs itself.
-That's where Kythe's complexity lives — per-language compiler
-plumbing, schema, verifier, build integration. scry stays small
-by treating the indexer artifact as just another file in the
-build output, ingested by `scry build-symbols --build-{gn,kbuild,
-cmake,cargo,kzip}` into the canonical sidecar shape. The
-complexity budget for "be Kythe-class precise for N languages"
-collapses from "implement N indexers" to "consume N indexer
-outputs in a shared on-disk format" — same value, two orders
-of magnitude less code.
-
-The one place scry does add post-processing on top of Kythe
-output is the **cross-CU JVM bridge** (`scip_index_fqn.bin`).
-Kythe's per-CU indexer is correct but the cross-CU join lives
-in Kythe's own `write_tables` LevelDB serving layer, which
-adds 30+ min of post-processing and a separate query API. scry
-shortcuts this by reading the same `/kythe/edge/named` edges
-the indexer already emits, lifting `language=java` ↔
-`language=jvm` mappings into a packed sidecar that the query
-path consumes directly — see § 12.X (or
-`crates/scry-kzip/src/fqn_importer.rs` for the 2-pass
-streaming implementation).
-
-This is also why precision is default-on: the only thing the
-filter costs is one hash lookup per candidate ref, and if the
-sidecar isn't present the filter no-ops gracefully. There's
-nothing to "turn on" — you point `scry build-symbols
---build-kzip PATH` at the kzip once, and every subsequent
-query gets the structured narrowing. `--lexical` exists as
-an opt-out for "show me everything" workflows; the default
-workflow needs no flags.
 
 ---
 

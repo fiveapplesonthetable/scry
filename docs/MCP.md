@@ -55,57 +55,35 @@ Any other method gets a JSON-RPC `-32601` (method not found) error.
 | tool             | required args | optional args                                                                                            | what it returns                              |
 |------------------|---------------|----------------------------------------------------------------------------------------------------------|----------------------------------------------|
 | `def`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`                                                                  | symbol definition records                    |
-| `ref`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`              | reference records (any kind)                 |
-| `callers`        | `name`        | `lang`, `in`, `not_in`, `limit`, `scope`, `def_in`, `strict`, `format`, `reachable`                      | references with `kind=call`                  |
+| `ref`            | `name`        | `lang`, `kind`, `in`, `not_in`, `limit`, `scope`, `format`, `reachable`                                  | reference records (any kind)                 |
+| `callers`        | `name`        | `lang`, `in`, `not_in`, `limit`, `scope`, `format`, `reachable`                                          | references with `kind=call`                  |
 | `prefix`         | `prefix`      | `in`, `not_in`, `limit`                                                                                  | symbols whose name starts with PREFIX        |
 | `fuzzy`          | `substr`      | `in`, `not_in`, `distance`, `limit`                                                                      | edit-distance-ranked symbol matches          |
 | `grep`           | `pattern`     | `regex`, `case_insensitive`, `lang`, `in`, `not_in`, `limit`, `format`                                   | content matches                              |
 | `outline`        | `path`        | `limit`                                                                                                  | every symbol in the file, by line            |
 | `coverage`       | `path`        | `by_kind`                                                                                                | per-language file/byte/symbol counts         |
-| `stats`          | —             | —                                                                                                        | index metadata (incl `refs_resolved` %)      |
+| `stats`          | —             | —                                                                                                        | index metadata                               |
 | `subclasses`     | `name`        | `in`, `not_in`, `limit`, `depth`                                                                         | direct or transitive subtypes                |
-| `implementations`| `name`        | `in`, `not_in`, `limit`, `depth`                                                                         | alias of `subclasses` (LSP shape)            |
-| `impact`         | `name`        | `in`, `not_in`, `limit`, `subclass_depth`, `reachable`, `def_in`, `strict`                               | callers + subclasses + files_touched         |
-| `callgraph`      | `name`        | `in`, `not_in`, `depth`, `max_nodes`, `reachable`, `def_in`, `strict`                                    | recursive caller tree                        |
-| `uses`           | `name`        | `in`, `not_in`, `kind`, `limit`                                                                          | outgoing edges from NAME's body              |
-| `ask`            | `query`       | `in`, `not_in`, `limit`                                                                                  | semantic-retrieval chunks (cosine-ranked)    |
+| `impact`         | `name`        | `in`, `not_in`, `limit`, `subclass_depth`, `reachable`                                                   | callers + subclasses + files_touched         |
+| `callgraph`      | `name`        | `in`, `not_in`, `depth`, `max_nodes`, `reachable`                                                        | recursive caller tree                        |
+| `uses`           | `name`        | `in`, `not_in`, `kind`, `format`                                                                         | outgoing edges from NAME's body              |
 
 `limit` defaults to 20. `in` is a path-substring filter, same
-semantics as the CLI's `--in`. `not_in` (v0.1.51) is the
-symmetric negative filter — drops results whose file path
-contains the substring. Both can combine (`in: "frameworks", not_in: "/tests/"`
-scopes to frameworks AND drops test paths in one call).
-Tool `ask` requires the index to have been processed by
-`scry build-embeddings`; otherwise the tool returns a tool-level
-error (see "Error semantics" below).
+semantics as the CLI's `--in`. `not_in` is the symmetric negative
+filter — drops results whose file path contains the substring.
+Both can combine (`in: "frameworks", not_in: "/tests/"` scopes to
+frameworks AND drops test paths in one call).
 
-#### Resolver-aware flags (v0.1.26+)
+#### `format: "by-def"`
 
-`def_in`, `strict`, and `format: "by-def"` are available on
-the `ref`, `callers`, `callgraph`, and `impact` tools (some
-also expose `scope`):
-
-- **`def_in: string`** — substring of the def-site file path.
-  Keeps only refs whose Layer 2 resolution (`resolved_to`)
-  lands at a def in a file containing this path. Permissive:
-  refs with `resolved_to=null` pass through (over-include
-  rather than silently drop). No-op without the
-  build-resolutions sidecar.
-- **`strict: bool`** — drop refs whose Layer 2 resolution
-  didn't land on a specific def. With `def_in`, also drops
-  the permissive over-include — only confident hits survive.
-- **`format: "by-def"`** (ref/callers only) — returns a
-  histogram array instead of per-ref records. Each entry:
-  `{count, def: {path, line, col, scope, kind, id}}`. The
-  unresolved bucket is last as `{count, def: null}`. Use this
-  to see WHICH def the refs actually target — invaluable for
-  polymorphic names like `close`, `onCreate`, `transact`.
-
-The `stats` tool's response now includes
-`refs_resolved: number | null` and
-`refs_resolved_pct: number | null` — `null` when the
-build-resolutions sidecar isn't present. Higher percentage
-means `def_in`/`strict` narrowing will be more effective.
+`format: "by-def"` is available on the `ref` and `callers` tools.
+It groups refs by their resolved def — a best-effort in-memory
+name match (`resolved_to`) populated only on non-streaming
+indexes. It returns a histogram array instead of per-ref records.
+Each entry: `{count, def: {path, line, col, scope, kind, id}}`,
+with the unresolved bucket as `{count, def: null}`. The default
+`scry index` streams, so on a typical index `resolved_to` is null
+and the histogram collapses to the single unresolved bucket.
 
 ---
 
@@ -134,11 +112,11 @@ just couldn't satisfy it. Cases:
   treating `{"name": ""}` as "match anything" returned ~50 garbage
   results in a real session and is exactly the bug this validation
   closes.
-- **Tool-couldn't-run** (e.g. `ask` against an index without
-  embeddings):
+- **Tool-couldn't-run** (e.g. `outline` against a path that isn't
+  in the index):
   ```json
   {"isError": true, "content": [{"type": "text",
-    "text": "no embedding sidecar — run `scry build-embeddings`"}]}
+    "text": "no file in the index matches path 'NoSuchFile.java'"}]}
   ```
   The bare error message is in `text` — clients (and LLMs reading
   the content) don't need a second `json.parse()` to get the human
@@ -175,9 +153,9 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
 ```
 
 Restart Claude Desktop; the scry tools (def, ref, callers, prefix,
-fuzzy, grep, outline, coverage, stats, ask) appear in the tool
-picker. The MCP server starts on demand and stays alive for the
-session.
+fuzzy, grep, outline, coverage, stats, subclasses, impact,
+callgraph, uses) appear in the tool picker. The MCP server starts
+on demand and stays alive for the session.
 
 ### Cursor
 
@@ -248,8 +226,7 @@ scry's MCP server is intentionally simple:
 - **Per-tool latency** matches `scry serve` because they share the
   underlying request path. Typical warm numbers on the live
   AOSP+Linux index: `def` ~8 ms, `callers` ~80 ms, `grep` ~600 ms,
-  `outline` ~600 ms, `ask` ~50–500 ms (depending on warm vs cold
-  embeddings.bin).
+  `outline` ~600 ms.
 - **Concurrent calls**: clients that pipeline `tools/call` requests
   see no contention — the StoreReader is mmap'd + immutable and
   `serve_one_request` is a pure function over reader + request.
@@ -295,10 +272,10 @@ $ printf '%s\n' \
 
 You should see three response lines (the notification produces
 nothing): `initialize` reports `serverInfo.name: "scry"`,
-`tools/list` returns 10 tools, `tools/call def Binder` returns a
-content array with one text part holding a JSON array of symbol
-records. If any of those don't match, the MCP wrapper is
-mis-configured or the index is missing.
+`tools/list` returns the tool array, `tools/call def Binder`
+returns a content array with one text part holding a JSON array
+of symbol records. If any of those don't match, the MCP wrapper
+is mis-configured or the index is missing.
 
 Error-path smoke:
 

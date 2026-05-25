@@ -59,9 +59,19 @@ scry man | gzip > /usr/local/share/man/man1/scry.1.gz
 ## Quickstart
 
 scry is **tree-sitter only**: one `index` command builds the index, then you
-query it. (For Kythe-grade *semantic* precision on the AOSP C++/Java slice —
-compiler-resolved def/ref/callers — use the companion tool `scry2`; scry is
-the broad, fast, lexical layer over every language + build/platform format.)
+query it. It is the broad, fast, **live** layer over every language +
+build/platform format — and the companion to **scry2** (the Kythe-grade AOSP
+semantic snapshot). The division:
+
+- scry resolves *where you are*: `scry whereis FILE:LINE` turns a crash frame /
+  compiler error / `rg` hit into the enclosing symbol's FQN, and `scry grep
+  --fqn` turns a text hit into one. These are syntactic span-containment (robust,
+  no resolution) and emit FQNs in scry2's form — pipe them straight in:
+  `scry whereis Foo.java:123 -q | xargs scry2 callers`.
+- scry2 resolves *what a symbol does*: Kythe-grade def/ref/callers/callgraph/type.
+  scry's own `def`/`ref`/`callers` are **lexical** (name/scope matching) — right
+  for the live just-edited tree, but re-confirm via scry2 once indexed.
+- `scry watch` keeps the index fresh as you edit; `whereis` needs no index at all.
 
 ```sh
 # 1. Index the source tree.

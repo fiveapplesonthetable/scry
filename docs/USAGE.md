@@ -20,6 +20,14 @@ Every command finishes with a one-line stats footer to stderr:
 Exact-name definition lookup. The closest analogue is LSP's
 `textDocument/definition` or gtags' tag lookup.
 
+> **Precision note.** `def`/`ref`/`callers` are **lexical** — tree-sitter name +
+> scope matching, not a resolved graph. They are the right tool for the *live*
+> tree (a file you just edited, before scry2 has reindexed), but they can over- or
+> under-match where a real resolver wouldn't (overloads, shadowing, macro/template
+> dispatch). For Kythe-grade def/ref/callers, use **scry2**; re-confirm there once
+> the edit is indexed. (`whereis` and `grep --fqn` are exempt — they are syntactic
+> span-containment, which needs no resolution.)
+
 ```sh
 $ scry def ActivityManagerService --kind class --lang Java --limit 3
 ```

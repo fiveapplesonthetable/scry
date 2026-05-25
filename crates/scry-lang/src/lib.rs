@@ -32,6 +32,26 @@ pub struct RawRef {
     pub scope_path: Vec<String>,
 }
 
+/// The innermost named declaration whose source span encloses a byte
+/// offset — what `scry whereis` returns for a crash frame / error
+/// location. Unlike a symbol's stored `byte_start..byte_end` (the
+/// IDENTIFIER token range), `span_start..span_end` is the FULL
+/// declaration span (signature + body), so containment is exact:
+/// `span_start <= offset < span_end`. The `fqn` is assembled from
+/// `scope_path` + `name` with the language's separator (`::` for
+/// C/C++/Rust, `.` otherwise), so it can be fed straight to scry2.
+#[derive(Debug, Clone)]
+pub struct Enclosing {
+    pub fqn: String,
+    pub name: String,
+    pub kind: SymbolKind,
+    pub scope_path: Vec<String>,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// 1-based line of the declaration's first byte.
+    pub line: u32,
+}
+
 thread_local! {
     static PARSER: RefCell<Parser> = RefCell::new(Parser::new());
     /// Filename of the file currently being parsed on this worker thread.
@@ -147,9 +167,13 @@ fn parse_with_explicit_timeout(
     }
 }
 
-pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
+/// Resolve the tree-sitter `LangSpec` for a file kind, or None for a
+/// kind scry parses some other way (build files, etc.). Shared by
+/// `extract` (symbol extraction) and `enclosing_symbol` (reverse
+/// lookup) so both agree on exactly which grammar handles each kind.
+fn spec_for(kind: FileKind) -> Option<&'static LangSpec> {
     use FileKind::*;
-    let spec = match kind {
+    Some(match kind {
         C => c_spec(),
         Cpp | HeaderCpp => cpp_spec(),
         Header => cpp_spec(),
@@ -167,8 +191,13 @@ pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
         Markdown => markdown_spec(),
         Toml => toml_spec(),
         Yaml => yaml_spec(),
-        _ => return Ok(Vec::new()),
-    };
+        _ => return None,
+    })
+}
+
+pub fn extract(kind: FileKind, source: &[u8]) -> Result<Vec<RawSymbol>> {
+    use FileKind::*;
+    let Some(spec) = spec_for(kind) else { return Ok(Vec::new()) };
     let mut syms = extract_with(spec, source)?;
     if kind == Kotlin {
         inject_anonymous_companions(source, &mut syms);
@@ -518,57 +547,8 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
                 }
             }
             let (Some(name_node), Some(kind)) = (name_node, kind) else { continue };
-            // C++ out-of-line method definitions (`Foo::bar() { ... }`)
-            // capture the whole qualified_identifier as @name. Drill in
-            // to extract the bare name + harvest the qualifiers into
-            // scope_path so a search for `def bar` finds it AND its
-            // scope reads `[Foo]` instead of the symbol being literally
-            // named `Foo::bar`.
-            let (name_node, qualified_prefix): (tree_sitter::Node, Vec<String>) =
-                if name_node.kind() == "qualified_identifier" {
-                    drill_qualified_identifier(name_node, source)
-                } else {
-                    (name_node, Vec::new())
-                };
-            let name = match name_node.utf8_text(source) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            };
-            let mut scope_path = compute_scope(
-                name_node,
-                source,
-                spec.scope_node_kinds,
-                spec.package_node_kind,
-            );
-            // Prepend any qualifiers we drilled out of the
-            // qualified_identifier (e.g. ["BBinder"] for BBinder::transact)
-            // AFTER the ancestor-derived scope (the enclosing namespace),
-            // so a method on android::BBinder reads as
-            // ["android", "BBinder"] → "android::BBinder::transact".
-            if !qualified_prefix.is_empty() {
-                scope_path.extend(qualified_prefix);
-            }
-            // Receiver-typed declaration (Kotlin extension fn / property):
-            // - extension function name's parent IS function_declaration
-            // - extension property name's parent is variable_declaration,
-            //   grandparent is property_declaration. The receiver
-            //   user_type lives on the property_declaration directly.
-            // Prepend its identifier to scope_path so `def shouted` shows
-            // scope "String", and outline groups extensions by receiver.
-            let decl_node = if let Some(parent) = name_node.parent() {
-                match parent.kind() {
-                    "function_declaration" => Some((parent, name_node)),
-                    "variable_declaration" => parent.parent()
-                        .filter(|gp| gp.kind() == "property_declaration")
-                        .map(|gp| (gp, parent)),
-                    _ => None,
-                }
-            } else { None };
-            if let Some((decl, boundary)) = decl_node {
-                if let Some(recv) = kotlin_receiver_for_decl(decl, boundary, source) {
-                    scope_path.insert(0, recv);
-                }
-            }
+            let Some((name_node, name, scope_path)) =
+                symbol_identity(name_node, source, spec) else { continue };
             let start = name_node.start_position();
             out.push(RawSymbol {
                 name,
@@ -581,6 +561,182 @@ fn extract_with(spec: &'static LangSpec, source: &[u8]) -> Result<Vec<RawSymbol>
             });
         }
         Ok(out)
+    })
+}
+
+/// Resolve a symbol's `@name` capture into its bare name, its
+/// (possibly drilled) name node, and its `scope_path` — applying the
+/// C++ out-of-line qualified-identifier drilling and the Kotlin
+/// extension-receiver handling. Shared by `extract_with` and
+/// `enclosing_with` so a symbol's FQN is identical whether it is reached
+/// by name (`def`) or by location (`whereis`).
+fn symbol_identity<'a>(
+    name_node: tree_sitter::Node<'a>,
+    source: &[u8],
+    spec: &'static LangSpec,
+) -> Option<(tree_sitter::Node<'a>, String, Vec<String>)> {
+    // C++ out-of-line method definitions (`Foo::bar() { ... }`) capture
+    // the whole qualified_identifier as @name. Drill in to the bare name
+    // and harvest the qualifiers into scope_path so `bar` is found AND
+    // its scope reads `[Foo]` rather than the symbol being named `Foo::bar`.
+    let (name_node, qualified_prefix): (tree_sitter::Node, Vec<String>) =
+        if name_node.kind() == "qualified_identifier" {
+            drill_qualified_identifier(name_node, source)
+        } else {
+            (name_node, Vec::new())
+        };
+    let name = name_node.utf8_text(source).ok()?.to_string();
+    let mut scope_path = compute_scope(
+        name_node,
+        source,
+        spec.scope_node_kinds,
+        spec.package_node_kind,
+    );
+    // Append the drilled qualifiers AFTER the ancestor-derived scope, so
+    // a method on android::BBinder reads ["android", "BBinder"].
+    if !qualified_prefix.is_empty() {
+        scope_path.extend(qualified_prefix);
+    }
+    // Kotlin extension fn / property: prepend the receiver type so
+    // `fun String.shouted()` scopes under "String".
+    let decl_node = if let Some(parent) = name_node.parent() {
+        match parent.kind() {
+            "function_declaration" => Some((parent, name_node)),
+            "variable_declaration" => parent.parent()
+                .filter(|gp| gp.kind() == "property_declaration")
+                .map(|gp| (gp, parent)),
+            _ => None,
+        }
+    } else { None };
+    if let Some((decl, boundary)) = decl_node {
+        if let Some(recv) = kotlin_receiver_for_decl(decl, boundary, source) {
+            scope_path.insert(0, recv);
+        }
+    }
+    Some((name_node, name, scope_path))
+}
+
+/// FQN component separator for a language: `::` for C/C++/Rust, `.` for
+/// everything else. Matches what scry2 emits, so a `whereis` FQN can be
+/// fed straight to a scry2 `def`/`ref`/`callers` query.
+fn fqn_separator(kind: FileKind) -> &'static str {
+    use FileKind::*;
+    match kind {
+        C | Cpp | Header | HeaderCpp | Rust => "::",
+        _ => ".",
+    }
+}
+
+/// Reverse lookup: the innermost named declaration whose FULL source
+/// span encloses `byte_offset`. This is the `scry whereis` primitive —
+/// given a crash frame / error location, name the enclosing
+/// function/class/etc. and assemble its FQN.
+///
+/// Parses the source live (no index dependency), runs the language's
+/// symbol query, and for every matched declaration tests its full span
+/// (`@def.*` capture node, signature + body) for containment. Among the
+/// containing declarations it returns the one with the smallest span
+/// (deepest nesting), tie-broken toward the later start. Returns None
+/// for an unparsed kind, a parse failure, or an offset inside no
+/// declaration (file-scope / between members).
+pub fn enclosing_symbol(
+    kind: FileKind,
+    source: &[u8],
+    byte_offset: u32,
+) -> Option<Enclosing> {
+    enclosing_symbols(kind, source, &[byte_offset]).pop().flatten()
+}
+
+/// Batch form of [`enclosing_symbol`]: resolve the enclosing declaration
+/// for many byte offsets in ONE parse. The returned vec is aligned with
+/// `offsets`. This is what `scry grep --fqn` uses to annotate every hit
+/// in a file without reparsing per hit.
+pub fn enclosing_symbols(
+    kind: FileKind,
+    source: &[u8],
+    offsets: &[u32],
+) -> Vec<Option<Enclosing>> {
+    let Some(spec) = spec_for(kind) else { return vec![None; offsets.len()] };
+    let sep = fqn_separator(kind);
+    PARSER.with(|cell| {
+        let mut parser = cell.borrow_mut();
+        if parser.set_language(spec.language).is_err() {
+            return vec![None; offsets.len()];
+        }
+        let tree = match parse_with_timeout(&mut parser, source) {
+            (ParseOutcome::Tree(t), _) => t,
+            _ => return vec![None; offsets.len()],
+        };
+        // All declaration candidates: (span_start, span_end, name_node, kind).
+        let mut cands: Vec<(u32, u32, tree_sitter::Node, SymbolKind)> = Vec::new();
+        // File-level package (Java/Kotlin/Go/Proto) — a sibling of the
+        // top-level decls, so `compute_scope` (ancestors only) misses it.
+        // Captured and prepended so Java FQNs are package-qualified,
+        // matching what scry2 emits (`android.os.Bundle.EMPTY`).
+        let mut pkg: Option<String> = None;
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(spec.query, tree.root_node(), source);
+        while let Some(m) = matches.next() {
+            let mut name_node: Option<tree_sitter::Node> = None;
+            let mut kind: Option<SymbolKind> = None;
+            let mut def_node: Option<tree_sitter::Node> = None;
+            for cap in m.captures {
+                let cap_name = &spec.query.capture_names()[cap.index as usize];
+                if *cap_name == spec.name_capture {
+                    name_node = Some(cap.node);
+                } else if let Some((_, k)) =
+                    spec.capture_kinds.iter().find(|(n, _)| *n == *cap_name)
+                {
+                    kind = Some(*k);
+                    // The kind capture (`@def.*`) sits on the whole
+                    // declaration node — its range is the full span.
+                    def_node = Some(cap.node);
+                }
+            }
+            let (Some(name_node), Some(kind), Some(def_node)) =
+                (name_node, kind, def_node) else { continue };
+            // A package declaration's span doesn't enclose a body offset;
+            // record its name and skip it as an enclosing candidate.
+            if kind == SymbolKind::Package {
+                if pkg.is_none() {
+                    if let Some((_, n, _)) = symbol_identity(name_node, source, spec) {
+                        pkg = Some(n);
+                    }
+                }
+                continue;
+            }
+            cands.push((def_node.start_byte() as u32, def_node.end_byte() as u32,
+                        name_node, kind));
+        }
+        // For each offset, the innermost (smallest) containing candidate,
+        // tie-broken toward the later start (more deeply nested).
+        offsets.iter().map(|&offset| {
+            let mut best: Option<&(u32, u32, tree_sitter::Node, SymbolKind)> = None;
+            for c in &cands {
+                if !(c.0 <= offset && offset < c.1) { continue; }
+                let take = match best {
+                    None => true,
+                    Some(b) => (c.1 - c.0) < (b.1 - b.0)
+                        || ((c.1 - c.0) == (b.1 - b.0) && c.0 > b.0),
+                };
+                if take { best = Some(c); }
+            }
+            let (span_start, span_end, name_node, kind) = *best?;
+            let (name_node, name, mut scope_path) =
+                symbol_identity(name_node, source, spec)?;
+            if let Some(p) = &pkg {
+                if scope_path.first().map(String::as_str) != Some(p.as_str()) {
+                    scope_path.insert(0, p.clone());
+                }
+            }
+            let line = (name_node.start_position().row as u32).saturating_add(1);
+            let fqn = if scope_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}{sep}{name}", scope_path.join(sep))
+            };
+            Some(Enclosing { fqn, name, kind, scope_path, span_start, span_end, line })
+        }).collect()
     })
 }
 
@@ -2018,6 +2174,94 @@ mod tests {
         assert!(names.contains(&"Foo"), "names: {:?}", names);
         assert!(names.contains(&"bar"));
         assert!(names.contains(&"baz"));
+    }
+
+    fn byte_of(src: &[u8], needle: &str) -> u32 {
+        std::str::from_utf8(src).unwrap().find(needle)
+            .unwrap_or_else(|| panic!("needle {needle:?} not in source")) as u32
+    }
+
+    #[test]
+    fn whereis_java_picks_innermost_method() {
+        let src = br#"
+package com.android.foo;
+public class Outer {
+    public void alpha() {
+        int x = 1;
+    }
+    int gap;
+    public void beta() {
+        int y = 2;
+    }
+}
+"#;
+        // Inside alpha's body.
+        let a = enclosing_symbol(FileKind::Java, src, byte_of(src, "int x")).unwrap();
+        assert_eq!(a.fqn, "com.android.foo.Outer.alpha");
+        assert_eq!(a.kind, SymbolKind::Method);
+        // Inside beta's body — must NOT bleed back to alpha.
+        let b = enclosing_symbol(FileKind::Java, src, byte_of(src, "int y")).unwrap();
+        assert_eq!(b.fqn, "com.android.foo.Outer.beta");
+        // On the field BETWEEN the two methods: the old nearest-preceding
+        // heuristic would wrongly say `alpha`; precise containment says
+        // the field (and never a method).
+        let g = enclosing_symbol(FileKind::Java, src, byte_of(src, "int gap")).unwrap();
+        assert_eq!(g.fqn, "com.android.foo.Outer.gap");
+        assert_eq!(g.kind, SymbolKind::Field);
+    }
+
+    #[test]
+    fn whereis_cpp_in_class_and_out_of_line() {
+        let inl = br#"
+namespace android {
+class Parcel {
+public:
+    void writeInt32(int v) {
+        int local = v;
+    }
+};
+}
+"#;
+        let e = enclosing_symbol(FileKind::Cpp, inl, byte_of(inl, "int local")).unwrap();
+        assert_eq!(e.fqn, "android::Parcel::writeInt32");
+
+        let oob = br#"
+namespace android {
+class Parcel { public: void writeInt32(int v); };
+void Parcel::writeInt32(int v) {
+    int local = v;
+}
+}
+"#;
+        let e2 = enclosing_symbol(FileKind::Cpp, oob, byte_of(oob, "int local = v")).unwrap();
+        assert_eq!(e2.fqn, "android::Parcel::writeInt32");
+    }
+
+    #[test]
+    fn whereis_rust_uses_colon_separator() {
+        let src = br#"
+mod outer {
+    pub fn compute(x: i32) -> i32 {
+        let y = x + 1;
+        y
+    }
+}
+"#;
+        let e = enclosing_symbol(FileKind::Rust, src, byte_of(src, "let y")).unwrap();
+        assert_eq!(e.fqn, "outer::compute");
+        assert!(e.span_start <= byte_of(src, "let y"));
+        assert!(e.span_end > byte_of(src, "let y"));
+    }
+
+    #[test]
+    fn whereis_file_scope_is_none() {
+        let src = br#"
+package com.x;
+import java.util.List;
+public class Z { void m() {} }
+"#;
+        // On the import line — inside no declaration span.
+        assert!(enclosing_symbol(FileKind::Java, src, byte_of(src, "import java")).is_none());
     }
 
     #[test]

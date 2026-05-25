@@ -160,6 +160,37 @@ enum Cmd {
         #[arg(long)]
         incremental: bool,
     },
+    /// Keep the index continuously up to date: watch the source ROOT(S)
+    /// and, on every change, run an incremental reindex (reparse only the
+    /// changed/added files, replay the rest) so `def`/`ref`/`grep` stay
+    /// current as you edit. Pairs with `scry whereis`, which parses the
+    /// live file and is always current regardless.
+    ///
+    /// Requires an existing index with digests (run `scry index … -o DIR`
+    /// once, then `scry build-digests -o DIR`). Long-lived; Ctrl-C to
+    /// stop. Each cycle costs the same as `scry index --incremental` (it
+    /// re-walks + re-hashes to find the delta), so on very large trees
+    /// the walk dominates the per-change latency.
+    Watch {
+        /// Source root(s). Default: same as `scry index`.
+        roots: Vec<PathBuf>,
+        /// Index directory to keep fresh. Default: the standard index dir.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        workers: Option<usize>,
+        #[arg(long, default_value_t = 100 * 1024 * 1024)]
+        max_file_bytes: u64,
+        /// Also refresh the trigram index each cycle.
+        #[arg(long)]
+        build_trigrams: bool,
+        /// Quiet period (ms) after the last change before reindexing —
+        /// coalesces a burst (editor save, `git checkout`) into one pass.
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
+    },
     /// Look up references to a name.
     Ref {
         name: String,
@@ -525,6 +556,33 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Reverse lookup: name the symbol enclosing a source LOCATION.
+    /// The inverse of `def` — given a crash frame, compiler-error
+    /// location, or `rg` hit, print the FQN of the function/class that
+    /// CONTAINS that point, ready to feed to scry2.
+    ///
+    /// LOCATION is `PATH:LINE` (e.g. `Foo.java:123`, the crash-frame
+    /// shape), `PATH:LINE:COL`, or `PATH@BYTE`. The file is parsed LIVE
+    /// from disk, so the answer reflects your current working tree, not
+    /// a build-time snapshot — correct even on unsaved edits. PATH is
+    /// used as-is if it exists; otherwise it is resolved by suffix
+    /// against the index (so a root-relative crash path still works).
+    ///
+    /// The FQN uses the language separator scry2 expects (`::` for
+    /// C/C++/Rust, `.` for Java/Kotlin/…), so the synergy is a pipe:
+    ///   scry whereis AMS.java:1024 -q | xargs scry2 callers
+    Whereis {
+        /// PATH:LINE | PATH:LINE:COL | PATH@BYTE
+        location: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        /// Quiet: print ONLY the bare FQN (nothing else) for piping
+        /// into scry2. Mutually exclusive with --json.
+        #[arg(long, short = 'q')]
+        fqn_only: bool,
+    },
     /// Substring or regex search over indexed source files (rg-like).
     Grep {
         pattern: String,
@@ -576,6 +634,14 @@ enum Cmd {
         /// formats.
         #[arg(long)]
         explain: bool,
+        /// Annotate each hit with the FQN of the symbol that ENCLOSES
+        /// it (resolved live from the file via tree-sitter) — turning a
+        /// text search into a symbol search. `grep "some log string"
+        /// --fqn` tells you which function emits it, ready to pipe to
+        /// scry2: `scry grep … --fqn --format lines | awk '{print $NF}'
+        /// | xargs -n1 scry2 callers`.
+        #[arg(long)]
+        fqn: bool,
     },
     /// Symbols and references in files that changed since a git
     /// commit. Useful for code review and for agents working on a
@@ -946,12 +1012,16 @@ fn main() -> Result<()> {
         Cmd::Outline { path, index, json, limit, with_snippets } =>
             cmd_outline(path, index, json, limit, with_snippets),
         Cmd::Tldr { path, index, json } => cmd_tldr(path, index, json),
+        Cmd::Whereis { location, index, json, fqn_only } =>
+            cmd_whereis(location, index, json, fqn_only),
+        Cmd::Watch { roots, out, profile, workers, max_file_bytes, build_trigrams, debounce_ms } =>
+            cmd_watch(roots, out, profile, workers, max_file_bytes, build_trigrams, debounce_ms),
         Cmd::Grep {
             pattern, index, regex, ignore_case, lang, in_, not_in, limit, json, workers,
-            max_file_bytes, mem_cap, format, explain,
+            max_file_bytes, mem_cap, format, explain, fqn,
         } => cmd_grep(
             pattern, index, regex, ignore_case, lang, in_, not_in, limit, json, workers,
-            max_file_bytes, mem_cap, format, explain,
+            max_file_bytes, mem_cap, format, explain, fqn,
         ),
         Cmd::Serve { index, listen, max_conns } => cmd_serve(index, listen, max_conns),
         Cmd::Warm { index } => cmd_warm(index),
@@ -3221,6 +3291,130 @@ fn resolve_file_id(r: &StoreReader, arg: &str) -> Option<u32> {
     r.resolve_file_id(arg)
 }
 
+/// A parsed `whereis` target within a file.
+enum WhereTarget {
+    Byte(u32),
+    Line(u32, Option<u32>),
+}
+
+/// Parse a `whereis` LOCATION into (path, target). Recognizes
+/// `PATH@BYTE`, `PATH:LINE`, and `PATH:LINE:COL`, parsed from the right
+/// so a path containing ':' is still handled.
+fn parse_location(loc: &str) -> Result<(String, WhereTarget)> {
+    if let Some((p, b)) = loc.rsplit_once('@') {
+        let byte: u32 = b.parse()
+            .with_context(|| format!("bad byte offset in '{loc}'"))?;
+        return Ok((p.to_string(), WhereTarget::Byte(byte)));
+    }
+    let parts: Vec<&str> = loc.split(':').collect();
+    let n = parts.len();
+    let is_num = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    if n >= 3 && is_num(parts[n - 1]) && is_num(parts[n - 2]) {
+        return Ok((parts[..n - 2].join(":"),
+            WhereTarget::Line(parts[n - 2].parse()?, Some(parts[n - 1].parse()?))));
+    }
+    if n >= 2 && is_num(parts[n - 1]) {
+        return Ok((parts[..n - 1].join(":"),
+            WhereTarget::Line(parts[n - 1].parse()?, None)));
+    }
+    anyhow::bail!("LOCATION must be PATH:LINE, PATH:LINE:COL, or PATH@BYTE (got '{loc}')")
+}
+
+/// Byte offset of a 1-based (line, col) in `bytes`. Col defaults to the
+/// line's first byte and is clamped to the line's extent; a line past
+/// EOF is an error. Any byte on the crash line lands inside the
+/// enclosing declaration, so start-of-line is sufficient for lookup.
+fn line_col_to_byte(bytes: &[u8], line: u32, col: Option<u32>) -> Result<u32> {
+    if line == 0 { anyhow::bail!("line numbers are 1-based"); }
+    let mut off = 0usize;
+    for _ in 1..line {
+        match bytes[off..].iter().position(|&b| b == b'\n') {
+            Some(p) => off += p + 1,
+            None => anyhow::bail!("line {line} is past end of file"),
+        }
+    }
+    let line_end = bytes[off..].iter().position(|&b| b == b'\n')
+        .map(|p| off + p).unwrap_or(bytes.len());
+    let target = match col {
+        None => off,
+        Some(c) => (off + c.saturating_sub(1) as usize)
+            .min(line_end.saturating_sub(1)).max(off),
+    };
+    Ok(target as u32)
+}
+
+/// `whereis` — reverse lookup from a source location to its enclosing
+/// symbol's FQN. Parses the file live from disk; falls back to index
+/// suffix resolution only to turn a root-relative path into a real one.
+fn cmd_whereis(
+    location: String, index: Option<PathBuf>, json: bool, fqn_only: bool,
+) -> Result<()> {
+    if json && fqn_only {
+        anyhow::bail!("--json and --fqn-only are mutually exclusive");
+    }
+    let (path_arg, target) = parse_location(&location)?;
+
+    let file_path: PathBuf = if Path::new(&path_arg).exists() {
+        PathBuf::from(&path_arg)
+    } else {
+        // Not on disk as given — resolve by suffix against the index.
+        let r = open_index(index).with_context(|| {
+            format!("'{path_arg}' not found on disk and no index to resolve it")
+        })?;
+        let fid = resolve_file_id(&r, &path_arg)
+            .ok_or_else(|| anyhow::anyhow!("'{path_arg}' not found on disk or in the index"))?;
+        PathBuf::from(r.file_view(fid)
+            .ok_or_else(|| anyhow::anyhow!("file_id {fid} out of range"))?
+            .display_path())
+    };
+    let bytes = std::fs::read(&file_path)
+        .with_context(|| format!("reading {}", file_path.display()))?;
+    let kind = FileKind::classify(&file_path)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized file type: {}", file_path.display()))?;
+
+    let (offset, disp_line) = match target {
+        WhereTarget::Byte(b) => (b, None),
+        WhereTarget::Line(l, c) => (line_col_to_byte(&bytes, l, c)?, Some(l)),
+    };
+
+    let hit = scry_lang::enclosing_symbol(kind, &bytes, offset);
+
+    if json {
+        let obj = match &hit {
+            Some(e) => serde_json::json!({
+                "fqn": e.fqn, "name": e.name, "kind": e.kind.short(),
+                "lang": kind.as_str(), "file": file_path.display().to_string(),
+                "line": disp_line, "byte": offset,
+                "span": [e.span_start, e.span_end], "scope": e.scope_path,
+            }),
+            None => serde_json::json!({
+                "fqn": serde_json::Value::Null, "lang": kind.as_str(),
+                "file": file_path.display().to_string(),
+                "line": disp_line, "byte": offset,
+            }),
+        };
+        println!("{obj}");
+        return Ok(());
+    }
+
+    let Some(e) = hit else {
+        if fqn_only { return Ok(()); }
+        anyhow::bail!("no enclosing symbol at {location} (file scope / between declarations)");
+    };
+    if fqn_only {
+        println!("{}", e.fqn);
+    } else {
+        let at = match disp_line {
+            Some(l) => format!("{}:{l}", file_path.display()),
+            None => format!("{}@{offset}", file_path.display()),
+        };
+        println!("{}", e.fqn);
+        println!("  kind: {}  lang: {}  at: {at}  span: {}..{}",
+                 e.kind.short(), kind.as_str(), e.span_start, e.span_end);
+    }
+    Ok(())
+}
+
 fn cmd_outline(
     path: String, index: Option<PathBuf>, json: bool,
     limit: usize, with_snippets: usize,
@@ -4052,6 +4246,7 @@ fn cmd_grep(
     mem_cap: u32,
     format: Option<String>,
     explain: bool,
+    fqn: bool,
 ) -> Result<()> {
     if json && format.is_some() {
         anyhow::bail!("--json and --format are mutually exclusive");
@@ -4285,7 +4480,8 @@ fn cmd_grep(
             };
             for m in re.find_iter(&bytes) {
                 let (line, col, snippet) = locate_match(&bytes, m.start(), m.end());
-                local.push(Hit { file_id: fe.id, line, col, snippet });
+                local.push(Hit { file_id: fe.id, line, col,
+                    byte: m.start() as u32, snippet, fqn: None });
                 if local.len() >= limit { break; }
             }
         } else {
@@ -4310,7 +4506,8 @@ fn cmd_grep(
             };
             for abs in offsets {
                 let (line, col, snippet) = locate_match(&bytes, abs, abs + needle.len());
-                local.push(Hit { file_id: fe.id, line, col, snippet });
+                local.push(Hit { file_id: fe.id, line, col,
+                    byte: abs as u32, snippet, fqn: None });
                 if local.len() >= limit { break; }
             }
         }
@@ -4322,16 +4519,44 @@ fn cmd_grep(
 
     let mut hits = hits.into_inner();
     hits.truncate(limit);
+
+    // --fqn: annotate each surviving hit with its enclosing symbol's
+    // FQN. Group by file so each file is read + parsed exactly once,
+    // then batch-resolve all of that file's hit offsets.
+    if fqn {
+        use std::collections::HashMap;
+        let mut by_file: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, h) in hits.iter().enumerate() {
+            by_file.entry(h.file_id).or_default().push(i);
+        }
+        for (fid, idxs) in by_file {
+            let Some(fe) = r.file_view(fid) else { continue };
+            let kind = fe.kind;
+            let Ok(bytes) = std::fs::read(fe.display_path()) else { continue };
+            let offsets: Vec<u32> = idxs.iter().map(|&i| hits[i].byte).collect();
+            let encs = scry_lang::enclosing_symbols(kind, &bytes, &offsets);
+            for (slot, enc) in idxs.into_iter().zip(encs) {
+                hits[slot].fqn = enc.map(|e| e.fqn);
+            }
+        }
+    }
+
     match (json, format) {
         (true, _) => {
             for h in &hits {
                 let path = r.display_path_cached(h.file_id).unwrap_or("");
-                let obj = serde_json::json!({
+                let mut obj = serde_json::json!({
                     "path": path,
                     "line": h.line,
                     "col": h.col,
                     "snippet": h.snippet,
                 });
+                if fqn {
+                    obj["fqn"] = match &h.fqn {
+                        Some(f) => serde_json::Value::String(f.clone()),
+                        None => serde_json::Value::Null,
+                    };
+                }
                 println!("{obj}");
             }
         }
@@ -4348,13 +4573,25 @@ fn cmd_grep(
         (false, Some("lines")) => {
             for h in &hits {
                 let path = r.display_path_cached(h.file_id).unwrap_or("");
-                println!("{}:{}:{}\t{}", path, h.line, h.col, h.snippet);
+                if fqn {
+                    // rg-shaped + a trailing FQN column (— when unresolved),
+                    // so `awk '{print $NF}'` pipes straight to scry2.
+                    println!("{}:{}:{}\t{}\t{}", path, h.line, h.col, h.snippet,
+                             h.fqn.as_deref().unwrap_or("—"));
+                } else {
+                    println!("{}:{}:{}\t{}", path, h.line, h.col, h.snippet);
+                }
             }
         }
         _ => {
             for h in &hits {
                 let path = r.display_path_cached(h.file_id).unwrap_or("");
-                println!("{}:{}:{}: {}", path, h.line, h.col, h.snippet);
+                if fqn {
+                    println!("{}:{}:{}: {}  [{}]", path, h.line, h.col, h.snippet,
+                             h.fqn.as_deref().unwrap_or("?"));
+                } else {
+                    println!("{}:{}:{}: {}", path, h.line, h.col, h.snippet);
+                }
             }
             eprintln!("\n{} hits across {} files", hits.len(), total_files);
         }
@@ -4373,7 +4610,12 @@ struct Hit {
     file_id: u32,
     line: u32,
     col: u32,
+    /// Byte offset of the match start — used by `--fqn` to resolve the
+    /// enclosing symbol.
+    byte: u32,
     snippet: String,
+    /// FQN of the enclosing symbol, filled when `--fqn` is set.
+    fqn: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4928,6 +5170,103 @@ fn cmd_index_diff(
 //     the new mapping. (No external state depends on file_id stability.)
 //   - Re-run build-file-symbols / build-file-refs. The user can
 //     invoke them post-incremental if they need the sidecars.
+/// `scry watch` — keep the index fresh as code changes. Recursively
+/// watches the roots and, after a quiet debounce window, runs the same
+/// incremental reindex as `scry index --incremental` (digest-diff: only
+/// changed/added files are reparsed). Long-lived; Ctrl-C to stop.
+fn cmd_watch(
+    roots: Vec<PathBuf>,
+    out: Option<PathBuf>,
+    profile: Option<String>,
+    workers: Option<usize>,
+    max_file_bytes: u64,
+    build_trigrams: bool,
+    debounce_ms: u64,
+) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+
+    let roots = if roots.is_empty() { default_roots() } else { roots };
+    if roots.is_empty() {
+        anyhow::bail!("no source roots provided and no default available");
+    }
+    let out_dir = out.unwrap_or_else(default_index_dir);
+    // Same prerequisite as the incremental pass — fail fast with guidance.
+    if !out_dir.join("manifest.json").exists() {
+        anyhow::bail!(
+            "no existing index at {0} — run `scry index {1} -o {0}` then \
+             `scry build-digests -o {0}` first, so watch has a base to update",
+            out_dir.display(),
+            roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(" "),
+        );
+    }
+    // Ignore events under the index dir (our own writes) — avoids a loop.
+    let out_canon = std::fs::canonicalize(&out_dir).unwrap_or_else(|_| out_dir.clone());
+
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res| { let _ = tx.send(res); })
+        .context("create filesystem watcher")?;
+    for root in &roots {
+        watcher.watch(root, RecursiveMode::Recursive).with_context(|| format!(
+            "watch {} — on a large tree this can exceed the inotify limit; \
+             raise it with `sudo sysctl fs.inotify.max_user_watches=524288`",
+            root.display()))?;
+    }
+    eprintln!("[watch] roots: {}  ->  index {}  (debounce {debounce_ms}ms, Ctrl-C to stop)",
+        roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", "),
+        out_dir.display());
+
+    let debounce = Duration::from_millis(debounce_ms);
+    // Collect the source files touched by an event, skipping VCS churn
+    // and our own index writes. CRUCIAL: react only to content-changing
+    // events (create / write / remove / rename). inotify also reports
+    // ACCESS and metadata events, and the reindex itself READS every
+    // source file — reacting to reads would feed back into an endless
+    // reindex loop.
+    let collect = |ev: &notify::Event, set: &mut HashSet<PathBuf>| {
+        use notify::event::{EventKind, ModifyKind};
+        let changes_content = matches!(ev.kind,
+            EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Modify(ModifyKind::Any));
+        if !changes_content { return; }
+        for p in &ev.paths {
+            if p.starts_with(&out_canon) || p.starts_with(&out_dir) { continue; }
+            if p.components().any(|c| c.as_os_str() == ".git") { continue; }
+            if FileKind::classify(p).is_some() { set.insert(p.clone()); }
+        }
+    };
+
+    // Block for the first change; exit when the watcher is dropped.
+    while let Ok(first) = rx.recv() {
+        let mut pending: HashSet<PathBuf> = HashSet::new();
+        if let Ok(ev) = first { collect(&ev, &mut pending); }
+        // Coalesce the burst: keep draining until quiet for `debounce`.
+        loop {
+            match rx.recv_timeout(debounce) {
+                Ok(Ok(ev)) => collect(&ev, &mut pending),
+                Ok(Err(_)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+        if pending.is_empty() { continue; }
+        let t = Instant::now();
+        match cmd_index_incremental(
+            roots.clone(), Some(out_dir.clone()), profile.clone(),
+            workers, max_file_bytes, build_trigrams,
+        ) {
+            Ok(()) => eprintln!("[watch] {} change(s) -> reindexed in {:.1}s",
+                                pending.len(), t.elapsed().as_secs_f64()),
+            Err(e) => eprintln!("[watch] reindex failed: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
 fn cmd_index_incremental(
     roots: Vec<PathBuf>,
     out: Option<PathBuf>,
@@ -7353,6 +7692,38 @@ fn short_lang(k: FileKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whereis_parse_location_forms() {
+        // PATH:LINE
+        let (p, t) = parse_location("Foo.java:123").unwrap();
+        assert_eq!(p, "Foo.java");
+        assert!(matches!(t, WhereTarget::Line(123, None)));
+        // PATH:LINE:COL
+        let (p, t) = parse_location("a/b/Foo.cpp:40:7").unwrap();
+        assert_eq!(p, "a/b/Foo.cpp");
+        assert!(matches!(t, WhereTarget::Line(40, Some(7))));
+        // PATH@BYTE
+        let (p, t) = parse_location("x/y.rs@2048").unwrap();
+        assert_eq!(p, "x/y.rs");
+        assert!(matches!(t, WhereTarget::Byte(2048)));
+        // No line/byte → error.
+        assert!(parse_location("Foo.java").is_err());
+    }
+
+    #[test]
+    fn whereis_line_col_to_byte_maps_lines() {
+        let src = b"line1\nline2\nline3\n";
+        // line 1 starts at 0; line 2 at 6; line 3 at 12.
+        assert_eq!(line_col_to_byte(src, 1, None).unwrap(), 0);
+        assert_eq!(line_col_to_byte(src, 2, None).unwrap(), 6);
+        assert_eq!(line_col_to_byte(src, 3, None).unwrap(), 12);
+        // col offsets within the line.
+        assert_eq!(line_col_to_byte(src, 2, Some(3)).unwrap(), 8);
+        // line past EOF errors; line 0 is rejected (1-based).
+        assert!(line_col_to_byte(src, 99, None).is_err());
+        assert!(line_col_to_byte(src, 0, None).is_err());
+    }
 
     /// v0.1.39 — disambiguates same-basename files (the many
     /// MainActivity.java in AOSP) by showing the parent dir too,

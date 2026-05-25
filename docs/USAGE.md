@@ -325,6 +325,26 @@ $ scry grep '\bZygoteInit\b' --regex --limit 2
 |       | `--json`              | NDJSON (one object per hit)                  |
 |       | `--format lines`      | `path:line:col\tsnippet`, one hit per line   |
 |       | `--format count`      | Just `N hits across M files` — no per-hit rows |
+|       | `--fqn`               | Annotate each hit with the **enclosing symbol's FQN** (turns text search into symbol search; feeds scry2) |
+
+### Hit → enclosing FQN (`--fqn`)
+
+`--fqn` resolves the symbol that encloses each hit (live, via tree-sitter) and
+appends it — a text search becomes a symbol search. The FQN is in scry2's form
+(`::` for C/C++/Rust, `.` for Java/Kotlin), so it pipes straight through:
+
+```
+$ scry grep 'clearCallingIdentity' --fqn --format lines
+…/BugreportManager.java:446:42  …Binder.clearCallingIdentity();  android.os.BugreportManager.DumpstateListener.onProgress
+…/IPCThreadState.h:149:32       int64_t clearCallingIdentity();   android::IPCThreadState
+
+# Which functions log a given string → who calls them, via scry2:
+$ scry grep 'some log string' --fqn --format lines \
+    | awk -F'\t' '{print $NF}' | sort -u | xargs -n1 scry2 callers
+```
+
+`--fqn` also adds an `"fqn"` field in `--json` (null at file scope). Each file is
+parsed once regardless of hit count.
 
 ### Case-insensitive grep (`-i` / `--ignore-case`)
 
@@ -393,6 +413,65 @@ across the corpus and a `--lang` / `--in` filter would help.
 Regex patterns report whether literal-extraction analysis
 found anything to pre-filter on, falling back to a full-scan
 notice when no literals could be extracted.
+
+---
+
+## Reverse lookup: `scry whereis`
+
+The inverse of `def`: given a source **location**, print the FQN of the symbol
+that **encloses** it. This turns a crash frame, a compiler-error location, or an
+`rg` hit into a symbol you can hand to scry2.
+
+`whereis` parses the file **live** from disk (no index needed), so the answer
+reflects the current working tree — correct even on unsaved edits. Containment is
+exact (the full declaration span, not "nearest definition above"), so a line
+*between* two methods resolves to the enclosing class/field, never the wrong
+method.
+
+```
+$ scry whereis frameworks/.../Parcel.java:661
+android.os.Parcel.recycle
+  kind: method  lang: Java  at: …/Parcel.java:661  span: 28989..30194
+
+$ scry whereis some.cpp:88 -q          # bare FQN only, for piping
+android::Foo::bar
+$ scry whereis some.cpp@20159           # PATH@BYTE form
+$ scry whereis Foo.java:123 --json      # {fqn,name,kind,lang,line,byte,span,scope}
+```
+
+LOCATION is `PATH:LINE`, `PATH:LINE:COL`, or `PATH@BYTE`. PATH is used as-is if it
+exists; otherwise it is resolved by suffix against `--index DIR` (so a bare crash
+filename like `Parcel.java` works). The FQN uses scry2's separator (`::` for
+C/C++/Rust, `.` for Java/Kotlin), so:
+
+```
+$ scry whereis Parcel.java:661 -q | xargs scry2 callers
+```
+
+Limitations: a C++ **anonymous-namespace** function resolves to its bare name (no
+synthetic qualifier — use `scry2 … --substr` for those); a point inside a
+`TEST_F`/macro body resolves to the macro token.
+
+---
+
+## Keep the index fresh: `scry watch`
+
+Watch the source root(s) and reindex incrementally on every change, so
+`def`/`ref`/`grep` stay current as you edit:
+
+```
+$ scry watch frameworks/base -o /path/to/index --build-trigrams
+[watch] roots: frameworks/base  ->  index /path/to/index  (debounce 500ms, Ctrl-C to stop)
+[watch] 3 change(s) -> reindexed in 0.4s
+```
+
+Requires an existing index with digests (`scry index … -o DIR` then `scry
+build-digests --index DIR`). It reacts only to create/write/remove/rename (never
+to reads, so it can't loop on its own scan), coalesces bursts within
+`--debounce-ms` (default 500), and each cycle is exactly a `scry index
+--incremental` (only changed files reparsed). On a very large tree the per-cycle
+walk dominates; raise `fs.inotify.max_user_watches` if the watch setup errors.
+For point lookups you don't need watch at all — `whereis` always parses live.
 
 ---
 
